@@ -1,0 +1,19 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "../logger" },
+    { "path": "../config" },
+    { "path": "../native" },
+    { "path": "../platform" },
+    { "path": "../som" },
+    { "path": "../llm" },
+    { "path": "../tools" },
+    { "path": "../scout-client" }
+  ]
+}

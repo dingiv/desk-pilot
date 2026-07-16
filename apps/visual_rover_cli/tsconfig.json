@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "../../packages/agent" },
+    { "path": "../../packages/config" },
+    { "path": "../../packages/llm" },
+    { "path": "../../packages/native" },
+    { "path": "../../packages/platform" },
+    { "path": "../../packages/providers" }
+  ]
+}

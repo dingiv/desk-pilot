@@ -1,0 +1,28 @@
+{
+  "name": "@vrover/visual-rover-cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "VRover — the GUI agent (brain) one-shot CLI frontend.",
+  "main": "./src/main.ts",
+  "bin": {
+    "visual-rover-cli": "./src/main.ts"
+  },
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "start:mock": "tsx src/main.ts --platform mock",
+    "start:desktop": "tsx src/main.ts --platform desktop",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@vrover/agent": "workspace:*",
+    "@vrover/config": "workspace:*",
+    "@vrover/llm": "workspace:*",
+    "@vrover/native": "workspace:*",
+    "@vrover/platform": "workspace:*",
+    "@vrover/providers": "workspace:*"
+  },
+  "devDependencies": {
+    "tsx": "^4.22.4"
+  }
+}

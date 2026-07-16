@@ -1,0 +1,20 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/logger" },
+    { "path": "packages/config" },
+    { "path": "packages/scout-protocol" },
+    { "path": "packages/scout-client" },
+    { "path": "packages/platform" },
+    { "path": "packages/som" },
+    { "path": "packages/llm" },
+    { "path": "packages/providers" },
+    { "path": "packages/tools" },
+    { "path": "packages/scout" },
+    { "path": "packages/native" },
+    { "path": "packages/agent" },
+    { "path": "apps/omni_scout" },
+    { "path": "apps/visual_rover_cli" },
+    { "path": "apps/visual_rover_web" }
+  ]
+}

@@ -1,0 +1,44 @@
+# Project cargo config. Merges with ~/.cargo/config.toml (rsproxy mirror).
+#
+# IMPORTANT: this workspace pulls mistralrs + candle + sherpa — their release builds are
+# memory-heavy (candle CUDA codegen can spike a single rustc to ~8GB). On this shared desktop
+# (59GB RAM, but kasm VNC + Chrome + IDE share it) full -j16 parallelism OOM-swaps the desktop.
+# So we cap build parallelism and bump codegen units to flatten the peak.
+[build]
+jobs = 4
+# Native .so discovery at RUNTIME — "DLL-next-to-exe" for Linux.
+# The binary bakes a $ORIGIN-relative RUNPATH so it finds <workspace>/lib/ with NO system
+# ldconfig entry and NO LD_LIBRARY_PATH. Two entries cover cargo's two output depths:
+#   - $ORIGIN/../../lib      → bins at      target/<profile>/
+#   - $ORIGIN/../../../lib   → examples at  target/<profile>/examples/
+# The sherpa .so themselves carry RPATH=[$ORIGIN], so transitive deps (libonnxruntime.so)
+# resolve from the same dir. lib/ holds symlinks to the real prebuilt libs (see native/sherpa).
+# NOTE: changing rustflags invalidates the whole build cache (one-time full rebuild).
+rustflags = [
+    "-C", "codegen-units=16",
+    "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../lib",
+    "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../../lib",
+]
+
+[env]
+CUDA_PATH = "/usr/local/cuda-13.2"
+CUDA_ROOT = "/usr/local/cuda-13.2"
+CUDA_HOME = "/usr/local/cuda-13.2"
+CUDA_COMPUTE_CAP = "120"
+# Point cudaforge (candle-kernels build) at the REAL nvcc path. /usr/local/bin/nvcc is a symlink
+# to cuda-13.2, but cudaforge derives the toolkit root from nvcc's PARENT dir without resolving
+# the symlink → gets /usr/local → include /usr/local/include (no cuda_runtime.h) → nvcc fails.
+# cudaforge's find_nvcc() checks NVCC first, so this forces the correct /usr/local/cuda-13.2 root.
+NVCC = "/usr/local/cuda-13.2/bin/nvcc"
+# sherpa-onnx official crate BUILD-time lib discovery (so build.rs skips the github download,
+# blocked here). Points at the version-agnostic <workspace>/lib/ — the same dir the binary's
+# RUNPATH resolves at runtime. If you upgrade sherpa, just repoint the lib/*.so symlinks.
+SHERPA_ONNX_LIB_DIR = "/workspaces/gui_agent/audio-aura/lib"
+
+[alias]
+# Legacy Stage1+2 bench (bin) — deprecated with the aura-core legacy code.
+benchaura = "run -p audio-aura-core --release --features cuda,asr --bin stage12 --"
+# Thin Stage1→Stage2 bench on the Pipeline composer (moved here from aura-asr).
+benchlive = "run -p audio-aura-core --release --features cuda,asr --example stage12_live --"
+# Full daemon (Pipeline + Stage3 rule trigger + socket skeleton).
+daemon = "run -p aura-daemon --release --features asr,cuda --"

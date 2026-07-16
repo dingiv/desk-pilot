@@ -1,0 +1,15 @@
+[package]
+name = "audio-aura-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Stage3 capability layer — Tool trait + capability interfaces (HotwordManager/FineTuner/ContextSummarizer/MemoryStore). Capabilities only; scheduling lives in desktop-pet (via the daemon)."
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Stage1/Stage2/data types will be added as capabilities that need them land (HotwordManager
+# operates on a plain shared Vec<String>, so this crate is currently dependency-light).
+
+[features]
+default = []

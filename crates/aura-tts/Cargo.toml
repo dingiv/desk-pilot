@@ -1,0 +1,8 @@
+[package]
+name = "audio-aura-tts"
+version = "0.1.0"
+edition = "2021"
+description = "TTS capability placeholder. Text to synthesize comes from the agent layer (Stage3/geek-familiar). Real backend (Kokoro/Piper via sherpa-onnx) lands later."
+
+[dependencies]
+anyhow = "1"

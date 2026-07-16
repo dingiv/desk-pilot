@@ -1,0 +1,21 @@
+[package]
+name = "geek-familiar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+core = { workspace = true }
+render = { workspace = true }
+platform = { workspace = true }
+ui = { workspace = true }
+
+[features]
+default = []
+# Select the GTK4 backend (no-op stub until M1; real build needs libgtk-4-dev).
+gtk = ["platform/gtk"]
+# Render the pet UI with egui (offscreen wgpu → RGBA8). Use together with `gtk`;
+# needs a Vulkan GPU (set VK_ICD_FILENAMES).
+egui = ["gtk", "platform/egui"]

@@ -1,0 +1,11 @@
+# pnpm v11+ reads build-script approvals here.
+allowBuilds:
+  esbuild: true
+
+packages:
+  - 'packages/*'
+  - 'apps/visual_rover_cli'
+  - 'apps/visual_rover_web'
+  - 'apps/omni_scout'
+  - 'apps/omni_scout_devtools'
+

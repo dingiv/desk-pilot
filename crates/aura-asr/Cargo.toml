@@ -1,0 +1,47 @@
+[package]
+name = "audio-aura-asr"
+version = "0.1.0"
+edition = "2021"
+description = "Stage1 — capture + VAD + ASR (two-pass) + the Stage1Executor abstraction. A true leaf crate (no aura-dcl dep)."
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+aura-fs = { path = "../aura-fs" }
+# ONNX ecosystem: VAD (Silero) + ASR (SenseVoice) via the OFFICIAL sherpa-onnx crate.
+sherpa-onnx = { version = "1.13", default-features = false, features = ["shared"], optional = true }
+
+[build-dependencies]
+aura-fs = { path = "../aura-fs" }
+
+# Namespace: model files. dev = relative to this crate's dir → ../../native/models.
+# prod = user-installed models under ~/.audio-aura/models.
+[package.metadata.aura-fs]
+MODELS = { dev = "../../native/models", prod = "~/.audio-aura/models" }
+
+[[example]]
+name = "transcribe"
+required-features = ["onnx"]
+
+[[example]]
+name = "batch_transcribe"
+required-features = ["onnx"]
+
+[[example]]
+name = "scout_debug"
+
+[[example]]
+name = "streaming_asr"
+required-features = ["onnx"]
+
+[[example]]
+name = "streaming_asr_hot"
+required-features = ["onnx"]
+
+[features]
+default = []
+# ONNX-side models (VAD/ASR) via sherpa-onnx official crate. Also gates the Stage1Executor impl.
+onnx = ["dep:sherpa-onnx"]
+# Enable everything (currently just onnx). Lets upstream crates pull Stage1 via a stable `all`
+# handle regardless of how many onnx-gated features grow here.
+all = ["onnx"]

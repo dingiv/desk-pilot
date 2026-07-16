@@ -1,0 +1,49 @@
+# VRover native layer — a Cargo workspace living alongside the pnpm TS monorepo.
+#
+# The TS monorepo (`packages/*`, `apps/*`) and this Rust workspace coexist at the repo
+# root without interfering: pnpm ignores `crates/`/`target/`, cargo ignores `packages/`.
+#
+# Layout (see crates/README.md):
+#   crates/drivers   vrover-drivers   capture+input traits + feature-gated backends
+#                                    (pipewire / uinput / libei are modules here, not crates)
+[workspace]
+resolver = "2"
+members = [
+    "crates/drivers",
+    "crates/native",
+    "crates/omniparser",
+    "crates/omni-scout",
+
+    "crates/core",
+    "crates/fs",
+    "crates/render",
+    "crates/platform",
+    "crates/ui",
+    "crates/geek-familiar",
+
+    "native",
+    "crates/aura-dcl",
+    "crates/aura-store",
+    "crates/aura-core",
+    "crates/aura-asr",
+    "crates/aura-tts",
+    "crates/aura-agent",
+    "crates/daemon",
+    "crates/aura-fs",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "MIT"
+authors = ["VRover"]
+description = "VRover native capture + input driver layer"
+
+# In-workspace path dep (for the future napi binding crate that composes a
+# CaptureSource + InputSink into a NativeLayer).
+[workspace.dependencies]
+vrover-drivers = { path = "crates/drivers", version = "0.1.0" }
+
+[profile.release]
+lto = "thin"

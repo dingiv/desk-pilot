@@ -1,0 +1,13 @@
+{
+  "name": "vrover-native",
+  "version": "0.0.0",
+  "private": true,
+  "napi": {
+    "binaryName": "vrover-native",
+    "triples": {}
+  },
+  "scripts": {
+    "artifacts": "napi artifacts",
+    "build": "napi build --platform --release"
+  }
+}

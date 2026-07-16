@@ -1,0 +1,6 @@
+# ONNX weights are fetched by fetch_weights.sh (AGPL-3.0, ~80MB) — not committed.
+weights/*.onnx
+
+# Vendored onnxruntime-gpu + CUDA/cuDNN .so deps (~3.5GB) — populated by
+# fetch_lib.sh, NOT committed. ort loads them at runtime via `load-dynamic`.
+lib/

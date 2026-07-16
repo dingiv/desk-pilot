@@ -1,0 +1,41 @@
+[package]
+name = "audio-aura-core"
+version = "0.1.0"
+edition = "2021"
+description = "audio-aura Rust daemon spine — axum WS/SSE/REST + session/event-bus + RouterEngine hot loop"
+
+[[bin]]
+name = "audio-aura-core"
+path = "src/main.rs"
+
+# Stage1+Stage2 latency/accuracy bench over WAV test cases. Build with --features "cuda,asr".
+[[bin]]
+name = "stage12"
+path = "src/bin/stage12.rs"
+required-features = ["asr"]
+
+# Thin Stage1→Stage2 bench built on the Pipeline composer (moved from aura-asr).
+[[example]]
+name = "stage12_live"
+required-features = ["asr", "cuda"]
+
+[features]
+default = []
+cuda = ["audio-aura-router/cuda"]
+# Stage1 local ASR (SenseVoice via audio-aura-asr/onnx). Needs SHERPA_ONNX_LIB_DIR at build + the model.
+asr = ["audio-aura-asr/onnx"]
+
+[dependencies]
+audio-aura-router = { path = "../aura-dcl" }
+audio-aura-store = { path = "../aura-store" }
+audio-aura-asr = { path = "../aura-asr", optional = true }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http = { version = "0.6", features = ["cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+base64 = "0.22"

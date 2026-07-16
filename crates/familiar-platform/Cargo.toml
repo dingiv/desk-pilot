@@ -1,0 +1,52 @@
+[package]
+name = "platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+core = { workspace = true }
+ui = { workspace = true }
+
+[dependencies.gtk4]
+version = "0.11"
+optional = true
+
+# egui render path (offscreen wgpu → RGBA8 → blitted to the GTK Picture). The GTK
+# backend gates its use on the `egui` feature. wgpu comes via egui-wgpu's
+# re-export, so its version can't mismatch (use `egui_wgpu::wgpu`).
+[dependencies.egui]
+version = "0.28"
+optional = true
+[dependencies.egui-wgpu]
+version = "0.28"
+optional = true
+[dependencies.pollster]
+version = "1"
+optional = true
+# PNG decode + high-quality resize for the egui image widget.
+[dependencies.image]
+version = "0.25"
+default-features = false
+features = ["png"]
+optional = true
+
+[features]
+default = []
+# GTK4 transparent topmost canvas-window backend (Linux Wayland). Needs libgtk-4-dev.
+gtk = ["dep:gtk4"]
+# Render the pet UI with egui into the GTK window (headless render-to-buffer).
+# Needs a Vulkan-capable GPU (set VK_ICD_FILENAMES). Implies use with `gtk`.
+egui = ["dep:egui", "dep:egui-wgpu", "dep:pollster", "dep:image"]
+# Windows backend (GLFW/WGL) — interface scaffold, impl in M5.
+windows = []
+# macOS backend (NSPanel/Metal) — interface scaffold, impl in M5.
+macos = []
+
+# Generate a high-res test "pet" PNG (coral circle on transparent). Needs the
+# `image` dep (pulled by the `egui` feature).
+[[example]]
+name = "gen_pet_png"
+required-features = ["egui"]

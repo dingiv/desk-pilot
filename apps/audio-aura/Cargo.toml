@@ -1,0 +1,28 @@
+[package]
+name = "aura-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "audio-aura daemon binary — composes the Pipeline (Stage1→Stage2), runs a Stage3 rule trigger for the closed-loop demo, and exposes a socket skeleton (health real, control/stream/query endpoints stubbed) for desktop-pet."
+
+[[bin]]
+name = "aura-daemon"
+path = "src/main.rs"
+required-features = ["asr", "cuda"]
+
+[features]
+default = []
+asr = ["audio-aura-core/asr"]
+cuda = ["audio-aura-core/cuda"]
+
+[dependencies]
+audio-aura-core = { path = "../aura-core" }
+audio-aura-agent = { path = "../aura-agent" }
+audio-aura-asr = { path = "../aura-asr" }
+audio-aura-router = { path = "../aura-dcl" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"

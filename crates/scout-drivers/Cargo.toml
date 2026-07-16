@@ -1,0 +1,55 @@
+[package]
+name = "vrover-drivers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Cross-platform capture + input trait abstractions for VRover's native driver layer, with feature-gated platform backends (PipeWire, uinput, libei)"
+
+[features]
+default = []
+# Real PipeWire + xdg-desktop-portal ScreenCast capture backend.
+pipewire = ["dep:pipewire", "dep:ashpd", "dep:tokio", "dep:async-channel"]
+# Real Linux uinput (evdev) input backend.
+uinput = ["dep:evdev"]
+# libei / xdg-desktop-portal emulated input backend (reserved — stub until libei is packaged).
+libei = []
+
+[dependencies]
+# PNG encode of BGRA frames — pure Rust, no system deps.
+png = "0.17"
+# Ergonomic error enum — pure Rust (proc-macro).
+thiserror = "2"
+# PipeWire backend deps (all optional; gated by the `pipewire` feature).
+pipewire = { version = "0.8", optional = true }
+ashpd = { version = "0.10", optional = true, default-features = false, features = ["tokio"] }
+tokio = { version = "1", optional = true, features = ["rt", "sync", "macros", "net"] }
+async-channel = { version = "2", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = { version = "0.12", optional = true }
+
+# The capture demo needs the real (feature-gated) PipeWire backend; skipped under
+# default features so `cargo build`/`test` stay green against the stub.
+[[example]]
+name = "capture_one"
+required-features = ["pipewire"]
+
+# Opens /dev/uinput, confirms the kernel registers the virtual device, then
+# exercises the InputSink surface. Needs the device passed through + writable.
+[[example]]
+name = "uinput_probe"
+required-features = ["uinput"]
+
+# Subscribes to the PipeWire mic (16 kHz mono S16LE), drains ~3 s, reports the
+# negotiated format + achieved byte rate. Needs the `pipewire` feature + a
+# running PipeWire daemon (no physical mic required to verify the pipeline).
+[[example]]
+name = "audio_one"
+required-features = ["pipewire"]
+
+# Media-backend sanity check: capture 2 video frames (confirm they differ) +
+# drain ~2 s of audio. Always compiled (media has no build deps); needs the
+# ffmpeg/ffprobe binaries + a media file arg at runtime.
+[[example]]
+name = "media_play"

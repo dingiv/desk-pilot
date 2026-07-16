@@ -1,0 +1,28 @@
+{
+  "name": "@vrover/agent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "example": "tsx examples/read-source.ts"
+  },
+  "dependencies": {
+    "@vrover/config": "workspace:*",
+    "@vrover/llm": "workspace:*",
+    "@vrover/logger": "workspace:*",
+    "@vrover/native": "workspace:*",
+    "@vrover/platform": "workspace:*",
+    "@vrover/scout-client": "workspace:*",
+    "@vrover/som": "workspace:*",
+    "@vrover/tools": "workspace:*"
+  }
+}

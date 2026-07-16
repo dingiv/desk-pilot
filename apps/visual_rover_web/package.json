@@ -1,0 +1,35 @@
+{
+  "name": "@vrover/visual-rover-web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "VRover — the GUI agent (brain) with a React web UI. One koa server serves the API and the SPA (Vite middleware in dev, static in prod).",
+  "scripts": {
+    "dev": "NODE_ENV=development tsx src/server.ts --platform desktop",
+    "dev:mock": "NODE_ENV=development tsx src/server.ts --platform mock",
+    "start": "NODE_ENV=production tsx src/server.ts --platform desktop",
+    "build:web": "vite build",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.web.json"
+  },
+  "dependencies": {
+    "@vrover/agent": "workspace:*",
+    "@vrover/config": "workspace:*",
+    "@vrover/llm": "workspace:*",
+    "@vrover/logger": "workspace:*",
+    "@vrover/platform": "workspace:*",
+    "@vrover/providers": "workspace:*",
+    "koa": "^2.15.4",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@types/koa": "^2.15.0",
+    "@types/node": "^25.9.3",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.0"
+  }
+}

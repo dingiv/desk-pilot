@@ -1,0 +1,20 @@
+[package]
+name = "ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+core = { workspace = true }
+fs = { workspace = true }
+
+[build-dependencies]
+fs = { workspace = true }
+
+# FileLoader namespaces (consumed by build.rs → fs::loader!()).
+# SKIN: skin assets — dev reads the crate's assets/skins/, prod reads the
+# user's ~/.geek-familiar/skins/ (drop-in skins without recompiling).
+[package.metadata.fs]
+SKIN = { dev = "assets/skins", prod = "~/.geek-familiar/skins" }

@@ -1,0 +1,25 @@
+{
+  "name": "@vrover/scout",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "example": "tsx src/examples/scout-server.ts"
+  },
+  "dependencies": {
+    "@vrover/platform": "workspace:*",
+    "@vrover/scout-protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "tsx": "^4.22.4"
+  }
+}

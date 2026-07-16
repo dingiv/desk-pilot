@@ -1,0 +1,53 @@
+{
+  "name": "visual-rover",
+  "version": "0.1.0",
+  "description": "VRover — a visual GUI agent with Set-of-Mark grounding. Desktop + browser targets behind a unified Platform abstraction, pluggable LLM.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "tsc --build tsconfig.build.json",
+    "build:native": "cd crates/native && napi build --platform --release --features capture && cp -f vrover-native.linux-x64-gnu.node ../../packages/native/"
+  },
+  "keywords": [
+    "gui-agent",
+    "automation",
+    "set-of-mark",
+    "computer-use",
+    "vision"
+  ],
+  "author": "",
+  "license": "ISC",
+  "engines": {
+    "node": ">=20"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "^11.2.2",
+      "onFail": "download"
+    }
+  },
+  "dependencies": {
+    "@vrover/agent": "workspace:*",
+    "@vrover/llm": "workspace:*",
+    "@vrover/logger": "workspace:*",
+    "@vrover/platform": "workspace:*",
+    "@vrover/providers": "workspace:*",
+    "@vrover/scout": "workspace:*",
+    "@vrover/scout-client": "workspace:*",
+    "@vrover/scout-protocol": "workspace:*",
+    "@vrover/som": "workspace:*",
+    "@vrover/tools": "workspace:*"
+  },
+  "devDependencies": {
+    "@napi-rs/canvas": "^1.0.0",
+    "@napi-rs/cli": "^3.7.2",
+    "@types/node": "^25.9.3",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  }
+}

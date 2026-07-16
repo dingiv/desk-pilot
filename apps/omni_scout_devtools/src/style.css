@@ -1,0 +1,190 @@
+:root {
+  color-scheme: light dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font: 13px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  color: #1f2328;
+  background: #f6f8fa;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* layout */
+header {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 12px;
+  background: #24292f;
+  color: #fff;
+}
+header strong {
+  margin-right: 4px;
+}
+.cols {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 260px 1fr 280px;
+  min-height: 0;
+}
+aside {
+  padding: 10px;
+  overflow: auto;
+  background: #fff;
+  border-right: 1px solid #d0d7de;
+}
+aside.right {
+  border-right: 0;
+  border-left: 1px solid #d0d7de;
+}
+
+/* typography */
+h3 {
+  font-size: 11px;
+  margin: 14px 0 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #57606a;
+}
+h3:first-child {
+  margin-top: 0;
+}
+label {
+  display: block;
+  color: #57606a;
+  margin: 6px 0 2px;
+}
+input,
+select {
+  width: 100%;
+  padding: 4px 6px;
+  border: 1px solid #d0d7de;
+  border-radius: 5px;
+  font: inherit;
+  background: #fff;
+  color: inherit;
+}
+.row {
+  display: flex;
+  gap: 6px;
+}
+.row > * {
+  flex: 1;
+}
+
+/* buttons */
+button {
+  padding: 4px 10px;
+  border: 1px solid #d0d7de;
+  border-radius: 5px;
+  background: #fff;
+  color: #1f2328;
+  cursor: pointer;
+  font: inherit;
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+button.primary {
+  background: #1f6feb;
+  color: #fff;
+  border-color: #1f6feb;
+}
+header button {
+  padding: 5px 12px;
+  border: 0;
+  border-radius: 5px;
+  background: #1f6feb;
+  color: #fff;
+}
+
+/* sessions */
+.session {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 7px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.session:hover {
+  background: #eaeef2;
+}
+.session.active {
+  background: #ddf4ff;
+}
+.session small {
+  color: #57606a;
+  margin-left: auto;
+}
+.session .del {
+  border: 0;
+  background: transparent;
+  color: #cf222e;
+  padding: 0 2px;
+}
+
+/* viewport */
+.viewport-wrap {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  overflow: auto;
+  padding: 12px;
+}
+.viewport {
+  max-width: 100%;
+  height: auto;
+  background: #000;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+  cursor: crosshair;
+  image-rendering: pixelated;
+}
+
+/* elements */
+.el-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 3px 5px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.el-row:hover {
+  background: #eaeef2;
+}
+.el-row .n {
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  line-height: 18px;
+  text-align: center;
+  background: #1f6feb;
+  color: #fff;
+  border-radius: 4px;
+  font-size: 11px;
+}
+
+/* status */
+#status {
+  color: #57606a;
+  font-size: 12px;
+  padding: 4px 12px;
+  border-top: 1px solid #d0d7de;
+  background: #fff;
+}
+.err {
+  color: #cf222e;
+}

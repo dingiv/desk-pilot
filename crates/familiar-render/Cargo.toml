@@ -1,0 +1,16 @@
+[package]
+name = "render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+core = { workspace = true }
+
+[features]
+default = []
+# Future GPU backends, chosen after the docs/rendering.md spike:
+#   gpu-wgpu     = ["dep:wgpu"]
+#   gpu-femtovg  = ["dep:femtovg"]

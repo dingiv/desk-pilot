@@ -1,0 +1,21 @@
+{
+  "name": "@vrover/omni-scout-devtools",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser DevTools UI (Vue 3 + Vite, client-rendered) for the Visual Scout server — drives the scout in-process HTTP/SSE devtools service.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "@vitejs/plugin-vue": "^6.0.7",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.0",
+    "vue": "^3.5.38",
+    "vue-tsc": "^3.3.5"
+  }
+}

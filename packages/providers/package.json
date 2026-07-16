@@ -1,0 +1,21 @@
+{
+  "name": "@vrover/providers",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@vrover/config": "workspace:*",
+    "@vrover/llm": "workspace:*"
+  }
+}

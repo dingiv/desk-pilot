@@ -1,0 +1,33 @@
+[package]
+name = "vrover-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "napi-rs bindings for VRover: OmniParser (vision) + DesktopNativeLayer (capture + input)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["uinput"]
+# Linux uinput input driver (needs /dev/uinput write access at runtime).
+uinput = ["vrover-drivers/uinput"]
+# Real PipeWire + xdg-desktop-portal ScreenCast capture backend (needs
+# libpipewire-0.3 dev headers + runtime modules — present in this container).
+# Off by default so `cargo build -p vrover-native` stays green without PipeWire
+# headers; `build:native` enables it to bake capture into the shipped .node.
+capture = ["vrover-drivers/pipewire"]
+
+[dependencies]
+vrover-drivers = { path = "../drivers", features = ["uinput"] }
+vrover-omniparser = { path = "../omniparser" }
+napi = { version = "2", default-features = false, features = ["napi6"] }
+napi-derive = "2"
+image = "0.25"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = "thin"

@@ -1,0 +1,28 @@
+[package]
+name = "audio-aura-router"
+version = "0.1.0"
+edition = "2021"
+description = "Local router SLM (Qwen3-1.7B via mistral.rs): merged 口语整流 + 意图路由. Pure logic shared by the napi shim and the daemon."
+
+[dependencies]
+mistralrs = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aura-fs = { path = "../aura-fs" }
+# Stage1 data contract (Utterance). aura-dcl → aura-asr is a single direction (no cycle: aura-asr
+# is a true leaf now that stage12_live moved to aura-core).
+audio-aura-asr = { path = "../aura-asr" }
+
+[build-dependencies]
+aura-fs = { path = "../aura-fs" }
+
+# Namespace: model files. dev = relative to this crate's dir → ../../native/models.
+[package.metadata.aura-fs]
+MODELS = { dev = "../../native/models", prod = "~/.audio-aura/models" }
+
+[features]
+default = []
+# GPU: build with `--features cuda` + CUDA_COMPUTE_CAP=120 (Blackwell sm_120).
+cuda = ["mistralrs/cuda"]

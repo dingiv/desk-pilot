@@ -1,0 +1,23 @@
+{
+  "name": "@vrover/omni-scout",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Visual Scout — standalone CLI app that runs the UI-operation TCP server.",
+  "main": "./src/main.ts",
+  "bin": {
+    "omni-scout": "./src/main.ts"
+  },
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@vrover/platform": "workspace:*",
+    "@vrover/scout": "workspace:*",
+    "@vrover/scout-protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "tsx": "^4.22.4"
+  }
+}

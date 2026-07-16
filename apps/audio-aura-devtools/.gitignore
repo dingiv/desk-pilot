@@ -1,0 +1,19 @@
+node_modules/
+web-dist/
+data/
+*.log
+.env
+test-results/
+playwright-report/
+target
+# downloaded native artifacts (models, prebuilt sherpa libs, built .node) — not source
+native/models/
+native/sherpa/
+native/target/
+native/*.node
+
+bench
+
+native-old
+
+dist

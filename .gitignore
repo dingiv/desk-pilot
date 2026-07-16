@@ -1,0 +1,50 @@
+node_modules
+dist
+*.tsbuildinfo
+playground
+
+# Rust
+target/
+
+# napi-rs native binaries + generated bindings (built by `pnpm build:native`).
+# The napi crate lives in crates/native/; build:native also copies the .node
+# into packages/native/ for loading, so both locations are ignored.
+packages/native/*.node
+crates/native/*.node
+crates/native/index.d.ts
+
+vrover.conf
+
+# vite-built SPA output (web app), served statically by koa in prod
+web-dist/
+
+# Local symlink to fetched ONNX weights (absolute path; per-machine).
+# Real weights live under crates/omniparser/weights/ (already ignored) and are
+# re-fetched via crates/omniparser/fetch_weights.sh.
+weights/
+
+
+node_modules/
+web-dist/
+data/
+*.log
+.env
+test-results/
+playwright-report/
+target
+# downloaded native artifacts (models, prebuilt sherpa libs, built .node) — not source
+native/models/
+native/sherpa/
+native/target/
+native/*.node
+
+bench
+
+native-old
+
+dist
+
+
+/target
+*.ppm
+*.png

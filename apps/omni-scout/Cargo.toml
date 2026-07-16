@@ -1,0 +1,23 @@
+[package]
+name = "vrover-omni-scout"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Visual Scout capture daemon — persistent PipeWire screen capture exposed over HTTP"
+
+[[bin]]
+name = "omni-scout"
+path = "src/main.rs"
+
+[dependencies]
+# Reuses the existing PipeWire ScreenCast CaptureSource (negotiated once, kept
+# alive for the daemon's lifetime; pausable when idle). Brings pipewire/ashpd/tokio
+# transitively.
+vrover-drivers = { path = "../drivers", features = ["pipewire"] }
+# `flock` for the /run/omni-scout.lock singleton (already in the dep tree via
+# the pipewire/ashpd graph, so this reuses a compiled copy).
+libc = "0.2"
+
+# HTTP is hand-rolled over std::net — no other deps.

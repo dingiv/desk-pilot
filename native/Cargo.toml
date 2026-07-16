@@ -1,0 +1,20 @@
+[package]
+name = "audio-aura-native"
+version = "0.1.0"
+edition = "2021"
+description = "napi shim over audio-aura-router — keeps the TS dev path (VOICE_LOCAL_ROUTER) working"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+cuda = ["audio-aura-router/cuda"]
+
+[dependencies]
+audio-aura-router = { path = "../crates/aura-dcl" }
+napi = "2"
+napi-derive = "2"
+
+[build-dependencies]
+napi-build = "2"

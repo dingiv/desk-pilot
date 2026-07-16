@@ -1,0 +1,42 @@
+[package]
+name = "vrover-omniparser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Rust port of OmniParser: YOLO icon detection + Set-of-Mark annotation (ONNX Runtime, CPU or CUDA)"
+
+# ort is linked one of two ways, selected by feature:
+#   - `download`  (default): ort fetches a prebuilt onnxruntime at build time.
+#                  CPU-only build that "just works". NOTE: ort's downloaded GPU
+#                  binary lacks Blackwell (sm_120) kernels.
+#   - `load-dynamic`: ort dlopens libonnxruntime.so at runtime from omniparser/lib
+#                  (set LD_LIBRARY_PATH / ORT_LIB_PATH). Pair with `cuda` to use a
+#                  vendored sm_120-capable onnxruntime-gpu. Build with
+#                  `--no-default-features --features load-dynamic,cuda`.
+[features]
+default = ["download"]
+download = ["ort/download-binaries"]
+load-dynamic = ["ort/load-dynamic"]
+# NVIDIA CUDA execution provider (pre-Blackwell; ort's download lacks sm_120).
+cuda = ["ort/cuda"]
+# NVIDIA TensorRT-RTX execution provider — RTX 50-series / Blackwell. ort declares
+# it Windows-only, so on Linux it falls back to CPU (verified).
+nvrtx = ["ort/nvrtx"]
+
+[dependencies]
+# Base ort: ndarray tensor API only — no auto-download (selected via features above).
+ort = { version = "=2.0.0-rc.12", features = ["ndarray"] }
+ndarray = "0.17"
+image = "0.25"
+imageproc = "0.25"
+# SIMD image resize (Tier 1) — far faster than `image`'s scalar Triangle.
+fast_image_resize = "5"
+ab_glyph = "0.2"
+thiserror = "2"
+
+[[example]]
+name = "parse_one"
+
+[[example]]
+name = "bench"
