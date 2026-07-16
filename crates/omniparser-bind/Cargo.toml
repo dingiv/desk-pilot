@@ -1,5 +1,5 @@
 [package]
-name = "vrover-native"
+name = "desk-pilot-native"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,16 +12,16 @@ crate-type = ["cdylib"]
 [features]
 default = ["uinput"]
 # Linux uinput input driver (needs /dev/uinput write access at runtime).
-uinput = ["vrover-drivers/uinput"]
+uinput = ["scout-drivers/uinput"]
 # Real PipeWire + xdg-desktop-portal ScreenCast capture backend (needs
 # libpipewire-0.3 dev headers + runtime modules — present in this container).
-# Off by default so `cargo build -p vrover-native` stays green without PipeWire
+# Off by default so `cargo build -p desk-pilot-native` stays green without PipeWire
 # headers; `build:native` enables it to bake capture into the shipped .node.
-capture = ["vrover-drivers/pipewire"]
+capture = ["scout-drivers/pipewire"]
 
 [dependencies]
-vrover-drivers = { path = "../drivers", features = ["uinput"] }
-vrover-omniparser = { path = "../omniparser" }
+scout-drivers = { path = "../../crates/scout-drivers", features = ["uinput"] }
+omniparser = { path = "../omniparser" }
 napi = { version = "2", default-features = false, features = ["napi6"] }
 napi-derive = "2"
 image = "0.25"

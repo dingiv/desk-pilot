@@ -1,5 +1,5 @@
 [package]
-name = "aura-fs"
+name = "shared"
 version = "0.1.0"
 edition = "2021"
 description = "FileLoader — dev/prod asset path resolution for cargo crates. Finds files under a crate's own assets/ regardless of pwd or target/ depth."

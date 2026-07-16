@@ -44,11 +44,11 @@ pub struct Stage1Config {
 }
 
 impl Stage1Config {
-    /// Sensible defaults — model paths resolved via `aura-fs` namespace `MODELS` (declared in
-    /// this crate's `Cargo.toml` `[package.metadata.aura-fs]`). Dev: `<workspace>/native/models/`;
+    /// Sensible defaults — model paths resolved via `shared` namespace `MODELS` (declared in
+    /// this crate's `Cargo.toml` `[package.metadata.shared]`). Dev: `<workspace>/native/models/`;
     /// prod: `~/.audio-aura/models/`. No `base` param needed — the caller never sees paths.
     pub fn new(scout_addr: impl Into<String>) -> Self {
-        let fs = aura_fs::loader!();
+        let fs = shared::loader!();
         let p = |rel: &str| -> String {
             fs.resolve(rel)
                 .map(|p| p.to_string_lossy().into_owned())

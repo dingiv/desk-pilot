@@ -1,4 +1,4 @@
-//! `vrover-omniparser` — a Rust port of OmniParser's screen-parsing pipeline.
+//! `omniparser` — a Rust port of OmniParser's screen-parsing pipeline.
 //!
 //! **Phase 1 (this round):** YOLO icon detection (ONNX Runtime) + Set-of-Mark
 //! annotation. A screenshot goes in; an annotated SoM image (each icon numbered)

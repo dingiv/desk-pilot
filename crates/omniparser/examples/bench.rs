@@ -4,9 +4,9 @@
 //! latency + throughput.
 //!
 //! CPU:
-//!   cargo run -p vrover-omniparser --example bench -- <imgs_dir> --workers 4
+//!   cargo run -p omniparser --example bench -- <imgs_dir> --workers 4
 //! CUDA (needs `--features cuda` + CUDA/cuDNN on the host):
-//!   cargo run -p vrover-omniparser --example bench --features cuda -- <imgs_dir> --device cuda --workers 2
+//!   cargo run -p omniparser --example bench --features cuda -- <imgs_dir> --device cuda --workers 2
 //!
 //! Flags: `--device cpu|cuda`  `--workers N`  `--repeat K` (duplicate the set)
 //!        `--out DIR` (write each annotated SoM PNG there)
@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use vrover_omniparser::{CudaOptions, Device, OmniParser, OmniParserConfig, TensorRtxOptions};
+use omniparser::{CudaOptions, Device, OmniParser, OmniParserConfig, TensorRtxOptions};
 
 fn main() {
     let mut args = std::env::args().skip(1);

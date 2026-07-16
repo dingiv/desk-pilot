@@ -15,10 +15,10 @@ asr = ["audio-aura-core/asr"]
 cuda = ["audio-aura-core/cuda"]
 
 [dependencies]
-audio-aura-core = { path = "../aura-core" }
-audio-aura-agent = { path = "../aura-agent" }
-audio-aura-asr = { path = "../aura-asr" }
-audio-aura-router = { path = "../aura-dcl" }
+audio-aura-core = { path = "../../crates/aura-core" }
+audio-aura-agent = { path = "../../crates/aura-agent" }
+audio-aura-asr = { path = "../../crates/aura-asr" }
+audio-aura-router = { path = "../../crates/aura-dcl" }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

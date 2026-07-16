@@ -239,7 +239,7 @@ fn emittable_key_codes() -> &'static [u16] {
 // and a compositor (Wayland/X11) attached to turn the emitted events into
 // on-screen motion.
 //
-//   cargo test -p vrover-drivers --features uinput -- \
+//   cargo test -p scout-drivers --features uinput -- \
 //       live_demo_keyboard_and_mouse --ignored --nocapture
 
 #[cfg(test)]

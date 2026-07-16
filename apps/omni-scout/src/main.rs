@@ -29,7 +29,7 @@
 //! `/run/omni-scout.lock` (falls back to `$XDG_RUNTIME_DIR` if `/run` isn't
 //! writable); exits if another instance holds it.
 //!
-//! Reuses [`vrover_drivers`]'s `CaptureSource` + `AudioSource` traits (PipeWire
+//! Reuses [`scout_drivers`]'s `CaptureSource` + `AudioSource` traits (PipeWire
 //! and `media` backends).
 
 use std::fs::OpenOptions;
@@ -37,11 +37,11 @@ use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 
-use vrover_drivers::audio::AudioSource;
-use vrover_drivers::backends::media::{MediaAudioSource, MediaVideoSource};
-use vrover_drivers::backends::pipewire::{PipeWireAudioSource, PipeWireSource};
-use vrover_drivers::CaptureSource;
-use vrover_drivers::mock::MockCaptureSource;
+use scout_drivers::audio::AudioSource;
+use scout_drivers::backends::media::{MediaAudioSource, MediaVideoSource};
+use scout_drivers::backends::pipewire::{PipeWireAudioSource, PipeWireSource};
+use scout_drivers::CaptureSource;
+use scout_drivers::mock::MockCaptureSource;
 
 mod server;
 
@@ -56,12 +56,29 @@ fn main() {
     let args = Args::parse();
     acquire_singleton_lock(); // exits(3) if another instance holds the lock
 
-    let (src, audio) = if let Some(file) = &args.mock {
+    // Resolve mock/mock_audio paths via shared FileLoader: bare filenames like
+    // `hungry_snake.m4a` resolve to this crate's `assets/` dir (declared in Cargo.toml
+    // `[package.metadata.shared]`). Full paths work too.
+    let fs = shared::loader!();
+    let resolve = |path: &str| -> String {
+        // Try as-is first (absolute / cwd-relative).
+        if std::path::Path::new(path).exists() {
+            return path.to_string();
+        }
+        // Try as a bare filename in the ASSETS namespace.
+        let resolved = fs.resolve(&format!("ASSETS::{path}"));
+        match resolved {
+            Some(p) => p.to_string_lossy().into_owned(),
+            None => path.to_string(), // let ffmpeg error naturally
+        }
+    };
+    let mock = args.mock.as_deref().map(|p| resolve(p));
+    let mock_audio = args.mock_audio.as_deref().map(|p| resolve(p));
+
+    let (src, audio) = if let Some(file) = &mock {
         build_mock(file, &args)
-    } else if args.mock_audio.is_some() {
-        // `--mock-audio <file>` alone (no --mock): mock the AUDIO only, no video/portal. Lets us
-        // feed a pure-audio file (m4a/wav/mp3) as a simulated mic without a video track.
-        build_mock_audio_only(args.mock_audio.as_deref().unwrap())
+    } else if mock_audio.is_some() {
+        build_mock_audio_only(mock_audio.as_deref().unwrap())
     } else {
         build_real(args.audio_only)
     };
@@ -126,7 +143,7 @@ fn build_real(audio_only: bool) -> (Arc<Mutex<ScreenBox>>, Option<AudioArc>) {
                 std::process::exit(2);
             }
         };
-        return (Arc::new(Mutex::new(Box::new(vrover_drivers::mock::MockCaptureSource::solid(1, 1, 0, 0, 0)))), audio);
+        return (Arc::new(Mutex::new(Box::new(scout_drivers::mock::MockCaptureSource::solid(1, 1, 0, 0, 0)))), audio);
     }
     eprintln!(
         "[omni-scout] negotiating PipeWire ScreenCast session (the portal may prompt to pick a screen)…"

@@ -7,16 +7,16 @@ description = "Stage1 — capture + VAD + ASR (two-pass) + the Stage1Executor ab
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
-aura-fs = { path = "../aura-fs" }
+shared = { path = "../shared" }
 # ONNX ecosystem: VAD (Silero) + ASR (SenseVoice) via the OFFICIAL sherpa-onnx crate.
 sherpa-onnx = { version = "1.13", default-features = false, features = ["shared"], optional = true }
 
 [build-dependencies]
-aura-fs = { path = "../aura-fs" }
+shared = { path = "../shared" }
 
 # Namespace: model files. dev = relative to this crate's dir → ../../native/models.
 # prod = user-installed models under ~/.audio-aura/models.
-[package.metadata.aura-fs]
+[package.metadata.shared]
 MODELS = { dev = "../../native/models", prod = "~/.audio-aura/models" }
 
 [[example]]

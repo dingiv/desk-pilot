@@ -1,4 +1,4 @@
-//! `vrover-drivers` — the cross-platform **abstraction** layer for VRover's native
+//! `scout-drivers` — the cross-platform **abstraction** layer for VRover's native
 //! driver layer.
 //!
 //! Two independent concerns, deliberately split (see `crates/README.md`):

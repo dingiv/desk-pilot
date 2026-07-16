@@ -5,13 +5,13 @@
 //!
 //! Run (real backend; needs `/dev/uinput` write access — root or the `uinput`
 //! group, and the device passed through into the container/namespace):
-//!   cargo run -p vrover-drivers --example uinput_probe --features uinput
+//!   cargo run -p scout-drivers --example uinput_probe --features uinput
 //!
 //! It does **not** move your real cursor unless a compositor is attached; it only
 //! proves the device opens and the kernel accepts the emitted events. A live
 //! session (Wayland/X11) is what turns those events into on-screen motion.
 
-use vrover_drivers::{Button, InputSink, Key, UinputSink};
+use scout_drivers::{Button, InputSink, Key, UinputSink};
 
 /// The device name [`UinputSink`] advertises (matches `backend.rs`).
 const DEVICE_NAME: &str = "VRover uinput sink";
@@ -54,7 +54,7 @@ fn main() {
     eprintln!("[uinput_probe] done — all emits accepted by the kernel.");
 }
 
-fn step<F: FnOnce() -> vrover_drivers::Result<()>>(name: &str, f: F) {
+fn step<F: FnOnce() -> scout_drivers::Result<()>>(name: &str, f: F) {
     match f() {
         Ok(()) => eprintln!("[uinput_probe]   ✓ {name}"),
         Err(e) => eprintln!("[uinput_probe]   ✗ {name}: {e}"),

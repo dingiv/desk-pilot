@@ -10,16 +10,16 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-aura-fs = { path = "../aura-fs" }
+shared = { path = "../shared" }
 # Stage1 data contract (Utterance). aura-dcl → aura-asr is a single direction (no cycle: aura-asr
 # is a true leaf now that stage12_live moved to aura-core).
 audio-aura-asr = { path = "../aura-asr" }
 
 [build-dependencies]
-aura-fs = { path = "../aura-fs" }
+shared = { path = "../shared" }
 
 # Namespace: model files. dev = relative to this crate's dir → ../../native/models.
-[package.metadata.aura-fs]
+[package.metadata.shared]
 MODELS = { dev = "../../native/models", prod = "~/.audio-aura/models" }
 
 [features]

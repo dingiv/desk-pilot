@@ -37,11 +37,11 @@ impl RouterEngine {
         })
     }
 
-    /// Load by model file name only — the model **directory** is resolved via aura-fs namespace
+    /// Load by model file name only — the model **directory** is resolved via shared namespace
     /// `MODELS` (declared in this crate's `Cargo.toml`). Dev: `<workspace>/native/models/`;
     /// prod: `~/.audio-aura/models/`. The caller never sees the directory path.
     pub fn load_default(model_file: &str) -> Result<Self> {
-        let fs = aura_fs::loader!();
+        let fs = shared::loader!();
         let dir = fs
             .resolve("MODELS::")
             .map(|p| p.to_string_lossy().into_owned())

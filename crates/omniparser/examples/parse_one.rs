@@ -3,9 +3,9 @@
 //!
 //! Run from anywhere:
 //!   ./crates/omniparser/fetch_weights.sh
-//!   cargo run -p vrover-omniparser --example parse_one -- <in.png> [out_som.png]
+//!   cargo run -p omniparser --example parse_one -- <in.png> [out_som.png]
 
-use vrover_omniparser::{OmniParser, OmniParserConfig};
+use omniparser::{OmniParser, OmniParserConfig};
 
 fn main() {
     let in_path = match std::env::args().nth(1) {

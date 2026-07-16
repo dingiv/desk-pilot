@@ -1,14 +1,14 @@
 //! napi-rs bindings for VRover's native driver layer.
 //!
-//! - [`OmniParserNative`] — YOLO icon detection + SoM annotation (wraps `vrover-omniparser`).
-//! - [`DesktopNativeLayer`] — mouse + keyboard input via Linux uinput (wraps `vrover-drivers`).
+//! - [`OmniParserNative`] — YOLO icon detection + SoM annotation (wraps `omniparser`).
+//! - [`DesktopNativeLayer`] — mouse + keyboard input via Linux uinput (wraps `scout-drivers`).
 
 use std::cell::RefCell;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use vrover_omniparser::{ElementType, OmniParser, OmniParserConfig};
+use omniparser::{ElementType, OmniParser, OmniParserConfig};
 
 // ── config ──────────────────────────────────────────────────────────────────
 
@@ -135,7 +135,7 @@ impl OmniParserNative {
 //  DesktopNativeLayer — uinput mouse + keyboard injection
 // ══════════════════════════════════════════════════════════════════════════════
 
-use vrover_drivers::{Button, InputSink, Key, UinputSink};
+use scout_drivers::{Button, InputSink, Key, UinputSink};
 
 /// Mouse + keyboard input via Linux uinput (`/dev/uinput`).
 ///
@@ -285,9 +285,9 @@ use std::sync::Mutex;
 #[cfg(feature = "capture")]
 use std::time::{Duration, Instant};
 #[cfg(feature = "capture")]
-use vrover_drivers::backends::pipewire::PipeWireSource;
+use scout_drivers::backends::pipewire::PipeWireSource;
 #[cfg(feature = "capture")]
-use vrover_drivers::CaptureSource;
+use scout_drivers::CaptureSource;
 
 /// Screen capture via PipeWire ScreenCast (the dialog-free GNOME/Wayland path).
 ///

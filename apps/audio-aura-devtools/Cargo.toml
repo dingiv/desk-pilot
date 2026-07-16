@@ -11,7 +11,7 @@ members = [
     "crates/aura-tts",
     "crates/aura-agent",
     "crates/daemon",
-    "crates/aura-fs",
+    "crates/shared",
 ]
 
 [profile.release]

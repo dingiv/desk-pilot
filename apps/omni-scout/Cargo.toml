@@ -1,5 +1,5 @@
 [package]
-name = "vrover-omni-scout"
+name = "omni-scout"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,12 +12,14 @@ name = "omni-scout"
 path = "src/main.rs"
 
 [dependencies]
-# Reuses the existing PipeWire ScreenCast CaptureSource (negotiated once, kept
-# alive for the daemon's lifetime; pausable when idle). Brings pipewire/ashpd/tokio
-# transitively.
-vrover-drivers = { path = "../drivers", features = ["pipewire"] }
-# `flock` for the /run/omni-scout.lock singleton (already in the dep tree via
-# the pipewire/ashpd graph, so this reuses a compiled copy).
+scout-drivers = { path = "../../crates/scout-drivers", features = ["pipewire"] }
+shared = { path = "../../crates/shared" }
 libc = "0.2"
 
-# HTTP is hand-rolled over std::net — no other deps.
+[build-dependencies]
+shared = { path = "../../crates/shared" }
+
+# Mock audio assets: --mock-audio <filename> resolves here.
+# dev → this crate's assets/ dir; prod → ~/.desk-pilot/assets/
+[package.metadata.shared]
+ASSETS = { dev = "assets", prod = "~/.desk-pilot/assets" }

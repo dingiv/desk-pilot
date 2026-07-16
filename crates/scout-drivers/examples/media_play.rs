@@ -1,15 +1,15 @@
 //! Media-backend sanity check: open a file, capture 2 video frames (confirm they
 //! differ → content is advancing) and drain ~2 s of audio (confirm ~32 KB/s).
 //!
-//!   cargo run -p vrover-drivers --example media_play -- /home/host/Videos/bilibili_demo.mp4
+//!   cargo run -p scout-drivers --example media_play -- /home/host/Videos/bilibili_demo.mp4
 
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use vrover_drivers::audio::AudioSource;
-use vrover_drivers::backends::media::{MediaAudioSource, MediaVideoSource};
-use vrover_drivers::CaptureSource;
+use scout_drivers::audio::AudioSource;
+use scout_drivers::backends::media::{MediaAudioSource, MediaVideoSource};
+use scout_drivers::CaptureSource;
 
 fn main() {
     let path = std::env::args()

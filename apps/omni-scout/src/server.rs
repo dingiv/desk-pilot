@@ -20,8 +20,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vrover_drivers::audio::AudioSource;
-use vrover_drivers::CaptureSource;
+use scout_drivers::audio::AudioSource;
+use scout_drivers::CaptureSource;
 
 /// Screen source: a (mockable) frame producer behind a mutex (capture is `&mut`).
 type Screen = Arc<Mutex<Box<dyn CaptureSource + Send>>>;

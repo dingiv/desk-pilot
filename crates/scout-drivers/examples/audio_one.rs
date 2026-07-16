@@ -3,7 +3,7 @@
 //! negotiated format + the achieved byte rate vs. the expected 32 KB/s.
 //!
 //! Run (real backend + PipeWire running):
-//!   cargo run -p vrover-drivers --example audio_one --features pipewire
+//!   cargo run -p scout-drivers --example audio_one --features pipewire
 //!
 //! A real input device isn't required to verify the *pipeline* — even with no
 //! physical mic the graph still delivers buffers (silence), so the byte rate
@@ -12,8 +12,8 @@
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use vrover_drivers::audio::AudioSource;
-use vrover_drivers::backends::pipewire::PipeWireAudioSource;
+use scout_drivers::audio::AudioSource;
+use scout_drivers::backends::pipewire::PipeWireAudioSource;
 
 const DURATION_SECS: f64 = 3.0;
 
