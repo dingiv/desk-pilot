@@ -153,15 +153,33 @@ impl OnlineAsr {
         StreamingSession { stream: rec.create_stream() }
     }
 
-    /// Decode pending audio and return the current best hypothesis (partial text). Call this
+    /// Decode ALL pending audio and return the current best hypothesis (partial text). Call this
     /// after each `accept_waveform` to get the latest partial — it may differ from the previous
     /// one (earlier text gets corrected as more context arrives).
+    ///
+    /// sherpa's `decode()` decodes **one chunk-step** (~320ms); the official pattern is to drain
+    /// with `while is_ready { decode }`. A single `decode` per call made the hypothesis fall
+    /// ~160ms further behind real-time on every poll — after 20s of continuous speech the partial
+    /// lagged seconds, and the backlog was silently discarded when the session was replaced at
+    /// EOS (the "hidden audio loss" between the two passes). The `is_ready` gate also makes this
+    /// safe on a fresh session (never decodes before a full chunk is buffered — the bare `decode`
+    /// used to trip sherpa's C++ `GetFrames` assertion).
     pub fn decode_and_result(&self, session: &StreamingSession) -> String {
         let rec = self.rec.lock().unwrap();
-        rec.decode(&session.stream);
+        while rec.is_ready(&session.stream) {
+            rec.decode(&session.stream);
+        }
         rec.get_result(&session.stream)
             .map(|r| r.text)
             .unwrap_or_default()
+    }
+
+    /// Finalize an utterance: signal end-of-input (flushes the encoder's tail chunk — without it
+    /// the last sub-chunk of audio is never decoded), drain every pending step, and return the
+    /// final text. The session is spent afterwards — create a fresh one for the next utterance.
+    pub fn finalize_and_result(&self, session: &StreamingSession) -> String {
+        session.input_finished();
+        self.decode_and_result(session)
     }
 
     /// Check if the engine's internal endpointing detected end-of-utterance.
@@ -289,10 +307,21 @@ impl Default for VadConfig {
     fn default() -> Self {
         VadConfig {
             model: String::new(),
-            threshold: 0.6,
-            min_silence_duration: 1.5,
-            min_speech_duration: 0.5,
-            max_speech_duration: 20.0,
+            // Silero's stock threshold. 0.6 (the old value) crossed too late on soft onsets and
+            // clipped the first syllable — the segment start only looks back ~64ms past the
+            // min-speech probation window, so a late trigger = a cut head.
+            threshold: 0.5,
+            // Sentence pauses in lecture-style speech run 0.5–1.2s. At the old 1.5s they NEVER
+            // ended a segment, so continuous speech always hit the max_speech force-split —
+            // which sherpa performs in an eager mode (threshold 0.90 / min_silence 0.1s) that
+            // cuts MID-WORD, producing severed fragments on both sides of the cut.
+            min_silence_duration: 1.0,
+            // Utterances shorter than this are discarded entirely by sherpa's state machine.
+            // 0.5s swallowed short commands ("好", "停"); 0.3s keeps them.
+            min_speech_duration: 0.3,
+            // Force-split backstop only (natural pauses should split first, see min_silence).
+            // SenseVoice is comfortable up to ~30s per batch.
+            max_speech_duration: 28.0,
             window_size: 512,
             buffer_seconds: 60.0,
         }

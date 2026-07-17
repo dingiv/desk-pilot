@@ -16,5 +16,9 @@ fs = { workspace = true }
 # FileLoader namespaces (consumed by build.rs → fs::loader!()).
 # SKIN: skin assets — dev reads the crate's assets/skins/, prod reads the
 # user's ~/.geek-familiar/skins/ (drop-in skins without recompiling).
-[package.metadata.fs]
+# NOTE: the loader crate merged as `shared` (imported under the `fs` alias) and
+# reads the package.metadata.shared section — metadata.fs is no longer read.
+# (Don't write the bracketed section name in comments — the loader's naive
+# scanner matches the first occurrence anywhere in the file.)
+[package.metadata.shared]
 SKIN = { dev = "assets/skins", prod = "~/.geek-familiar/skins" }

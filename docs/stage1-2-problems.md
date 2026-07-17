@@ -1,5 +1,18 @@
 > ⚪ **已全部解决（2026-07-15）** —— Silero VAD、AudioRing 环形缓冲、流式两阶段 ASR、ContextWindow 上下文窗口均已落地。留作历史。**现状见 [architecture.md](architecture.md)。**
 
+# 复盘补章（2026-07-17）：隐蔽丢音 —— 流式解码欠账 + VAD 强切
+
+真机长句讲述测试再次出现"识别不完整、partial 与 final 对不上"。四个叠加根因（均已修）：
+
+1. **流式解码欠账（核心）**：sherpa 的 `decode()` 是 *decode one step*（一步 ≈ 一个 chunk ~320ms），官方用法是 `while is_ready { decode }`；我们每 480ms 只调一次 → 每轮欠 ~160ms，长句下 partial 滞后滚雪球；EOS 时旧 session 直接丢弃，**积压未解码音频被无声扔掉**。修：`decode_and_result` 改 drain 循环；新增 `finalize_and_result`（`input_finished` + drain，冲出编码器尾块）。`is_ready` 门控同时天然防住了 fresh session 早解码的 GetFrames 崩溃 → 删掉 WARMUP_FRAMES hack。
+2. **VAD 20s 强切腰斩**：sherpa `VoiceActivityDetector` 内部 buffer 超过 `max_speech_duration` 后自动切到急切模式（threshold=0.90 / min_silence=0.1s），在词中间强行 EOS（C++ 源码证实）。而 `min_silence=1.5s` 太长，讲述式句间自然停顿（0.5–1.2s）永远触发不了正常切分 → 全靠强切。修：min_silence 1.5→1.0s（自然停顿先切），max_speech 20→28s（只作兜底）。
+3. **头部削字 / 短句整吞**：段起点回看仅 `2×window + min_speech`（试探期外余量 ~64ms），threshold 0.6 跨阈晚 → 首音节剪掉；`min_speech=0.5s` 把短命令整段丢弃。修：threshold→0.5（Silero 默认），min_speech→0.3s。
+4. **问题被日志掩盖**：daemon 只打印 Stage2 整流文本（会删语气词、改写），分不清 ASR 丢字还是 LLM 改写。修：Final 行加打 批式/流式 原文。
+
+验证：`streaming_asr_hot` 示例（500ms 轮询 100ms 喂入）partial 与音频进度同步、final 完整（旧代码下 5.6s 音频只解得 ~3.5s，final 必截断）；workspace 34 个测试套件全绿。
+
+---
+
 # Stage1+2 实时录音问题分析与解决方案
 
 来源：真机录音测试反馈（2026-07-12）。四个问题：

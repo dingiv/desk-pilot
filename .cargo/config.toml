@@ -15,9 +15,12 @@ jobs = 4
 # resolve from the same dir. lib/ holds symlinks to the real prebuilt libs (see native/sherpa).
 # NOTE: changing rustflags invalidates the whole build cache (one-time full rebuild).
 rustflags = [
-    "-C", "codegen-units=16",
-    "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../lib",
-    "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../../lib",
+    "-C",
+    "codegen-units=16",
+    "-C",
+    "link-arg=-Wl,-rpath,$ORIGIN/../../lib",
+    "-C",
+    "link-arg=-Wl,-rpath,$ORIGIN/../../../lib",
 ]
 
 [env]
@@ -37,8 +40,10 @@ SHERPA_ONNX_LIB_DIR = "/workspaces/gui_agent/audio-aura/lib"
 
 [alias]
 # Legacy Stage1+2 bench (bin) — deprecated with the aura-core legacy code.
-benchaura = "run -p audio-aura-core --release --features cuda,asr --bin stage12 --"
+benchaura = "run -p audio-aura-core --features cuda,asr --bin stage12 --"
 # Thin Stage1→Stage2 bench on the Pipeline composer (moved here from aura-asr).
-benchlive = "run -p audio-aura-core --release --features cuda,asr --example stage12_live --"
+benchlive = "run -p audio-aura-core --features cuda,asr --example stage12_live --"
 # Full daemon (Pipeline + Stage3 rule trigger + socket skeleton).
-daemon = "run -p aura-daemon --release --features asr,cuda --"
+aura = "run -p aura-daemon --features asr,cuda --"
+
+scout = "run -p omni-scout --"

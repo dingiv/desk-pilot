@@ -153,16 +153,12 @@ impl Stage1Executor for OnnxStage1Executor {
 
         // Streaming session for the two-pass live path. Replaced (not reset) at each VAD EOS —
         // `reset` leaves encoder context that bleeds across segment boundaries; a fresh session
-        // starts with zero context.
+        // starts with zero context. Decoding is `is_ready`-gated inside `decode_and_result`, so a
+        // fresh session is safe to poll immediately (no warmup dance needed).
         let sasr = self.mgr.streaming_asr();
         let mut stream_sess = sasr.map(|s| s.create_session());
         let mut last_partial = String::new();
         let mut frames_since_partial = 0u32;
-        // Frames fed to the current streaming session since creation. Don't decode until this
-        // reaches WARMUP_FRAMES — a fresh session's encoder needs enough data or sherpa's
-        // GetFrames C++ assertion aborts the process.
-        let mut sess_warmup: u32 = 0;
-        const WARMUP_FRAMES: u32 = 30; // ~0.96s @ 32ms Silero windows
 
         loop {
             // Connection toggle: when the scout connection is paused, skip VAD/ASR (the ingest
@@ -190,13 +186,12 @@ impl Stage1Executor for OnnxStage1Executor {
             }
 
             // (1) streaming partial (two-pass: live path) — throttle to ~0.5s, only on change.
-            // Guard: don't decode until the session has enough warmup frames (fresh sessions
-            // crash sherpa's GetFrames if decoded too early).
+            // `decode_and_result` drains ALL pending chunks (is_ready loop), so the hypothesis
+            // stays caught-up with real-time instead of falling further behind on every poll.
             if let (Some(s), Some(sess)) = (sasr, stream_sess.as_ref()) {
                 sess.accept_waveform(sr as i32, &frame);
-                sess_warmup += 1;
                 frames_since_partial += 1;
-                if frames_since_partial >= PARTIAL_EVERY_FRAMES && sess_warmup >= WARMUP_FRAMES {
+                if frames_since_partial >= PARTIAL_EVERY_FRAMES {
                     let partial = s.decode_and_result(sess);
                     if !partial.is_empty() && partial != last_partial {
                         on_event(Stage1Event::Interim {
@@ -217,16 +212,16 @@ impl Stage1Executor for OnnxStage1Executor {
                 let at_s = start.elapsed().as_secs_f64();
                 let duration_ms = (ev.pcm.len() as f32 / sr as f32) * 1000.0;
 
-                // capture streaming final (hotword-biased) for comparison, then replace the
-                // session with a FRESH one (reset leaves encoder context that bleeds across
-                // segment boundaries — a new session starts clean).
+                // capture streaming final (hotword-biased) for comparison — `finalize_and_result`
+                // flushes end-of-input + drains every pending chunk, so the tail is complete —
+                // then replace the session with a FRESH one (reset leaves encoder context that
+                // bleeds across segment boundaries — a new session starts clean).
                 let streaming_text = if let (Some(s), Some(sess)) = (sasr, stream_sess.as_ref()) {
-                    s.decode_and_result(sess)
+                    s.finalize_and_result(sess)
                 } else {
                     String::new()
                 };
                 stream_sess = sasr.map(|s| s.create_session());
-                sess_warmup = 0;
 
                 // batch final (authoritative) — what Stage2 routes on
                 let raw_text = self

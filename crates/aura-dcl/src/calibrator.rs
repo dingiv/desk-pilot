@@ -90,6 +90,7 @@ mod tests {
             streaming_text: String::new(),
             duration_ms: 1000.0,
             at_s: 1.0,
+            pcm: Vec::new(),
         }
     }
 

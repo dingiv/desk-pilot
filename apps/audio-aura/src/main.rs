@@ -107,9 +107,13 @@ fn main() -> Result<()> {
                             bus.send(json!({ "type":"interim", "seq":seq, "partial":partial, "at_s":at_s })).ok();
                         }
                         TurnEvent::Final { utterance: u, decision: d, route_ms } => {
+                            // Print all three text layers — batch ASR (authoritative), streaming
+                            // ASR (hotword-biased), and the Stage2 rewrite — so ASR-level loss is
+                            // distinguishable from LLM rewriting when diagnosing "missing" words.
                             eprintln!(
-                                "▶ #{} @{:.1}s [{}, {:.0}ms]  整流: {}",
-                                u.seq, u.at_s, d.intent, route_ms, d.calibrated_text
+                                "▶ #{} @{:.1}s [{}, {:.0}ms]  批式: {} | 流式: {}\n   整流: {}",
+                                u.seq, u.at_s, d.intent, route_ms, u.raw_text, u.streaming_text,
+                                d.calibrated_text
                             );
                             if stage3_on {
                                 stage3_rule_trigger(&tool, &d.calibrated_text);
