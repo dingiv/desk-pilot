@@ -46,3 +46,6 @@ onnx = ["dep:sherpa-onnx"]
 # Enable everything (currently just onnx). Lets upstream crates pull Stage1 via a stable `all`
 # handle regardless of how many onnx-gated features grow here.
 all = ["onnx"]
+
+[dev-dependencies]
+audio-aura-store = { path = "../aura-store" }

@@ -2,6 +2,10 @@
 //! `src/store.ts` (voice_chunks / calibrated_nodes / topics / tasks), so the daemon and the TS
 //! devtools can share `data/voice-agent.db`. Single `Connection` behind a `Mutex` (single-user).
 
+pub mod archive;
+pub mod hub;
+pub mod wav;
+
 use std::path::Path;
 use std::sync::Mutex;
 

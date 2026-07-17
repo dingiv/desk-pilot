@@ -324,6 +324,7 @@ name = "audio-aura-asr"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "audio-aura-store",
  "serde",
  "shared",
  "sherpa-onnx",
@@ -378,9 +379,11 @@ name = "audio-aura-store"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "rusqlite",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -399,6 +402,7 @@ dependencies = [
  "audio-aura-asr",
  "audio-aura-core",
  "audio-aura-router",
+ "audio-aura-store",
  "axum",
  "clap",
  "serde",

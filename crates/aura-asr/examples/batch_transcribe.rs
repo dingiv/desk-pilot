@@ -1,12 +1,13 @@
 //! Batch-transcribe several WAVs through SenseVoice (loads the model once). Reads each file's real
-//! sample rate via `audio_aura_asr::wav`.
+//! sample rate via `audio_aura_store::wav`.
 //! Run: SHERPA_LIB_PATH=<dir> cargo run -p audio-aura-asr --features sherpa --example batch_transcribe -- <wav>...
 
 use std::path::Path;
 use std::time::Instant;
 
 use audio_aura_asr::onnx::{AsrConfig, OnnxAsr};
-use audio_aura_asr::{wav, Asr};
+use audio_aura_asr::Asr;
+use audio_aura_store::wav;
 
 fn main() -> anyhow::Result<()> {
     let base = "/workspaces/gui_agent/audio-aura/native/models/sensevoice";

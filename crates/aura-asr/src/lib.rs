@@ -12,7 +12,6 @@ use serde::Serialize;
 
 pub mod buffer;
 pub mod scout;
-pub mod wav;
 pub mod source;
 
 /// The ONNX-runtime side of the dual-runtime architecture (see docs/runtime-selection.md):

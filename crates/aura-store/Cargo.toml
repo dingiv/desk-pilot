@@ -2,10 +2,12 @@
 name = "audio-aura-store"
 version = "0.1.0"
 edition = "2021"
-description = "rusqlite storage for the voice core — same 4-table schema as the TS src/store.ts"
+description = "persistence crate — Storage hub (audio archive + WAV + per-day turn log) + legacy 4-table sqlite store"
 
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = "0.4"
+tracing = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

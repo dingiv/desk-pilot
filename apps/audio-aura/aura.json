@@ -18,5 +18,6 @@
     "蛇身",
     "计分器"
   ],
-  "web_dist": null
+  "web_dist": null,
+  "recordings_dir": null
 }

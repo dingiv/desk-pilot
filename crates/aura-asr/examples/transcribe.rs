@@ -4,7 +4,8 @@
 use std::path::Path;
 
 use audio_aura_asr::onnx::{AsrConfig, OnnxAsr};
-use audio_aura_asr::{wav, Asr};
+use audio_aura_asr::Asr;
+use audio_aura_store::wav;
 
 fn main() -> anyhow::Result<()> {
     let base = "/workspaces/gui_agent/audio-aura/native/models/sensevoice";

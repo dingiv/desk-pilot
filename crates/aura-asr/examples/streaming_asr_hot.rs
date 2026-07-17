@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use audio_aura_asr::onnx::{OnlineAsr, StreamingAsrConfig};
-use audio_aura_asr::wav;
+use audio_aura_store::wav;
 
 fn main() -> anyhow::Result<()> {
     let base = "/workspaces/gui_agent/audio-aura/native/models/zipformer-streaming-zh-en";

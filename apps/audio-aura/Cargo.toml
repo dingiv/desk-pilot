@@ -19,6 +19,7 @@ audio-aura-core = { path = "../../crates/aura-core" }
 audio-aura-agent = { path = "../../crates/aura-agent" }
 audio-aura-asr = { path = "../../crates/aura-asr" }
 audio-aura-router = { path = "../../crates/aura-dcl" }
+audio-aura-store = { path = "../../crates/aura-store" }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -36,7 +37,10 @@ shared = { path = "../../crates/shared" }
 # FileLoader namespaces (consumed by build.rs → shared::loader!()).
 # CONF: runtime config — dev reads this crate's dir (apps/audio-aura/aura.json),
 # prod reads the unified config folder ~/.desk-pilot/aura.json.
+# DATA: runtime data (utterance recordings etc.) — dev writes this crate's data/,
+# prod writes the unified data folder ~/.desk-pilot/data.
 # (Don't write the bracketed section name in comments — the loader's naive
 # scanner matches the first occurrence anywhere in the file.)
 [package.metadata.shared]
 CONF = { dev = ".", prod = "~/.desk-pilot" }
+DATA = { dev = "data", prod = "~/.desk-pilot/data" }

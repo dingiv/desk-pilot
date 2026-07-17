@@ -8,4 +8,4 @@ packages:
   - 'apps/visual_rover_web'
   - 'apps/omni_scout'
   - 'apps/omni_scout_devtools'
-
+  - 'apps/audio-aura-devtools'

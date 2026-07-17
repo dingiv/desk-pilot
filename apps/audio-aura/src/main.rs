@@ -15,7 +15,6 @@
 //! Config precedence: CLI (high-frequency knobs, see `Cli`) > `aura.json` (full surface, dev:
 //! this crate's dir, prod: ~/.desk-pilot/) > built-in defaults. No env vars.
 
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,6 +37,8 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
 use audio_aura_agent::{AddHotwordTool, HotwordManager, SharedHotwordManager, Tool};
+use audio_aura_store::archive::{ArchiveConfig, AudioArchive};
+use audio_aura_store::hub::{FinalTurn, Storage};
 use audio_aura_asr::executor::{OnnxStage1Executor, Stage1Config};
 use audio_aura_core::{Pipeline, TurnEvent};
 use audio_aura_router::calibrator::RouterStage2Calibrator;
@@ -74,6 +75,9 @@ struct AuraConf {
     hotwords: Option<Vec<String>>,
     /// Built SPA dist dir the daemon serves (default: workspace `dist/`).
     web_dist: Option<String>,
+    /// Recordings base dir override (default: DATA::recordings — dev: this crate's data/,
+    /// prod: ~/.desk-pilot/data/). Clips land in per-day subdirs (`<YYYY-MM-DD>/`).
+    recordings_dir: Option<String>,
 }
 
 impl AuraConf {
@@ -132,6 +136,7 @@ struct Settings {
     model: String,
     hotwords: Vec<String>,
     web_dist: Option<String>,
+    recordings_dir: Option<String>,
 }
 
 /// Pure merge: CLI > `aura.json` > built-in default. (`--no-stage3` wins over the file;
@@ -149,14 +154,11 @@ fn resolve(cli: Cli, conf: AuraConf) -> Settings {
             .hotwords
             .unwrap_or_else(|| SEED_HOTWORDS.iter().map(|s| s.to_string()).collect()),
         web_dist: conf.web_dist,
+        recordings_dir: conf.recordings_dir,
     }
 }
 
 /// Shared daemon state surfaced over the socket.
-/// In-memory audio clip store (seq → PCM), for the web UI's playback feature.
-/// Bounded to the last 30 segments (~minutes of speech) to cap memory.
-type AudioClips = Arc<Mutex<HashMap<u64, Vec<i16>>>>;
-
 #[derive(Clone)]
 struct DaemonState {
     hotwords: Arc<Mutex<Vec<String>>>,
@@ -164,8 +166,9 @@ struct DaemonState {
     active: Arc<AtomicBool>,
     /// Event bus bridging the Pipeline thread → SSE clients.
     bus: broadcast::Sender<Value>,
-    /// PCM audio clips keyed by utterance seq (for `GET /api/audio/:seq` playback).
-    audio_clips: AudioClips,
+    /// The Storage supervisor: audio archive (hot replay + date-named WAV flush) +
+    /// per-turn day log + recent ring (backs /api/audio, /api/recordings, /results).
+    storage: Arc<Storage>,
 }
 
 impl DaemonState {
@@ -179,7 +182,7 @@ fn main() -> Result<()> {
     // (dev: human-readable; release: JSON lines; RUST_LOG filter, default info).
     shared::init_tracing();
     let s = resolve(Cli::parse(), AuraConf::load());
-    let Settings { scout_addr, port, stage3_on, model, hotwords: seed_hotwords, web_dist } = s;
+    let Settings { scout_addr, port, stage3_on, model, hotwords: seed_hotwords, web_dist, recordings_dir } = s;
 
     // Connection toggle + event bus, shared across the Pipeline thread + socket handlers.
     let active = Arc::new(AtomicBool::new(true));
@@ -191,8 +194,21 @@ fn main() -> Result<()> {
     let mgr: Arc<dyn HotwordManager> = Arc::new(SharedHotwordManager::new(Arc::clone(&hotwords)));
     let tool = AddHotwordTool::new(Arc::clone(&mgr));
 
-    // Audio clip store for playback.
-    let audio_clips: AudioClips = Arc::new(Mutex::new(HashMap::new()));
+    // Storage supervisor: audio archive (date-named WAVs under recordings/<YYYY-MM-DD>/) +
+    // per-turn day log (turns/<YYYY-MM-DD>.jsonl) + recent ring. Dirs: aura.json
+    // `recordings_dir` override, else DATA:: (dev: apps/audio-aura/data/, prod: ~/.desk-pilot/data/).
+    let data = shared::loader!();
+    let rec_dir = recordings_dir.map(std::path::PathBuf::from).unwrap_or_else(|| {
+        data.resolve("DATA::recordings")
+            .unwrap_or_else(|| std::path::PathBuf::from("data/recordings"))
+    });
+    let turns_dir = data
+        .resolve("DATA::turns")
+        .unwrap_or_else(|| std::path::PathBuf::from("data/turns"));
+    info!(recordings = %rec_dir.display(), turns = %turns_dir.display(), "storage ready (periodic flush)");
+    let archive = Arc::new(AudioArchive::new(ArchiveConfig { dir: rec_dir, ..Default::default() }));
+    let _flusher = archive.spawn_flusher();
+    let storage = Arc::new(Storage::new(archive, turns_dir));
 
     info!("loading Stage1 (ONNX) + Stage2 (Qwen router) …");
     let mut cfg = Stage1Config::new(scout_addr.clone());
@@ -209,7 +225,7 @@ fn main() -> Result<()> {
     {
         let bus = bus.clone();
         let tool = tool.clone();
-        let audio_clips = Arc::clone(&audio_clips);
+        let storage = Arc::clone(&storage);
         thread::Builder::new()
             .name("aura-pipeline".into())
             .spawn(move || {
@@ -237,15 +253,20 @@ fn main() -> Result<()> {
                             if stage3_on {
                                 stage3_rule_trigger(&tool, &d.calibrated_text);
                             }
-                            // Store the PCM for playback (bound to last 30 clips).
-                            {
-                                let mut clips = audio_clips.lock().unwrap();
-                                if clips.len() >= 30 {
-                                    let oldest = *clips.keys().min().unwrap();
-                                    clips.remove(&oldest);
-                                }
-                                clips.insert(u.seq, u.pcm.clone());
-                            }
+                            // One call records everywhere: PCM → audio archive,
+                            // transcript+decision → day log + recent ring (/results).
+                            storage.record_final(FinalTurn {
+                                seq: u.seq,
+                                at_s: u.at_s,
+                                duration_ms: u.duration_ms,
+                                raw_text: u.raw_text.clone(),
+                                streaming_text: u.streaming_text.clone(),
+                                calibrated: d.calibrated_text.clone(),
+                                intent: d.intent.clone(),
+                                reply: d.reply.clone(),
+                                route_ms,
+                                pcm: u.pcm.clone(),
+                            });
                             bus.send(json!({
                                 "type":"final",
                                 "seq": u.seq,
@@ -263,7 +284,7 @@ fn main() -> Result<()> {
     }
 
     // ── Socket on the main thread's tokio runtime ──
-    let state = DaemonState { hotwords: Arc::clone(&hotwords), active: Arc::clone(&active), bus, audio_clips };
+    let state = DaemonState { hotwords: Arc::clone(&hotwords), active: Arc::clone(&active), bus, storage };
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("aura-socket")
@@ -317,10 +338,11 @@ async fn serve_socket(state: DaemonState, port: u16, web_dist: Option<String>) {
         .route("/api/control/scout", post(control_scout))
         .route("/api/stream", get(stream_asr))
         .route("/api/audio/{seq}", get(audio_handler))
+        .route("/api/recordings", get(recordings_handler))
         .route("/context", get(context_handler))
         // remaining stubs (speaker / results / annotate) — out of scope this round
         .route("/control/speaker", post(control_stub))
-        .route("/results", get(results_stub))
+        .route("/results", get(results_handler))
         .route("/annotate", post(annotate_stub))
         .fallback_service(static_spa)
         .layer(CorsLayer::permissive())
@@ -377,30 +399,31 @@ async fn context_handler(State(s): State<DaemonState>) -> Json<Value> {
     Json(json!({ "hotwords": s.hotwords.lock().unwrap().clone() }))
 }
 
-/// `GET /api/audio/:seq` — serve the raw PCM of utterance `seq` as a WAV file for playback.
+/// `GET /api/audio/:seq` — serve utterance `seq` as a WAV for playback. The archive resolves
+/// transparently: hot tier first, then the flushed file on disk.
 async fn audio_handler(
     State(s): State<DaemonState>,
     Path(seq): Path<u64>,
 ) -> impl IntoResponse {
-    let pcm = s.audio_clips.lock().unwrap().get(&seq).cloned();
-    match pcm {
-        Some(pcm) => {
-            let wav = audio_aura_asr::wav::wav_bytes(&pcm, 16000);
-            (
-                [(axum::http::header::CONTENT_TYPE, "audio/wav")],
-                wav,
-            )
-                .into_response()
+    match s.storage.audio.wav(seq) {
+        Some(wav) => {
+            ([(axum::http::header::CONTENT_TYPE, "audio/wav")], wav).into_response()
         }
         None => (axum::http::StatusCode::NOT_FOUND, "audio clip not found").into_response(),
     }
 }
 
+/// `GET /api/recordings` — list all known clips (hot + flushed), ascending seq.
+async fn recordings_handler(State(s): State<DaemonState>) -> Json<Value> {
+    Json(json!({ "recordings": s.storage.recordings() }))
+}
+
 async fn control_stub() -> Json<Value> {
     Json(json!({ "stub": true, "todo": "speaker control + runtime config" }))
 }
-async fn results_stub() -> Json<Value> {
-    Json(json!({ "stub": true, "todo": "stage1/2 results + rolling context window" }))
+/// `GET /results` — recent Stage1+Stage2 turn records (oldest → newest, bounded ring).
+async fn results_handler(State(s): State<DaemonState>) -> Json<Value> {
+    Json(json!({ "results": s.storage.recent() }))
 }
 async fn annotate_stub() -> Json<Value> {
     Json(json!({ "stub": true, "todo": "accept user corrections → progressive-improvement dataset" }))
@@ -448,6 +471,7 @@ mod tests {
             model: None,
             hotwords: None,
             web_dist: Some("/tmp/dist".into()),
+            recordings_dir: None,
         };
         let s = resolve(cli, conf);
         assert_eq!(s.scout_addr, "cli:1");
