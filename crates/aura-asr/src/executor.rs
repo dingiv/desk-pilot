@@ -195,6 +195,7 @@ impl Stage1Executor for OnnxStage1Executor {
                     let partial = s.decode_and_result(sess);
                     if !partial.is_empty() && partial != last_partial {
                         on_event(Stage1Event::Interim {
+                            seq: idx + 1, // the in-progress utterance's prospective seq
                             partial: partial.clone(),
                             at_s: start.elapsed().as_secs_f64(),
                         });

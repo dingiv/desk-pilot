@@ -17,7 +17,6 @@ use audio_aura_core::{Pipeline, TurnEvent};
 use audio_aura_router::calibrator::RouterStage2Calibrator;
 use audio_aura_router::RouterEngine;
 
-const BASE: &str = "/workspaces/gui_agent/audio-aura/native";
 const REPORT_DIR: &str = "/workspaces/gui_agent/audio-aura/bench";
 
 fn cell(s: &str) -> String {
@@ -60,7 +59,7 @@ fn main() -> anyhow::Result<()> {
 
     println!("\n● Pipeline 就绪 (scout {scout_addr}/audio). Ctrl-C 结束.\n");
     Pipeline::new(s1, s2).run(move |ev| match ev {
-        TurnEvent::Interim { partial, at_s } => println!("  …流式 @{at_s:.1}s: {partial}"),
+        TurnEvent::Interim { seq: _, partial, at_s } => println!("  …流式 @{at_s:.1}s: {partial}"),
         TurnEvent::Final { utterance: u, decision: d, route_ms } => {
             println!(
                 "▶ #{} @{:.1}s ({}s) [{}] 路由 {:.0}ms\n   流式: {}\n   原文: {}\n   整流: {}\n   回应: {}\n",

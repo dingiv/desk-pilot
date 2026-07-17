@@ -3,17 +3,19 @@
 //! a scout-connection toggle (`POST /api/control/scout`), a live SSE stream of Stage1 Interim
 //! partials + Final utterances (`GET /api/stream`), and status (`GET /api/status`).
 //!
-//! Threading: the Pipeline runs on a dedicated **std thread** (it blocks forever); the axum
-//! socket runs on a multi-thread tokio runtime on the main thread. The Pipeline's `on_turn`
-//! callback serializes each [`TurnEvent`] to owned JSON and publishes it on a
-//! `broadcast::Sender<Value>` — the SSE handler subscribes and streams it. (TurnEvent borrows, so
-//! it can't cross the channel directly; the JSON step also clones the borrowed fields.)
+//! Threading: the Pipeline runs Stage1 on a dedicated **std thread** (it blocks forever) and
+//! Stage2 on its own internal `aura-stage2` worker (so partials never freeze behind a 1-2s LLM
+//! route); the axum socket runs on a multi-thread tokio runtime on the main thread. The
+//! Pipeline's `on_turn` callback (invoked from both pipeline threads) serializes each
+//! [`TurnEvent`] to owned JSON and publishes it on a `broadcast::Sender<Value>` — the SSE
+//! handler subscribes and streams it. Events carry their utterance `seq`; an interim for
+//! utterance N+1 may arrive before the final of N (consumers group by seq, not arrival order).
 //!
 //! Run: cargo run -p aura-daemon --features asr,cuda -- 127.0.0.1:7879
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -37,6 +39,17 @@ use audio_aura_router::calibrator::RouterStage2Calibrator;
 use audio_aura_router::RouterEngine;
 
 const BASE: &str = "/workspaces/gui_agent/audio-aura/native";
+
+/// Streaming-ASR + Stage2 seed hotwords. 真麦 #9 proved the mechanism end-to-end: in-list terms
+/// decode clean (Rust→RUST), out-of-list ones shatter (Docker→DO CAR, GitHub→GUITAR,
+/// Kubernetes→KUBERNITIES). Seeded into BOTH layers: baked into the streaming recognizer at
+/// boot, and preloading the shared store Stage2 reads each turn. Stage3 grows the store at
+/// runtime (LLM layer only — pushing new words down into the ASR recognizer is M5: needs a
+/// recognizer rebuild).
+const SEED_HOTWORDS: &[&str] = &[
+    "Rust", "Bevy", "Docker", "GitHub", "Kubernetes", "API", "Markdown", "PDF", "Agent",
+    "README", "贪吃蛇", "蛇身", "计分器",
+];
 
 /// Shared daemon state surfaced over the socket.
 /// In-memory audio clip store (seq → PCM), for the web UI's playback feature.
@@ -72,8 +85,10 @@ fn main() -> Result<()> {
     let active = Arc::new(AtomicBool::new(true));
     let (bus, _rx) = broadcast::channel::<Value>(1024);
 
-    // Shared hotword store = the Stage3→Stage2 feedback channel (starts empty; Stage3 fills it).
-    let hotwords: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    // Shared hotword store = the Stage3→Stage2 feedback channel (seeded with the tech-term
+    // list; Stage3 grows it at runtime).
+    let hotwords: Arc<Mutex<Vec<String>>> =
+        Arc::new(Mutex::new(SEED_HOTWORDS.iter().map(|s| s.to_string()).collect()));
     let mgr: Arc<dyn HotwordManager> = Arc::new(SharedHotwordManager::new(Arc::clone(&hotwords)));
     let tool = AddHotwordTool::new(Arc::clone(&mgr));
 
@@ -83,26 +98,25 @@ fn main() -> Result<()> {
     eprintln!("[aura-daemon] loading Stage1 (ONNX) + Stage2 (Qwen router) …");
     let mut cfg = Stage1Config::new(scout_addr.clone());
     cfg.active = Arc::clone(&active); // share the toggle with the executor
+    // Bake the seed hotwords into the streaming recognizer (beam-search biasing).
+    cfg.streaming.hotwords = SEED_HOTWORDS.iter().map(|s| s.to_string()).collect();
     let s1 = OnnxStage1Executor::new(cfg)?;
     let router = RouterEngine::load_default("Qwen3-1.7B-Q8_0.gguf")?;
     let _ = router.route_blocking("你好", None, &[]); // HF warmup
     let s2 = RouterStage2Calibrator::new(router, Arc::clone(&hotwords));
 
     // ── Pipeline on a dedicated std thread ── it bridges each TurnEvent to the event bus as
-    //    owned JSON (seq tracked so the live (in-progress) item's id is known for interims).
-    let current_seq = Arc::new(AtomicU64::new(1));
+    //    owned JSON. Events carry their own utterance seq (assigned by Stage1).
     {
         let bus = bus.clone();
         let tool = tool.clone();
-        let current_seq = Arc::clone(&current_seq);
         let audio_clips = Arc::clone(&audio_clips);
         thread::Builder::new()
             .name("aura-pipeline".into())
             .spawn(move || {
                 Pipeline::new(s1, s2).run(move |ev| {
                     match ev {
-                        TurnEvent::Interim { partial, at_s } => {
-                            let seq = current_seq.load(Ordering::Relaxed);
+                        TurnEvent::Interim { seq, partial, at_s } => {
                             eprintln!("  …流式 @{at_s:.1}s: {partial}");
                             bus.send(json!({ "type":"interim", "seq":seq, "partial":partial, "at_s":at_s })).ok();
                         }
@@ -137,7 +151,6 @@ fn main() -> Result<()> {
                                 "reply": &d.reply,
                                 "route_ms": route_ms,
                             })).ok();
-                            current_seq.store(u.seq + 1, Ordering::Relaxed);
                         }
                     }
                 });
@@ -158,10 +171,12 @@ fn main() -> Result<()> {
 
 /// In-process Stage3 rule trigger (temporary; desktop-pet replaces it). Extracts uppercase-latin
 /// proper-noun candidates from the calibrated text and adds them as hotwords — locking in Stage2's
-/// corrections so future turns are reinforced.
+/// corrections so future turns are reinforced. Concatenation artifacts ("APIdocker" — batch ASR
+/// gluing adjacent terms) are rejected so they can't pollute the store.
 fn stage3_rule_trigger(tool: &AddHotwordTool, text: &str) {
     for tok in text.split(|c: char| !c.is_ascii_alphanumeric()) {
-        if tok.len() < 2 || !tok.chars().any(|c| c.is_ascii_uppercase()) {
+        if tok.len() < 2 || !tok.chars().any(|c| c.is_ascii_uppercase()) || looks_like_concat(tok)
+        {
             continue;
         }
         if let Ok(out) = tool.invoke(&json!({ "word": tok })) {
@@ -170,6 +185,16 @@ fn stage3_rule_trigger(tool: &AddHotwordTool, text: &str) {
             }
         }
     }
+}
+
+/// A concatenation artifact like "APIdocker": an UPPER-UPPER-lower trigram marks the glue seam
+/// (the standard camelCase word-split rule). Legit tokens survive — "GitHub" (single-cap
+/// boundaries), "README" (all caps, no lower after), "Rust" (TitleCase).
+fn looks_like_concat(tok: &str) -> bool {
+    let c: Vec<char> = tok.chars().collect();
+    c.windows(3).any(|w| {
+        w[0].is_ascii_uppercase() && w[1].is_ascii_uppercase() && w[2].is_ascii_lowercase()
+    })
 }
 
 async fn serve_socket(state: DaemonState, port: u16) {
@@ -273,4 +298,22 @@ async fn results_stub() -> Json<Value> {
 }
 async fn annotate_stub() -> Json<Value> {
     Json(json!({ "stub": true, "todo": "accept user corrections → progressive-improvement dataset" }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_like_concat;
+
+    #[test]
+    fn concat_seam_rejected_legit_tokens_pass() {
+        // Glue seams (UPPER-UPPER-lower trigram) — the "APIdocker" class.
+        assert!(looks_like_concat("APIdocker"));
+        assert!(looks_like_concat("PDFmarkdown"));
+        assert!(looks_like_concat("APIs")); // plural junk, acceptable loss
+        // Legit proper nouns survive.
+        assert!(!looks_like_concat("Rust"));
+        assert!(!looks_like_concat("GitHub")); // single-cap boundaries
+        assert!(!looks_like_concat("README")); // all caps, no lower after
+        assert!(!looks_like_concat("PDF"));
+    }
 }

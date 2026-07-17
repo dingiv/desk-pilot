@@ -11,6 +11,15 @@
 
 验证：`streaming_asr_hot` 示例（500ms 轮询 100ms 喂入）partial 与音频进度同步、final 完整（旧代码下 5.6s 音频只解得 ~3.5s，final 必截断）；workspace 34 个测试套件全绿。
 
+## 第二轮（2026-07-17 真麦复测后）：P1–P4
+
+真麦读 bench/case.txt 复测确认第一轮修复生效（长句 partial 全程跟手、无强切碎片、ring 尖峰=Stage2 阻塞期的正常缓冲）。新暴露四题，当日全修：
+
+- **P1 段头削字**（#7 批式丢"帮我"、流式抓到）→ Stage2 提示词加「双通道对照」：calibrator 把 `streaming_text` 以 `<streaming_transcript>` 信封一并入 prompt，指示只用流式补批式缺的段头/段尾、正文仍以批式为准。
+- **P2 英文术语崩坏**（在热词表的 Rust 全对，不在表的 Docker→DO CAR / GitHub→GUITAR / Kubernetes→KUBERNITIES）→ daemon 种子热词表 `SEED_HOTWORDS` 同时注入流式识别器（beam 偏置）与 Stage2 共享库；规则触发器加 `looks_like_concat` 过滤（大写-大写-小写三连=拼接缝，拦"APIdocker"类垃圾词）。ASR 层动态加词仍留 M5（需重建 recognizer）。
+- **P3 Stage2 过度删减/漏修**（删"测试语料一"、代办没改待办、ubernet 二次损伤成 ubnet）→ 提示词三条新规：开头称呼/编号/标题必须保留；常见模式表补 代办事项→待办事项、自动生产→自动生成；不认识的英文串原样保留禁止"修复"。
+- **P4 Stage2 阻塞消费线程**（route_ms 随上下文涨到 2.2s，期间 partial 冻结）→ `Pipeline::run` 内部起 `aura-stage2` worker 线程跑 calibrate，Stage1 消费线程只转发事件永不等 LLM。副作用契约：Interim(N+1) 可能先于 Final(N) 到达，事件一律按 `seq` 归组（`Stage1Event::Interim`/`TurnEvent::Interim` 新增 `seq` 字段，daemon 删掉 current_seq 原子量）。
+
 ---
 
 # Stage1+2 实时录音问题分析与解决方案

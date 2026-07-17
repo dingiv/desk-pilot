@@ -63,8 +63,11 @@ impl Utterance {
 /// can match on them without the `onnx` feature.
 #[derive(Debug, Clone)]
 pub enum Stage1Event {
-    /// A live streaming partial (the "phone input method" evolving text).
-    Interim { partial: String, at_s: f64 },
+    /// A live streaming partial (the "phone input method" evolving text). `seq` is the
+    /// prospective sequence number of the in-progress utterance (= last Final's seq + 1), so
+    /// consumers can group partials with their utterance even when events from different
+    /// pipeline threads interleave.
+    Interim { seq: u64, partial: String, at_s: f64 },
     /// A finalized utterance ready for Stage2 calibration.
     Final(Utterance),
 }

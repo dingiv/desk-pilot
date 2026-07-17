@@ -61,6 +61,10 @@ impl Stage2Calibrator for RouterStage2Calibrator {
         let hotwords = self.hotwords.lock().unwrap().clone();
 
         let mut pb = PromptBuilder::new(route).hotwords(&hotwords);
+        // Dual-transcript head/tail merge: the batch pass occasionally clips the segment head
+        // (VAD lookback margin); the streaming pass hears everything but with more homophone
+        // errors. Give the LLM both — the builder drops it when empty/identical to `route`.
+        pb = pb.streaming_ref(&utterance.streaming_text);
         if let Some(c) = ctx.as_deref() {
             pb = pb.context(c);
         }
