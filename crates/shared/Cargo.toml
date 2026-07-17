@@ -6,3 +6,9 @@ description = "FileLoader — dev/prod asset path resolution for cargo crates. F
 
 [dependencies]
 anyhow = "1"
+tracing-subscriber = { workspace = true, optional = true }
+
+[features]
+# Process-wide tracing subscriber init for BINARIES (shared::init_tracing). Lib crates must
+# NOT enable this — they depend on the `tracing` facade only.
+log = ["dep:tracing-subscriber"]

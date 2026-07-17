@@ -5,6 +5,7 @@ edition = "2021"
 description = "Stage1 — capture + VAD + ASR (two-pass) + the Stage1Executor abstraction. A true leaf crate (no aura-dcl dep)."
 
 [dependencies]
+tracing = { workspace = true }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 shared = { path = "../shared" }

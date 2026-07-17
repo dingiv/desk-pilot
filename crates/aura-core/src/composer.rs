@@ -84,7 +84,7 @@ impl Pipeline {
             }
             Stage1Event::Final(u) => {
                 if tx.send(u).is_err() {
-                    eprintln!("[pipeline] stage2 worker gone — dropping utterance");
+                    tracing::error!("stage2 worker gone — dropping utterance");
                 }
             }
         });

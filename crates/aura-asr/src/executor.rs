@@ -18,6 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use tracing::debug;
 
 use crate::buffer::AudioRing;
 use crate::onnx::{AsrConfig, OnnxRuntimeManager, StreamingAsrConfig, VadConfig, WINDOW};
@@ -181,7 +182,7 @@ impl Stage1Executor for OnnxStage1Executor {
             if last_diag.elapsed() >= Duration::from_secs(3) {
                 let rlen = self.ring.lock().unwrap().len();
                 let speaking = self.mgr.vad().map(|v| v.is_speaking()).unwrap_or(false);
-                eprintln!("[stage1] {frames_in} frames→VAD, ring={rlen} samples, speaking={speaking}");
+                debug!(frames = frames_in, ring = rlen, speaking, "stage1 diag");
                 last_diag = Instant::now();
             }
 

@@ -26,6 +26,7 @@ cuda = ["audio-aura-router/cuda"]
 asr = ["audio-aura-asr/onnx"]
 
 [dependencies]
+tracing = { workspace = true }
 audio-aura-router = { path = "../aura-dcl" }
 audio-aura-store = { path = "../aura-store" }
 audio-aura-asr = { path = "../aura-asr", optional = true }

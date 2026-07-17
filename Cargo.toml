@@ -47,6 +47,10 @@ publish = false
 # In-workspace path deps (consumed via `dep = { workspace = true }` in member crates).
 [workspace.dependencies]
 scout-drivers = { path = "crates/scout-drivers" }
+# Logging: `tracing` is the facade (lib crates depend on this only); the subscriber
+# implementation lives in binaries via shared::init_tracing (see crates/shared).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # familiar-* crates use short dep keys (core/render/platform/ui/fs) internally;
 # the `package` field maps them to the actual crate names.
 core     = { path = "crates/familiar-core", package = "familiar-core" }

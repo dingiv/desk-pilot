@@ -26,3 +26,17 @@ tower-http = { version = "0.6", features = ["cors", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+shared = { path = "../../crates/shared", features = ["log"] }
+tracing = { workspace = true }
+
+[build-dependencies]
+shared = { path = "../../crates/shared" }
+
+# FileLoader namespaces (consumed by build.rs → shared::loader!()).
+# CONF: runtime config — dev reads this crate's dir (apps/audio-aura/aura.json),
+# prod reads the unified config folder ~/.desk-pilot/aura.json.
+# (Don't write the bracketed section name in comments — the loader's naive
+# scanner matches the first occurrence anywhere in the file.)
+[package.metadata.shared]
+CONF = { dev = ".", prod = "~/.desk-pilot" }

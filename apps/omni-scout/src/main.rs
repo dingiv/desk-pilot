@@ -37,6 +37,8 @@ use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 
+use tracing::{error, info, warn};
+
 use scout_drivers::audio::AudioSource;
 use scout_drivers::backends::media::{MediaAudioSource, MediaVideoSource};
 use scout_drivers::backends::pipewire::{PipeWireAudioSource, PipeWireSource};
@@ -53,6 +55,9 @@ type ScreenBox = Box<dyn CaptureSource + Send>;
 type AudioArc = Arc<dyn AudioSource + Send + Sync>;
 
 fn main() {
+    // Init-stage side effect, first thing in main: the process-wide tracing subscriber
+    // (dev: human-readable; release: JSON lines; RUST_LOG filter, default info).
+    shared::init_tracing();
     let args = Args::parse();
     acquire_singleton_lock(); // exits(3) if another instance holds the lock
 
@@ -93,16 +98,15 @@ fn main() {
         ""
     };
     let srv = server::HttpServer::new(src, audio);
-    eprintln!(
-        "[omni-scout] serving on http://{}:{}   (GET /health | /info | /frame | /audio{}; streams pause when idle)",
-        args.host,
-        args.port,
-        mode
+    info!(
+        host = %args.host,
+        port = args.port,
+        mode,
+        "serving (GET /health | /info | /frame | /audio; streams pause when idle) — Ctrl+C to stop"
     );
-    eprintln!("[omni-scout] Ctrl+C to stop.");
 
     if let Err(e) = srv.serve(&args.host, args.port) {
-        eprintln!("[omni-scout] server error: {e}");
+        error!(error = %e, "server error");
         std::process::exit(1);
     }
 }
@@ -111,17 +115,17 @@ fn main() {
 /// The screen is a stub solid frame (nobody reads /frame in this mode). Used to replay recordings
 /// for reproducible ASR testing without a real microphone.
 fn build_mock_audio_only(audio_path: &str) -> (Arc<Mutex<ScreenBox>>, Option<AudioArc>) {
-    eprintln!("[omni-scout] MOCK-AUDIO mode: decoding {audio_path} via ffmpeg (no video/portal)");
+    info!(path = %audio_path, "MOCK-AUDIO mode: decoding via ffmpeg (no video/portal)");
     let src: Arc<Mutex<ScreenBox>> = Arc::new(Mutex::new(Box::new(
         MockCaptureSource::solid(320, 240, 0, 0, 0),
     )));
     let audio = match MediaAudioSource::new(audio_path) {
         Ok(a) => {
-            eprintln!("[omni-scout] mock audio ready ({audio_path})");
+            info!(path = %audio_path, "mock audio ready");
             Some(Arc::new(a) as AudioArc)
         }
         Err(e) => {
-            eprintln!("[omni-scout] mock audio unavailable: {e}");
+            warn!(error = %e, "mock audio unavailable");
             None
         }
     };
@@ -132,42 +136,40 @@ fn build_mock_audio_only(audio_path: &str) -> (Arc<Mutex<ScreenBox>>, Option<Aud
 /// Mic is best-effort: a missing/broken mic degrades to screen-only.
 fn build_real(audio_only: bool) -> (Arc<Mutex<ScreenBox>>, Option<AudioArc>) {
     if audio_only {
-        eprintln!("[omni-scout] audio-only mode — skipping ScreenCast portal");
+        info!("audio-only mode — skipping ScreenCast portal");
         let audio = match PipeWireAudioSource::new() {
             Ok(a) => {
-                eprintln!("[omni-scout] mic source ready (16 kHz mono S16LE requested)");
+                info!("mic source ready (16 kHz mono S16LE requested)");
                 Some(Arc::new(a) as AudioArc)
             }
             Err(e) => {
-                eprintln!("[omni-scout] mic source unavailable: {e}");
+                error!(error = %e, "mic source unavailable");
                 std::process::exit(2);
             }
         };
         return (Arc::new(Mutex::new(Box::new(scout_drivers::mock::MockCaptureSource::solid(1, 1, 0, 0, 0)))), audio);
     }
-    eprintln!(
-        "[omni-scout] negotiating PipeWire ScreenCast session (the portal may prompt to pick a screen)…"
-    );
+    info!("negotiating PipeWire ScreenCast session (the portal may prompt to pick a screen)…");
     let pw = match PipeWireSource::new() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[omni-scout] capture session failed: {e}");
+            error!(error = %e, "capture session failed");
             std::process::exit(2);
         }
     };
     match pw.size() {
-        Some((w, h)) => eprintln!("[omni-scout] stream size {w}x{h}"),
-        None => eprintln!("[omni-scout] size unknown yet (learned on the first frame)"),
+        Some((w, h)) => info!(w, h, "stream size"),
+        None => info!("size unknown yet (learned on the first frame)"),
     }
     let src: Arc<Mutex<ScreenBox>> = Arc::new(Mutex::new(Box::new(pw)));
 
     let audio = match PipeWireAudioSource::new() {
         Ok(a) => {
-            eprintln!("[omni-scout] mic source ready (16 kHz mono S16LE requested)");
+            info!("mic source ready (16 kHz mono S16LE requested)");
             Some(Arc::new(a) as AudioArc)
         }
         Err(e) => {
-            eprintln!("[omni-scout] mic source unavailable: screen-only mode ({e})");
+            warn!(error = %e, "mic source unavailable: screen-only mode");
             None
         }
     };
@@ -181,25 +183,25 @@ fn build_real(audio_only: bool) -> (Arc<Mutex<ScreenBox>>, Option<AudioArc>) {
 fn build_mock(file: &str, args: &Args) -> (Arc<Mutex<ScreenBox>>, Option<AudioArc>) {
     let video_path = args.mock_video.as_deref().unwrap_or(file);
     let audio_path = args.mock_audio.as_deref().unwrap_or(file);
-    eprintln!("[omni-scout] MOCK mode: decoding {video_path} (video) via ffmpeg");
+    info!(path = %video_path, "MOCK mode: decoding video via ffmpeg");
 
     let mv = match MediaVideoSource::new(video_path) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[omni-scout] mock video open failed: {e}");
+            error!(error = %e, "mock video open failed");
             std::process::exit(2);
         }
     };
-    eprintln!("[omni-scout] mock video ready {:?}", mv.dims());
+    info!(dims = ?mv.dims(), "mock video ready");
     let src: Arc<Mutex<ScreenBox>> = Arc::new(Mutex::new(Box::new(mv)));
 
     let audio = match MediaAudioSource::new(audio_path) {
         Ok(a) => {
-            eprintln!("[omni-scout] mock audio ready ({audio_path})");
+            info!(path = %audio_path, "mock audio ready");
             Some(Arc::new(a) as AudioArc)
         }
         Err(e) => {
-            eprintln!("[omni-scout] mock audio unavailable: screen-only mock ({e})");
+            warn!(error = %e, "mock audio unavailable: screen-only mock");
             None
         }
     };
@@ -222,7 +224,7 @@ fn acquire_singleton_lock() {
     } else {
         let dir = xdg.as_deref().unwrap_or("/run/user/1000");
         let p = format!("{dir}/omni-scout.lock");
-        eprintln!("[omni-scout] {LOCK_PATH} not writable; using {p}");
+        info!(fallback = %p, "{LOCK_PATH} not writable; using XDG runtime dir");
         f = OpenOptions::new()
             .read(true)
             .write(true)
@@ -233,29 +235,95 @@ fn acquire_singleton_lock() {
     let mut f = match f {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("[omni-scout] cannot open lock {path}: {e}");
+            error!(path = %path, error = %e, "cannot open lock");
             std::process::exit(3);
         }
     };
     // LOCK_EX | LOCK_NB: exclusive, non-blocking. The lock auto-releases on exit.
     let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if r != 0 {
-        eprintln!(
-            "[omni-scout] another omni-scout instance is running (lock {path} held) — exiting."
-        );
+        error!(lock = %path, "another omni-scout instance is running — exiting");
         std::process::exit(3);
     }
     let _ = f.set_len(0);
     let _ = f.write_all(format!("{}\n", std::process::id()).as_bytes());
-    eprintln!(
-        "[omni-scout] singleton lock acquired: {path} (pid {})",
-        std::process::id()
-    );
+    info!(lock = %path, pid = std::process::id(), "singleton lock acquired");
     // Leak the file so the lock lives for the process lifetime (released on exit).
     std::mem::forget(f);
 }
 
-/// Parsed CLI args. A leading literal `--` (pnpm forwarding) is stripped.
+/// Runtime config (`CONF::scout.json` via the shared FileLoader — dev: this crate's dir;
+/// prod: the unified `~/.desk-pilot/` folder). Every field is optional; precedence is
+/// CLI arg > env var > config file > built-in default.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default)]
+struct ScoutConf {
+    host: Option<String>,
+    port: Option<u16>,
+    audio_only: Option<bool>,
+    /// Default mock media file (CLI `--mock` overrides). Bare filenames resolve in ASSETS.
+    mock: Option<String>,
+    mock_video: Option<String>,
+    mock_audio: Option<String>,
+}
+
+impl ScoutConf {
+    /// Load `CONF::scout.json`. Missing file = all defaults; malformed = reported + ignored.
+    fn load() -> Self {
+        let fs = shared::loader!();
+        match fs.read_str("CONF::scout.json") {
+            Ok(s) => match serde_json::from_str(&s) {
+                Ok(conf) => {
+                    let from = fs
+                        .resolve("CONF::scout.json")
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "scout.json".into());
+                    info!(path = %from, "conf loaded");
+                    conf
+                }
+                Err(e) => {
+                    warn!(error = %e, "scout.json parse error — using defaults");
+                    Self::default()
+                }
+            },
+            Err(_) => {
+                info!("no scout.json — using built-in defaults");
+                Self::default()
+            }
+        }
+    }
+}
+
+/// CLI — high-frequency knobs only; the FULL config surface lives in `scout.json`
+/// (see [`ScoutConf`]). Precedence: CLI > config file > built-in default.
+#[derive(Debug, Default, clap::Parser)]
+#[command(
+    name = "omni-scout",
+    about = "Visual Scout capture daemon — persistent screen + mic capture over HTTP",
+    version
+)]
+struct Cli {
+    /// Bind host
+    #[arg(long)]
+    host: Option<String>,
+    /// Bind port
+    #[arg(short, long)]
+    port: Option<u16>,
+    /// Mock mode: decode FILE to frames + audio (no portal/mic); bare names resolve in assets/
+    #[arg(long, value_name = "FILE")]
+    mock: Option<String>,
+    /// Override the mock video file (defaults to --mock's FILE)
+    #[arg(long, value_name = "FILE")]
+    mock_video: Option<String>,
+    /// Override the mock audio file (defaults to --mock's FILE)
+    #[arg(long, value_name = "FILE")]
+    mock_audio: Option<String>,
+    /// Only capture mic audio — skip the ScreenCast portal (zero GPU)
+    #[arg(long)]
+    audio_only: bool,
+}
+
+/// Fully-resolved runtime settings (what `main` actually runs on).
 struct Args {
     host: String,
     port: u16,
@@ -268,57 +336,55 @@ struct Args {
     audio_only: bool,
 }
 
+/// Pure merge: CLI > `scout.json` > built-in default.
+fn resolve(cli: Cli, conf: ScoutConf) -> Args {
+    Args {
+        host: cli.host.or(conf.host).unwrap_or_else(|| "127.0.0.1".into()),
+        port: cli.port.or(conf.port).unwrap_or(7878),
+        mock: cli.mock.or(conf.mock),
+        mock_video: cli.mock_video.or(conf.mock_video),
+        mock_audio: cli.mock_audio.or(conf.mock_audio),
+        audio_only: cli.audio_only || conf.audio_only.unwrap_or(false),
+    }
+}
+
 impl Args {
     fn parse() -> Self {
-        let mut host: Option<String> = None;
-        let mut port: Option<u16> = None;
-        let mut mock: Option<String> = None;
-        let mut mock_video: Option<String> = None;
-        let mut mock_audio: Option<String> = None;
-        let mut audio_only = false;
-        let mut help = false;
-        let mut it = std::env::args().skip(1).filter(|a| a.as_str() != "--");
-        while let Some(a) = it.next() {
-            match a.as_str() {
-                "-h" | "--help" => help = true,
-                "--host" => host = it.next(),
-                "--port" => port = it.next().and_then(|p| p.parse().ok()),
-                "--mock" => mock = it.next(),
-                "--mock-video" => mock_video = it.next(),
-                "--mock-audio" => mock_audio = it.next(),
-                "--audio-only" => audio_only = true,
-                _ => {}
-            }
-        }
-        if help {
-            eprintln!(
-                "omni-scout — Visual Scout capture daemon\n\n\
-                 Usage:\n  omni-scout [--host <host>] [--port <port>] [--mock <file>]\n\n\
-                 Options:\n  --host <host>  Bind host (default $SCOUT_HOST or 127.0.0.1)\n\
-                 \x20 --port <port>  Bind port (default $SCOUT_PORT or 7878)\n\
-                 \x20 --mock <file>  Mock mode: decode <file> to frames + audio (no portal/mic)\n\
-                 \x20 --mock-video <f> / --mock-audio <f>  Separate mock files per stream\n\
-                 \x20 --audio-only        Only capture mic audio — skip the ScreenCast portal (zero GPU)\n\
-                 \x20 -h, --help          Show this help"
-            );
-            std::process::exit(0);
-        }
-        let host = host.unwrap_or_else(|| {
-            std::env::var("SCOUT_HOST").unwrap_or_else(|_| "127.0.0.1".into())
-        });
-        let port = port.unwrap_or_else(|| {
-            std::env::var("SCOUT_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(7878)
-        });
-        Args {
-            host,
-            port,
-            mock,
-            mock_video,
-            mock_audio,
-            audio_only,
-        }
+        resolve(<Cli as clap::Parser>::parse(), ScoutConf::load())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve, Cli, ScoutConf};
+
+    #[test]
+    fn checked_in_scout_json_parses() {
+        // Guard the dev runtime config against schema drift / typos.
+        let s = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/scout.json"))
+            .expect("apps/omni-scout/scout.json missing");
+        let conf: ScoutConf = serde_json::from_str(&s).expect("scout.json must parse");
+        assert_eq!(conf.port, Some(7878));
+        assert_eq!(conf.mock, None, "checked-in config must not pin a mock file");
+    }
+
+    #[test]
+    fn resolve_precedence_cli_over_conf_over_default() {
+        let cli = Cli { port: Some(9000), mock: Some("cli.m4a".into()), ..Cli::default() };
+        let conf = ScoutConf {
+            host: Some("0.0.0.0".into()),
+            port: Some(1234),
+            audio_only: Some(true),
+            mock: Some("conf.m4a".into()),
+            ..ScoutConf::default()
+        };
+        let a = resolve(cli, conf);
+        assert_eq!(a.host, "0.0.0.0", "file wins when CLI silent");
+        assert_eq!(a.port, 9000, "CLI wins over file");
+        assert_eq!(a.mock.as_deref(), Some("cli.m4a"));
+        assert!(a.audio_only, "file flag applies when CLI flag absent");
+
+        let d = resolve(Cli::default(), ScoutConf::default());
+        assert_eq!((d.host.as_str(), d.port, d.audio_only), ("127.0.0.1", 7878, false));
     }
 }

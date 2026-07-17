@@ -318,7 +318,7 @@ impl MediaAudioSource {
             )));
         }
         let dur = pcm.len() as f64 / (16000.0 * 2.0);
-        eprintln!("[media-audio] decoded {path}: {} bytes ({dur:.1}s @ 16k mono)", pcm.len());
+        tracing::info!(path = %path, bytes = pcm.len(), dur_s = dur, "media audio decoded (16k mono)");
         Ok(Self {
             pcm: Arc::new(pcm),
             active_count: Arc::new(AtomicUsize::new(0)),

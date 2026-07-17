@@ -277,26 +277,26 @@ mod live_tests {
 
         // 1. immediately create the virtual keyboard + mouse (one combined evdev
         //    device advertising keys + absolute pointer + wheel).
-        eprintln!("[live] screen hint {w}x{h}; opening virtual keyboard+mouse via /dev/uinput…");
+        tracing::info!("screen hint {w}x{h}; opening virtual keyboard+mouse via /dev/uinput…");
         let mut sink = UinputSink::with_screen(w, h).expect("open /dev/uinput");
-        eprintln!("[live] device live — kernel registered \"VRover uinput sink\".");
+        tracing::info!("device live — kernel registered \"VRover uinput sink\".");
 
         // 2. keyboard: type 'demo_uinput' — the underscore is now mappable
         //    (Shift + KEY_MINUS), so the whole string injects.
-        eprintln!("[live] typing 'demo_uinput'…");
+        tracing::info!("typing 'demo_uinput'…");
         match sink.type_text("demo_uinput") {
-            Ok(()) => eprintln!("[live]   typed 'demo_uinput' ok"),
-            Err(e) => eprintln!("[live]   ✗ type_text failed: {e}"),
+            Ok(()) => tracing::info!("typed 'demo_uinput' ok"),
+            Err(e) => tracing::warn!(error = %e, "live probe: type_text failed"),
         }
         thread::sleep(Duration::from_millis(300));
 
         // 3. mouse: from screen center, sweep RIGHT 100 px slowly, then LEFT back.
         let (cx, cy) = (w as i32 / 2, h as i32 / 2);
-        eprintln!("[live] mouse sweep: {cx},{cy} → RIGHT +100px (slow)…");
+        tracing::info!("mouse sweep: {cx},{cy} → RIGHT +100px (slow)…");
         h_sweep(&mut sink, cx, cx + 100, cy, Duration::from_millis(20));
         thread::sleep(Duration::from_millis(200));
-        eprintln!("[live] mouse sweep: → LEFT back to {cx},{cy} (slow)…");
+        tracing::info!("mouse sweep: → LEFT back to {cx},{cy} (slow)…");
         h_sweep(&mut sink, cx + 100, cx, cy, Duration::from_millis(20));
-        eprintln!("[live] done.");
+        tracing::info!("done.");
     }
 }

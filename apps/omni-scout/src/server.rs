@@ -101,16 +101,13 @@ fn idle_ticker(src: Screen, audio: Option<Audio>, demand: Arc<Mutex<Demand>>) {
                 s.set_active(false);
             }
             d.screen_active = false;
-            eprintln!(
-                "[omni-scout] screen paused (idle {}s) — ~zero capture cost",
-                IDLE_TIMEOUT.as_secs()
-            );
+            tracing::info!(idle_s = IDLE_TIMEOUT.as_secs(), "screen paused — ~zero capture cost");
         }
         if let Some(a) = &audio {
             if d.audio_active && a.subscriber_count() == 0 {
                 a.set_active(false);
                 d.audio_active = false;
-                eprintln!("[omni-scout] audio paused (no subscribers)");
+                tracing::info!("audio paused (no subscribers)");
             }
         }
     }
@@ -128,7 +125,7 @@ fn ensure_active_and_capture(src: &Screen, demand: &Arc<Mutex<Demand>>) -> Optio
                 s.clear_frame();
             }
             d.screen_active = true;
-            eprintln!("[omni-scout] screen resumed (capture active)");
+            tracing::info!("screen resumed (capture active)");
         }
         d.last_request = Instant::now();
     }

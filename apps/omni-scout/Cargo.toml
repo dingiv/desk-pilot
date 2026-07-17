@@ -13,13 +13,21 @@ path = "src/main.rs"
 
 [dependencies]
 scout-drivers = { path = "../../crates/scout-drivers", features = ["pipewire"] }
-shared = { path = "../../crates/shared" }
+shared = { path = "../../crates/shared", features = ["log"] }
+tracing = { workspace = true }
 libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
 
 [build-dependencies]
 shared = { path = "../../crates/shared" }
 
-# Mock audio assets: --mock-audio <filename> resolves here.
-# dev → this crate's assets/ dir; prod → ~/.desk-pilot/assets/
+# FileLoader namespaces (consumed by build.rs → shared::loader!()).
+# ASSETS: mock audio assets — --mock-audio <filename> resolves here.
+#   dev → this crate's assets/ dir; prod → ~/.desk-pilot/assets/
+# CONF: runtime config — dev reads this crate's dir (apps/omni-scout/scout.json),
+#   prod reads the unified config folder ~/.desk-pilot/scout.json.
 [package.metadata.shared]
 ASSETS = { dev = "assets", prod = "~/.desk-pilot/assets" }
+CONF = { dev = ".", prod = "~/.desk-pilot" }

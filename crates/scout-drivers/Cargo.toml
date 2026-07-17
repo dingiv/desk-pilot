@@ -16,6 +16,7 @@ uinput = ["dep:evdev"]
 libei = []
 
 [dependencies]
+tracing = { workspace = true }
 # PNG encode of BGRA frames — pure Rust, no system deps.
 png = "0.17"
 # Ergonomic error enum — pure Rust (proc-macro).

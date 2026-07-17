@@ -15,6 +15,7 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{info, warn};
 
 const READ_BUF: usize = 8 * 1024;
 
@@ -45,24 +46,24 @@ impl ScoutAudioSource {
     /// thread. Reconnects after `reconnect_delay` on any stream error. While `active == false`, it
     /// does NOT connect (and logs the pause/resume transitions).
     pub fn stream<F: FnMut(&[i16])>(&self, mut on_window: F, reconnect_delay: Duration) -> ! {
-        eprintln!("[scout] ingest started, connecting to {}/audio …", self.addr);
+        info!(addr = %self.addr, "scout ingest started, connecting to /audio");
         let mut was_active = self.active.load(Ordering::Relaxed);
         loop {
             let active = self.active.load(Ordering::Relaxed);
             if !active {
                 if was_active {
-                    eprintln!("[scout] paused — connection toggled off (not connecting)");
+                    info!("scout ingest paused — connection toggled off");
                     was_active = false;
                 }
                 std::thread::sleep(reconnect_delay);
                 continue;
             }
             if !was_active {
-                eprintln!("[scout] resumed — connecting to {}/audio", self.addr);
+                info!(addr = %self.addr, "scout ingest resumed — reconnecting");
                 was_active = true;
             }
             if let Err(e) = self.stream_once(&mut on_window) {
-                eprintln!("[scout] stream ended ({e}); reconnecting in {reconnect_delay:?}");
+                warn!(error = %e, retry_in = ?reconnect_delay, "scout stream ended; reconnecting");
             }
             std::thread::sleep(reconnect_delay);
         }

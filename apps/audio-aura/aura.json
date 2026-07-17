@@ -1,0 +1,22 @@
+{
+  "scout_addr": "127.0.0.1:7878",
+  "port": 9091,
+  "stage3": true,
+  "model": "Qwen3-1.7B-Q8_0.gguf",
+  "hotwords": [
+    "Rust",
+    "Bevy",
+    "Docker",
+    "GitHub",
+    "Kubernetes",
+    "API",
+    "Markdown",
+    "PDF",
+    "Agent",
+    "README",
+    "贪吃蛇",
+    "蛇身",
+    "计分器"
+  ],
+  "web_dist": null
+}

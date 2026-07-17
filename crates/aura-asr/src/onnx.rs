@@ -25,6 +25,7 @@ use sherpa_onnx::{
     SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
 };
 use std::sync::Mutex;
+use tracing::info;
 
 /// Silero window = 512 samples = 32 ms @ 16 kHz (fixed by the model).
 pub const WINDOW: usize = 512;
@@ -136,10 +137,10 @@ impl OnlineAsr {
             hotwords_score: cfg.hotwords_score,
             ..Default::default()
         };
-        eprintln!(
-            "[streaming-asr] hotwords: {} (score {}, modeling-unit=cjkchar+bpe)",
-            if cfg.hotwords.is_empty() { "none".into() } else { cfg.hotwords.join(", ") },
-            cfg.hotwords_score
+        info!(
+            hotwords = %if cfg.hotwords.is_empty() { "none".to_string() } else { cfg.hotwords.join(", ") },
+            score = cfg.hotwords_score,
+            "streaming-asr hotwords (modeling-unit=cjkchar+bpe)"
         );
         let rec = OnlineRecognizer::create(&rc)
             .ok_or_else(|| anyhow::anyhow!("OnlineRecognizer::create failed"))?;
