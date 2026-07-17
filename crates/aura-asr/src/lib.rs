@@ -6,7 +6,7 @@
 //!
 //! Design mirror: livekit `vad.py` (VADEvent SOS/EOS carrying accumulated frames),
 //! `stt/stream_adapter.py` (VAD-gated batch→streaming), `voice/endpointing.py` (min/max delay).
-//! See audio-aura/docs/livekit-port-notes.md.
+//! See docs/aura/livekit-port-notes.md.
 
 use serde::Serialize;
 
@@ -14,7 +14,7 @@ pub mod buffer;
 pub mod scout;
 pub mod source;
 
-/// The ONNX-runtime side of the dual-runtime architecture (see docs/runtime-selection.md):
+/// The ONNX-runtime side of the dual-runtime architecture (see docs/aura/runtime-selection.md):
 /// VAD (Silero) + ASR (SenseVoice) via the OFFICIAL `sherpa-onnx` crate, which owns the single
 /// onnxruntime instance. Gated behind `onnx` so the pure-DSP core builds without it.
 #[cfg(feature = "onnx")]

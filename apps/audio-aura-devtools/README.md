@@ -134,7 +134,7 @@ VOICE_LOCAL_ROUTER=1 npm run dev
 ```
 CPU 版：省略 `--features cuda` 与 CUDA 环境即可（慢但零依赖）。
 
-**迁移路线**：M1 本地路由 SLM（✅ CPU 闭环）→ **M1-GPU（✅ 亚秒级路由）** → **M-transport（✅ Rust 独立守护进程脊柱）** → **M2 本地流式 ASR（✅ SenseVoice + VAD，接 omni-scout /audio）** → M3 本地流式 TTS（Kokoro/Piper）→ M4 完整流式级联 + 可打断（LiveKit 式重叠 + 语义断句）。选型与 LiveKit 调研见 `docs/livekit-port-notes.md`。
+**迁移路线**：M1 本地路由 SLM（✅ CPU 闭环）→ **M1-GPU（✅ 亚秒级路由）** → **M-transport（✅ Rust 独立守护进程脊柱）** → **M2 本地流式 ASR（✅ SenseVoice + VAD，接 omni-scout /audio）** → M3 本地流式 TTS（Kokoro/Piper）→ M4 完整流式级联 + 可打断（LiveKit 式重叠 + 语义断句）。选型与 LiveKit 调研见 `docs/aura/livekit-port-notes.md`。
 
 ### Rust Stage1 本地 ASR（audio-aura-asr，M2 ✅）
 

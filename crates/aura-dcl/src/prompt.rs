@@ -1,6 +1,6 @@
 //! prompt.rs — Stage2 校准提示词构造器。模板与参数分离，按配置动态拼接。
 //!
-//! 落地的提示词优化手段（见 docs/stage2-optimization.md §一）：
+//! 落地的提示词优化手段（见 docs/aura/stage2-optimization.md §一）：
 //! - 1.1 ASR 纠错分级策略（高/中/低置信度）→ [`CORRECTION_STRATEGY`]
 //! - 1.2 常见同音错误模式表 → [`COMMON_PATTERNS`]
 //! - 1.3 Few-shot 示例 → [`PromptBuilder::few_shot`]（默认开，可覆盖/关闭）

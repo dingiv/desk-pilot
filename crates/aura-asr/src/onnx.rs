@@ -1,5 +1,5 @@
 //! onnx — the single ONNX-runtime owner for Stage1 (ONNX ecosystem side of the dual-runtime
-//! architecture, see docs/runtime-selection.md). All ONNX models — VAD (Silero), ASR (SenseVoice),
+//! architecture, see docs/aura/runtime-selection.md). All ONNX models — VAD (Silero), ASR (SenseVoice),
 //! and future streaming ASR / TTS — are loaded, warmed, and owned by [`OnnxRuntimeManager`],
 //! which holds them through the OFFICIAL `sherpa-onnx` crate (one onnxruntime instance for all).
 //!
@@ -42,7 +42,7 @@ pub struct StreamingAsrConfig {
     pub num_threads: i32,
     /// Path to `bpe.vocab` (text vocab exported from `bpe.model` via sentencepiece, format
     /// `piece score` per line). sherpa uses it to tokenize RAW-TEXT hotwords itself when
-    /// `modeling_unit = cjkchar+bpe`. Generate it with: see docs/stage2-optimization.md §2.1.
+    /// `modeling_unit = cjkchar+bpe`. Generate it with: see docs/aura/stage2-optimization.md §2.1.
     pub bpe_vocab: String,
     /// Hotword phrases (RAW TEXT — sherpa tokenizes them via bpe_vocab + modeling_unit).
     pub hotwords: Vec<String>,

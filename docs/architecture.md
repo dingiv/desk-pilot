@@ -1,83 +1,81 @@
-# audio-aura 架构（as-built）
+# 现状架构（代码为准）
 
-> 现状权威文档（2026-07-15，脊柱重构后）。与代码为准。北极星见 [[ai-secretary-north-star]]。
+> 本文记录**已经落地**的架构与契约，对照代码。长期方向见 [design.md](./design.md)；待定的设计决策见 [decisions.md](./decisions.md)；SoM 子模块见 [som.md](./som.md)；Scout server 见 [scout-server.md](./scout-server.md)。
+> 状态：pnpm monorepo（`packages/*`），首版里程碑（骨架 + 循环 + mock + Scout TCP server + 客户端 SDK）已落地，43 个测试全绿。
 
-## 定位：语音助手前端 + 中间守护进程
+## 一句话
 
-audio-aura 是**系统级 AI 秘书**的语音功能层，在整盘棋里的位置：
-
-```
-        geek-familiar  (Rust 桌面宠物悬浮窗 = 秘书 UI + agent 调度)
-              │  TCP/unix socket
-        ▼
-     aura-daemon   ← 本仓库：语音助手前端 + 三阶段提交管线
-              │  HTTP (omni-scout /audio)
-        ▼
-     omni-scout  (录音源：PipeWire / mock-audio)
-```
-
-audio-aura 用 **AI-agent 手段把 ASR 准确率榨到极致**（别人只做 1+2 阶段，我们加第三阶段：可选的带工具元 agent）。它**不是**整个秘书——视觉/操作在 visual-rover，宠物形态/调度在 geek-familiar；audio-aura 只管"听准 → 整流 → 路由 → 反馈"。
-
-## 三阶段提交
-
-| 阶段 | 职责 | crate | 抽象 |
-|---|---|---|---|
-| **Stage1** | 录音 → VAD → 两阶段 ASR（流式 Zipformer 偏置 partial + 批式 SenseVoice 权威 final） | `aura-asr` | `Stage1Executor`（发 `Stage1Event::{Interim,Final(Utterance)}`） |
-| **Stage2** | 口语整流 + 意图路由（Qwen3-1.7B via mistral.rs，GPU）+ (raw,calibrated) 对上下文 | `aura-dcl` | `Stage2Calibrator`（`calibrate(&Utterance)->Decision`） |
-| **Stage3** | 可选的带工具元 agent：热词整理 / 动态微调 / 上下文归纳 / 长期记忆 | `aura-agent` | 能力 trait（`HotwordManager`/`FineTuner`/`ContextSummarizer`/`MemoryStore`）+ `Tool` |
-
-**关键原则**：Stage3 的**能力**在 `aura-agent`，**调度**（何时微调、用哪些标注）在 geek-familiar 这个秘书 agent（经 daemon socket 发起）。本轮 daemon 内挂一个进程内规则触发器跑通闭环 demo，geek-familiar 接入后替换它。
-
-## crate 拓扑（依赖自下而上，无环）
+agent 跑一个 **observe → think → act** 循环：每步截图 + 取元素 → SoM 画编号框 → 把「标注图 + 元素表 + 工具」交给 LLM → 执行模型挑的 mark 对应的元素。两层可插拔缝：`Platform`（驱动什么目标）+ `CompleteFn`（用什么大脑）。
 
 ```
-aura-asr   (Stage1 叶子)   Stage1Executor + Utterance/Stage1Event + onnx(VAD/ASR)
-aura-tts   (占位叶子)       Tts trait + NoopTts   ← 本轮占位，真模型(Kokoro/Piper)后续
-aura-dcl   (Stage2) ► asr   Stage2Calibrator + RouterEngine(ContextWindow/PromptBuilder)
-aura-core  (组装车间) ► asr+dcl   Pipeline + TurnEvent   ← legacy main/ingest/pipeline 待迁
-aura-agent (顶层)           能力 trait + Tool + AddHotwordTool（只实现 Hotword，无调度）
-daemon     (二进制) ► core+agent   Pipeline + Stage3 规则触发器 + socket 骨架
+agent loop（observe → think → act）
+   ├─ observe: Platform.captureScreen() + Platform.getElements() → SoM.annotate()  （带编号框的图 + 元素表）
+   ├─ think:   LLM（@vrover/llm；可插拔）
+   └─ act:     工具执行器：mark → 元素 → 中心坐标 → Platform 原语（click / type / scroll / keypress）
 ```
 
-**数据契约**：`Utterance`/`Stage1Event` 在 `aura-asr`（不 gate `onnx`，故 `aura-dcl` 不被迫拉 sherpa）；`Decision` 在 `aura-dcl`；aura-agent 同时见二者。
+核心设计：**action 用 SoM「编号(mark)」引用元素，而非裸坐标**。模型只挑编号，定位精度交给真实的元素边界框；`Platform` 保持坐标导向，贴合真实鼠标键盘。
 
-**Stage3→Stage2 反馈通道**：共享 `Arc<Mutex<Vec<String>>>` 热词 store——Stage3 加词 → Stage2 下次 `calibrate` 读最新。闭环已验证（见下）。
-**Stage3→Stage1 反馈**：暂不可行——sherpa 在 `OnlineRecognizer` 创建时烘焙热词，运行时不能动态改（需重建 recognizer / per-stream 热词，TODO）。
+## 包结构与依赖（pnpm workspace，无环）
 
-## 破环（迁移要点）
-
-重构前 `stage12_live` 在 `aura-asr/examples`，且 `aura-asr` 经 `bench-live` 依赖 `aura-dcl`（用 RouterEngine）。要让 `aura-dcl ► aura-asr`（Stage2 消费 Stage1 的 `Utterance`）就会成环。解法：把 `stage12_live` 移到 `aura-core/examples/`（薄壳），`aura-asr` 卸掉 dcl 依赖变真叶子 → `aura-dcl ► aura-asr` 单向。
-
-## 双运行时（ONNX + HF）
-
-进程内两个隔离运行时，各管各的、只通过"文本"交互（见 `runtime-selection.md`）：
-- **ONNX 侧**（`sherpa-onnx` 官方 crate，单一 onnxruntime）：VAD(Silero) + ASR(SenseVoice 批式 + Zipformer 流式)。
-- **HF 侧**（`mistral.rs`/candle，GPU sm_120）：Qwen3-1.7B 整流+路由（Stage2）。
-
-## 运行
-
-```bash
-# 1. 起 omni-scout 录音源（mock 或真麦）
-omni-scout --port 7879 --mock-audio <wav>     # 或真 PipeWire
-
-# 2. 跑 daemon（全管线 + Stage3 闭环 + socket）
-cargo daemon -- 127.0.0.1:7879          # = cargo run -p aura-daemon --release --features asr,cuda --
-curl http://127.0.0.1:9091/health        # {"status":"ok"}
-curl http://127.0.0.1:9091/context       # {"hotwords":[...]}  ← Stage3 填充的热词 store
-
-# 或只跑 S1→S2 行为基准（无 Stage3）
-cargo benchlive -- 127.0.0.1:7879        # = aura-core example stage12_live
+```
+@vrover/scout-protocol  (leaf)  线协议（二进制帧 + 消息 + UiElement/Bounds）—— client 与 server 共享契约
+@vrover/scout-client    → scout-protocol            第三方客户端 SDK（只依赖协议；面向第三方开发人员）
+@vrover/platform        → scout-protocol            Platform 接口 + Mock/MultiScreen/Desktop
+@vrover/som             → platform                  SoM 标注 + 元素表
+@vrover/llm             (leaf)                      Anthropic 适配器 + loadConfig
+@vrover/tools           → platform, som, llm        工具定义 + mark→坐标 执行器
+@vrover/scout           → scout-protocol, platform  Visual Scout TCP server（会话化）
+@vrover/agent           → platform, llm, som, tools, scout-client   runAgent 循环 + RemotePlatform
 ```
 
-构建期：`NVCC`/`CUDA_PATH`/`CUDA_COMPUTE_CAP` 已在 `.cargo/config.toml [env]`；sherpa `.so` 在工作区 `lib/`（RUNPATH `$ORIGIN`-relative 自定位，零 ldconfig，见 `ldconfig.md`）。
+关键边界：
 
-## 已验证（2026-07-15）
+- `UiElement`/`Bounds` 定义在 **`@vrover/scout-protocol`**（让 client 只依赖协议）；`@vrover/platform` re-export，下游照旧从 platform 取。
+- **`RemotePlatform`**（大脑侧 TCP client，薄包 `ScoutClient`）在 **`@vrover/agent`**——它是项目内唯一消费 `scout-client` 的地方，client 因此对第三方完全独立。
+- 开发用 **source-resolving exports**（`exports → ./src/index.ts`）：`tsx`/`vitest` 直读 TS，无需 build；`pnpm build` 经 TS project references 给各包产出 `dist/`。
 
-- 26 单测全绿（asr 9 / dcl 11 / tts 1 / agent 5）。
-- 行为对齐：Pipeline 版输出 == 重构前 `stage12_live`（rost→Rust、蛇声→蛇身、计分起→计分器、readdme→README、B位→Bevy；路由 ~0.5–1.4s GPU）。
-- Stage3 闭环：热词 store 初始空 → Stage3 规则触发器加 Rust/Bevy → `GET /context` 实时显示。
-- ASR 层热词（同音词类）生效：蛇身 7:舌身 0（见 `stage2-optimization.md` §2.1）。
+## 契约边界（精确版）
 
-## 未完成 / 后续
+### `Platform`（`@vrover/platform`）— 目标抽象
+最底层驱动，坐标导向（贴近真实鼠标键盘）：`captureScreen(): Promise<Screenshot>`、`getElements(): Promise<UiElement[]>`、`performClick(x,y)` / `performType(text)` / `performScroll(x,y,dir)` / `performKeypress(keys)`。
 
-见 `roadmap.md`。
+> ⚠️ **`getElements` vs `GroundingSource.detect` 重叠**：`@vrover/platform` 里还有一个**未接线**的 `GroundingSource` 缝。节点身份签名（建图地基）本质是 grounding 关切——walker 也要拿元素结构做签名。grounding 最终是留在 Platform 里、还是抽成独立注入件，是 [decisions.md](./decisions.md) 的 D9 待定项。
+
+### `CompleteFn`（`@vrover/llm`）— 大脑出口
+`(req: CompleteRequest) => Promise<LLMResponse>`，loop 拿它当依赖注入，测试用假 LLM 零成本跑。今天只有 `anthropic.ts` 实现；加 provider = 加一个同签名函数。`loadConfig`（读环境变量）也归本包（其唯一消费者 `anthropic.ts` 在此）。
+
+### SoM（`@vrover/som`）— 感知
+`annotate(screenshot, elements) → { annotated PNG, table }`。模型说「点 mark 3」，执行器把 mark → 元素 → `centerOf(bounds)` → `Platform.performClick`。详见 [som.md](./som.md)。
+
+### Action / 工具面（`@vrover/tools`）
+工具一律 **mark-only**：`click(mark)` / `type(mark,text)` / `scroll(mark,dir)` / `keypress(keys)` / `done(summary)`。schema 用 Zod 写一次 → 转 JSON Schema 给模型，单一来源不漂移。
+
+### agent loop（`@vrover/agent`）
+每步：capture → getElements → annotate → 塞进 history → `complete(...)` → 逐个 `dispatch` tool call → tool_result 塞回 history。`done` 或 maxSteps 或 LLM 报错时停。`TaskResult { status, summary, steps }`。
+
+### Visual Scout（`@vrover/scout` + `-client` + `-protocol`）
+独立 TCP server，说一种自定义二进制协议；客户端先握手建立会话，每个会话拥有独立操作终端（一个 `Platform` = 截屏器 + 键鼠）。详见 [scout-server.md](./scout-server.md)。
+
+## 原生驱动层（Rust `crates/`）
+
+仓库根新增了一个 **Cargo workspace**（`crates/`），与 pnpm TS monorepo 并存、互不干扰。这是填 `NativeLayer` 那块预留 Rust 缝的**真正原生层**（取代 `playground/nutjs`/`pyautogui` 的 JS/Python 平替）。详见 [`crates/README.md`](../crates/README.md)。
+
+核心拆分（**截屏与键鼠分离**，两条独立 trait）：
+
+只有一个 crate `vrover-drivers`：截屏/键鼠是它内部两条独立 trait，三个平台后端是 feature-gated 模块（默认关，所以无原生依赖也能全测）。pipewire/uinput/libei 原本是三个独立 crate，现已合并进来。
+
+| 模块 (feature) | 角色 | 状态 |
+|---|---|---|
+| `drivers` 核心 | `CaptureSource` + `InputSink` trait、`Frame`/`Button`/`Key`/`DriverError` + 测试桩 | ✅ 全测（本容器） |
+| `backends::pipewire` (`pipewire`) | `CaptureSource` via PipeWire ScreenCast(ashpd + pipewire-rs) | ✅ 编译通过;实时截屏需真机 |
+| `backends::uinput` (`uinput`) | `InputSink` via uinput 内核虚拟设备(evdev);键码映射表全测 | ✅ 编译通过(Linux);实时注入需真机 |
+| `backends::libei` (`libei`) | `InputSink` via libei/portal 模拟输入 | 🟡 预留脚手架(libei 未打包) |
+
+trait 与 `NativeLayer` 一一对应(`CaptureSource::capture()`+`to_png` → `captureScreen()`;`InputSink` → `perform*()`)。**下一轮**:加 napi-rs 绑定 crate,把一个 `CaptureSource` + `InputSink` 组合成 `NativeLayer` 交给 `DesktopPlatform`,TS 侧零改动即接通。grounding(AT-SPI)不进此层。
+
+> 本容器无头(那个 Wayland socket 是 VS Code 自身渲染),所以原生路径只能**编译 + 纯逻辑单测**,实时截屏/注入验证在真实 Wayland 主机做。
+
+## 还没有 walker 的位置
+
+graph walker（按 node 动态注入高层操作 / 已知边直行）**尚未实现**：loop 里 `tools` 硬编码为 `TOOL_DEFS`，无 node / walker 概念，每步无状态地重新感知。要做 M1，loop 契约至少要长出工具注入钩子或 walker 接管 act（见 [decisions.md](./decisions.md) D8）。当前 `Walker` / `GraphMap` 是 `@vrover/scout` 里的空占位。
