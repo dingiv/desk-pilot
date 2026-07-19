@@ -329,6 +329,7 @@ async fn serve_socket(state: DaemonState, port: u16, web_dist: Option<String>) {
     // dist/ from the workspace root (BASE minus "/native") so it's independent of the daemon's
     // cwd; override with `web_dist` (aura.json). In dev Vite serves the page (dist may be
     // absent → 404, harmless).
+    // TODO: 硬编码了 static 文件路径，使用 FileLoader 提供的机制来处理
     let ws_root = BASE.strip_suffix("/native").unwrap_or(BASE);
     let dist_dir = web_dist.unwrap_or_else(|| format!("{ws_root}/dist"));
     let static_spa = ServeDir::new(&dist_dir).fallback(ServeFile::new(format!("{dist_dir}/index.html")));
