@@ -21,7 +21,7 @@ use anyhow::Result;
 use tracing::debug;
 
 use crate::buffer::AudioRing;
-use crate::onnx::{AsrConfig, OnnxRuntimeManager, StreamingAsrConfig, VadConfig, WINDOW};
+use crate::onnx::{AsrBackend, AsrConfig, OnnxRuntimeManager, StreamingAsrConfig, VadConfig, WINDOW};
 use crate::scout::ScoutAudioSource;
 use crate::{Asr, Stage1Event, Utterance, VadEventKind};
 
@@ -63,7 +63,10 @@ impl Stage1Config {
                 ..Default::default()
             },
             asr: AsrConfig {
-                model: p("MODELS::sensevoice/model.int8.onnx"),
+                backend: AsrBackend::SenseVoice {
+                    model: p("MODELS::sensevoice/model.int8.onnx"),
+                    language: "auto".into(),
+                },
                 tokens: p("MODELS::sensevoice/tokens.txt"),
                 ..Default::default()
             },
@@ -78,6 +81,25 @@ impl Stage1Config {
             ring_cap_samples: DEFAULT_RING_CAP,
             active: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// Use Whisper (e.g. large-v3-turbo) as the batch ASR backend instead of SenseVoice.
+    /// Model paths resolve via the same `MODELS` namespace.
+    pub fn with_whisper_asr(mut self, language: &str) -> Self {
+        let fs = shared::loader!();
+        let p = |rel: &str| -> String {
+            fs.resolve(rel).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+        };
+        self.asr = AsrConfig {
+            backend: AsrBackend::Whisper {
+                encoder: p("MODELS::whisper/large-v3-turbo/encoder.onnx"),
+                decoder: p("MODELS::whisper/large-v3-turbo/decoder.onnx"),
+                language: language.into(),
+            },
+            tokens: p("MODELS::whisper/large-v3-turbo/tokens.txt"),
+            ..Default::default()
+        };
+        self
     }
 }
 

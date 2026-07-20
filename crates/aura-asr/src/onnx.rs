@@ -21,6 +21,7 @@ use crate::{Asr, VadEvent, VadEventKind};
 use anyhow::Result;
 use sherpa_onnx::{
     OfflineRecognizer, OfflineRecognizerConfig, OfflineSenseVoiceModelConfig,
+    OfflineWhisperModelConfig,
     OnlineModelConfig, OnlineRecognizer, OnlineRecognizerConfig, OnlineTransducerModelConfig,
     SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
 };
@@ -400,13 +401,24 @@ impl OnnxVad {
     }
 }
 
-// ── ASR: SenseVoice via the official sherpa-onnx crate ──
+// ── ASR: offline recognizers (SenseVoice / Whisper / Paraformer) ────────────
+
+/// Which batch ASR backend to use. All three are sherpa-onnx `OfflineRecognizer` —
+/// same `recognize()` path, different model configs.
+#[derive(Debug, Clone)]
+pub enum AsrBackend {
+    /// FunAudioLLM SenseVoice — fast, multi-language, emotion/event detection.
+    SenseVoice { model: String, language: String },
+    /// OpenAI Whisper (e.g. large-v3-turbo) — 99 languages, slower.
+    Whisper { encoder: String, decoder: String, language: String },
+    /// Alibaba Paraformer — strongest Chinese CER, fast.
+    Paraformer { model: String },
+}
 
 #[derive(Debug, Clone)]
 pub struct AsrConfig {
-    pub model: String,
+    pub backend: AsrBackend,
     pub tokens: String,
-    pub language: String, // "auto" | "zh" | "en" | ...
     pub use_itn: bool,
     pub num_threads: i32,
 }
@@ -414,33 +426,56 @@ pub struct AsrConfig {
 impl Default for AsrConfig {
     fn default() -> Self {
         AsrConfig {
-            model: String::new(),
+            backend: AsrBackend::SenseVoice {
+                model: String::new(),
+                language: "auto".into(),
+            },
             tokens: String::new(),
-            language: "auto".into(),
             use_itn: true,
             num_threads: 2,
         }
     }
 }
 
-/// Offline SenseVoice recognizer. `recognize` runs one utterance through the model. Thread-safe.
+/// Offline recognizer wrapping any sherpa-onnx backend (SenseVoice / Whisper / Paraformer).
+/// `recognize()` runs one utterance through the model. Thread-safe.
 pub struct OnnxAsr {
     rec: Mutex<OfflineRecognizer>,
 }
 
 impl OnnxAsr {
     pub fn new(cfg: AsrConfig) -> Result<Self> {
-        let rc = OfflineRecognizerConfig {
-            model_config: sherpa_onnx::OfflineModelConfig {
-                sense_voice: OfflineSenseVoiceModelConfig {
-                    model: Some(cfg.model),
-                    language: Some(cfg.language),
+        let mut mc = sherpa_onnx::OfflineModelConfig {
+            tokens: Some(cfg.tokens),
+            num_threads: cfg.num_threads,
+            ..Default::default()
+        };
+        match &cfg.backend {
+            AsrBackend::SenseVoice { model, language } => {
+                mc.sense_voice = OfflineSenseVoiceModelConfig {
+                    model: Some(model.clone()),
+                    language: Some(language.clone()),
                     use_itn: cfg.use_itn,
-                },
-                tokens: Some(cfg.tokens),
-                num_threads: cfg.num_threads,
-                ..Default::default()
-            },
+                };
+            }
+            AsrBackend::Whisper { encoder, decoder, language } => {
+                mc.whisper = sherpa_onnx::OfflineWhisperModelConfig {
+                    encoder: Some(encoder.clone()),
+                    decoder: Some(decoder.clone()),
+                    language: Some(language.clone()),
+                    task: Some("transcribe".into()),
+                    tail_paddings: -1,
+                    ..Default::default()
+                };
+            }
+            AsrBackend::Paraformer { model } => {
+                mc.paraformer = sherpa_onnx::OfflineParaformerModelConfig {
+                    model: Some(model.clone()),
+                };
+            }
+        }
+        let rc = OfflineRecognizerConfig {
+            model_config: mc,
             ..Default::default()
         };
         let rec = OfflineRecognizer::create(&rc)

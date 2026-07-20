@@ -71,6 +71,10 @@ struct AuraConf {
     stage3: Option<bool>,
     /// Stage2 GGUF model file name, resolved inside the MODELS namespace.
     model: Option<String>,
+    /// Stage1 batch ASR backend: "sensevoice" (default) | "whisper".
+    asr_backend: Option<String>,
+    /// ASR language code (default "auto" for SenseVoice, "zh" for Whisper).
+    asr_language: Option<String>,
     /// Seed hotwords for the streaming recognizer + the shared Stage2 store.
     hotwords: Option<Vec<String>>,
     /// Built SPA dist dir the daemon serves (default: workspace `dist/`).
@@ -134,6 +138,8 @@ struct Settings {
     port: u16,
     stage3_on: bool,
     model: String,
+    asr_backend: String,
+    asr_language: String,
     hotwords: Vec<String>,
     web_dist: Option<String>,
     recordings_dir: Option<String>,
@@ -150,6 +156,8 @@ fn resolve(cli: Cli, conf: AuraConf) -> Settings {
         port: cli.port.or(conf.port).unwrap_or(9091),
         stage3_on: !cli.no_stage3 && conf.stage3.unwrap_or(true),
         model: conf.model.unwrap_or_else(|| "Qwen3-1.7B-Q8_0.gguf".to_string()),
+        asr_backend: conf.asr_backend.unwrap_or_else(|| "sensevoice".to_string()),
+        asr_language: conf.asr_language.unwrap_or_else(|| "auto".to_string()),
         hotwords: conf
             .hotwords
             .unwrap_or_else(|| SEED_HOTWORDS.iter().map(|s| s.to_string()).collect()),
@@ -182,7 +190,7 @@ fn main() -> Result<()> {
     // (dev: human-readable; release: JSON lines; RUST_LOG filter, default info).
     shared::init_tracing();
     let s = resolve(Cli::parse(), AuraConf::load());
-    let Settings { scout_addr, port, stage3_on, model, hotwords: seed_hotwords, web_dist, recordings_dir } = s;
+    let Settings { scout_addr, port, stage3_on, model, asr_backend, asr_language, hotwords: seed_hotwords, web_dist, recordings_dir } = s;
 
     // Connection toggle + event bus, shared across the Pipeline thread + socket handlers.
     let active = Arc::new(AtomicBool::new(true));
@@ -215,6 +223,13 @@ fn main() -> Result<()> {
     cfg.active = Arc::clone(&active); // share the toggle with the executor
     // Bake the seed hotwords into the streaming recognizer (beam-search biasing).
     cfg.streaming.hotwords = seed_hotwords;
+    // Select batch ASR backend from config (default: SenseVoice; "whisper" → large-v3-turbo).
+    if asr_backend == "whisper" {
+        info!("ASR backend: Whisper large-v3-turbo (language: {asr_language})");
+        cfg = cfg.with_whisper_asr(&asr_language);
+    } else {
+        info!("ASR backend: SenseVoice (language: {asr_language})");
+    }
     let s1 = OnnxStage1Executor::new(cfg)?;
     let calibrator = Calibrator::load_default(&model)?;
     let _ = calibrator.calibrate_blocking("你好", None, &[]); // HF warmup
