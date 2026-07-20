@@ -1,32 +1,22 @@
 {
-  "name": "voice-agent",
+  "name": "@desk-pilot/aura-devtools",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "语音秘书雏形 — 实时语音 → 口语整流 → 意图路由(闲聊/任务) → 写作 worker 成文",
-  "packageManager": "pnpm@11.7.0",
+  "description": "aura-daemon devtools — React SPA for live ASR streaming + calibration display",
   "scripts": {
     "dev": "vite",
-    "dev:ts": "NODE_ENV=development tsx watch src/server.ts",
-    "start": "NODE_ENV=production tsx src/server.ts",
-    "build:web": "vite build",
-    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.web.json",
-    "test": "playwright test"
+    "build": "vite build",
+    "preview": "vite preview"
   },
   "dependencies": {
-    "koa": "^2.15.4",
-    "marked": "^14.1.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
-    "@playwright/test": "^1.61.1",
-    "@types/koa": "^2.15.0",
-    "@types/node": "^22.10.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
-    "tsx": "^4.19.2",
     "typescript": "^5.6.3",
     "vite": "^8.1.0"
   }

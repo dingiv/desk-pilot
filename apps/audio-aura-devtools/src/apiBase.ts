@@ -1,3 +1,6 @@
-// API base for the devtools frontend. Empty = same-origin (the TS backend on :8080).
-// Set VITE_API_BASE=http://127.0.0.1:9090 to point the devtools at the Rust daemon (voice-core).
+/// <reference types="vite/client" />
+
+// API base for the devtools frontend.
+// Dev: empty (Vite dev server proxies /api → aura-daemon). Prod: empty (daemon serves dist/).
+// Override only for non-standard setups: VITE_API_BASE=http://host:port
 export const API_BASE: string = import.meta.env.VITE_API_BASE ?? '';
