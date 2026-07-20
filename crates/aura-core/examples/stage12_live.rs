@@ -14,8 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use audio_aura_asr::executor::{OnnxStage1Executor, Stage1Config};
 use audio_aura_core::{Pipeline, TurnEvent};
-use audio_aura_router::calibrator::RouterStage2Calibrator;
-use audio_aura_router::RouterEngine;
+use audio_aura_router::calibrator::Stage2CalibratorImpl;
+use audio_aura_router::Calibrator;
 
 const REPORT_DIR: &str = "/workspaces/gui_agent/audio-aura/bench";
 
@@ -42,9 +42,9 @@ fn main() -> anyhow::Result<()> {
 
     eprintln!("[load] Stage1 (Silero VAD + 流式 Zipformer + SenseVoice) + Stage2 (Qwen3-1.7B) …");
     let s1 = OnnxStage1Executor::new(Stage1Config::new(scout_addr.clone()))?;
-    let router = RouterEngine::load_default("Qwen3-1.7B-Q8_0.gguf")?;
-    let _ = router.route_blocking("你好", None, &[]); // HF warmup
-    let s2 = RouterStage2Calibrator::new(router, Arc::clone(&hotwords));
+    let calibrator = Calibrator::load_default("Qwen3-1.7B-Q8_0.gguf")?;
+    let _ = calibrator.calibrate_blocking("你好", None, &[]); // HF warmup
+    let s2 = Stage2CalibratorImpl::new(calibrator, Arc::clone(&hotwords));
 
     fs::create_dir_all(REPORT_DIR).ok();
     let epoch = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);

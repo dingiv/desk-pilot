@@ -1,7 +1,7 @@
-//! Stage2Calibrator — wraps the [`RouterEngine`] + a rolling [`ContextWindow`] + an LLM-layer
+//! Stage2Calibrator — wraps the [`Calibrator`] + a rolling [`ContextWindow`] + an LLM-layer
 //! hotword store, and turns a Stage1 [`Utterance`] into a [`Decision`] (calibrated text + intent
 //! + reply + task). It owns prompt construction (hotwords + (raw,calibrated) pairs context +
-//! few-shot), so the router is left as a pure inference primitive (`RouterEngine::infer`).
+//! few-shot), so the calibrator is left as a pure inference primitive (`Calibrator::infer`).
 //!
 //! The hotword store is `Arc<Mutex<Vec<String>>>` and is **shared with Stage3** — when the agent
 //! (or desktop-pet) adds a correction hotword, the very next `calibrate` picks it up. That is the
@@ -13,27 +13,27 @@ use audio_aura_asr::Utterance;
 
 use crate::context::ContextWindow;
 use crate::prompt::PromptBuilder;
-use crate::{parse_decision, Decision, RouterEngine};
+use crate::{parse_decision, Decision, Calibrator};
 
 /// Turns a finalized utterance into a calibrated Decision. Implementations own their context.
 pub trait Stage2Calibrator {
     fn calibrate(&mut self, utterance: &Utterance) -> Decision;
 }
 
-/// Default Stage2 calibrator over the local Qwen router. Holds a rolling (raw,calibrated) pairs
+/// Default Stage2 calibrator over the local Qwen calibrator. Holds a rolling (raw,calibrated) pairs
 /// window and reads the latest hotwords (shared with Stage3) on every call.
-pub struct RouterStage2Calibrator {
-    router: RouterEngine,
+pub struct Stage2CalibratorImpl {
+    calibrator: Calibrator,
     ctx_win: ContextWindow,
     /// Shared with Stage3 — the feedback channel. Read fresh on every calibrate.
     hotwords: Arc<Mutex<Vec<String>>>,
     few_shot: Vec<(String, String)>,
 }
 
-impl RouterStage2Calibrator {
-    /// `hotwords` is shared (clone the Arc from wherever Stage3 holds it); `router` is moved in.
-    pub fn new(router: RouterEngine, hotwords: Arc<Mutex<Vec<String>>>) -> Self {
-        Self { router, ctx_win: ContextWindow::new(5), hotwords, few_shot: Vec::new() }
+impl Stage2CalibratorImpl {
+    /// `hotwords` is shared (clone the Arc from wherever Stage3 holds it); `calibrator` is moved in.
+    pub fn new(calibrator: Calibrator, hotwords: Arc<Mutex<Vec<String>>>) -> Self {
+        Self { calibrator, ctx_win: ContextWindow::new(5), hotwords, few_shot: Vec::new() }
     }
 
     /// Rolling context capacity (number of (raw,calibrated) pairs kept). Default 4.
@@ -49,7 +49,7 @@ impl RouterStage2Calibrator {
     }
 }
 
-impl Stage2Calibrator for RouterStage2Calibrator {
+impl Stage2Calibrator for Stage2CalibratorImpl {
     fn calibrate(&mut self, utterance: &Utterance) -> Decision {
         let route = utterance.route_text();
         let ctx = if self.ctx_win.is_empty() {
@@ -73,7 +73,8 @@ impl Stage2Calibrator for RouterStage2Calibrator {
         }
         let (system, user) = pb.build();
 
-        let raw = self.router.infer(&system, &user).unwrap_or_default();
+        // TODO: 调用 calibartor 进行纠正
+        let raw = self.calibrator.infer(&system, &user).unwrap_or_default();
         let decision = parse_decision(&raw, route);
 
         // Roll the context window: this utterance's (raw→calibrated) becomes a pattern the LLM

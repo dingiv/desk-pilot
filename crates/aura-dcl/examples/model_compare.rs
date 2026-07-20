@@ -1,5 +1,5 @@
 //! 对比三个模型对同一句 ASR 原文的纠错效果。
-use audio_aura_router::{parse_decision, RouterEngine};
+use audio_aura_router::{parse_decision, Calibrator};
 use std::time::Instant;
 
 const BASE: &str = "/workspaces/gui_agent/audio-aura/native/models";
@@ -14,19 +14,19 @@ const TEST_INPUTS: &[(&str, &str)] = &[
 
 fn test_model(name: &str, dir: &str, file: &str, use_json_prompt: bool) {
     eprintln!("\n=== {} ===", name);
-    let router = match RouterEngine::load(dir, file) {
+    let calibrator = match Calibrator::load(dir, file) {
         Ok(r) => r,
         Err(e) => { eprintln!("  load failed: {e}"); return; }
     };
     // warmup
-    let _ = router.route_blocking("test", None, &[]);
+    let _ = calibrator.calibrate_blocking("test", None, &[]);
 
     for (label, input) in TEST_INPUTS {
         let t = Instant::now();
         if use_json_prompt {
             // Qwen 用 JSON 整流+路由 prompt
             let hotwords = vec!["Bevy".to_string(), "Rust".to_string(), "蛇身".to_string(), "计分器".to_string(), "README".to_string()];
-            let out = router.route_blocking(input, None, &hotwords).unwrap_or_default();
+            let out = calibrator.calibrate_blocking(input, None, &hotwords).unwrap_or_default();
             let d = parse_decision(&out, input);
             let ms = t.elapsed().as_millis();
             eprintln!("  [{label}] {ms}ms");
@@ -35,7 +35,7 @@ fn test_model(name: &str, dir: &str, file: &str, use_json_prompt: bool) {
         } else {
             // chinese-text-correction 模型用直接纠错 prompt
             let prompt = format!("纠错：{}", input);
-            let out = router.route_blocking(&prompt, None, &[]).unwrap_or_default();
+            let out = calibrator.calibrate_blocking(&prompt, None, &[]).unwrap_or_default();
             let ms = t.elapsed().as_millis();
             eprintln!("  [{label}] {ms}ms");
             eprintln!("    原: {input}");

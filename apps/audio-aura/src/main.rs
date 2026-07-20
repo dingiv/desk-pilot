@@ -41,8 +41,8 @@ use audio_aura_store::archive::{ArchiveConfig, AudioArchive};
 use audio_aura_store::hub::{FinalTurn, Storage};
 use audio_aura_asr::executor::{OnnxStage1Executor, Stage1Config};
 use audio_aura_core::{Pipeline, TurnEvent};
-use audio_aura_router::calibrator::RouterStage2Calibrator;
-use audio_aura_router::RouterEngine;
+use audio_aura_router::calibrator::Stage2CalibratorImpl;
+use audio_aura_router::Calibrator;
 
 const BASE: &str = "/workspaces/gui_agent/audio-aura/native";
 
@@ -210,15 +210,15 @@ fn main() -> Result<()> {
     let _flusher = archive.spawn_flusher();
     let storage = Arc::new(Storage::new(archive, turns_dir));
 
-    info!("loading Stage1 (ONNX) + Stage2 (Qwen router) …");
+    info!("loading Stage1 (ONNX) + Stage2 (Qwen calibrator) …");
     let mut cfg = Stage1Config::new(scout_addr.clone());
     cfg.active = Arc::clone(&active); // share the toggle with the executor
     // Bake the seed hotwords into the streaming recognizer (beam-search biasing).
     cfg.streaming.hotwords = seed_hotwords;
     let s1 = OnnxStage1Executor::new(cfg)?;
-    let router = RouterEngine::load_default(&model)?;
-    let _ = router.route_blocking("你好", None, &[]); // HF warmup
-    let s2 = RouterStage2Calibrator::new(router, Arc::clone(&hotwords));
+    let calibrator = Calibrator::load_default(&model)?;
+    let _ = calibrator.calibrate_blocking("你好", None, &[]); // HF warmup
+    let s2: Stage2CalibratorImpl = Stage2CalibratorImpl::new(calibrator, Arc::clone(&hotwords));
 
     // ── Pipeline on a dedicated std thread ── it bridges each TurnEvent to the event bus as
     //    owned JSON. Events carry their own utterance seq (assigned by Stage1).
@@ -229,6 +229,7 @@ fn main() -> Result<()> {
         thread::Builder::new()
             .name("aura-pipeline".into())
             .spawn(move || {
+                // TODO: 这里是核心的模型推理触发点；
                 Pipeline::new(s1, s2).run(move |ev| {
                     match ev {
                         TurnEvent::Interim { seq, partial, at_s } => {

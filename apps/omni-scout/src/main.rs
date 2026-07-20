@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
 
 use scout_drivers::audio::AudioSource;
-use scout_drivers::backends::media::{MediaAudioSource, MediaVideoSource};
+use scout_drivers::backends::media::{MediaAudioSource, MediaVideoSource, MockAudioDirSource};
 use scout_drivers::backends::pipewire::{PipeWireAudioSource, PipeWireSource};
 use scout_drivers::CaptureSource;
 use scout_drivers::mock::MockCaptureSource;
@@ -83,7 +83,17 @@ fn main() {
     let (src, audio) = if let Some(file) = &mock {
         build_mock(file, &args)
     } else if mock_audio.is_some() {
-        build_mock_audio_only(mock_audio.as_deref().unwrap())
+        // mock_audio is now a DIRECTORY (not a single file). Default to the ASSETS/mock-audio
+        // namespace if the user passed `--mock-audio` without a path.
+        let dir = mock_audio.as_deref().unwrap_or("mock-audio");
+        let resolved_dir = if std::path::Path::new(dir).exists() {
+            dir.to_string()
+        } else {
+            fs.resolve(&format!("ASSETS::{dir}"))
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dir.to_string())
+        };
+        build_mock_audio_dir(&resolved_dir)
     } else {
         build_real(args.audio_only)
     };
@@ -111,21 +121,19 @@ fn main() {
     }
 }
 
-/// Mock AUDIO only (no video, no portal): feed a pure-audio file (m4a/wav/mp3) as a simulated mic.
-/// The screen is a stub solid frame (nobody reads /frame in this mode). Used to replay recordings
-/// for reproducible ASR testing without a real microphone.
-fn build_mock_audio_only(audio_path: &str) -> (Arc<Mutex<ScreenBox>>, Option<AudioArc>) {
-    info!(path = %audio_path, "MOCK-AUDIO mode: decoding via ffmpeg (no video/portal)");
+/// Mock AUDIO from a directory (no video, no portal): each subscriber gets a randomly
+/// chosen file from `dir`, decoded on-demand (no preheating). The screen is a stub.
+fn build_mock_audio_dir(dir: &str) -> (Arc<Mutex<ScreenBox>>, Option<AudioArc>) {
     let src: Arc<Mutex<ScreenBox>> = Arc::new(Mutex::new(Box::new(
         MockCaptureSource::solid(320, 240, 0, 0, 0),
     )));
-    let audio = match MediaAudioSource::new(audio_path) {
+    let audio = match MockAudioDirSource::new(dir) {
         Ok(a) => {
-            info!(path = %audio_path, "mock audio ready");
+            info!(dir = %dir, "mock-audio dir ready");
             Some(Arc::new(a) as AudioArc)
         }
         Err(e) => {
-            warn!(error = %e, "mock audio unavailable");
+            warn!(error = %e, "mock-audio dir unavailable");
             None
         }
     };
@@ -315,8 +323,9 @@ struct Cli {
     /// Override the mock video file (defaults to --mock's FILE)
     #[arg(long, value_name = "FILE")]
     mock_video: Option<String>,
-    /// Override the mock audio file (defaults to --mock's FILE)
-    #[arg(long, value_name = "FILE")]
+    /// Override the mock audio source — a directory of audio files (each subscriber gets a random
+    /// one). With no arg, defaults to the `assets/mock-audio` dir.
+    #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "mock-audio")]
     mock_audio: Option<String>,
     /// Only capture mic audio — skip the ScreenCast portal (zero GPU)
     #[arg(long)]

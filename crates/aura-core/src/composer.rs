@@ -3,7 +3,7 @@
 //! file I/O, no Stage3 logic. The caller (the `stage12_live` bench example, or the `daemon`)
 //! decides what to do with each turn (print / report / invoke a Stage3 trigger).
 //!
-//! **Threading**: Stage2 calibration (~1-2s per utterance on the local Qwen router) runs on its
+//! **Threading**: Stage2 calibration (~1-2s per utterance on the local Qwen calibrator) runs on its
 //! own `aura-stage2` worker thread, NOT on the Stage1 consume loop. The consume loop therefore
 //! never blocks on the LLM — streaming partials keep flowing while a previous utterance is still
 //! being calibrated. Consequence: an `Interim` for utterance N+1 can arrive BEFORE the `Final`
@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use audio_aura_asr::executor::{OnnxStage1Executor, Stage1Executor};
 use audio_aura_asr::{Stage1Event, Utterance};
-use audio_aura_router::calibrator::{RouterStage2Calibrator, Stage2Calibrator};
+use audio_aura_router::calibrator::{Stage2CalibratorImpl, Stage2Calibrator};
 use audio_aura_router::Decision;
 
 /// One turn surfaced to the caller. `Final` carries the calibrated decision + Stage2 latency.
@@ -39,11 +39,11 @@ pub enum TurnEvent<'a> {
 /// forever driving the loop and invoking `on_turn` for each event.
 pub struct Pipeline {
     s1: OnnxStage1Executor,
-    s2: RouterStage2Calibrator,
+    s2: Stage2CalibratorImpl,
 }
 
 impl Pipeline {
-    pub fn new(s1: OnnxStage1Executor, s2: RouterStage2Calibrator) -> Self {
+    pub fn new(s1: OnnxStage1Executor, s2: Stage2CalibratorImpl) -> Self {
         Self { s1, s2 }
     }
 

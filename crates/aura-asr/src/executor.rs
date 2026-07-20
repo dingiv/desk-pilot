@@ -49,6 +49,7 @@ impl Stage1Config {
     /// this crate's `Cargo.toml` `[package.metadata.shared]`). Dev: `<workspace>/native/models/`;
     /// prod: `~/.audio-aura/models/`. No `base` param needed — the caller never sees paths.
     pub fn new(scout_addr: impl Into<String>) -> Self {
+        // TODO: 在一个 new 函数中使用了 IO 操作，会失败，将 IO 拆出去作为另一个函数
         let fs = shared::loader!();
         let p = |rel: &str| -> String {
             fs.resolve(rel)
@@ -145,6 +146,7 @@ fn spawn_ingest(
 }
 
 impl Stage1Executor for OnnxStage1Executor {
+    // TODO: 该函数静默阻塞线程，使用睡眠轮询的方式；需要整改成异步非阻塞模式；
     fn run(&self, on_event: &mut dyn FnMut(Stage1Event)) -> ! {
         let sr = 16000u32;
         let start = Instant::now();

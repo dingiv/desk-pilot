@@ -396,6 +396,100 @@ fn replay_from_start(
     active_count.fetch_sub(1, Ordering::Relaxed);
 }
 
+// ── mock-audio directory source ──────────────────────────────────────────────
+
+/// Directory-backed mock [`AudioSource`]: holds a directory of audio files.
+/// On each `subscribe()`, a random file is picked, decoded on-demand (no
+/// preheating), and replayed at realtime pace. Each subscriber gets an
+/// independent, randomly-chosen file.
+pub struct MockAudioDirSource {
+    files: Vec<String>,
+}
+
+impl MockAudioDirSource {
+    /// Scan `dir` for audio files (m4a, wav, mp3, flac, ogg). Errors if none found.
+    pub fn new(dir: &str) -> Result<Self> {
+        let entries = std::fs::read_dir(dir).map_err(|e| {
+            DriverError::Session(format!("mock-audio dir {dir}: {e}"))
+        })?;
+        let exts = ["m4a", "wav", "mp3", "flac", "ogg", "webm", "opus"];
+        let mut files: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let p = e.path();
+                let ext = p.extension()?.to_str()?.to_lowercase();
+                exts.contains(&ext.as_str()).then(|| p.to_string_lossy().into_owned())
+            })
+            .collect();
+        files.sort();
+        if files.is_empty() {
+            return Err(DriverError::Session(format!(
+                "mock-audio dir {dir} has no audio files (supported: {:?})",
+                exts
+            )));
+        }
+        tracing::info!(dir = %dir, count = files.len(), "mock-audio directory ready");
+        Ok(Self { files })
+    }
+}
+
+impl AudioSource for MockAudioDirSource {
+    fn format(&self) -> Option<AudioFormat> {
+        Some(AudioFormat { rate: 16_000, channels: 1 })
+    }
+
+    fn set_active(&self, _active: bool) {}
+
+    fn subscribe(&self) -> Result<AudioSubscription> {
+        // Pick a random file.
+        let idx = (NEXT_SUB.fetch_add(1, Ordering::Relaxed) as usize) % self.files.len();
+        let path = self.files[idx].clone();
+        tracing::info!(path = %path, idx, "mock-audio: decoding for new subscriber");
+
+        // Decode on-demand (no preheating): one-shot ffmpeg → 16kHz mono S16LE in memory.
+        let mut child = spawn_audio_ffmpeg_oneshot(&path)
+            .map_err(|e| DriverError::Session(format!("ffmpeg spawn for {path}: {e}")))?;
+        let mut pcm = Vec::new();
+        child
+            .stdout
+            .take()
+            .expect("piped stdout")
+            .read_to_end(&mut pcm)
+            .map_err(|e| DriverError::Session(format!("ffmpeg read {path}: {e}")))?;
+        let _ = child.wait();
+        if pcm.is_empty() {
+            return Err(DriverError::Session(format!("ffmpeg produced no audio from {path}")));
+        }
+        let pcm: Arc<Vec<u8>> = Arc::new(pcm);
+        let dur = pcm.len() as f64 / (16000.0 * 2.0);
+        tracing::info!(path = %path, dur_s = dur, "mock-audio: decoded, starting replay");
+
+        // Same replay mechanism as MediaAudioSource.
+        let (tx, rx) = mpsc::sync_channel::<Arc<[u8]>>(SUBSCRIBER_BUF);
+        let active_count = Arc::new(AtomicUsize::new(0)); // not shared across subscribers; per-sub
+        active_count.fetch_add(1, Ordering::Relaxed);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let ac = Arc::clone(&active_count);
+
+        thread::Builder::new()
+            .name("omni-scout-mock-replay".into())
+            .spawn(move || replay_from_start(&pcm, tx, &stop_for_thread, &ac))
+            .map_err(|e| DriverError::Session(format!("replay thread spawn: {e}")))?;
+
+        let stop_for_unsub = Arc::clone(&stop);
+        let unsub = Box::new(move || {
+            stop_for_unsub.store(true, Ordering::Relaxed);
+        });
+        Ok(AudioSubscription::new(rx, unsub))
+    }
+
+    fn subscriber_count(&self) -> usize {
+        0 // we don't track global count (each subscriber is independent)
+    }
+}
+
 /// One-shot audio decode: no `-re` (decode as fast as possible), no `-stream_loop`
 /// (no loop). Produces the entire file as 16 kHz mono S16LE on stdout.
 fn spawn_audio_ffmpeg_oneshot(path: &str) -> std::io::Result<Child> {

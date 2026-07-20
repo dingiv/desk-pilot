@@ -1,7 +1,7 @@
-//! audio-aura-router — the local router SLM as pure Rust logic (no napi), shared by the napi shim
+//! audio-aura-calibrator — the local calibrator SLM as pure Rust logic (no napi), shared by the napi shim
 //! (`native/`) and the standalone daemon (`audio-aura-core`). Runs Qwen3-1.7B (GGUF) via mistral.rs and
 //! does the merged 口语整流 + 意图路由 in one call, returning the model's raw JSON text. `parse_decision`
-//! normalizes that into a `Decision` (mirrors the TS `local-router.ts` tolerance for a flattened task).
+//! normalizes that into a `Decision` (mirrors the TS `local-calibrator.ts` tolerance for a flattened task).
 
 use std::sync::Arc;
 
@@ -16,13 +16,13 @@ pub mod calibrator;
 
 
 /// Resident engine: GGUF model loaded once, kept warm. Holds its own tokio runtime so callers
-/// (napi Task threadpool, or the daemon via spawn_blocking) can call `route_blocking` synchronously.
-pub struct RouterEngine {
+/// (napi Task threadpool, or the daemon via spawn_blocking) can call `calibrate_blocking` synchronously.
+pub struct Calibrator {
     model: Arc<Model>,
     rt: Arc<Runtime>,
 }
 
-impl RouterEngine {
+impl Calibrator {
     /// Load the GGUF model (blocks ~seconds, once). GPU is used when built with `--features cuda`.
     pub fn load(model_dir: &str, model_file: &str) -> Result<Self> {
         let rt = Runtime::new()?;
@@ -52,7 +52,7 @@ impl RouterEngine {
     /// Run the merged 整流+路由 on one utterance; returns the model's raw JSON text.
     /// `context` = recent-dialogue text prepended for homophone/intent context.
     /// `hotwords` = user-specific terms whose homophones should be corrected to these spellings.
-    pub fn route_blocking(
+    pub fn calibrate_blocking(
         &self,
         raw_text: &str,
         context: Option<&str>,
@@ -83,7 +83,7 @@ impl RouterEngine {
     }
 }
 
-// ── decision parsing (mirrors TS local-router.ts normalization) ─────────────────
+// ── decision parsing (mirrors TS local-calibrator.ts normalization) ─────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSpec {
