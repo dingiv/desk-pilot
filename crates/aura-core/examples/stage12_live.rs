@@ -44,7 +44,7 @@ fn main() -> anyhow::Result<()> {
     let s1 = OnnxStage1Executor::new(Stage1Config::new(scout_addr.clone()))?;
     let calibrator = Calibrator::load_default("Qwen3-1.7B-Q8_0.gguf")?;
     let _ = calibrator.calibrate_blocking("你好", None, &[]); // HF warmup
-    let s2 = Stage2CalibratorImpl::new(calibrator, Arc::clone(&hotwords));
+    let s2 = Stage2CalibratorImpl::new(Arc::new(calibrator), Arc::clone(&hotwords));
 
     fs::create_dir_all(REPORT_DIR).ok();
     let epoch = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -58,7 +58,7 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     println!("\n● Pipeline 就绪 (scout {scout_addr}/audio). Ctrl-C 结束.\n");
-    Pipeline::new(s1, s2).run(move |ev| match ev {
+    Pipeline::new(s1, Box::new(s2)).run(move |ev| match ev {
         TurnEvent::Interim { seq: _, partial, at_s } => println!("  …流式 @{at_s:.1}s: {partial}"),
         TurnEvent::Final { utterance: u, decision: d, route_ms } => {
             println!(

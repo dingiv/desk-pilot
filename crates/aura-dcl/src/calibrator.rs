@@ -13,17 +13,17 @@ use audio_aura_asr::Utterance;
 
 use crate::context::ContextWindow;
 use crate::prompt::PromptBuilder;
-use crate::{parse_decision, Decision, Calibrator};
+use crate::{parse_decision, Decision};
 
 /// Turns a finalized utterance into a calibrated Decision. Implementations own their context.
-pub trait Stage2Calibrator {
+pub trait Stage2Calibrator: Send {
     fn calibrate(&mut self, utterance: &Utterance) -> Decision;
 }
 
 /// Default Stage2 calibrator over the local Qwen calibrator. Holds a rolling (raw,calibrated) pairs
 /// window and reads the latest hotwords (shared with Stage3) on every call.
 pub struct Stage2CalibratorImpl {
-    calibrator: Calibrator,
+    llm: Arc<dyn dp_models::LlmProvider>,
     ctx_win: ContextWindow,
     /// Shared with Stage3 — the feedback channel. Read fresh on every calibrate.
     hotwords: Arc<Mutex<Vec<String>>>,
@@ -31,9 +31,10 @@ pub struct Stage2CalibratorImpl {
 }
 
 impl Stage2CalibratorImpl {
-    /// `hotwords` is shared (clone the Arc from wherever Stage3 holds it); `calibrator` is moved in.
-    pub fn new(calibrator: Calibrator, hotwords: Arc<Mutex<Vec<String>>>) -> Self {
-        Self { calibrator, ctx_win: ContextWindow::new(5), hotwords, few_shot: Vec::new() }
+    /// `hotwords` is shared (clone the Arc from wherever Stage3 holds it); `llm` is the local
+    /// `Calibrator` or a remote `HttpLlm` (as `Arc<dyn LlmProvider>`).
+    pub fn new(llm: Arc<dyn dp_models::LlmProvider>, hotwords: Arc<Mutex<Vec<String>>>) -> Self {
+        Self { llm, ctx_win: ContextWindow::new(5), hotwords, few_shot: Vec::new() }
     }
 
     /// Rolling context capacity (number of (raw,calibrated) pairs kept). Default 4.
@@ -74,7 +75,7 @@ impl Stage2Calibrator for Stage2CalibratorImpl {
         let (system, user) = pb.build();
 
         // TODO: 调用 calibartor 进行纠正
-        let raw = self.calibrator.infer(&system, &user).unwrap_or_default();
+        let raw = self.llm.complete(&system, &user).unwrap_or_default();
         let decision = parse_decision(&raw, route);
 
         // Roll the context window: this utterance's (raw→calibrated) becomes a pattern the LLM

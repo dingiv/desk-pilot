@@ -25,7 +25,7 @@ use sherpa_onnx::{
     OnlineModelConfig, OnlineRecognizer, OnlineRecognizerConfig, OnlineTransducerModelConfig,
     SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
 };
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::info;
 
 /// Silero window = 512 samples = 32 ms @ 16 kHz (fixed by the model).
@@ -211,7 +211,7 @@ impl OnlineAsr {
 /// Thread-safe — share via `Arc<OnnxRuntimeManager>`. Each inner model has its own Mutex.
 pub struct OnnxRuntimeManager {
     vad: Option<OnnxVad>,
-    asr: Option<OnnxAsr>,
+    asr: Option<Arc<OnnxAsr>>,
     streaming_asr: Option<OnlineAsr>,
     // future: tts — add field here when it lands
 }
@@ -226,8 +226,9 @@ impl OnnxRuntimeManager {
         self.vad.as_ref()
     }
 
-    /// Access the (batch) ASR, if configured.
-    pub fn asr(&self) -> Option<&OnnxAsr> {
+    /// Access the (batch) ASR, if configured. Behind an `Arc` so the executor can hand it
+    /// out as `Arc<dyn AsrProvider>` for the local/remote swap.
+    pub fn asr(&self) -> Option<&Arc<OnnxAsr>> {
         self.asr.as_ref()
     }
 
@@ -285,7 +286,7 @@ impl OnnxRuntimeManagerBuilder {
     /// Load all configured models. Errors propagate (e.g. missing model file → build fails fast).
     pub fn build(self) -> Result<OnnxRuntimeManager> {
         let vad = self.vad.map(OnnxVad::new).transpose()?;
-        let asr = self.asr.map(OnnxAsr::new).transpose()?;
+        let asr = self.asr.map(OnnxAsr::new).transpose()?.map(Arc::new);
         let streaming_asr = self.streaming_asr.map(OnlineAsr::new).transpose()?;
         Ok(OnnxRuntimeManager { vad, asr, streaming_asr })
     }

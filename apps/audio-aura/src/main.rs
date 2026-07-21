@@ -82,6 +82,16 @@ struct AuraConf {
     /// Batch-ASR onnxruntime intra-op threads (default 8 = sweet spot on 8C/16T; 2 wastes
     /// cores, 16 contends on mem bandwidth). Lower if it starves the streaming recognizer.
     asr_threads: Option<i32>,
+    /// Batch-ASR location: "local" (default, in-process sherpa) | "remote" (HTTP).
+    asr_kind: Option<String>,
+    /// Remote ASR endpoint (OpenAI-compatible base, e.g. http://127.0.0.1:8080). asr_kind=remote.
+    asr_endpoint: Option<String>,
+    /// Stage2 LLM location: "local" (default, in-process mistral.rs) | "remote" (HTTP).
+    llm_kind: Option<String>,
+    /// Remote LLM endpoint (OpenAI-compatible base). llm_kind=remote.
+    llm_endpoint: Option<String>,
+    /// Remote LLM model name (passed to /v1/chat/completions). llm_kind=remote.
+    llm_model: Option<String>,
     /// Seed hotwords for the streaming recognizer + the shared Stage2 store.
     hotwords: Option<Vec<String>>,
     /// Built SPA dist dir the daemon serves (default: workspace `dist/`).
@@ -149,6 +159,11 @@ struct Settings {
     asr_language: String,
     asr_provider: String,
     asr_threads: i32,
+    asr_kind: String,
+    asr_endpoint: Option<String>,
+    llm_kind: String,
+    llm_endpoint: Option<String>,
+    llm_model: Option<String>,
     hotwords: Vec<String>,
     web_dist: Option<String>,
     recordings_dir: Option<String>,
@@ -169,6 +184,11 @@ fn resolve(cli: Cli, conf: AuraConf) -> Settings {
         asr_language: conf.asr_language.unwrap_or_else(|| "auto".to_string()),
         asr_provider: conf.asr_provider.unwrap_or_else(|| "cpu".to_string()),
         asr_threads: conf.asr_threads.unwrap_or(8),
+        asr_kind: conf.asr_kind.unwrap_or_else(|| "local".to_string()),
+        asr_endpoint: conf.asr_endpoint,
+        llm_kind: conf.llm_kind.unwrap_or_else(|| "local".to_string()),
+        llm_endpoint: conf.llm_endpoint,
+        llm_model: conf.llm_model,
         hotwords: conf
             .hotwords
             .unwrap_or_else(|| SEED_HOTWORDS.iter().map(|s| s.to_string()).collect()),
@@ -201,7 +221,7 @@ fn main() -> Result<()> {
     // (dev: human-readable; release: JSON lines; RUST_LOG filter, default info).
     shared::init_tracing();
     let s = resolve(Cli::parse(), AuraConf::load());
-    let Settings { scout_addr, port, stage3_on, model, asr_backend, asr_language, asr_provider, asr_threads, hotwords: seed_hotwords, web_dist, recordings_dir } = s;
+    let Settings { scout_addr, port, stage3_on, model, asr_backend, asr_language, asr_provider, asr_threads, asr_kind, asr_endpoint, llm_kind, llm_endpoint, llm_model, hotwords: seed_hotwords, web_dist, recordings_dir } = s;
 
     // Connection toggle + event bus, shared across the Pipeline thread + socket handlers.
     let active = Arc::new(AtomicBool::new(true));
@@ -237,29 +257,42 @@ fn main() -> Result<()> {
     // Select batch ASR backend from config (default: SenseVoice).
     //   "whisper"   → large-v3-turbo
     //   "qwen3-asr" → Qwen3-Audio ASR 1.7B int8 (high accuracy, slow on CPU)
-    if asr_backend == "whisper" {
-        info!("ASR backend: Whisper large-v3-turbo (language: {asr_language})");
-        cfg = cfg.with_whisper_asr(&asr_language);
-    } else if asr_backend == "qwen3-asr" {
-        info!("ASR backend: Qwen3-Audio ASR 1.7B int8 (CPU-only build ⇒ slow per utterance)");
-        cfg = cfg.with_qwen3_asr();
+    if asr_kind == "remote" {
+        let endpoint = asr_endpoint.clone().unwrap_or_default();
+        info!("ASR: remote HTTP {endpoint}");
+        cfg = cfg.with_remote_asr(endpoint);
     } else {
-        info!("ASR backend: SenseVoice (language: {asr_language})");
+        if asr_backend == "whisper" {
+            info!("ASR backend: Whisper large-v3-turbo (language: {asr_language})");
+            cfg = cfg.with_whisper_asr(&asr_language);
+        } else if asr_backend == "qwen3-asr" {
+            info!("ASR backend: Qwen3-Audio ASR 1.7B int8");
+            cfg = cfg.with_qwen3_asr();
+        } else {
+            info!("ASR backend: SenseVoice (language: {asr_language})");
+        }
+        // Batch-ASR ONNX provider (VAD + streaming stay CPU). cuDNN 9.25+ for sm_120 numerics.
+        cfg.asr.provider = asr_provider.clone();
+        cfg.asr.num_threads = asr_threads;
+        if asr_backend == "qwen3-asr" && asr_provider == "cuda" {
+            info!("Qwen3-ASR on CUDA: correct (cuDNN 9.25) but autoregressive ⇒ ~CPU speed");
+        }
+        info!("ASR provider: {} | threads: {} (batch ASR; VAD + streaming on CPU)", cfg.asr.provider, cfg.asr.num_threads);
     }
-    // Batch-ASR ONNX provider (VAD + streaming stay CPU). "cuda" needs the GPU sherpa lib +
-    // cuDNN 9.25+ (native/cudnn) for correct sm_120 (Blackwell) numerics. SenseVoice+cuda is the
-    // fast path; Qwen3-ASR+cuda is now correct too (cuDNN 9.25 fixed the old 9.1 mis-decode) but
-    // its autoregressive decoder isn't faster than CPU.
-    cfg.asr.provider = asr_provider.clone();
-    cfg.asr.num_threads = asr_threads;
-    if asr_backend == "qwen3-asr" && asr_provider == "cuda" {
-        info!("Qwen3-ASR on CUDA: correct (cuDNN 9.25) but autoregressive ⇒ ~CPU speed; Qwen3 is fastest on CPU");
-    }
-    info!("ASR provider: {} | threads: {} (batch ASR; VAD + streaming on CPU)", cfg.asr.provider, cfg.asr.num_threads);
     let s1 = OnnxStage1Executor::new(cfg)?;
-    let calibrator = Calibrator::load_default(&model)?;
-    let _ = calibrator.calibrate_blocking("你好", None, &[]); // HF warmup
-    let s2: Stage2CalibratorImpl = Stage2CalibratorImpl::new(calibrator, Arc::clone(&hotwords));
+    // Stage2 LLM: local mistral.rs Calibrator, or remote HttpLlm (vLLM/SGLang, OpenAI-compatible).
+    let llm: Arc<dyn dp_models::LlmProvider> = if llm_kind == "remote" {
+        let ep = llm_endpoint.clone().unwrap_or_default();
+        let m = llm_model.clone().unwrap_or_else(|| model.clone());
+        info!("Stage2 LLM: remote HTTP {ep} (model {m})");
+        Arc::new(dp_models::http::HttpLlm::new(ep, m))
+    } else {
+        let calibrator = Calibrator::load_default(&model)?;
+        let _ = calibrator.calibrate_blocking("你好", None, &[]); // HF warmup
+        info!("Stage2 LLM: local mistral.rs ({model})");
+        Arc::new(calibrator)
+    };
+    let s2 = Stage2CalibratorImpl::new(llm, Arc::clone(&hotwords));
 
     // ── Pipeline on a dedicated std thread ── it bridges each TurnEvent to the event bus as
     //    owned JSON. Events carry their own utterance seq (assigned by Stage1).
@@ -271,7 +304,7 @@ fn main() -> Result<()> {
             .name("aura-pipeline".into())
             .spawn(move || {
                 // TODO: 这里是核心的模型推理触发点；
-                Pipeline::new(s1, s2).run(move |ev| {
+                Pipeline::new(s1, Box::new(s2)).run(move |ev| {
                     match ev {
                         TurnEvent::Interim { seq, partial, at_s } => {
                             info!(seq, at_s, partial = %partial, "流式");

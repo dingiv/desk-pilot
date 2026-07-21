@@ -9,6 +9,7 @@ tracing = { workspace = true }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 shared = { path = "../shared" }
+dp-models = { workspace = true }
 # ONNX ecosystem: VAD (Silero) + ASR (SenseVoice) via the OFFICIAL sherpa-onnx crate.
 sherpa-onnx = { version = "1.13", default-features = false, features = ["shared"], optional = true }
 

@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use audio_aura_asr::executor::{OnnxStage1Executor, Stage1Executor};
 use audio_aura_asr::{Stage1Event, Utterance};
-use audio_aura_router::calibrator::{Stage2CalibratorImpl, Stage2Calibrator};
+use audio_aura_router::calibrator::Stage2Calibrator;
 use audio_aura_router::Decision;
 
 /// One turn surfaced to the caller. `Final` carries the calibrated decision + Stage2 latency.
@@ -39,11 +39,11 @@ pub enum TurnEvent<'a> {
 /// forever driving the loop and invoking `on_turn` for each event.
 pub struct Pipeline {
     s1: OnnxStage1Executor,
-    s2: Stage2CalibratorImpl,
+    s2: Box<dyn Stage2Calibrator>,
 }
 
 impl Pipeline {
-    pub fn new(s1: OnnxStage1Executor, s2: Stage2CalibratorImpl) -> Self {
+    pub fn new(s1: OnnxStage1Executor, s2: Box<dyn Stage2Calibrator>) -> Self {
         Self { s1, s2 }
     }
 

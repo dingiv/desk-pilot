@@ -83,6 +83,13 @@ impl Calibrator {
     }
 }
 
+/// Calibrator is a local `LlmProvider` (a remote one uses `dp_models::HttpLlm`).
+impl dp_models::LlmProvider for Calibrator {
+    fn complete(&self, system: &str, user: &str) -> anyhow::Result<String> {
+        self.infer(system, user)
+    }
+}
+
 // ── decision parsing (mirrors TS local-calibrator.ts normalization) ─────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

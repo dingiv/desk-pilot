@@ -18,6 +18,7 @@ cuda = ["audio-aura-core/cuda"]
 audio-aura-core = { path = "../../crates/aura-core" }
 audio-aura-agent = { path = "../../crates/aura-agent" }
 audio-aura-asr = { path = "../../crates/aura-asr" }
+dp-models = { workspace = true }
 audio-aura-router = { path = "../../crates/aura-dcl" }
 audio-aura-store = { path = "../../crates/aura-store" }
 axum = "0.8"

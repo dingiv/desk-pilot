@@ -7,5 +7,7 @@
   "asr_language": "auto",
   "asr_provider": "cpu",
   "asr_threads": 8,
+  "asr_kind": "local",
+  "llm_kind": "local",
   "hotwords": ["Rust", "Bevy", "贪吃蛇"]
 }

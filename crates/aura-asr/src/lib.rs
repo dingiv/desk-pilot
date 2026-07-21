@@ -221,11 +221,10 @@ impl EnergyVad {
     }
 }
 
-// ── ASR trait + stub (real sherpa-onnx plugs in here) ──────────────────────────
-pub trait Asr: Send + Sync {
-    /// Batch-recognize one utterance's PCM. (Streaming ASR can also emit interims; M2 starts batch.)
-    fn recognize(&self, pcm: &[i16], sample_rate: u32) -> anyhow::Result<String>;
-}
+// ── ASR trait (re-export from dp-models, the cross-subsystem provider abstraction) ──
+// OnnxAsr / StubAsr impl `Asr` (= dp_models::AsrProvider); a remote HttpAsr impls it too.
+// VadSegmenter<A: Asr> is unchanged — `Asr` is just an alias now.
+pub use dp_models::AsrProvider as Asr;
 
 /// Placeholder until the real ASR (sherpa-onnx Zipformer-zh) is wired — returns empty text so the
 /// audio→VAD→segment→chunk plumbing is verifiable offline.

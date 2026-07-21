@@ -50,3 +50,7 @@ dist
 *.png
 
 lib
+
+.venv
+__pycache__
+*.egg-info

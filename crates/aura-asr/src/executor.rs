@@ -23,7 +23,8 @@ use tracing::debug;
 use crate::buffer::AudioRing;
 use crate::onnx::{AsrBackend, AsrConfig, OnnxRuntimeManager, StreamingAsrConfig, VadConfig, WINDOW};
 use crate::scout::ScoutAudioSource;
-use crate::{Asr, Stage1Event, Utterance, VadEventKind};
+use crate::{Stage1Event, Utterance, VadEventKind};
+use dp_models::{http::HttpAsr, AsrProvider, ProviderKind};
 
 /// Default ring capacity: 10 min @ 16 kHz mono (~19 MB).
 const DEFAULT_RING_CAP: usize = 16_000 * 600;
@@ -39,6 +40,9 @@ pub struct Stage1Config {
     pub asr: AsrConfig,
     pub streaming: StreamingAsrConfig,
     pub ring_cap_samples: usize,
+    /// Batch ASR backend: `Local` (lib sherpa OnnxAsr) or `Remote` (HTTP, OpenAI-compatible).
+    /// Streaming ASR + VAD stay local sherpa regardless (real-time partials need low latency).
+    pub asr_kind: ProviderKind,
     /// Shared connection toggle (see [`ScoutAudioSource::with_active`]). Flip to false to stop
     /// ingesting from scout (does NOT kill scout). Defaults to true.
     pub active: Arc<AtomicBool>,
@@ -79,6 +83,7 @@ impl Stage1Config {
                 ..Default::default()
             },
             ring_cap_samples: DEFAULT_RING_CAP,
+            asr_kind: ProviderKind::Local,
             active: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -124,6 +129,13 @@ impl Stage1Config {
         };
         self
     }
+
+    /// Use a remote HTTP ASR (OpenAI-compatible `/v1/audio/transcriptions`) instead of local
+    /// sherpa. Streaming ASR + VAD stay local sherpa (real-time partials need low latency).
+    pub fn with_remote_asr(mut self, endpoint: impl Into<String>) -> Self {
+        self.asr_kind = ProviderKind::Remote { endpoint: endpoint.into() };
+        self
+    }
 }
 
 /// A Stage1 executor: audio in → [`Stage1Event`]s out. `run` blocks forever (drives the
@@ -137,6 +149,9 @@ pub trait Stage1Executor {
 /// consume loop runs on the caller's thread.
 pub struct OnnxStage1Executor {
     mgr: Arc<OnnxRuntimeManager>,
+    /// Batch ASR as a trait object: local OnnxAsr (from `mgr`) or remote HttpAsr. Streaming/VAD
+    /// stay in `mgr` (always local sherpa).
+    batch_asr: Arc<dyn AsrProvider>,
     ring: Arc<Mutex<AudioRing>>,
     active: Arc<AtomicBool>,
 }
@@ -144,25 +159,46 @@ pub struct OnnxStage1Executor {
 impl OnnxStage1Executor {
     /// Build models from `cfg`, warm them, spawn the scout→ring ingest thread.
     pub fn new(cfg: Stage1Config) -> Result<Self> {
-        let mgr = Arc::new(
-            OnnxRuntimeManager::builder()
-                .vad(cfg.vad)
-                .asr(cfg.asr)
-                .streaming_asr(cfg.streaming)
-                .build()?,
-        );
+        // Batch ASR: Local → OnnxAsr lives in the mgr; Remote → HttpAsr (mgr skips .asr()).
+        let mgr = match &cfg.asr_kind {
+            ProviderKind::Local => Arc::new(
+                OnnxRuntimeManager::builder()
+                    .vad(cfg.vad.clone())
+                    .asr(cfg.asr.clone())
+                    .streaming_asr(cfg.streaming.clone())
+                    .build()?,
+            ),
+            ProviderKind::Remote { .. } => Arc::new(
+                OnnxRuntimeManager::builder()
+                    .vad(cfg.vad.clone())
+                    .streaming_asr(cfg.streaming.clone())
+                    .build()?, // no local batch ASR — remote HttpAsr handles it
+            ),
+        };
+        let batch_asr: Arc<dyn AsrProvider> = match &cfg.asr_kind {
+            ProviderKind::Local => {
+                Arc::clone(mgr.asr().expect("local asr just loaded")) as Arc<dyn AsrProvider>
+            }
+            ProviderKind::Remote { endpoint } => Arc::new(HttpAsr::new(endpoint.clone())),
+        };
         mgr.warm();
         let ring = Arc::new(Mutex::new(AudioRing::new(cfg.ring_cap_samples)));
         spawn_ingest(Arc::clone(&ring), &cfg.scout_addr, Arc::clone(&cfg.active))?;
-        Ok(Self { mgr, ring, active: cfg.active })
+        Ok(Self { mgr, ring, active: cfg.active, batch_asr })
     }
 
     /// Use an already-loaded [`OnnxRuntimeManager`] (e.g. shared with another stage); spawns the
     /// ingest thread against `cfg.scout_addr`.
     pub fn new_with_mgr(mgr: Arc<OnnxRuntimeManager>, cfg: Stage1Config) -> Result<Self> {
+        let batch_asr: Arc<dyn AsrProvider> = match &cfg.asr_kind {
+            ProviderKind::Local => {
+                Arc::clone(mgr.asr().expect("local mgr must carry the batch ASR")) as Arc<dyn AsrProvider>
+            }
+            ProviderKind::Remote { endpoint } => Arc::new(HttpAsr::new(endpoint.clone())),
+        };
         let ring = Arc::new(Mutex::new(AudioRing::new(cfg.ring_cap_samples)));
         spawn_ingest(Arc::clone(&ring), &cfg.scout_addr, Arc::clone(&cfg.active))?;
-        Ok(Self { mgr, ring, active: cfg.active })
+        Ok(Self { mgr, ring, active: cfg.active, batch_asr })
     }
 
     /// Access the underlying ONNX model manager (e.g. for diagnostics / direct ASR calls).
@@ -273,12 +309,7 @@ impl Stage1Executor for OnnxStage1Executor {
                 stream_sess = sasr.map(|s| s.create_session());
 
                 // batch final (authoritative) — what Stage2 routes on
-                let raw_text = self
-                    .mgr
-                    .asr()
-                    .expect("Stage1 executor requires a batch ASR")
-                    .recognize(&ev.pcm, sr)
-                    .unwrap_or_default();
+                let raw_text = self.batch_asr.recognize(&ev.pcm, sr).unwrap_or_default();
 
                 if raw_text.trim().is_empty() && streaming_text.trim().is_empty() {
                     continue;

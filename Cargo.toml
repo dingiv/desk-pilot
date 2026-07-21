@@ -11,6 +11,7 @@ resolver = "2"
 members = [
     # desk-pilot shared
     "crates/shared",
+    "crates/dp-models",
 
     # audio-aura (voice)
     "crates/aura-dcl",
@@ -46,6 +47,10 @@ publish = false
 
 # In-workspace path deps (consumed via `dep = { workspace = true }` in member crates).
 [workspace.dependencies]
+# Cross-subsystem model provider abstraction (local lib + remote HTTP).
+dp-models = { path = "crates/dp-models" }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
+base64 = "0.22"
 scout-drivers = { path = "crates/scout-drivers" }
 # Logging: `tracing` is the facade (lib crates depend on this only); the subscriber
 # implementation lives in binaries via shared::init_tracing (see crates/shared).

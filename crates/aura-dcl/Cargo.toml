@@ -6,6 +6,7 @@ description = "Local router SLM (Qwen3-1.7B via mistral.rs): merged 口语整流
 
 [dependencies]
 mistralrs = "0.8"
+dp-models = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
