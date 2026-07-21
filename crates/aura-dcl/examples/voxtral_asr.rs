@@ -6,7 +6,7 @@
 //!
 //! Run:
 //!   cargo run -p audio-aura-router --features cuda --example voxtral_asr -- [wav]
-//!   REPEAT=5 VOXTRAL_MODEL=native/models/voxtral-mini-4b-realtime cargo run ...
+//!   REPEAT=5 VOXTRAL_MODEL=assets/models/voxtral-mini-4b-realtime cargo run ...
 
 use anyhow::Result;
 use mistralrs::{AudioInput, MultimodalMessages, MultimodalModelBuilder, TextMessageRole};
@@ -15,10 +15,10 @@ use std::time::Instant;
 #[tokio::main]
 async fn main() -> Result<()> {
     let model_dir = std::env::var("VOXTRAL_MODEL")
-        .unwrap_or_else(|_| "native/models/voxtral-mini-4b-realtime".into());
+        .unwrap_or_else(|_| "assets/models/voxtral-mini-4b-realtime".into());
     let wav = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "native/models/testwavs/zh-standard-0.wav".into());
+        .unwrap_or_else(|| "assets/models/testwavs/zh-standard-0.wav".into());
     let repeat: usize = std::env::var("REPEAT").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
     eprintln!("[voxtral] model={model_dir} wav={wav} repeat={repeat}");
 

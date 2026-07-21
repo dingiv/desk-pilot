@@ -9,18 +9,18 @@ jobs = 4
 # Native .so discovery at RUNTIME — "DLL-next-to-exe" for Linux.
 # The binary bakes a $ORIGIN-relative RUNPATH so it finds <workspace>/lib/ with NO system
 # ldconfig entry and NO LD_LIBRARY_PATH. Two entries cover cargo's two output depths:
-#   - $ORIGIN/../../lib      → bins at      target/<profile>/
-#   - $ORIGIN/../../../lib   → examples at  target/<profile>/examples/
+#   - $ORIGIN/../../assets/lib      → bins at      target/<profile>/
+#   - $ORIGIN/../../../assets/lib   → examples at  target/<profile>/examples/
 # The sherpa .so themselves carry RPATH=[$ORIGIN], so transitive deps (libonnxruntime.so)
-# resolve from the same dir. lib/ holds symlinks to the real prebuilt libs (see native/sherpa).
+# resolve from the same dir. lib/ holds symlinks to the real prebuilt libs (see assets/sherpa).
 # NOTE: changing rustflags invalidates the whole build cache (one-time full rebuild).
 rustflags = [
     "-C",
     "codegen-units=16",
     "-C",
-    "link-arg=-Wl,-rpath,$ORIGIN/../../lib",
+    "link-arg=-Wl,-rpath,$ORIGIN/../../assets/lib",
     "-C",
-    "link-arg=-Wl,-rpath,$ORIGIN/../../../lib",
+    "link-arg=-Wl,-rpath,$ORIGIN/../../../assets/lib",
 ]
 
 [env]
@@ -36,11 +36,11 @@ NVCC = "/usr/local/cuda-13.2/bin/nvcc"
 # sherpa-onnx official crate BUILD-time lib discovery (so build.rs skips the github download,
 # blocked here). Points at <workspace>/lib/ — the same dir the binary's RUNPATH resolves at
 # runtime. lib/*.so are symlinks; repoint them to switch the active sherpa bundle:
-#   - GPU (CUDA): native/sherpa/sherpa-onnx-v1.13.4-cuda-12.x-cudnn-9.x-linux-x64-gpu/lib
+#   - GPU (CUDA): assets/sherpa/sherpa-onnx-v1.13.4-cuda-12.x-cudnn-9.x-linux-x64-gpu/lib
 #       (CUDA EP providers + omniparser/lib CUDA/cuDNN runtime libs symlinked in; providers
 #        patched with RUNPATH=$ORIGIN). Then set aura.json `asr_provider: "cuda"`.
-#   - CPU:        native/sherpa/sherpa-onnx-v1.13.4-linux-x64-shared/lib
-SHERPA_ONNX_LIB_DIR = "/workspaces/gui_agent/desk-pilot/lib"
+#   - CPU:        assets/sherpa/sherpa-onnx-v1.13.4-linux-x64-shared/lib
+SHERPA_ONNX_LIB_DIR = "/workspaces/gui_agent/desk-pilot/assets/lib"
 
 [alias]
 # Legacy Stage1+2 bench (bin) — deprecated with the aura-core legacy code.

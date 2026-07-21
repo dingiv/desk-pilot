@@ -50,7 +50,7 @@ pub struct Stage1Config {
 
 impl Stage1Config {
     /// Sensible defaults — model paths resolved via `shared` namespace `MODELS` (declared in
-    /// this crate's `Cargo.toml` `[package.metadata.shared]`). Dev: `<workspace>/native/models/`;
+    /// this crate's `Cargo.toml` `[package.metadata.shared]`). Dev: `<workspace>/assets/models/`;
     /// prod: `~/.audio-aura/models/`. No `base` param needed — the caller never sees paths.
     pub fn new(scout_addr: impl Into<String>) -> Self {
         // TODO: 在一个 new 函数中使用了 IO 操作，会失败，将 IO 拆出去作为另一个函数

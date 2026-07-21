@@ -16,10 +16,10 @@ sherpa-onnx = { version = "1.13", default-features = false, features = ["shared"
 [build-dependencies]
 shared = { path = "../shared" }
 
-# Namespace: model files. dev = relative to this crate's dir → ../../native/models.
+# Namespace: model files. dev = relative to this crate's dir → ../../assets/models.
 # prod = user-installed models under ~/.audio-aura/models.
 [package.metadata.shared]
-MODELS = { dev = "../../native/models", prod = "~/.audio-aura/models" }
+MODELS = { dev = "../../assets/models", prod = "~/.desk-pilot/models" }
 
 [[example]]
 name = "transcribe"

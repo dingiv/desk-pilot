@@ -1,7 +1,7 @@
 //! Batch-transcribe WAVs through Qwen3-Audio ASR (loads the model once). Smoke test for the
 //! `AsrBackend::Qwen3Asr` path — also quantifies the CPU latency caveat (autoregressive encoder-
 //! decoder LLM-style; sherpa-onnx ships CPU-only libs here). Model paths resolve via the `MODELS`
-//! namespace (`native/models/qwen3-asr/`).
+//! namespace (`assets/models/qwen3-asr/`).
 //!
 //! Run:
 //!   cargo run -p audio-aura-asr --features onnx --example qwen3_asr -- [wav]...

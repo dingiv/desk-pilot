@@ -13,7 +13,7 @@
 # (cuDNN 9.1 / sm_120 mis-decodes Chinese — see crates/aura-asr warning).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SHERPA="$ROOT/native/sherpa/sherpa-onnx-v1.13.4-cuda-12.x-cudnn-9.x-linux-x64-gpu/lib"
+SHERPA="$ROOT/assets/sherpa/sherpa-onnx-v1.13.4-cuda-12.x-cudnn-9.x-linux-x64-gpu/lib"
 OMP="$ROOT/crates/omniparser/lib"
 PROVS="libonnxruntime_providers_cuda.so libonnxruntime_providers_shared.so libonnxruntime_providers_tensorrt.so"
 CUDA_LIBS="libcudart.so.12 libcublas.so.12 libcublasLt.so.12 libcufft.so.11 libcurand.so.10 \

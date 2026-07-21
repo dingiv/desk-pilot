@@ -21,7 +21,7 @@ members = [
     "crates/aura-tts",
     "crates/aura-agent",
     "apps/audio-aura",
-    "native",
+    "crates/native",
 
     # omni-scout + visual-rover (vision)
     "crates/scout-drivers",

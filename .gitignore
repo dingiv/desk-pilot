@@ -54,3 +54,6 @@ lib
 .venv
 __pycache__
 *.egg-info
+assets/
+native/target/
+native/*.node

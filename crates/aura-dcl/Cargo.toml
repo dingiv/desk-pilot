@@ -19,9 +19,9 @@ audio-aura-asr = { path = "../aura-asr" }
 [build-dependencies]
 shared = { path = "../shared" }
 
-# Namespace: model files. dev = relative to this crate's dir → ../../native/models.
+# Namespace: model files. dev = relative to this crate's dir → ../../assets/models.
 [package.metadata.shared]
-MODELS = { dev = "../../native/models", prod = "~/.audio-aura/models" }
+MODELS = { dev = "../../assets/models", prod = "~/.desk-pilot/models" }
 
 [features]
 default = []

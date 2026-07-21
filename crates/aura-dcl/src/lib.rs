@@ -38,7 +38,7 @@ impl Calibrator {
     }
 
     /// Load by model file name only — the model **directory** is resolved via shared namespace
-    /// `MODELS` (declared in this crate's `Cargo.toml`). Dev: `<workspace>/native/models/`;
+    /// `MODELS` (declared in this crate's `Cargo.toml`). Dev: `<workspace>/assets/models/`;
     /// prod: `~/.audio-aura/models/`. The caller never sees the directory path.
     pub fn load_default(model_file: &str) -> Result<Self> {
         let fs = shared::loader!();
