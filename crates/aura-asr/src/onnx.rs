@@ -20,8 +20,8 @@ use crate::{Asr, VadEvent, VadEventKind};
 
 use anyhow::Result;
 use sherpa_onnx::{
-    OfflineRecognizer, OfflineRecognizerConfig, OfflineSenseVoiceModelConfig,
-    OfflineWhisperModelConfig,
+    OfflineQwen3ASRModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
+    OfflineSenseVoiceModelConfig,
     OnlineModelConfig, OnlineRecognizer, OnlineRecognizerConfig, OnlineTransducerModelConfig,
     SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
 };
@@ -401,9 +401,9 @@ impl OnnxVad {
     }
 }
 
-// ── ASR: offline recognizers (SenseVoice / Whisper / Paraformer) ────────────
+// ── ASR: offline recognizers (SenseVoice / Whisper / Paraformer / Qwen3-ASR) ─
 
-/// Which batch ASR backend to use. All three are sherpa-onnx `OfflineRecognizer` —
+/// Which batch ASR backend to use. All four are sherpa-onnx `OfflineRecognizer` —
 /// same `recognize()` path, different model configs.
 #[derive(Debug, Clone)]
 pub enum AsrBackend {
@@ -413,6 +413,12 @@ pub enum AsrBackend {
     Whisper { encoder: String, decoder: String, language: String },
     /// Alibaba Paraformer — strongest Chinese CER, fast.
     Paraformer { model: String },
+    /// Alibaba Qwen3-Audio ASR — encoder-decoder LLM-style, strong multilingual.
+    /// Autoregressive decode ⇒ slow on CPU (sherpa-onnx CPU-only here; fast once a CUDA
+    /// build lands). `tokenizer` is a HuggingFace tokenizer DIRECTORY (vocab.json +
+    /// merges.txt + tokenizer_config.json), NOT a single tokens file — so the shared
+    /// `AsrConfig.tokens` is left empty for this backend.
+    Qwen3Asr { conv_frontend: String, encoder: String, decoder: String, tokenizer: String },
 }
 
 #[derive(Debug, Clone)]
@@ -445,8 +451,11 @@ pub struct OnnxAsr {
 
 impl OnnxAsr {
     pub fn new(cfg: AsrConfig) -> Result<Self> {
+        // `tokens` is shared across backends EXCEPT Qwen3-ASR, which loads its vocab from the
+        // HF tokenizer DIRECTORY (`backend.tokenizer`). Pass `None` when empty so sherpa doesn't
+        // try to open a "" path.
         let mut mc = sherpa_onnx::OfflineModelConfig {
-            tokens: Some(cfg.tokens),
+            tokens: if cfg.tokens.is_empty() { None } else { Some(cfg.tokens.clone()) },
             num_threads: cfg.num_threads,
             ..Default::default()
         };
@@ -471,6 +480,15 @@ impl OnnxAsr {
             AsrBackend::Paraformer { model } => {
                 mc.paraformer = sherpa_onnx::OfflineParaformerModelConfig {
                     model: Some(model.clone()),
+                };
+            }
+            AsrBackend::Qwen3Asr { conv_frontend, encoder, decoder, tokenizer } => {
+                mc.qwen3_asr = OfflineQwen3ASRModelConfig {
+                    conv_frontend: Some(conv_frontend.clone()),
+                    encoder: Some(encoder.clone()),
+                    decoder: Some(decoder.clone()),
+                    tokenizer: Some(tokenizer.clone()),
+                    ..Default::default()
                 };
             }
         }

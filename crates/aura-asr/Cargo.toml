@@ -29,6 +29,10 @@ name = "batch_transcribe"
 required-features = ["onnx"]
 
 [[example]]
+name = "qwen3_asr"
+required-features = ["onnx"]
+
+[[example]]
 name = "scout_debug"
 
 [[example]]

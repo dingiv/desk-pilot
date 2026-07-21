@@ -71,7 +71,7 @@ struct AuraConf {
     stage3: Option<bool>,
     /// Stage2 GGUF model file name, resolved inside the MODELS namespace.
     model: Option<String>,
-    /// Stage1 batch ASR backend: "sensevoice" (default) | "whisper".
+    /// Stage1 batch ASR backend: "sensevoice" (default) | "whisper" | "qwen3-asr".
     asr_backend: Option<String>,
     /// ASR language code (default "auto" for SenseVoice, "zh" for Whisper).
     asr_language: Option<String>,
@@ -223,10 +223,15 @@ fn main() -> Result<()> {
     cfg.active = Arc::clone(&active); // share the toggle with the executor
     // Bake the seed hotwords into the streaming recognizer (beam-search biasing).
     cfg.streaming.hotwords = seed_hotwords;
-    // Select batch ASR backend from config (default: SenseVoice; "whisper" → large-v3-turbo).
+    // Select batch ASR backend from config (default: SenseVoice).
+    //   "whisper"   → large-v3-turbo
+    //   "qwen3-asr" → Qwen3-Audio ASR 1.7B int8 (high accuracy, slow on CPU)
     if asr_backend == "whisper" {
         info!("ASR backend: Whisper large-v3-turbo (language: {asr_language})");
         cfg = cfg.with_whisper_asr(&asr_language);
+    } else if asr_backend == "qwen3-asr" {
+        info!("ASR backend: Qwen3-Audio ASR 1.7B int8 (CPU-only build ⇒ slow per utterance)");
+        cfg = cfg.with_qwen3_asr();
     } else {
         info!("ASR backend: SenseVoice (language: {asr_language})");
     }
@@ -489,6 +494,7 @@ mod tests {
             hotwords: None,
             web_dist: Some("/tmp/dist".into()),
             recordings_dir: None,
+            ..Default::default()
         };
         let s = resolve(cli, conf);
         assert_eq!(s.scout_addr, "cli:1");

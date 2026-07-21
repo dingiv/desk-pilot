@@ -101,6 +101,29 @@ impl Stage1Config {
         };
         self
     }
+
+    /// Use Qwen3-Audio ASR (e.g. 1.7B int8) as the batch ASR backend instead of SenseVoice.
+    /// `tokenizer` is a HF tokenizer DIRECTORY. Qwen3-ASR is autoregressive (encoder-decoder,
+    /// LLM-style), so it is **slow on CPU** (sherpa-onnx ships CPU-only libs here) — useful as a
+    /// high-accuracy offline backend, and fast once a CUDA build is available. `tokens` is left
+    /// empty (Qwen3 loads its vocab from the tokenizer dir).
+    pub fn with_qwen3_asr(mut self) -> Self {
+        let fs = shared::loader!();
+        let p = |rel: &str| -> String {
+            fs.resolve(rel).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+        };
+        self.asr = AsrConfig {
+            backend: AsrBackend::Qwen3Asr {
+                conv_frontend: p("MODELS::qwen3-asr/conv_frontend.onnx"),
+                encoder: p("MODELS::qwen3-asr/encoder.int8.onnx"),
+                decoder: p("MODELS::qwen3-asr/decoder.int8.onnx"),
+                tokenizer: p("MODELS::qwen3-asr/tokenizer"),
+            },
+            tokens: String::new(), // Qwen3 loads tokens from the tokenizer dir
+            ..Default::default()
+        };
+        self
+    }
 }
 
 /// A Stage1 executor: audio in → [`Stage1Event`]s out. `run` blocks forever (drives the

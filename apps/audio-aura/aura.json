@@ -1,0 +1,9 @@
+{
+  "scout_addr": "127.0.0.1:7879",
+  "port": 9091,
+  "stage3": true,
+  "model": "Qwen3-1.7B-Q8_0.gguf",
+  "asr_backend": "qwen3-asr",
+  "asr_language": "auto",
+  "hotwords": ["Rust", "Bevy", "贪吃蛇"]
+}
