@@ -1,1 +1,1 @@
-../native/sherpa/sherpa-onnx-v1.13.4-linux-x64-shared/lib/libsherpa-onnx-cxx-api.so
+../native/sherpa/sherpa-onnx-v1.13.4-cuda-12.x-cudnn-9.x-linux-x64-gpu/lib/libsherpa-onnx-cxx-api.so

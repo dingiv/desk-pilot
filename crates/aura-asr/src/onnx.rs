@@ -427,6 +427,11 @@ pub struct AsrConfig {
     pub tokens: String,
     pub use_itn: bool,
     pub num_threads: i32,
+    /// ONNX Runtime execution provider for the BATCH ASR only: `"cpu"` (default) | `"cuda"`.
+    /// Empty/`"cpu"` ⇒ sherpa's default (CPU). Anything else is passed through as the provider
+    /// name. Requires the CUDA-enabled sherpa shared lib (see `.cargo/config.toml` lib symlinks);
+    /// with the CPU-only lib, a non-cpu value will fail at `OfflineRecognizer::create`.
+    pub provider: String,
 }
 
 impl Default for AsrConfig {
@@ -438,7 +443,8 @@ impl Default for AsrConfig {
             },
             tokens: String::new(),
             use_itn: true,
-            num_threads: 2,
+            num_threads: 8, // sweet spot on 8C/16T (Zen5); 2 wastes cores, 16 (SMT) contends on mem bw
+            provider: "cpu".into(),
         }
     }
 }
@@ -454,9 +460,17 @@ impl OnnxAsr {
         // `tokens` is shared across backends EXCEPT Qwen3-ASR, which loads its vocab from the
         // HF tokenizer DIRECTORY (`backend.tokenizer`). Pass `None` when empty so sherpa doesn't
         // try to open a "" path.
+        //
+        // `provider`: batch ASR only — VAD/streaming stay CPU. Empty/`"cpu"` ⇒ sherpa default.
+        let provider = if cfg.provider.trim().is_empty() || cfg.provider == "cpu" {
+            None
+        } else {
+            Some(cfg.provider.clone())
+        };
         let mut mc = sherpa_onnx::OfflineModelConfig {
             tokens: if cfg.tokens.is_empty() { None } else { Some(cfg.tokens.clone()) },
             num_threads: cfg.num_threads,
+            provider,
             ..Default::default()
         };
         match &cfg.backend {

@@ -34,9 +34,13 @@ CUDA_COMPUTE_CAP = "120"
 # cudaforge's find_nvcc() checks NVCC first, so this forces the correct /usr/local/cuda-13.2 root.
 NVCC = "/usr/local/cuda-13.2/bin/nvcc"
 # sherpa-onnx official crate BUILD-time lib discovery (so build.rs skips the github download,
-# blocked here). Points at the version-agnostic <workspace>/lib/ — the same dir the binary's
-# RUNPATH resolves at runtime. If you upgrade sherpa, just repoint the lib/*.so symlinks.
-SHERPA_ONNX_LIB_DIR = "/workspaces/gui_agent/audio-aura/lib"
+# blocked here). Points at <workspace>/lib/ — the same dir the binary's RUNPATH resolves at
+# runtime. lib/*.so are symlinks; repoint them to switch the active sherpa bundle:
+#   - GPU (CUDA): native/sherpa/sherpa-onnx-v1.13.4-cuda-12.x-cudnn-9.x-linux-x64-gpu/lib
+#       (CUDA EP providers + omniparser/lib CUDA/cuDNN runtime libs symlinked in; providers
+#        patched with RUNPATH=$ORIGIN). Then set aura.json `asr_provider: "cuda"`.
+#   - CPU:        native/sherpa/sherpa-onnx-v1.13.4-linux-x64-shared/lib
+SHERPA_ONNX_LIB_DIR = "/workspaces/gui_agent/desk-pilot/lib"
 
 [alias]
 # Legacy Stage1+2 bench (bin) — deprecated with the aura-core legacy code.

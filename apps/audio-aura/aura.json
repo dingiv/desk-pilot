@@ -5,5 +5,7 @@
   "model": "Qwen3-1.7B-Q8_0.gguf",
   "asr_backend": "qwen3-asr",
   "asr_language": "auto",
+  "asr_provider": "cpu",
+  "asr_threads": 8,
   "hotwords": ["Rust", "Bevy", "贪吃蛇"]
 }
