@@ -1,0 +1,2 @@
+# Standard dh_install will pick up the CMake-installed files from debian/tmp.
+# No additional paths needed — CMake install() handles everything.

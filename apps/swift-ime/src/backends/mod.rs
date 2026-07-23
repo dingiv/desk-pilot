@@ -5,31 +5,10 @@ pub mod ibus;
 pub mod tsf;
 pub mod imk;
 
-/// [`PlatformAdapter`] translates between raw key events and [`ImeAction`]s
-/// produced by the pure [`Dispatcher`](ime_core::Dispatcher).
+// C ABI types and constants — defined in the library target (src/lib.rs → ffi module).
+pub use swift_ime::ffi::{ImeActionFFI, CandidateFFI, MAX_CANDIDATES};
 
 use ime_core::ImeAction;
-
-/// C-compatible action enum for FFI (fcitx5 C++ glue reads this).
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImeActionFFI {
-    PassThrough = 0,
-    Preedit = 1,
-    Commit = 2,
-    Candidates = 3,
-}
-
-/// C-compatible candidate entry (returned alongside ImeActionFFI::Candidates).
-#[repr(C)]
-#[derive(Debug, Clone)]
-pub struct CandidateFFI {
-    pub label: [u8; 16],
-    pub preview: [u8; 64],
-}
-
-/// How many candidates can be passed back in one call (fcitx5 LookupTable size).
-pub const MAX_CANDIDATES: usize = 9;
 
 /// Translate `ime_core::ImeAction` into the C ABI version plus an optional
 /// string buffer (commit / preedit text).

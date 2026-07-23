@@ -1,0 +1,8 @@
+fcitx5-swift-ime (0.1.0-1) unstable; urgency=low
+
+  * Initial release.
+  * Phase 1: fcitx5 addon with snippet expansion (trie-based trigger matching).
+  * Built-in snippets: /greet, /sig with $DATE variable support.
+  * Upcoming: pinyin engine (Phase 3), ibus support (Phase 4), voice input (Phase 2).
+
+ -- DeskPilot <desk-pilot@example.com>  Wed, 23 Jul 2026 00:00:00 +0800

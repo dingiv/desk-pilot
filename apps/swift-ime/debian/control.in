@@ -1,0 +1,16 @@
+Package: fcitx5-swift-ime
+Version: 0.1.0
+Architecture: amd64
+Maintainer: DeskPilot <desk-pilot@example.com>
+Depends: fcitx5 (>= 5.1), libfcitx5core7
+Recommends: fcitx5-frontend-gtk3 | fcitx5-frontend-gtk4 | fcitx5-frontend-qt5 | fcitx5-frontend-qt6
+Description: DeskPilot AI-powered input method engine for fcitx5
+ swift-ime is the input method engine of DeskPilot, an AI-powered
+ personal assistant. It provides:
+  * Snippet expansion: type /trigger and get expanded text
+  * Mixed Chinese-English input (pinyin + English, no switching needed)
+  * Voice input via #asr trigger (requires audio-aura daemon)
+  * Action triggers via #exec_* (requires geek-familiar)
+ .
+ This package contains the fcitx5 addon (.so) and its Rust runtime
+ library.

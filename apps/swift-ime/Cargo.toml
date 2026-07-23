@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "swift-ime — DeskPilot input method engine (fcitx5 addon .so + ibus DBus engine)"
 
+[lib]
+name = "swift_ime"
+crate-type = ["cdylib", "rlib"]
+
 [[bin]]
 name = "swift-ime"
 path = "src/main.rs"

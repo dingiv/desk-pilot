@@ -1,0 +1,31 @@
+#!/usr/bin/make -f
+# Debian build rules for fcitx5-swift-ime
+
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	# 1. Build the Rust shared library (cdylib)
+	cd $(CURDIR)/../../crates/ime-core-ffi && \
+		cargo build --release
+	# 2. Build the C++ fcitx5 addon via CMake
+	mkdir -p $(CURDIR)/build
+	cd $(CURDIR)/build && \
+		cmake .. \
+			-DCMAKE_INSTALL_PREFIX=/usr \
+			-DCMAKE_BUILD_TYPE=Release \
+			-DRUST_BUILD_DIR=$(CURDIR)/../../target/release && \
+		make -j$$(nproc)
+
+override_dh_auto_install:
+	# Install via CMake into debian/tmp
+	cd $(CURDIR)/build && \
+		DESTDIR=$(CURDIR)/debian/tmp cmake --install .
+	# Also install the Rust .so (CMake picks it up via install(FILES ...))
+	# Already covered by the CMake install() above.
+
+override_dh_auto_clean:
+	rm -rf $(CURDIR)/build
+	cd $(CURDIR)/../../crates/ime-core-ffi && cargo clean || true

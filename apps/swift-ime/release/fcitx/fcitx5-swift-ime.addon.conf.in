@@ -1,0 +1,9 @@
+[Addon]
+Name=DeskPilot IME
+Comment=AI-powered input method with snippet expansion and voice input
+Category=InputMethod
+Version=@PROJECT_VERSION@
+Library=swift-ime
+Type=SharedLibrary
+OnDemand=True
+Configurable=True
