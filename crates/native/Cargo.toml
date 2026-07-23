@@ -12,7 +12,7 @@ default = []
 cuda = ["audio-aura-router/cuda"]
 
 [dependencies]
-audio-aura-router = { path = "../crates/aura-dcl" }
+audio-aura-router = { path = "../aura-dcl" }
 napi = "2"
 napi-derive = "2"
 
