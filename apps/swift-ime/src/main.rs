@@ -68,8 +68,9 @@ fn main() -> Result<()> {
 }
 
 fn run_mock(config_path: &str) -> Result<()> {
-    use ime_core::{Dispatcher, Expander, ImeState, Matcher, SnippetStore, platform::NoopPinyin};
+    use ime_core::{Dispatcher, Expander, ImeState, Matcher, SnippetStore};
     use ime_core::expander::StaticProvider;
+    use swift_ime::pinyin::InputxPinyin;
     use std::io::{self, Write};
 
     let store = std::fs::read_to_string(config_path)
@@ -84,9 +85,10 @@ fn run_mock(config_path: &str) -> Result<()> {
         date: "2026-07-23".into(),
         clipboard: String::new(),
     }));
-    let dispatcher = Dispatcher::new(matcher, expander, Box::new(NoopPinyin));
+    eprintln!("loading pinyin dictionary …");
+    let dispatcher = Dispatcher::new(matcher, expander, Box::new(InputxPinyin::new()));
     println!("swift-ime mock — type a line and press Enter. Trigger prefixes: / and #");
-    println!("Type /greet or /sig to test. Ctrl-C to exit.\n");
+    println!("Type /greet, #date, or pinyin (ni, nihao) to test. Ctrl-C to exit.\n");
 
     let mut input = String::new();
     loop {
@@ -97,7 +99,7 @@ fn run_mock(config_path: &str) -> Result<()> {
             break;
         }
         let mut state = ImeState::default();
-        for ch in input.trim_end().chars() {
+        for ch in input.trim_end_matches(['\n', '\r']).chars() {
             match dispatcher.process_key(ch, &mut state) {
                 ime_core::ImeAction::PassThrough => {}
                 ime_core::ImeAction::Preedit { text, .. } => {
@@ -107,7 +109,11 @@ fn run_mock(config_path: &str) -> Result<()> {
                 ime_core::ImeAction::Commit(text) => {
                     println!(" → {text}");
                 }
-                _ => {}
+                ime_core::ImeAction::Candidates { items, .. } => {
+                    let joined: Vec<&str> = items.iter().map(|c| c.text.as_str()).collect();
+                    print!("[{} → {}]", state.buffer, joined.join("/"));
+                    io::stdout().flush()?;
+                }
             }
         }
         if !state.buffer.is_empty() {
@@ -119,5 +125,6 @@ fn run_mock(config_path: &str) -> Result<()> {
 
 const DEFAULT_SNIPPETS: &str = r##"[
     {"trigger": "/greet", "expand": "你好，我是 AI 秘书，请问有什么可以帮你的？", "desc": "通用问候语"},
-    {"trigger": "/sig", "expand": "Best regards,\nAlice\n$DATE", "desc": "邮件签名"}
+    {"trigger": "/sig", "expand": "Best regards,\nAlice\n$DATE", "desc": "邮件签名"},
+    {"trigger": "#date", "expand": "2026-07-23", "desc": "今日日期（固定）"}
 ]"##;

@@ -13,8 +13,9 @@ use std::sync::Mutex;
 use ime_core::{
     Dispatcher, Expander, ImeState, Matcher, SnippetStore,
     expander::StaticProvider,
-    platform::NoopPinyin,
 };
+
+use crate::pinyin::InputxPinyin;
 
 // ── C ABI types (cbindgen exports these) ───────────────────────────────
 
@@ -28,11 +29,11 @@ pub enum ImeActionFFI {
     Candidates = 3,
 }
 
-/// One candidate entry.
+/// One candidate entry — the hanzi text to display and commit on selection.
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct CandidateFFI {
-    pub label:   [u8; 16],
-    pub preview: [u8; 64],
+    pub text: [u8; 64],
 }
 
 pub const MAX_CANDIDATES: usize = 9;
@@ -58,7 +59,7 @@ pub extern "C" fn swift_ime_init(config_path: *const c_char) -> i32 {
         date: String::from("2026-07-23"),
         clipboard: String::new(),
     }));
-    let dispatcher = Dispatcher::new(matcher, expander, Box::new(NoopPinyin));
+    let dispatcher = Dispatcher::new(matcher, expander, Box::new(InputxPinyin::new()));
 
     *STATE.lock().unwrap() = Some(State { dispatcher, ime_state: ImeState::default() });
     tracing::info!(snippets = store.len(), "ime-core-ffi initialised");
@@ -88,7 +89,12 @@ pub extern "C" fn swift_ime_process_key(
     }
 
     let action = state.dispatcher.process_key(c, &mut state.ime_state);
-    let (ffi, text) = translate(action);
+    let (ffi, mut text) = translate(action);
+    // Candidates: expose the in-progress pinyin buffer as the preedit text so the
+    // C++ glue can display it above the candidate window.
+    if ffi == ImeActionFFI::Candidates {
+        text = state.ime_state.buffer.clone();
+    }
 
     if !text.is_empty() && !out_text.is_null() && out_cap > 0 {
         unsafe { write_out(text.as_bytes(), out_text, out_cap, out_len); }
@@ -99,25 +105,57 @@ pub extern "C" fn swift_ime_process_key(
     ffi
 }
 
-/// Select a candidate by index.
+/// Select a candidate by index (digit key / mouse in the fcitx5 candidate window).
+/// Writes the committed hanzi text into `out_text`. Returns the action (Commit).
 #[no_mangle]
-pub extern "C" fn swift_ime_select_candidate(index: u32) -> ImeActionFFI {
+pub extern "C" fn swift_ime_select_candidate(
+    index: u32,
+    out_text: *mut u8,
+    out_cap: u32,
+    out_len: *mut u32,
+) -> ImeActionFFI {
     let mut guard = STATE.lock().unwrap();
     let state = match guard.as_mut() {
         Some(s) => s,
         None => return ImeActionFFI::PassThrough,
     };
     let action = state.dispatcher.select_candidate(index as usize, &mut state.ime_state);
-    translate(action).0
+    let (ffi, text) = translate(action);
+    if !text.is_empty() && !out_text.is_null() && out_cap > 0 {
+        unsafe { write_out(text.as_bytes(), out_text, out_cap, out_len); }
+    } else if !out_len.is_null() {
+        unsafe { *out_len = 0; }
+    }
+    ffi
 }
 
-/// Fill `out_items` with candidates. Returns count written.
+/// Fill `out_items` with the current candidate list (from the last Pinyin keystroke).
+/// Returns the count written. C++ builds the fcitx5 LookupTable from this.
 #[no_mangle]
 pub extern "C" fn swift_ime_candidates(
-    _out_items: *mut CandidateFFI,
-    _max_items: u32,
+    out_items: *mut CandidateFFI,
+    max_items: u32,
 ) -> u32 {
-    0 // Phase 3: pinyin candidates
+    let guard = STATE.lock().unwrap();
+    let state = match guard.as_ref() {
+        Some(s) => s,
+        None => return 0,
+    };
+    let cands = &state.ime_state.candidates;
+    if out_items.is_null() || max_items == 0 {
+        return cands.len().min(max_items as usize) as u32;
+    }
+    let n = cands.len().min(max_items as usize);
+    for i in 0..n {
+        unsafe {
+            let item = &mut *out_items.add(i);
+            item.text.fill(0);
+            let bytes = cands[i].as_bytes();
+            let copy = bytes.len().min(item.text.len() - 1);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), item.text.as_mut_ptr(), copy);
+        }
+    }
+    n as u32
 }
 
 #[no_mangle] pub extern "C" fn swift_ime_activate()   { tracing::debug!("activate"); }
@@ -165,5 +203,6 @@ unsafe fn write_out(text: &[u8], out: *mut u8, cap: u32, out_len: *mut u32) {
 
 const DEFAULT_SNIPPETS: &str = r##"[
     {"trigger": "/greet", "expand": "你好，我是 AI 秘书，请问有什么可以帮你的？", "desc": "通用问候语"},
-    {"trigger": "/sig",   "expand": "Best regards,\nAlice\n$DATE",          "desc": "邮件签名"}
+    {"trigger": "/sig",   "expand": "Best regards,\nAlice\n$DATE",          "desc": "邮件签名"},
+    {"trigger": "#date",  "expand": "2026-07-23",                             "desc": "今日日期（固定）"}
 ]"##;

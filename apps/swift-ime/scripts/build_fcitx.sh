@@ -14,6 +14,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"   # apps/swift-ime/
+cd "$PROJECT_DIR"                              # ensure cargo commands work
 
 # ── Parse flags ────────────────────────────────────────────────────────────
 BUILD_TYPE="Release"
@@ -75,6 +76,7 @@ mkdir -p "$BUILD_DIR"
 cmake -S "$PROJECT_DIR" -B "$BUILD_DIR" \
     -DCMAKE_INSTALL_PREFIX=/usr \
     -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+    -DCMAKE_SKIP_RPATH=ON \
     -DRUST_BUILD_DIR="$RUST_BUILD_DIR"
 echo ""
 

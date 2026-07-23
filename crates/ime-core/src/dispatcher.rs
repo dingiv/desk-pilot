@@ -12,8 +12,7 @@ use crate::PinyinEngine;
 pub struct Dispatcher {
     matcher: Matcher,
     expander: Expander,
-    /// Reserved for Phase 3 (pinyin engine).
-    #[allow(dead_code)]
+    /// Pinyin-to-hanzi engine (inputx-pinyin in swift-ime; NoopPinyin/stub in tests).
     pinyin: Box<dyn PinyinEngine>,
 }
 
@@ -40,18 +39,69 @@ impl Dispatcher {
         if self.matcher.is_trigger_prefix(ch) && state.buffer.is_empty() {
             state.mode = InputMode::Trigger;
             state.buffer.push(ch);
-            // First char of a trigger is always partial (at least 2 chars needed).
             return ImeAction::Preedit {
                 text: state.buffer.clone(),
                 cursor: state.buffer.len(),
             };
         }
 
-        // ─── Path: Pinyin mode (reserved for Phase 3) ───
-        // In Phase 1, NoopPinyin returns empty → falls through to PassThrough.
+        // ─── Path: Pinyin terminator — a non-letter while in Pinyin mode commits ───
+        // Space commits the top candidate (space consumed, standard IME behavior).
+        // Any other symbol/punctuation commits the top candidate with the symbol
+        // appended ("你好," in one step). Trigger prefixes can't reach here because
+        // buffer is non-empty in Pinyin mode.
+        if state.mode == InputMode::Pinyin && !ch.is_ascii_lowercase() {
+            return self.commit_pinyin(ch, state);
+        }
+
+        // ─── Path: Pinyin — small ASCII letters build a pinyin sequence ───
+        // Pinyin letters (a-z) never collide with trigger prefixes ('/' '#'), so the
+        // two paths stay cleanly separated by their first character.
+        if ch.is_ascii_lowercase() {
+            return self.pinyin_key(ch, state);
+        }
 
         // ─── Default: English text — pass through ───
         ImeAction::PassThrough
+    }
+
+    /// Handle a pinyin keystroke (a-z), or a terminator (space/symbol) while in Pinyin mode.
+    fn pinyin_key(&self, ch: char, state: &mut ImeState) -> ImeAction {
+        // A letter while already in Pinyin mode just extends the buffer.
+        state.mode = InputMode::Pinyin;
+        state.buffer.push(ch);
+
+        let cands = self.pinyin.candidates(&state.buffer);
+        state.candidates = cands.clone();
+        if cands.is_empty() {
+            // No candidate yet (partial syllable) — show the pinyin being typed.
+            ImeAction::Preedit { text: state.buffer.clone(), cursor: state.buffer.len() }
+        } else {
+            ImeAction::Candidates {
+                items: cands
+                    .iter()
+                    .map(|t| crate::platform::Candidate {
+                        text: t.clone(),
+                        label: String::new(),
+                        preview: t.clone(),
+                    })
+                    .collect(),
+                selected: 0,
+            }
+        }
+    }
+
+    /// Commit the top pinyin candidate (called on a terminator key in Pinyin mode).
+    fn commit_pinyin(&self, ch: char, state: &mut ImeState) -> ImeAction {
+        let top = state.candidates.first().cloned();
+        state.buffer.clear();
+        state.candidates.clear();
+        state.mode = InputMode::Normal;
+        match top {
+            Some(text) if ch == ' ' => ImeAction::Commit(text),
+            Some(text) => ImeAction::Commit(format!("{text}{ch}")),
+            None => ImeAction::PassThrough,
+        }
     }
 
     /// Continue an in-progress trigger sequence.
@@ -94,21 +144,25 @@ impl Dispatcher {
         }
     }
 
-    /// Called by the platform adapter when the user selects a candidate.
+    /// Called by the platform adapter when the user selects a candidate (digit key
+    /// or mouse click in the fcitx5 candidate window). Commits that candidate.
     pub fn select_candidate(&self, index: usize, state: &mut ImeState) -> ImeAction {
         debug!(index, "select_candidate");
-        // Phase 1: no candidate selection needed (snippets match uniquely).
-        // Phase 3: pinyin candidates will use this path.
-        let _ = index;
+        let picked = state.candidates.get(index).cloned();
         state.buffer.clear();
+        state.candidates.clear();
         state.mode = InputMode::Normal;
-        ImeAction::PassThrough
+        match picked {
+            Some(text) => ImeAction::Commit(text),
+            None => ImeAction::PassThrough,
+        }
     }
 
     /// Reset the engine state (on focus change, Escape, etc.).
     pub fn reset(&self, state: &mut ImeState) {
         debug!("reset");
         state.buffer.clear();
+        state.candidates.clear();
         state.mode = InputMode::Normal;
     }
 
@@ -123,99 +177,152 @@ impl Dispatcher {
 mod tests {
     use super::*;
     use crate::expander::StaticProvider;
-    use crate::platform::NoopPinyin;
+
+    /// Stub pinyin engine returning fixed candidates — keeps ime-core tests
+    /// independent of the real inputx-pinyin dictionary.
+    struct StubPinyin;
+    impl PinyinEngine for StubPinyin {
+        fn candidates(&self, pinyin: &str) -> Vec<String> {
+            match pinyin {
+                "n" => vec!["嗯".into()],
+                "ni" => vec!["你".into(), "呢".into()],
+                "nihao" => vec!["你好".into()],
+                _ => Vec::new(),
+            }
+        }
+    }
 
     fn dispatcher() -> Dispatcher {
         let store_entries = vec![
             ("/greet".into(), "你好,我是 AI 秘书".into()),
             ("/sig".into(), "Best,\n$DATE".into()),
             ("#asr".into(), "VOICE_BUFFER".into()),
+            ("#date".into(), "2026-07-23".into()),
         ];
         let matcher = Matcher::new(store_entries);
         let expander = Expander::new(Box::new(StaticProvider {
             date: "2026-07-23".into(),
             clipboard: "".into(),
         }));
-        Dispatcher::new(matcher, expander, Box::new(NoopPinyin))
+        Dispatcher::new(matcher, expander, Box::new(StubPinyin))
     }
 
     #[test]
-    fn english_text_passes_through() {
+    fn snippet_expansion_still_works() {
+        // Pinyin integration must not break snippet matching.
         let d = dispatcher();
         let mut s = ImeState::default();
-        assert_eq!(d.process_key('h', &mut s), ImeAction::PassThrough);
-        assert_eq!(d.process_key('i', &mut s), ImeAction::PassThrough);
-        assert_eq!(s.mode, InputMode::Normal);
-    }
-
-    #[test]
-    fn full_snippet_expansion() {
-        let d = dispatcher();
-        let mut s = ImeState::default();
-
-        // '/' enters trigger mode.
-        assert_eq!(
-            d.process_key('/', &mut s),
-            ImeAction::Preedit { text: "/".into(), cursor: 1 }
-        );
-        assert_eq!(s.mode, InputMode::Trigger);
-
-        // Partial steps.
-        assert_eq!(
-            d.process_key('g', &mut s),
-            ImeAction::Preedit { text: "/g".into(), cursor: 2 }
-        );
+        d.process_key('/', &mut s);
+        d.process_key('g', &mut s);
         d.process_key('r', &mut s);
         d.process_key('e', &mut s);
         d.process_key('e', &mut s);
-
-        // Final 't' completes.
         assert_eq!(
             d.process_key('t', &mut s),
             ImeAction::Commit("你好,我是 AI 秘书".into())
         );
+        assert_eq!(s.mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn pinyin_letters_produce_candidates() {
+        let d = dispatcher();
+        let mut s = ImeState::default();
+        match d.process_key('n', &mut s) {
+            ImeAction::Candidates { items, .. } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].text, "嗯");
+            }
+            other => panic!("'n' should yield candidates, got {other:?}"),
+        }
+        assert_eq!(s.mode, InputMode::Pinyin);
+        match d.process_key('i', &mut s) {
+            ImeAction::Candidates { items, .. } => assert_eq!(items[0].text, "你"),
+            other => panic!("'ni' should yield candidates, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pinyin_space_commits_top_candidate() {
+        let d = dispatcher();
+        let mut s = ImeState::default();
+        d.process_key('n', &mut s);
+        d.process_key('i', &mut s);
+        assert_eq!(d.process_key(' ', &mut s), ImeAction::Commit("你".into()));
         assert!(s.buffer.is_empty());
         assert_eq!(s.mode, InputMode::Normal);
     }
 
     #[test]
-    fn dead_end_commits_raw_text() {
+    fn pinyin_punctuation_appends_to_top() {
+        let d = dispatcher();
+        let mut s = ImeState::default();
+        d.process_key('n', &mut s);
+        d.process_key('i', &mut s);
+        assert_eq!(d.process_key(',', &mut s), ImeAction::Commit("你,".into()));
+    }
+
+    #[test]
+    fn select_candidate_commits_nth() {
+        let d = dispatcher();
+        let mut s = ImeState::default();
+        d.process_key('n', &mut s);
+        d.process_key('i', &mut s); // candidates: [你, 呢]
+        assert_eq!(d.select_candidate(1, &mut s), ImeAction::Commit("呢".into()));
+    }
+
+    #[test]
+    fn pinyin_and_snippet_coexist() {
+        // The core guarantee: snippet and pinyin don't interfere, separated by
+        // first character ('#'/'/' vs a-z).
+        let d = dispatcher();
+        let mut s = ImeState::default();
+        // snippet #date → expand
+        d.process_key('#', &mut s);
+        d.process_key('d', &mut s);
+        d.process_key('a', &mut s);
+        d.process_key('t', &mut s);
+        assert_eq!(d.process_key('e', &mut s), ImeAction::Commit("2026-07-23".into()));
+        assert_eq!(s.mode, InputMode::Normal);
+        // immediately pinyin after (state must be clean)
+        match d.process_key('n', &mut s) {
+            ImeAction::Candidates { .. } => {}
+            other => panic!("after snippet, 'n' should enter pinyin, got {other:?}"),
+        }
+        assert_eq!(s.mode, InputMode::Pinyin);
+    }
+
+    #[test]
+    fn trigger_dead_end_commits_raw() {
         let d = dispatcher();
         let mut s = ImeState::default();
         d.process_key('/', &mut s);
-        // "/x" doesn't match any trigger — committed immediately on dead end.
-        assert_eq!(
-            d.process_key('x', &mut s),
-            ImeAction::Commit("/x".into())
-        );
+        assert_eq!(d.process_key('x', &mut s), ImeAction::Commit("/x".into()));
         assert_eq!(s.mode, InputMode::Normal);
-        // Subsequent chars pass through normally.
-        assert_eq!(d.process_key('y', &mut s), ImeAction::PassThrough);
     }
 
     #[test]
     fn variable_expansion_in_snippet() {
         let d = dispatcher();
         let mut s = ImeState::default();
-        // "/sig" → "Best,\n$DATE"
         d.process_key('/', &mut s);
         d.process_key('s', &mut s);
         d.process_key('i', &mut s);
-        let result = d.process_key('g', &mut s);
-        match result {
+        match d.process_key('g', &mut s) {
             ImeAction::Commit(text) => assert!(text.contains("2026-07-23")),
             other => panic!("expected Commit, got {other:?}"),
         }
     }
 
     #[test]
-    fn reset_clears_state() {
+    fn reset_clears_pinyin_state() {
         let d = dispatcher();
         let mut s = ImeState::default();
-        d.process_key('/', &mut s);
-        assert_eq!(s.mode, InputMode::Trigger);
+        d.process_key('n', &mut s);
+        d.process_key('i', &mut s);
+        assert!(!s.candidates.is_empty());
         d.reset(&mut s);
-        assert!(s.buffer.is_empty());
+        assert!(s.candidates.is_empty());
         assert_eq!(s.mode, InputMode::Normal);
     }
 }

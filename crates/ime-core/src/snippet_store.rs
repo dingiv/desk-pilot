@@ -39,7 +39,7 @@ impl std::fmt::Display for LoadError {
 #[derive(Debug, Clone, Default)]
 pub struct SnippetStore {
     snippets: Vec<Snippet>,
-}
+}nihao
 
 impl SnippetStore {
     /// Create an empty store.

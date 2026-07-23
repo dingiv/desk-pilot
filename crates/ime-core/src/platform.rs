@@ -37,6 +37,9 @@ pub struct ImeState {
     pub buffer: String,
     /// Which path the dispatcher is currently in.
     pub mode: InputMode,
+    /// Cached hanzi candidates while in Pinyin mode (backs the candidate window +
+    /// `select_candidate`). Empty outside Pinyin mode.
+    pub candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

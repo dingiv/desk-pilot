@@ -8,18 +8,24 @@
 #include <fcitx/inputmethodengine.h>
 #include <fcitx/addonfactory.h>
 
-// Rust C ABI return types — ImeActionFFI enum (0=PassThrough, 1=Preedit, 2=Commit, 3=Candidates).
-// Defined in crates/ime-core-ffi/src/lib.rs. The enum is #[repr(C)] → int in C.
+// Rust C ABI. ImeActionFFI enum: 0=PassThrough, 1=Preedit, 2=Commit, 3=Candidates.
 extern "C" {
     int  swift_ime_init(const char *config_path);
     int  swift_ime_process_key(unsigned int ch, char *out_text,
                                unsigned int out_cap, unsigned int *out_len);
-    int  swift_ime_select_candidate(unsigned int index);
-    int  swift_ime_candidates(void *out_items, unsigned int max_items);
+    int  swift_ime_select_candidate(unsigned int index, char *out_text,
+                                    unsigned int out_cap, unsigned int *out_len);
+    unsigned int swift_ime_candidates(void *out_items, unsigned int max_items);
     void swift_ime_activate(void);
     void swift_ime_deactivate(void);
     void swift_ime_reset(void);
 }
+
+// One candidate as returned by swift_ime_candidates — 64-byte NUL-terminated UTF-8 text.
+struct SwiftImeCandidateFFI {
+    char text[64];
+};
+static const unsigned int SWIFT_IME_MAX_CANDIDATES = 9;
 
 /// fcitx5 engine addon — the ONLY class we need to write.
 class SwiftImeEngine : public fcitx::InputMethodEngineV2 {

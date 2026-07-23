@@ -8,7 +8,28 @@
 #include <fcitx/inputcontext.h>
 #include <fcitx/inputpanel.h>
 #include <fcitx/candidatelist.h>
+#include <fcitx/userinterfacemanager.h>
 #include <fcitx-utils/key.h>
+#include <memory>
+
+// ── Candidate word — one entry in the pinyin candidate window ────────────
+// (defined early so keyEvent can append it to the candidate list)
+
+class SwiftCandidateWord : public fcitx::CandidateWord {
+public:
+    SwiftCandidateWord(const std::string &text, int index)
+        : fcitx::CandidateWord(fcitx::Text(text)), index_(index) {}
+
+    void select(fcitx::InputContext *inputContext) const override {
+        char out[256] = {0};
+        unsigned int len = 0;
+        swift_ime_select_candidate(index_, out, sizeof(out), &len);
+        inputContext->commitString(std::string(out, len));
+    }
+
+private:
+    int index_;
+};
 
 // ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -74,8 +95,25 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
         break;
     }
 
-    case 3: // Candidates — Phase 3 (pinyin engine).
+    case 3: { // Candidates — build the fcitx5 LookupTable from the pinyin engine.
+        keyEvent.filterAndAccept();
+        // Show the in-progress pinyin as preedit (out_text holds the buffer).
+        ic->inputPanel().setClientPreedit(
+            fcitx::Text(std::string(out_text, out_len)));
+        // Fetch candidate list from Rust.
+        SwiftImeCandidateFFI items[SWIFT_IME_MAX_CANDIDATES];
+        unsigned int n = swift_ime_candidates(items, SWIFT_IME_MAX_CANDIDATES);
+        if (n > 0) {
+            auto list = std::make_unique<fcitx::CommonCandidateList>();
+            for (unsigned int i = 0; i < n; i++) {
+                std::string text(items[i].text);
+                list->append<SwiftCandidateWord>(text, (int)i);
+            }
+            ic->inputPanel().setCandidateList(std::move(list));
+        }
+        ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
         break;
+    }
 
     default:
         break;
@@ -84,8 +122,14 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
 
 // ── Factory ──────────────────────────────────────────────────────────────
 
+static bool initialized = false;
+
 fcitx::AddonInstance *SwiftImeFactory::create(fcitx::AddonManager *manager) {
     FCITX_UNUSED(manager);
+    if (!initialized) {
+        swift_ime_init(nullptr);  // nullptr = use built-in snippets
+        initialized = true;
+    }
     return new SwiftImeEngine;
 }
 

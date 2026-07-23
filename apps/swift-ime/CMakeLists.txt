@@ -51,5 +51,4 @@ install(FILES "${CMAKE_SOURCE_DIR}/release/fcitx/swift-ime.conf"
 # Use GNUInstallDirs for standard paths (not affected by fcitx5's cmake module).
 include(GNUInstallDirs)
 install(FILES "${RUST_BUILD_DIR}/libswift_ime.so"
-        DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-        RENAME libswift_ime.so.0.1)
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}")
