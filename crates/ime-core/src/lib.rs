@@ -5,11 +5,13 @@
 pub mod dispatcher;
 pub mod expander;
 pub mod matcher;
+pub mod pinyin;
 pub mod platform;
 pub mod snippet_store;
+pub mod state;
 
 pub use dispatcher::Dispatcher;
 pub use expander::Expander;
 pub use matcher::Matcher;
-pub use platform::{ImeAction, ImeState, PinyinEngine};
+pub use platform::{ImeAction, PinyinEngine};
 pub use snippet_store::SnippetStore;

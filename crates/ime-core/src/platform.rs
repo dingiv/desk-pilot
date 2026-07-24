@@ -29,30 +29,6 @@ pub struct Candidate {
     pub preview: String,
 }
 
-/// Mutable engine state that lives for the duration of this input session (one
-/// `InputContext` in fcitx5 terms). Reset on focus change / Escape.
-#[derive(Debug, Clone, Default)]
-pub struct ImeState {
-    /// Accumulated key characters since the last commit / reset.
-    pub buffer: String,
-    /// Which path the dispatcher is currently in.
-    pub mode: InputMode,
-    /// Cached hanzi candidates while in Pinyin mode (backs the candidate window +
-    /// `select_candidate`). Empty outside Pinyin mode.
-    pub candidates: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum InputMode {
-    /// No trigger prefix seen yet — check all paths.
-    #[default]
-    Normal,
-    /// Inside a snippet trigger (accumulating "/greet", "#asr", etc.).
-    Trigger,
-    /// Inside a pinyin sequence — showing hanzi candidates.
-    Pinyin,
-}
-
 /// Pinyin-to-hanzi engine (Phase 3 — reserved trait, empty impl for Phase 1).
 /// Community crate `inputx-pinyin` fills this later.
 pub trait PinyinEngine: Send + Sync {
@@ -80,8 +56,8 @@ mod tests {
 
     #[test]
     fn ime_state_defaults() {
-        let state = ImeState::default();
-        assert!(state.buffer.is_empty());
-        assert_eq!(state.mode, InputMode::Normal);
+        let sm = crate::state::StateMachine::new();
+        assert!(sm.buffer.is_empty());
+        assert_eq!(sm.state, crate::state::ComposeState::Idle);
     }
 }

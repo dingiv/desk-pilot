@@ -9,16 +9,19 @@
 #include <fcitx/addonfactory.h>
 
 // Rust C ABI. ImeActionFFI enum: 0=PassThrough, 1=Preedit, 2=Commit, 3=Candidates.
+// First arg `ctx` is the fcitx5 InputContext pointer — per-window state isolation.
 extern "C" {
     int  swift_ime_init(const char *config_path);
-    int  swift_ime_process_key(unsigned int ch, char *out_text,
+    int  swift_ime_process_key(void *ctx, unsigned int ch, char *out_text,
                                unsigned int out_cap, unsigned int *out_len);
-    int  swift_ime_select_candidate(unsigned int index, char *out_text,
+    int  swift_ime_select_candidate(void *ctx, unsigned int index, char *out_text,
                                     unsigned int out_cap, unsigned int *out_len);
-    unsigned int swift_ime_candidates(void *out_items, unsigned int max_items);
-    void swift_ime_activate(void);
-    void swift_ime_deactivate(void);
-    void swift_ime_reset(void);
+    unsigned int swift_ime_candidates(void *ctx, void *out_items, unsigned int max_items);
+    void swift_ime_activate(void *ctx);
+    void swift_ime_deactivate(void *ctx);
+    void swift_ime_commit_pending(void *ctx, char *out_text,
+                                   unsigned int out_cap, unsigned int *out_len);
+    void swift_ime_reset(void *ctx);
 }
 
 // One candidate as returned by swift_ime_candidates — 64-byte NUL-terminated UTF-8 text.

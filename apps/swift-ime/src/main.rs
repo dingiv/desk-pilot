@@ -68,9 +68,9 @@ fn main() -> Result<()> {
 }
 
 fn run_mock(config_path: &str) -> Result<()> {
-    use ime_core::{Dispatcher, Expander, ImeState, Matcher, SnippetStore};
+    use ime_core::{Dispatcher, Expander, Matcher, SnippetStore};
     use ime_core::expander::StaticProvider;
-    use swift_ime::pinyin::InputxPinyin;
+    use ime_core::state::StateMachine;
     use std::io::{self, Write};
 
     let store = std::fs::read_to_string(config_path)
@@ -86,7 +86,7 @@ fn run_mock(config_path: &str) -> Result<()> {
         clipboard: String::new(),
     }));
     eprintln!("loading pinyin dictionary …");
-    let dispatcher = Dispatcher::new(matcher, expander, Box::new(InputxPinyin::new()));
+    let dispatcher = Dispatcher::new(matcher, expander);
     println!("swift-ime mock — type a line and press Enter. Trigger prefixes: / and #");
     println!("Type /greet, #date, or pinyin (ni, nihao) to test. Ctrl-C to exit.\n");
 
@@ -98,9 +98,9 @@ fn run_mock(config_path: &str) -> Result<()> {
         if io::stdin().read_line(&mut input)? == 0 {
             break;
         }
-        let mut state = ImeState::default();
+        let mut sm = StateMachine::new();
         for ch in input.trim_end_matches(['\n', '\r']).chars() {
-            match dispatcher.process_key(ch, &mut state) {
+            match dispatcher.process_key(ch, &mut sm) {
                 ime_core::ImeAction::PassThrough => {}
                 ime_core::ImeAction::Preedit { text, .. } => {
                     print!("[{text}]");
@@ -111,13 +111,13 @@ fn run_mock(config_path: &str) -> Result<()> {
                 }
                 ime_core::ImeAction::Candidates { items, .. } => {
                     let joined: Vec<&str> = items.iter().map(|c| c.text.as_str()).collect();
-                    print!("[{} → {}]", state.buffer, joined.join("/"));
+                    print!("[{} → {}]", sm.buffer, joined.join("/"));
                     io::stdout().flush()?;
                 }
             }
         }
-        if !state.buffer.is_empty() {
-            println!(" → {}", state.buffer);
+        if !sm.buffer.is_empty() {
+            println!(" → {}", sm.buffer);
         }
     }
     Ok(())

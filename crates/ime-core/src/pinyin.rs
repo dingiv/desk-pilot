@@ -1,13 +1,13 @@
-//! inputx-pinyin adapter — implements ime-core's [`PinyinEngine`] trait.
+//! Pinyin engine — the built-in pinyin-to-hanzi converter used by the dispatcher's
+//! PinyinPath. Powered by the community `inputx-pinyin` crate (embedded dictionary).
 //!
-//! `inputx-pinyin` ships an embedded dictionary (core + bigrams + trigrams), so no
-//! runtime download is needed. The engine is constructed once and reused; per-query
-//! a short-lived [`Session`] borrows it (Session can't outlive the engine, so it's
-//! kept inside the `candidates` call scope).
+//! Implements the [`PinyinEngine`] trait so the dispatcher can call `candidates()` on
+//! every keystroke. Tests inject a [`StubPinyin`] to avoid the dictionary overhead.
 
-use ime_core::PinyinEngine;
+use crate::PinyinEngine;
 
-/// Wraps the inputx-pinyin engine. Clone is cheap-ish (shares dict data).
+/// The real pinyin engine (inputx-pinyin). Construct once and reuse — the dictionary
+/// is loaded at construction time and shared across all queries.
 pub struct InputxPinyin(inputx_pinyin::PinyinEngine);
 
 impl InputxPinyin {
@@ -31,7 +31,7 @@ impl PinyinEngine for InputxPinyin {
         for c in pinyin.chars() {
             session.input_char(c);
         }
-        session.candidates().to_vec()
+        session.candidates().iter().take(16).cloned().collect()
     }
 }
 
@@ -44,7 +44,8 @@ mod tests {
         let engine = InputxPinyin::new();
         let cands = engine.candidates("nihao");
         assert!(!cands.is_empty(), "expected candidates for 'nihao'");
-        assert!(cands[0].contains("你好"), "top candidate was {:?}, expected 你好", cands[0]);
+        assert!(cands[0].contains("你好"),
+            "top candidate was {:?}, expected 你好", cands[0]);
     }
 
     #[test]

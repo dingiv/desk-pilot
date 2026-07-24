@@ -38,11 +38,9 @@ for arg in "$@"; do
     esac
 done
 
-# ── Resolve the cargo target directory (workspace-aware) ───────────────────
-# Works from any subdirectory — cargo auto-discovers the workspace root.
-WS_ROOT="$(dirname "$(cargo locate-project --workspace 2>/dev/null \
-    | python3 -c 'import sys,json; print(json.load(sys.stdin)["root"])' 2>/dev/null)")"
-TARGET_DIR="${WS_ROOT:-$PROJECT_DIR/../..}/target"
+# Cargo always writes to <workspace_root>/target, never to a sub-crate's local dir.
+# From apps/swift-ime/ that's ../../target. Respect $CARGO_TARGET_DIR if set.
+TARGET_DIR="${CARGO_TARGET_DIR:-../../target}"
 
 if [ "$BUILD_TYPE" = "Release" ]; then
     CARGO_FLAGS="--release"

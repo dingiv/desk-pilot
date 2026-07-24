@@ -23,8 +23,10 @@ public:
     void select(fcitx::InputContext *inputContext) const override {
         char out[256] = {0};
         unsigned int len = 0;
-        swift_ime_select_candidate(index_, out, sizeof(out), &len);
+        swift_ime_select_candidate((void *)inputContext, index_, out, sizeof(out), &len);
+        inputContext->inputPanel().reset();
         inputContext->commitString(std::string(out, len));
+        inputContext->updatePreedit();
     }
 
 private:
@@ -36,22 +38,34 @@ private:
 void SwiftImeEngine::activate(const fcitx::InputMethodEntry &entry,
                                fcitx::InputContextEvent &event) {
     FCITX_UNUSED(entry);
-    FCITX_UNUSED(event);
-    swift_ime_activate();
+    swift_ime_activate((void *)event.inputContext());
 }
 
 void SwiftImeEngine::deactivate(const fcitx::InputMethodEntry &entry,
                                  fcitx::InputContextEvent &event) {
     FCITX_UNUSED(entry);
-    FCITX_UNUSED(event);
-    swift_ime_deactivate();
+    auto *ic = event.inputContext();
+    if (!ic) return;
+    if (event.type() != fcitx::EventType::InputContextSwitchInputMethod) {
+        // FocusOut (window defocus / window close): keep composition state
+        // alive so the user can switch back and continue typing.
+        return;
+    }
+    // IM-switch (user explicitly chose another input method): commit the
+    // in-progress text so nothing is lost, then clean up the context.
+    char out[4096] = {0};
+    unsigned int len = 0;
+    swift_ime_commit_pending((void *)ic, out, sizeof(out), &len);
+    if (len > 0) {
+        ic->commitString(std::string(out, len));
+    }
+    swift_ime_deactivate((void *)ic);
 }
 
 void SwiftImeEngine::reset(const fcitx::InputMethodEntry &entry,
                             fcitx::InputContextEvent &event) {
     FCITX_UNUSED(entry);
-    FCITX_UNUSED(event);
-    swift_ime_reset();
+    swift_ime_reset((void *)event.inputContext());
 }
 
 // ── Key event (the only required method) ─────────────────────────────────
@@ -70,11 +84,11 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
     // ── Call the Rust engine ──
     char out_text[4096] = {0};
     unsigned int out_len = 0;
-    int action = swift_ime_process_key(
-        ch, out_text, sizeof(out_text), &out_len);
-
     auto *ic = keyEvent.inputContext();
     if (!ic) return;
+
+    int action = swift_ime_process_key(
+        (void *)ic, ch, out_text, sizeof(out_text), &out_len);
 
     // ── Execute the returned action ──
     switch (action) {
@@ -83,26 +97,33 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
 
     case 1: { // Preedit — show composing text inline.
         keyEvent.filterAndAccept();
-        ic->inputPanel().setClientPreedit(
-            fcitx::Text(std::string(out_text, out_len)));
+        auto text = fcitx::Text(std::string(out_text, out_len));
+        text.setCursor(out_len);  // cursor at end (Text constructor defaults to 0)
+        ic->inputPanel().setClientPreedit(text);
+        ic->inputPanel().setAuxUp(text);
         ic->updatePreedit();
         break;
     }
 
     case 2: { // Commit — final text replaces any preedit.
         keyEvent.filterAndAccept();
+        ic->inputPanel().reset();  // clear stale preedit before commit
         ic->commitString(std::string(out_text, out_len));
+        ic->updatePreedit();
         break;
     }
 
     case 3: { // Candidates — build the fcitx5 LookupTable from the pinyin engine.
         keyEvent.filterAndAccept();
-        // Show the in-progress pinyin as preedit (out_text holds the buffer).
-        ic->inputPanel().setClientPreedit(
-            fcitx::Text(std::string(out_text, out_len)));
+        auto text = fcitx::Text(std::string(out_text, out_len));
+        text.setCursor(out_len);
+        // Inline preedit in the application (underlined composing text).
+        ic->inputPanel().setClientPreedit(text);
+        // Pinyin string shown ABOVE the candidate list in the IME panel.
+        ic->inputPanel().setAuxUp(text);
         // Fetch candidate list from Rust.
         SwiftImeCandidateFFI items[SWIFT_IME_MAX_CANDIDATES];
-        unsigned int n = swift_ime_candidates(items, SWIFT_IME_MAX_CANDIDATES);
+        unsigned int n = swift_ime_candidates((void *)ic, items, SWIFT_IME_MAX_CANDIDATES);
         if (n > 0) {
             auto list = std::make_unique<fcitx::CommonCandidateList>();
             for (unsigned int i = 0; i < n; i++) {
@@ -111,6 +132,7 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
             }
             ic->inputPanel().setCandidateList(std::move(list));
         }
+        ic->updatePreedit();
         ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
         break;
     }

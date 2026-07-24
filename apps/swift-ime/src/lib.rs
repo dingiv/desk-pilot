@@ -2,4 +2,3 @@
 //! shared Rust backend used by the binary target (mock/ibus modes).
 
 pub mod ffi;
-pub mod pinyin;
