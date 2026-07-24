@@ -106,14 +106,20 @@ impl AuraConf {
     /// reported and ignored rather than killing the daemon.
     fn load() -> Self {
         let fs = shared::loader!();
+        // 优先 aura.yaml (支持 # 注释, 嵌套友好); fallback aura.json (向下兼容).
+        if let Ok(s) = fs.read_str("CONF::aura.yaml") {
+            match serde_yaml::from_str::<Self>(&s) {
+                Ok(conf) => {
+                    info!(path = %"aura.yaml", "conf loaded (yaml)");
+                    return conf;
+                }
+                Err(e) => warn!(error = %e, "aura.yaml parse error — trying json fallback"),
+            }
+        }
         match fs.read_str("CONF::aura.json") {
             Ok(s) => match serde_json::from_str(&s) {
                 Ok(conf) => {
-                    let from = fs
-                        .resolve("CONF::aura.json")
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "aura.json".into());
-                    info!(path = %from, "conf loaded");
+                    info!(path = %"aura.json", "conf loaded (json)");
                     conf
                 }
                 Err(e) => {
@@ -122,7 +128,7 @@ impl AuraConf {
                 }
             },
             Err(_) => {
-                info!("no aura.json — using built-in defaults");
+                info!("no aura.yaml / aura.json — using built-in defaults");
                 Self::default()
             }
         }

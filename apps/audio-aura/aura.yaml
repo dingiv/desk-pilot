@@ -1,0 +1,34 @@
+# aura-daemon 配置 (YAML — 支持 # 注释, 比 JSON 更适合复杂嵌套配置)
+# 优先级: CLI > 本文件 > 内置默认。aura.yaml 优先于 aura.json (向下兼容)。
+
+scout_addr: "127.0.0.1:7879"   # omni-scout /audio 地址
+port: 9091                      # daemon socket 端口
+stage3: true                    # 运行进程内 Stage3 规则触发器
+
+# ── Stage2 LLM (mistral.rs Qwen3-1.7B GGUF, local; 或 remote vLLM/sglang) ──
+model: "Qwen3-1.7B-Q8_0.gguf"  # GGUF 文件名 (MODELS namespace 内)
+llm_kind: "local"               # local | remote
+# llm_endpoint: "http://127.0.0.1:8000"  # llm_kind=remote 时 (sglang/vllm)
+# llm_model: "Qwen3-1.7B"                 # remote 时传给 /v1/chat/completions
+
+# ── Stage1 batch ASR (当前 flat 字段; 未来升级为 stage_asr 嵌套, 见 docs/dp-models.md) ──
+asr_backend: "qwen3-asr"        # sensevoice | whisper | qwen3-asr
+asr_language: "auto"
+asr_provider: "cpu"             # cpu | cuda (cuda 需 GPU sherpa lib + cuDNN 9.25)
+asr_threads: 8                  # onnxruntime intra-op 线程 (8 核甜点)
+asr_kind: "remote"              # local | remote (remote → qwen-asr-serve)
+asr_endpoint: "http://127.0.0.1:8080"  # qwen-asr-serve OpenAI 兼容 ASR 服务
+
+# ── 种子热词 (流式 recognizer beam bias + Stage2 整流参考) ──
+hotwords: ["Rust", "Bevy", "贪吃蛇"]
+
+# ── 未来: dp-models ModelSpec 结构化配置 (当前 AuraConf 不认, 待整改 docs/dp-models.md) ──
+# stage_asr:
+#   type: local              # local | remote
+#   model: qwen3-asr-1.7b-hf # 模型名 (local: onnx/gguf 路径; remote: HF id)
+#   language: auto
+#   hardware: gpu            # cpu | gpu
+#   thread: null             # null = 默认
+# stage_llm:
+#   type: local
+#   model: Qwen3-1.7B-Q8_0.gguf
