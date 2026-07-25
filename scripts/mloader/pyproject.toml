@@ -10,15 +10,15 @@ dependencies = [
     "huggingface_hub>=0.30",
     "numpy>=2.2.6",
     "pynvml>=12",
+    "qwen-asr>=0.0.6",
 ]
 
-# 重引擎 + mock 服务都可选 (按需装):
-#   uv pip install -e ".[engine]"   # vllm + sglang + transformers (serve.py vllm/sglang)
-#   uv pip install -e ".[server]"   # fastapi + uvicorn (serve.py mock)
-#   uv pip install -e ".[engine,server]"
+# mock/asr server 的 FastAPI (轻量, 可 lock):
 [project.optional-dependencies]
-engine = ["vllm", "sglang>=0.5.9", "transformers>=4.57.1"]
 server = ["fastapi", "uvicorn"]
+vllm = ["vllm"]
+sglang = ["sglang"]
+transformers = ["transformers"]
 
 [project.scripts]
 mloader-serve    = "mloader.serve:main"

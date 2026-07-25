@@ -44,7 +44,8 @@ fn main() -> anyhow::Result<()> {
     let s1 = OnnxStage1Executor::new(Stage1Config::new(scout_addr.clone()))?;
     let calibrator = Calibrator::load_default("Qwen3-1.7B-Q8_0.gguf")?;
     let _ = calibrator.calibrate_blocking("你好", None, &[]); // HF warmup
-    let s2 = Stage2CalibratorImpl::new(Arc::new(calibrator), Arc::clone(&hotwords));
+    let corrections = Arc::new(Mutex::new(Vec::new()));
+    let s2 = Stage2CalibratorImpl::new(Arc::new(calibrator), Arc::clone(&hotwords), corrections);
 
     fs::create_dir_all(REPORT_DIR).ok();
     let epoch = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);

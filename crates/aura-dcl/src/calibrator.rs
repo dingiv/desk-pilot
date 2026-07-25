@@ -27,14 +27,21 @@ pub struct Stage2CalibratorImpl {
     ctx_win: ContextWindow,
     /// Shared with Stage3 — the feedback channel. Read fresh on every calibrate.
     hotwords: Arc<Mutex<Vec<String>>>,
+    /// User corrections (raw→corrected pairs), shared with daemon's POST /api/correct handler.
+    /// Read fresh on every calibrate — the correction feedback channel.
+    corrections: Arc<Mutex<Vec<(String, String)>>>,
     few_shot: Vec<(String, String)>,
 }
 
 impl Stage2CalibratorImpl {
     /// `hotwords` is shared (clone the Arc from wherever Stage3 holds it); `llm` is the local
     /// `Calibrator` or a remote `HttpLlm` (as `Arc<dyn LlmProvider>`).
-    pub fn new(llm: Arc<dyn dp_models::LlmProvider>, hotwords: Arc<Mutex<Vec<String>>>) -> Self {
-        Self { llm, ctx_win: ContextWindow::new(5), hotwords, few_shot: Vec::new() }
+    pub fn new(
+        llm: Arc<dyn dp_models::LlmProvider>,
+        hotwords: Arc<Mutex<Vec<String>>>,
+        corrections: Arc<Mutex<Vec<(String, String)>>>,
+    ) -> Self {
+        Self { llm, ctx_win: ContextWindow::new(5), hotwords, corrections, few_shot: Vec::new() }
     }
 
     /// Rolling context capacity (number of (raw,calibrated) pairs kept). Default 4.
@@ -71,6 +78,11 @@ impl Stage2Calibrator for Stage2CalibratorImpl {
         }
         if !self.few_shot.is_empty() {
             pb = pb.few_shot(&self.few_shot);
+        }
+        // User corrections (raw→corrected) — authoritative few-shot, highest priority.
+        let corrections = self.corrections.lock().unwrap().clone();
+        if !corrections.is_empty() {
+            pb = pb.corrections(&corrections);
         }
         let (system, user) = pb.build();
 

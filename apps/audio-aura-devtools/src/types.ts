@@ -75,7 +75,8 @@ export type AsrEvent =
       intent: string;
       reply: string;
       route_ms: number;
-    };
+    }
+  | { type: 'correction'; seq: number; raw: string; corrected: string };
 
 /// One Stage1 utterance in the live list. `live` = currently being recognized (partial streams
 /// char-by-char, earlier chars get corrected as more audio arrives — forward correction).
@@ -93,4 +94,6 @@ export interface UtteranceItem {
     route_ms: number;
   };
   live: boolean;
+  /** Set when the user corrected this item via POST /api/correct. */
+  corrected_by_user?: boolean;
 }

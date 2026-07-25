@@ -207,6 +207,7 @@ fn resolve(cli: Cli, conf: AuraConf) -> Settings {
 #[derive(Clone)]
 struct DaemonState {
     hotwords: Arc<Mutex<Vec<String>>>,
+    corrections: Arc<Mutex<Vec<(String, String)>>>,
     /// Scout-connection toggle (shared with Stage1Executor's ingest + run loop).
     active: Arc<AtomicBool>,
     /// Event bus bridging the Pipeline thread → SSE clients.
@@ -236,6 +237,7 @@ fn main() -> Result<()> {
     // Shared hotword store = the Stage3→Stage2 feedback channel (seeded from the config /
     // built-in list; Stage3 grows it at runtime).
     let hotwords: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(seed_hotwords.clone()));
+    let corrections: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let mgr: Arc<dyn HotwordManager> = Arc::new(SharedHotwordManager::new(Arc::clone(&hotwords)));
     let tool = AddHotwordTool::new(Arc::clone(&mgr));
 
@@ -298,7 +300,7 @@ fn main() -> Result<()> {
         info!("Stage2 LLM: local mistral.rs ({model})");
         Arc::new(calibrator)
     };
-    let s2 = Stage2CalibratorImpl::new(llm, Arc::clone(&hotwords));
+    let s2 = Stage2CalibratorImpl::new(llm, Arc::clone(&hotwords), Arc::clone(&corrections));
 
     // ── Pipeline on a dedicated std thread ── it bridges each TurnEvent to the event bus as
     //    owned JSON. Events carry their own utterance seq (assigned by Stage1).
@@ -365,7 +367,7 @@ fn main() -> Result<()> {
     }
 
     // ── Socket on the main thread's tokio runtime ──
-    let state = DaemonState { hotwords: Arc::clone(&hotwords), active: Arc::clone(&active), bus, storage };
+    let state = DaemonState { hotwords: Arc::clone(&hotwords), corrections: Arc::clone(&corrections), active: Arc::clone(&active), bus, storage };
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("aura-socket")
@@ -425,7 +427,7 @@ async fn serve_socket(state: DaemonState, port: u16, web_dist: Option<String>) {
         // remaining stubs (speaker / results / annotate) — out of scope this round
         .route("/control/speaker", post(control_stub))
         .route("/results", get(results_handler))
-        .route("/annotate", post(annotate_stub))
+        .route("/api/correct", post(correction_handler))
         .fallback_service(static_spa)
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -507,8 +509,23 @@ async fn control_stub() -> Json<Value> {
 async fn results_handler(State(s): State<DaemonState>) -> Json<Value> {
     Json(json!({ "results": s.storage.recent() }))
 }
-async fn annotate_stub() -> Json<Value> {
-    Json(json!({ "stub": true, "todo": "accept user corrections → progressive-improvement dataset" }))
+async fn correction_handler(State(s): State<DaemonState>, body: Json<Value>) -> Json<Value> {
+    let raw = body.get("raw").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let corrected = body.get("corrected").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let seq = body.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+    if raw.is_empty() || corrected.is_empty() {
+        return Json(json!({ "ok": false, "error": "raw and corrected required" }));
+    }
+    // Push to correction store (ring buffer, cap 20 — short-term memory for Stage2)
+    {
+        let mut c = s.corrections.lock().unwrap();
+        if c.len() >= 20 { c.remove(0); } // evict oldest
+        c.push((raw.clone(), corrected.clone()));
+    }
+    // Broadcast correction event to all SSE clients (Web UI marks item as corrected)
+    s.emit(json!({ "type": "correction", "seq": seq, "raw": raw, "corrected": corrected }));
+    info!(seq, raw = %raw, corrected = %corrected, "user correction added → Stage2");
+    Json(json!({ "ok": true }))
 }
 
 #[cfg(test)]

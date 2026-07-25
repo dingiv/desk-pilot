@@ -524,6 +524,19 @@ impl Asr for OnnxAsr {
         let samples: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
         stream.accept_waveform(sample_rate as i32, &samples);
         rec.decode(&stream);
-        Ok(stream.get_result().map(|r| r.text).unwrap_or_default())
+        let text = stream.get_result().map(|r| r.text).unwrap_or_default();
+        Ok(strip_qwen3_markers(&text))
     }
+}
+
+/// Qwen3-ASR occasionally leaks internal markers into its output
+/// (`language Chinese<asr_text>文本</asr_text>`). Only strips when `<asr_text>` is present —
+/// SenseVoice/Whisper never emit this tag, so it's a safe no-op for them.
+fn strip_qwen3_markers(text: &str) -> String {
+    let t = text.trim();
+    if let Some(pos) = t.find("<asr_text>") {
+        let after = &t[pos + "<asr_text>".len()..];
+        return after.replace("</asr_text>", "").trim().to_string();
+    }
+    t.to_string()
 }

@@ -64,6 +64,18 @@ export default function App() {
           return next;
         });
         break;
+      case 'correction':
+        // mark the item as corrected_by_user (SSE confirmation from POST /api/correct)
+        setItems((prev) => {
+          const i = prev.findIndex((it) => it.seq === ev.seq);
+          if (i < 0) return prev;
+          const next = prev.slice();
+          const cur = next[i];
+          if (!cur) return prev;
+          next[i] = { ...cur, corrected_by_user: true };
+          return next;
+        });
+        break;
     }
   }, []);
   useAsrStream(onEvent);

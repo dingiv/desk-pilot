@@ -1,13 +1,6 @@
 {
   "scout_addr": "127.0.0.1:7879",
   "port": 9091,
-  // "stage_asr": {
-    //   "type": "local",
-  //   "model": "sencevoice",
-  //   "language": "auto",
-  //   "hardware": "cpu",
-  //   "thread": 8
-  // },
   "stage_asr": {
     "type": "local",
     "model": "qwen3-asr-1.7b-hf",

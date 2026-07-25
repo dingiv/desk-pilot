@@ -99,6 +99,8 @@ pub struct PromptBuilder {
     streaming_ref: Option<String>,
     /// `None` = 用 [`DEFAULT_FEW_SHOT`]；`Some(vec)` = 用给定示例（空 vec = 关闭 few-shot）。
     few_shot: Option<Vec<(String, String)>>,
+    /// 用户纠正的 (raw→corrected) 权威对。独立段注入（优先级最高，热词后、CONTEXT 前）。
+    corrections: Vec<(String, String)>,
     // 未来扩展：
     // calibration_mode: CalibrationMode,  // Light / Deep / Formal
     // domain: Option<String>,             // 领域标签(编程/写作/…)
@@ -114,6 +116,7 @@ impl PromptBuilder {
             context: None,
             streaming_ref: None,
             few_shot: None,
+            corrections: Vec::new(),
         }
     }
 
@@ -145,6 +148,12 @@ impl PromptBuilder {
     /// 不调用则使用 [`DEFAULT_FEW_SHOT`]。
     pub fn few_shot(mut self, examples: &[(String, String)]) -> Self {
         self.few_shot = Some(examples.to_vec());
+        self
+    }
+
+    /// 注入用户纠正的 (raw→corrected) 权威对。独立段、优先级最高（Stage2 再次看到 raw 时强纠）。
+    pub fn corrections(mut self, samples: &[(String, String)]) -> Self {
+        self.corrections = samples.to_vec();
         self
     }
 
@@ -184,6 +193,15 @@ impl PromptBuilder {
             s.push_str("转写中出现以下词的同音/形近误识别时，必须按此写法输出：\n");
             for h in &self.hotwords {
                 s.push_str(&format!("- {h}\n"));
+            }
+        }
+
+        // User corrections block (权威示例, 优先级最高 — 热词后, CONTEXT 前)
+        if !self.corrections.is_empty() {
+            s.push_str("\n# 用户纠正（权威示例，必须严格遵循）\n");
+            s.push_str("以下是用户明确纠正的样本。当原文中出现相同或高度相似的错误时，必须按纠正结果输出：\n");
+            for (raw, corrected) in &self.corrections {
+                s.push_str(&format!("原文：{raw}\n纠正：{corrected}\n"));
             }
         }
 
