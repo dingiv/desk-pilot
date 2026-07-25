@@ -97,6 +97,7 @@ impl EguiSurface {
             ctx: {
                 let ctx = egui::Context::default();
                 ctx.set_pixels_per_point(1.0);
+                register_cjk_font(&ctx);
                 ctx
             },
             device,
@@ -225,4 +226,39 @@ impl EguiSurface {
         *self.interactive_rects.borrow_mut() = rects;
         out
     }
+}
+
+/// Register a CJK font (WenQuanYi Zen Hei) with egui so Chinese/Japanese/Korean
+/// characters render instead of showing as tofu boxes (□). egui ships with a
+/// Latin-only font by default; we add CJK as a fallback in the Proportional +
+/// Monospace families. Tries several common system font paths; if none exist,
+/// silently falls back (Latin text still renders fine).
+fn register_cjk_font(ctx: &egui::Context) {
+    // Common CJK font paths on Linux (apt-installed or distro-default).
+    const CJK_PATHS: &[&str] = &[
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    ];
+
+    for path in CJK_PATHS {
+        if let Ok(data) = std::fs::read(path) {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts.font_data.insert(
+                "cjk".to_string(),
+                egui::FontData::from_owned(data).into(),
+            );
+            // Add as fallback after the default Latin font in both families.
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                if let Some(list) = fonts.families.get_mut(&family) {
+                    list.push("cjk".to_string());
+                }
+            }
+            ctx.set_fonts(fonts);
+            eprintln!("[geek-familiar] CJK font loaded from {path}");
+            return;
+        }
+    }
+    eprintln!("[geek-familiar] no CJK font found — Chinese will show as tofu boxes");
 }

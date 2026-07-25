@@ -134,6 +134,22 @@ fn render_node(
             apply_constraints(ui, style);
             render_node(ui, ctx, child, scratch, rects, msgs, img_cache);
         }
+        View::Decorated { decoration, child } => {
+            let mut frame = egui::Frame::default();
+            if let Some(bg) = decoration.background {
+                frame.fill = to_color32(bg);
+            }
+            if let Some(bc) = decoration.border_color {
+                frame.stroke = egui::Stroke::new(decoration.border_width, to_color32(bc));
+            }
+            if decoration.corner_radius > 0.0 {
+                frame.rounding = egui::Rounding::same(decoration.corner_radius);
+            }
+            if decoration.padding > 0.0 {
+                frame.inner_margin = egui::Margin::symmetric(decoration.padding, decoration.padding);
+            }
+            frame.show(ui, |ui| render_node(ui, ctx, child, scratch, rects, msgs, img_cache));
+        }
         View::ScrollView { child, stick_to_bottom } => {
             let mut area = egui::ScrollArea::vertical().auto_shrink([false; 2]);
             if *stick_to_bottom {

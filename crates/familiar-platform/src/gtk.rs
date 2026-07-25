@@ -18,6 +18,8 @@ use gtk4::gdk::{self, MemoryFormat, MemoryTexture};
 use gtk4::glib::translate::ToGlibPtr;
 use gtk4::glib::{Bytes, ControlFlow, Propagation};
 use gtk4::prelude::*;
+#[cfg(feature = "egui")]
+use gtk4::{EventControllerFocus, IMMulticontext};
 use gtk4::{
     Application, ApplicationWindow, CssProvider, EventControllerKey, EventControllerMotion,
     GestureClick, Picture,
@@ -230,13 +232,42 @@ fn build_window(gtk_app: &Application, app: &Rc<RefCell<Box<dyn App>>>) {
             win.add_controller(motion);
         }
 
-        // Keyboard → egui (special keys as Key events, printable as Text). The
-        // separate ESC controller below still closes the window.
+        // Keyboard → egui, routed through GtkIMContext for IME (ibus/fcitx)
+        // support. The IM context intercepts key events; when an IME is active
+        // (e.g. Chinese pinyin), it shows its own candidate popup and commits
+        // text via the `commit` signal → we forward as `egui::Event::Text`.
+        // If the IM context doesn't consume the key (English mode), we fall
+        // through to the direct egui key mapping.
         {
-            let surf = Rc::clone(&surface);
+            let surf_for_im = Rc::clone(&surface);
+            let surf_for_key = Rc::clone(&surface);
+
+            // IM context — auto-detects ibus/fcitx/etc. via the desktop session.
+            let im = IMMulticontext::new();
+            im.set_client_widget(Some(&win));
+            im.set_use_preedit(true);
+            im.focus_in();
+
+            // commit signal: IME committed text → forward to egui as Text event.
+            let im_commit_surf = Rc::clone(&surf_for_im);
+            im.connect_commit(move |_ctx, text| {
+                if let Some(s) = im_commit_surf.borrow().as_ref() {
+                    s.push_event(egui::Event::Text(text.to_string()));
+                }
+            });
+
+            let im_for_key = im.clone();
             let ec = EventControllerKey::new();
-            ec.connect_key_pressed(move |_e, key, _code, mods| {
-                let guard = surf.borrow();
+            ec.connect_key_pressed(move |controller, key, _code, mods| {
+                // Try IM context first (for IME: pinyin, Japanese, etc.)
+                if let Some(event) = controller.current_event() {
+                    if im_for_key.filter_keypress(&event) {
+                        return Propagation::Stop; // IM consumed it
+                    }
+                }
+
+                // IM didn't consume → direct egui key mapping (English, shortcuts)
+                let guard = surf_for_key.borrow();
                 let Some(s) = guard.as_ref() else {
                     return Propagation::Proceed;
                 };
@@ -268,6 +299,17 @@ fn build_window(gtk_app: &Application, app: &Rc<RefCell<Box<dyn App>>>) {
                 Propagation::Proceed
             });
             win.add_controller(ec);
+
+            // Focus tracking: tell the IM context when we gain/lose keyboard focus.
+            let im_focus = im.clone();
+            let focus = EventControllerFocus::new();
+            focus.connect_enter(move |_| { im_focus.focus_in(); });
+            let im_blur = im.clone();
+            focus.connect_leave(move |_| { im_blur.focus_out(); });
+            win.add_controller(focus);
+
+            // Keep the IM context alive for the window's lifetime.
+            std::mem::forget(im);
         }
 
         // Tick: declare (app.view) → render (egui binder) → route Msgs back

@@ -18,7 +18,7 @@ use std::time::Duration;
 use core::{geometry::Vec2, Canvas, Color, Config, Fsm, Scene};
 use platform::{App, InputRegion, PlatformEvent};
 use render::{CpuRenderer, Renderer};
-use ui::{column, image_src, scroll_view, text, ImageSource, Msg, View};
+use ui::{Column, ImageSrc, ScrollView, Text, ImageSource, Msg, View};
 
 /// The aura daemon's SSE address (loaded from familiar.yaml at startup).
 const AURA_ADDR_DEFAULT: &str = "127.0.0.1:9091";
@@ -200,7 +200,7 @@ impl App for PetApp {
         }
 
         let s = self.asr.borrow();
-        let mut nodes = vec![image_src(self.skin.clone(), 200.0, 200.0)];
+        let mut nodes = vec![ImageSrc(self.skin.clone(), 200.0, 200.0)];
 
         // Status indicator
         let (dot, label, color) = if s.connected {
@@ -208,11 +208,11 @@ impl App for PetApp {
         } else {
             ("○", "ASR off", Color::rgba(0xef, 0x6f, 0x6f, 0xff))
         };
-        nodes.push(text(format!("{dot} {label}")).color(color));
+        nodes.push(Text(format!("{dot} {label}")).color(color));
 
         // Live interim partial (gray)
         if !s.interim.is_empty() {
-            nodes.push(text(s.interim.clone()).color(Color::rgba(0xaa, 0xaa, 0xaa, 0xff)));
+            nodes.push(Text(s.interim.clone()).color(Color::rgba(0xaa, 0xaa, 0xaa, 0xff)));
         }
 
         // Scrollable transcript history (white, newest last, all items) — fills
@@ -223,17 +223,17 @@ impl App for PetApp {
             } else {
                 format!("[{intent}] {utt}")
             };
-            text(label).color(Color::WHITE)
+            Text(label).color(Color::WHITE)
         }).collect();
         if !history_nodes.is_empty() {
             nodes.push(
-                scroll_view(column(history_nodes).spacing(4.0))
+                ScrollView(Column(history_nodes).spacing(4.0))
                     .stick_to_bottom()
                     .flex(1.0),
             );
         }
 
-        column(nodes).spacing(6.0)
+        Column(nodes).spacing(6.0)
     }
 
     fn update(&mut self, _msg: Msg) {}

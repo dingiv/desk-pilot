@@ -31,3 +31,9 @@ gtk = ["platform/gtk"]
 # Render the pet UI with egui (offscreen wgpu → RGBA8). Use together with `gtk`;
 # needs a Vulkan GPU (set VK_ICD_FILENAMES).
 egui = ["gtk", "platform/egui"]
+
+# UI component gallery / playground — standalone window for testing all View
+# variants + flex layout, decoupled from the pet's business logic.
+[[example]]
+name = "ui_gallery"
+required-features = ["egui"]
