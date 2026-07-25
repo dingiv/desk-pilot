@@ -15,9 +15,6 @@ pub mod keep_above;
 /// Headless egui renderer (offscreen wgpu → RGBA8) for the GTK backend.
 #[cfg(all(feature = "gtk", feature = "egui"))]
 pub(crate) mod gtk_egui;
-/// egui binder for the declarative `ui::View` tree (the render layer).
-#[cfg(all(feature = "gtk", feature = "egui"))]
-pub(crate) mod egui_view;
 #[cfg(feature = "windows")]
 pub mod windows;
 #[cfg(feature = "macos")]

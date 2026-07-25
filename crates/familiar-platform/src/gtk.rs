@@ -64,9 +64,11 @@ impl PlatformBackend for GtkBackend {
 fn build_window(gtk_app: &Application, app: &Rc<RefCell<Box<dyn App>>>) {
     let win = ApplicationWindow::new(gtk_app);
     // Token in the (invisible, borderless) title lets the GNOME extension
-    // identify THIS window when we ask it to pin us. geek-familiar#<pid>
+    // identify THIS window when we ask it to pin us. The extension on the host
+    // matches prefix `desktop-pet#` (from when it was installed) — keep that
+    // prefix until the extension is updated to `geek-familiar#` + relogin.
     let token = std::process::id().to_string();
-    win.set_title(Some(&format!("geek-familiar#{token}")));
+    win.set_title(Some(&format!("desktop-pet#{token}")));
     win.set_decorated(false);
     // GTK4 dropped `set_keep_above`/`set_skip_*` — see keep_above.rs + docs §10.
 
@@ -290,7 +292,7 @@ fn build_window(gtk_app: &Application, app: &Rc<RefCell<Box<dyn App>>>) {
                 let scratch_c = Rc::clone(&scratch);
                 let img_cache_c = Rc::clone(&img_cache);
                 let rgba = surf.as_mut().unwrap().render(|ctx, rects| {
-                    *out_msgs_c.borrow_mut() = crate::egui_view::render_view(
+                    *out_msgs_c.borrow_mut() = render::egui_view::render_view(
                         ctx,
                         &view,
                         &mut scratch_c.borrow_mut(),

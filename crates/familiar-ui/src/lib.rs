@@ -73,6 +73,22 @@ pub enum Msg {
     TextChanged(Id, String),
 }
 
+/// Flex layout properties (Flutter's BoxConstraints + Expanded combined).
+/// Applied via `.width()/.height()/.flex()/.max_width()/.min_height()` builders.
+#[derive(Clone, Debug, Default)]
+pub struct FlexStyle {
+    /// Fixed width (None = auto / flex).
+    pub width: Option<f32>,
+    /// Fixed height (None = auto / flex).
+    pub height: Option<f32>,
+    /// Flex grow factor: 0 = fixed-size; >0 = share of remaining main-axis space.
+    pub flex_grow: f32,
+    pub min_width: Option<f32>,
+    pub max_width: Option<f32>,
+    pub min_height: Option<f32>,
+    pub max_height: Option<f32>,
+}
+
 /// A declarative UI node. Built fresh each frame from app state (pure) and
 /// handed to a renderer.
 #[derive(Clone, Debug)]
@@ -88,12 +104,13 @@ pub enum View {
         label: String,
         id: Id,
     },
-    /// A single-line text edit. `text` is the current value; edits arrive as
-    /// [`Msg::TextChanged`].
+    /// A text edit field. `multiline` + `desired_rows` control single vs multi.
     TextEdit {
         id: Id,
         text: String,
         hint: String,
+        multiline: bool,
+        desired_rows: usize,
     },
     /// A filled circle — a simple "pet body" shape and a customization hook.
     Circle {
@@ -102,9 +119,7 @@ pub enum View {
     },
     /// A raster image (high-res PNG with a transparent surround is the intended
     /// asset form). `src` identifies the asset; `width`/`height` are the display
-    /// size in px. The renderer pre-resizes with a high-quality filter so
-    /// downscaling stays crisp. Different pet forms = different `src`s (the app
-    /// switches between them); alignment between forms is the asset author's job.
+    /// size in px.
     Image {
         src: ImageSource,
         width: f32,
@@ -113,10 +128,12 @@ pub enum View {
     /// Stack children vertically.
     Column {
         children: Vec<View>,
+        spacing: f32,
     },
     /// Stack children horizontally.
     Row {
         children: Vec<View>,
+        spacing: f32,
     },
     /// Pad + optionally color behind `child`.
     Container {
@@ -124,18 +141,24 @@ pub enum View {
         padding: f32,
         child: Box<View>,
     },
-    /// Force a fixed size around `child` (None = unbounded on that axis).
-    SizedBox {
-        width: Option<f32>,
-        height: Option<f32>,
+    /// Apply flex constraints (width/height/flex_grow/min/max) around `child`.
+    /// The parent Column/Row reads `flex_grow` to distribute remaining space.
+    Sized {
+        style: FlexStyle,
         child: Box<View>,
+    },
+    /// A scrollable viewport (vertical). `stick_to_bottom` auto-scrolls to the
+    /// newest content (for transcript-style UIs).
+    ScrollView {
+        child: Box<View>,
+        stick_to_bottom: bool,
     },
 }
 
 impl Default for View {
     /// An empty UI (no nodes).
     fn default() -> Self {
-        View::Column { children: Vec::new() }
+        View::Column { children: Vec::new(), spacing: 0.0 }
     }
 }
 
@@ -153,7 +176,12 @@ pub fn button(label: impl Into<String>, id: Id) -> View {
 
 /// `text_edit(ID_MSG, &self.msg)` — a single-line text field.
 pub fn text_edit(id: Id, text: &str) -> View {
-    View::TextEdit { id, text: text.into(), hint: String::new() }
+    View::TextEdit { id, text: text.into(), hint: String::new(), multiline: false, desired_rows: 1 }
+}
+
+/// `text_multiline(ID_MSG, &self.msg, 5)` — a multi-line text editor.
+pub fn text_multiline(id: Id, text: &str, desired_rows: usize) -> View {
+    View::TextEdit { id, text: text.into(), hint: String::new(), multiline: true, desired_rows }
 }
 
 /// `circle(64.0, Color::CORAL)` — a filled circle (pet body).
@@ -178,14 +206,19 @@ pub fn image_src(src: ImageSource, width: f32, height: f32) -> View {
     View::Image { src, width, height }
 }
 
-/// `column(vec![...])` — vertical stack. See also the [`column!`] macro.
+/// `column(vec![...])` — vertical stack with no spacing. See [`column!`] macro.
 pub fn column(children: Vec<View>) -> View {
-    View::Column { children }
+    View::Column { children, spacing: 0.0 }
 }
 
-/// `row(vec![...])` — horizontal stack. See also the [`row!`] macro.
+/// `row(vec![...])` — horizontal stack with no spacing. See [`row!`] macro.
 pub fn row(children: Vec<View>) -> View {
-    View::Row { children }
+    View::Row { children, spacing: 0.0 }
+}
+
+/// `scroll_view(child)` — a vertical scrollable viewport.
+pub fn scroll_view(child: View) -> View {
+    View::ScrollView { child: Box::new(child), stick_to_bottom: false }
 }
 
 impl View {
@@ -209,16 +242,88 @@ impl View {
         self
     }
 
+    /// Set spacing between children (Column/Row).
+    #[must_use]
+    pub fn spacing(mut self, s: f32) -> Self {
+        match &mut self {
+            View::Column { spacing, .. } | View::Row { spacing, .. } => *spacing = s,
+            _ => {}
+        }
+        self
+    }
+
+    /// Auto-scroll to bottom (ScrollView).
+    #[must_use]
+    pub fn stick_to_bottom(mut self) -> Self {
+        if let View::ScrollView { stick_to_bottom, .. } = &mut self {
+            *stick_to_bottom = true;
+        }
+        self
+    }
+
+    // ── Flex layout builders (wrap in `Sized` or merge) ────────────────────
+
+    /// Wrap in [`View::Sized`] with flex constraints. If already `Sized`, merge.
+    fn wrap_flex(self, f: impl FnOnce(&mut FlexStyle)) -> Self {
+        match self {
+            View::Sized { mut style, child } => {
+                f(&mut style);
+                View::Sized { style, child }
+            }
+            other => {
+                let mut style = FlexStyle::default();
+                f(&mut style);
+                View::Sized { style, child: Box::new(other) }
+            }
+        }
+    }
+
+    /// Set flex grow factor (>0 = share of remaining main-axis space).
+    #[must_use]
+    pub fn flex(self, grow: f32) -> Self {
+        self.wrap_flex(|s| s.flex_grow = grow)
+    }
+
+    /// Set a fixed width.
+    #[must_use]
+    pub fn width(self, w: f32) -> Self {
+        self.wrap_flex(|s| s.width = Some(w))
+    }
+
+    /// Set a fixed height.
+    #[must_use]
+    pub fn height(self, h: f32) -> Self {
+        self.wrap_flex(|s| s.height = Some(h))
+    }
+
+    /// Set a max width constraint.
+    #[must_use]
+    pub fn max_width(self, w: f32) -> Self {
+        self.wrap_flex(|s| s.max_width = Some(w))
+    }
+
+    /// Set a min width constraint.
+    #[must_use]
+    pub fn min_width(self, w: f32) -> Self {
+        self.wrap_flex(|s| s.min_width = Some(w))
+    }
+
+    /// Set a max height constraint.
+    #[must_use]
+    pub fn max_height(self, h: f32) -> Self {
+        self.wrap_flex(|s| s.max_height = Some(h))
+    }
+
+    /// Set a min height constraint.
+    #[must_use]
+    pub fn min_height(self, h: f32) -> Self {
+        self.wrap_flex(|s| s.min_height = Some(h))
+    }
+
     /// Wrap in a [`View::Container`] with the given padding.
     #[must_use]
     pub fn padding(self, p: f32) -> Self {
         View::Container { color: None, padding: p, child: Box::new(self) }
-    }
-
-    /// Wrap in a [`View::SizedBox`] with a fixed width.
-    #[must_use]
-    pub fn width(self, w: f32) -> Self {
-        View::SizedBox { width: Some(w), height: None, child: Box::new(self) }
     }
 }
 
@@ -246,7 +351,7 @@ mod tests {
             text_edit(2, "x"),
         ];
         match v {
-            View::Column { children } => {
+            View::Column { children, .. } => {
                 assert_eq!(children.len(), 3);
                 assert!(matches!(children[1], View::Button { id: 7, .. }));
             }

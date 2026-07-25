@@ -8,9 +8,20 @@ publish.workspace = true
 
 [dependencies]
 core = { workspace = true }
+ui = { workspace = true }
+
+[dependencies.egui]
+version = "0.28"
+optional = true
+
+[dependencies.image]
+version = "0.25"
+default-features = false
+features = ["png"]
+optional = true
 
 [features]
 default = []
-# Future GPU backends, chosen after the docs/rendering.md spike:
-#   gpu-wgpu     = ["dep:wgpu"]
-#   gpu-femtovg  = ["dep:femtovg"]
+# egui binder: renders a `ui::View` tree via egui. Platform-agnostic — the
+# platform crate provides the window/surface; this provides the widget mapping.
+egui = ["dep:egui", "dep:image"]

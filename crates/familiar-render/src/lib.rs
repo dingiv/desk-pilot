@@ -3,6 +3,16 @@
 //! The concrete GPU renderer (wgpu / femtovg / ...) is picked after the survey
 //! in docs/rendering.md. Until then this CPU path both proves the pipeline and
 //! doubles as the "worst case: minimal own engine" fallback.
+//!
+//! # egui feature
+//! Behind the `egui` feature, this crate hosts the egui binder for the
+//! declarative [`ui::View`] tree — see [`egui_view`]. This is the platform-
+//! agnostic rendering layer; the platform crate (GTK4 / Win / Mac) provides
+//! the window + wgpu surface, then calls `egui_view::render_view`.
+
+/// egui binder for the `ui::View` tree (behind the `egui` feature).
+#[cfg(feature = "egui")]
+pub mod egui_view;
 
 use core::{Canvas, Color, PetShape, Scene};
 

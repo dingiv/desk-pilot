@@ -1,0 +1,10 @@
+# familiar.yaml — runtime config for geek-familiar.
+# Loaded by FileLoader: dev → apps/geek-familiar/familiar.yaml
+#                       prod → ~/.desk-pilot/familiar.yaml
+# Edit this file (or the prod copy) to change settings without recompiling.
+
+# audio-aura daemon SSE address (where the ASR transcript stream comes from).
+aura_addr: "127.0.0.1:9091"
+
+# Pet skin asset (resolved via the ui crate's SKIN namespace).
+skin: "default/idle.png"

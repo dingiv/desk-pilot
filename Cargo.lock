@@ -2393,6 +2393,10 @@ dependencies = [
  "familiar-core",
  "platform",
  "render",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "shared",
  "ui",
 ]
 
@@ -5164,8 +5168,8 @@ dependencies = [
  "egui-wgpu",
  "familiar-core",
  "gtk4",
- "image",
  "pollster",
+ "render",
  "ui",
 ]
 
@@ -5760,7 +5764,10 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "render"
 version = "0.1.0"
 dependencies = [
+ "egui",
  "familiar-core",
+ "image",
+ "ui",
 ]
 
 [[package]]
