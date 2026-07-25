@@ -34,7 +34,11 @@ pub enum ComposeState {
 }
 
 /// Per-input-context mutable state. Created fresh for each IME context, mutated
-/// by [`StateMachine::step`], queried by the C ABI layer for candidates.
+/// by [`StateMachine::step`], queried by the platform frontend for rendering.
+///
+/// This is the **cross-platform UI state** — every platform adapter (fcitx5,
+/// ibus, TSF, IMK) reads these fields to build its native candidate window.
+/// The engine owns this data; the frontend owns the pixels.
 #[derive(Debug, Clone, Default)]
 pub struct StateMachine {
     pub state: ComposeState,
@@ -43,12 +47,25 @@ pub struct StateMachine {
     pub buffer: String,
     /// The preedit text currently displayed in the application's input field.
     /// Updated every time the composition changes, cleared on commit/reset.
-    /// Guaranteed to match what `setClientPreedit` was last called with.
     pub preedit: String,
     /// Cursor position within `preedit` (byte offset). Updated alongside preedit.
     pub cursor: usize,
-    /// Current hanzi candidates (Pinyin mode only).
+    /// All hanzi candidates for the current pinyin input (Pinyin mode only).
+    /// This is the FULL list — the frontend applies pagination via `candidate_page`
+    /// and `candidate_page_size`.
     pub candidates: Vec<String>,
+    /// true when the current `candidates` were produced by the latest keystroke
+    /// (not carried over from a previous, shorter buffer). false = stale.
+    pub candidates_fresh: bool,
+    /// Which candidate is highlighted (0-based index into the FULL `candidates` list).
+    /// The frontend maps this to the visible page.
+    pub candidate_highlight: usize,
+    /// Current page of candidates (0-based). Frontend computes this from
+    /// `candidate_highlight / candidate_page_size`.
+    pub candidate_page: usize,
+    /// Number of candidates per page. Controlled by the frontend (engine doesn't
+    /// care about page boundaries — it provides the full list).
+    pub candidate_page_size: usize,
 }
 
 impl StateMachine {
@@ -85,6 +102,21 @@ impl StateMachine {
         self.preedit.clear();
         self.cursor = 0;
         self.candidates.clear();
+        self.candidate_highlight = 0;
+        self.candidate_page = 0;
+        self.candidates_fresh = false;
+    }
+
+    /// Move the candidate highlight to a different candidate. Called by the
+    /// frontend when the user presses up/down arrows or clicks a candidate.
+    pub fn move_highlight(&mut self, delta: i32) {
+        if self.candidates.is_empty() { return; }
+        let new = (self.candidate_highlight as i32 + delta)
+            .clamp(0, self.candidates.len() as i32 - 1) as usize;
+        self.candidate_highlight = new;
+        if self.candidate_page_size > 0 {
+            self.candidate_page = new / self.candidate_page_size;
+        }
     }
 
     // ── Idle handlers ─────────────────────────────────────────────────────
@@ -102,6 +134,7 @@ impl StateMachine {
             self.buffer.push(ch);
             self.preedit = self.buffer.clone();
             self.cursor = self.preedit.len();
+            self.candidates_fresh = false;
             return self.query_pinyin(env);
         }
         ImeAction::PassThrough
@@ -151,6 +184,7 @@ impl StateMachine {
                 self.buffer.push(c);
                 self.preedit = self.buffer.clone();
                 self.cursor = self.preedit.len();
+                self.candidates_fresh = false; // reset before query
                 self.query_pinyin(env)
             }
             c => self.pinyin_terminator(c),
@@ -159,8 +193,16 @@ impl StateMachine {
 
     fn query_pinyin(&mut self, env: &dyn StepEnv) -> ImeAction {
         let cands = env.pinyin().candidates(&self.buffer);
-        self.candidates.clone_from(&cands);
-        if cands.is_empty() {
+        // Only replace candidates when the new query produces results — a
+        // partial syllable (e.g. "niha") may return empty, and we must not
+        // overwrite the last good candidates ("你/呢") so space still works.
+        if !cands.is_empty() {
+            self.candidates.clone_from(&cands);
+            self.candidate_highlight = 0;  // reset highlight on new candidates
+            self.candidate_page = 0;
+            self.candidates_fresh = true;
+        }
+        if self.candidates.is_empty() {
             ImeAction::Preedit { text: self.preedit.clone(), cursor: self.cursor }
         } else {
             ImeAction::Candidates {
@@ -176,6 +218,7 @@ impl StateMachine {
         self.buffer.pop();
         self.preedit = self.buffer.clone();
         self.cursor = self.preedit.len();
+        self.candidates_fresh = false;
         if self.buffer.is_empty() {
             self.state = ComposeState::Idle;
             ImeAction::PassThrough
@@ -192,21 +235,34 @@ impl StateMachine {
     }
 
     fn pinyin_space(&mut self) -> ImeAction {
-        let top = self.candidates.first().cloned();
-        self.buffer.clear();
-        self.candidates.clear();
+        let raw = std::mem::take(&mut self.buffer);
+        let fresh = self.candidates_fresh;
+        self.candidates_fresh = false;
         self.state = ComposeState::Idle;
-        ImeAction::Commit(top.unwrap_or_default())
+        if !fresh {
+            self.candidates.clear();
+            return ImeAction::Commit(raw);
+        }
+        let idx = self.candidate_highlight.min(self.candidates.len().saturating_sub(1));
+        let picked = self.candidates.get(idx).cloned();
+        self.candidates.clear();
+        ImeAction::Commit(picked.unwrap_or(raw))
     }
 
     fn pinyin_terminator(&mut self, ch: char) -> ImeAction {
+        let fresh = self.candidates_fresh;
         let top = self.candidates.first().cloned();
-        self.buffer.clear();
-        self.candidates.clear();
+        let raw = std::mem::take(&mut self.buffer);
+        self.candidates_fresh = false;
         self.state = ComposeState::Idle;
+        if !fresh {
+            self.candidates.clear();
+            return ImeAction::Commit(format!("{raw}{ch}"));
+        }
+        self.candidates.clear();
         match top {
             Some(t) => ImeAction::Commit(format!("{t}{ch}")),
-            None => ImeAction::PassThrough,
+            None => ImeAction::Commit(format!("{raw}{ch}")),
         }
     }
 }

@@ -222,6 +222,73 @@ pub trait PlatformIme {
 
 `ImeState` 持有当前累积的 typing buffer（trigger 前缀）、Matcher 引用、SnippetStore 引用。
 
+## 架构：前后端分离
+
+IME 跨平台的核心架构决策：**后端(ime-core)拥有全部 UI 状态数据,前端(平台 adapter)只负责渲染**。不同平台的输入法框架和 UI 截然不同,但驱动 UI 的状态数据完全一致。
+
+```
+┌── 后端 (跨平台共享) ──────────────────────────┐
+│ crates/ime-core                                │
+│                                                │
+│ StateMachine {                                  │
+│   // 输入状态                                    │
+│   buffer: String            // 用户原始输入        │
+│   state: ComposeState       // Idle/Snippet/Pinyin│
+│                                                │
+│   // UI 状态 (所有平台前端都读这些字段)              │
+│   preedit: String           // 预编辑文本 + 光标    │
+│   cursor: usize                                  │
+│   candidates: Vec<String>   // 全部候选词列表       │
+│   candidate_highlight: usize // 当前高亮候选(0-based)│
+│   candidate_page: usize     // 当前页码             │
+│   candidate_page_size: usize // 每页候选数           │
+│ }                                              │
+│       ▲ 读/写                                  │
+│ Dispatcher  ◄── process_key(ch)                │
+│       │                                        │
+│       └── ImeAction(Commit/Preedit/Candidates) │
+└────────────────────────────────────────────────┘
+         │                              │
+    ┌────▼────┐                   ┌────▼────┐
+    │ fcitx5  │                   │  ibus   │  ...
+    │ adapter │                   │ adapter │
+    │ (.so +  │                   │ (DBus   │
+    │  C++)   │                   │  引擎)   │
+    └────┬────┘                   └────┬────┘
+         │                              │
+    ┌────▼────┐                   ┌────▼────┐
+    │ classicui│                  │ ibus    │
+    │ (候选窗)  │                  │ panel   │
+    └─────────┘                   └─────────┘
+```
+
+**前后端职责**:
+
+| | 后端(ime-core) | 前端(platform adapter) |
+|---|---|---|
+| 拥有 | 状态机 + 候选数据 + 分页状态 | 平台原生窗口/候选窗句柄 |
+| 输入 | `process_key(ch)` → `ImeAction` | OS IME 框架调 `keyEvent` → 转发 |
+| 输出 | ImeAction (Commit/Preedit/Candidates) | 读 `StateMachine` 的 UI 字段 → 渲染 |
+| 翻页 | `move_highlight(delta)` + `candidate_page` 更新 | 平台框架或自定义翻页键 → 调 `move_highlight` |
+| 选词 | `select(index)` → Commit | 候选窗数字键/点击 → 调 `select` |
+
+**跨平台要点**:
+- `StateMachine` 的所有字段都是 `pub`、可序列化,前端随意读取
+- 分页状态(`candidate_page`/`candidate_page_size`)在引擎侧维护,前端只管切页时回读
+- 每个平台 adapter 只需要实现 ~300 行代码:按键→`process_key`、读 `StateMachine` 渲染候选窗、`select` 上屏
+- 前端完全控制 UI 外观(候选窗大小/颜色/字体),后端只提供数据
+
+当前实现:fcitx5 adapter (`release/fcitx/engine.cpp` + `ffi.rs`) 约 200 行 C++ + 150 行 Rust C ABI,对应关系:
+
+| 后端 | fcitx5 前端 |
+|---|---|
+| `StateMachine.preedit` | `ic->inputPanel().setClientPreedit(text)` |
+| `StateMachine.candidates` | `CommonCandidateList::append(...)` |
+| `StateMachine.candidate_page_size` | `CommonCandidateList::setPageSize(7)` |
+| `ImeAction::Commit` | `ic->commitString(text)` |
+| `ImeAction::Preedit` | `ic->updatePreedit()` |
+| `ImeAction::Candidates` | `ic->updateUserInterface(InputPanel)` |
+
 ## 跨平台策略
 
 四平台 IME 底层完全不同 — 不存在统一的跨平台 IME 抽象库。对策：和 `scout-drivers` 完全相同的模式 — **平台各写一个适配器，共享 100% 的 `ime-core`**。

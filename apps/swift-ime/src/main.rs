@@ -15,7 +15,7 @@
 //! cargo run -p swift-ime -- --backend ibus
 //! ```
 
-mod backends;
+mod frontends;
 mod bridge;
 
 use anyhow::Result;
@@ -50,7 +50,7 @@ fn main() -> Result<()> {
 
         "ibus" => {
             info!("ibus backend — stub (Phase 4)");
-            backends::ibus::IbusAdapter::new();
+            frontends::ibus::IbusAdapter::new();
             std::thread::park();
         }
 

@@ -5,8 +5,8 @@ pub mod ibus;
 pub mod tsf;
 pub mod imk;
 
-// C ABI types and constants — defined in the library target (src/lib.rs → ffi module).
-pub use swift_ime::ffi::{ImeActionFFI, CandidateFFI, MAX_CANDIDATES};
+// C ABI types and constants — defined in fcitx5.rs (the fcitx5 frontend module).
+pub use crate::frontends::fcitx5::{ImeActionFFI, CandidateFFI, MAX_CANDIDATES};
 
 use ime_core::ImeAction;
 

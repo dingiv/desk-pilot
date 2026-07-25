@@ -91,6 +91,12 @@ pub extern "C" fn swift_ime_process_key(
     let (ffi, mut text) = with_ctx(ctx, |disp, sm| {
         let action = disp.process_key(c, sm);
         let (f, t) = translate(action);
+        // #wait demo: intercept the "__WAIT_DEMO__" expansion here.
+        // Don't commit — start async preedit mode instead.
+        if t == "__WAIT_DEMO__" {
+            start_wait(ctx as usize);
+            return (ImeActionFFI::Preedit, String::from("a"));
+        }
         // Candidates: pass the preedit (what the app shows) as out_text so
         // the C++ glue can display it above the candidate window.
         let t = if f == ImeActionFFI::Candidates { sm.preedit.clone() } else { t };
@@ -193,6 +199,61 @@ pub extern "C" fn swift_ime_reset(ctx: *const ::std::ffi::c_void) {
     with_ctx(ctx, |disp, sm| disp.reset(sm));
 }
 
+// ── Async preedit demo (#wait) ────────────────────────────────────────────
+
+use std::time::Instant;
+
+struct WaitState {
+    trigger_time: Instant,
+    chars: Vec<(u64, char)>, // (offset_ms, char)
+}
+
+static ASYNC_WAITS: LazyLock<Mutex<HashMap<usize, WaitState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// C++ timer calls this periodically. Returns the current async preedit text
+/// (empty string if no #wait is active for `ctx`). Once the sequence is
+/// complete, removes the state and returns the final text for commit.
+#[no_mangle]
+pub extern "C" fn swift_ime_poll_async(
+    ctx: *const ::std::ffi::c_void,
+    out_text: *mut u8,
+    out_cap: u32,
+    out_len: *mut u32,
+) -> i32 {
+    // 0 = nothing, 1 = preedit updated, 2 = commit (sequence done)
+    let mut waits = ASYNC_WAITS.lock().unwrap();
+    let Some(ws) = waits.get(&(ctx as usize)) else {
+        return 0;
+    };
+    let elapsed_ms = ws.trigger_time.elapsed().as_millis() as u64;
+    let text: String = ws
+        .chars
+        .iter()
+        .filter(|(t, _)| *t <= elapsed_ms)
+        .map(|(_, c)| *c)
+        .collect();
+    if elapsed_ms > 2100 {
+        // Sequence complete — commit "abc" and remove state.
+        waits.remove(&(ctx as usize));
+        unsafe { write_out(text.as_bytes(), out_text, out_cap, out_len); }
+        return 2;
+    }
+    unsafe { write_out(text.as_bytes(), out_text, out_cap, out_len); }
+    1
+}
+
+/// Called from swift_ime_process_key when the #wait trigger fires.
+fn start_wait(ctx: usize) {
+    ASYNC_WAITS.lock().unwrap().insert(
+        ctx,
+        WaitState {
+            trigger_time: Instant::now(),
+            chars: vec![(0, 'a'), (1000, 'b'), (2000, 'c')],
+        },
+    );
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────
 
 fn load_store(config_path: *const c_char) -> SnippetStore {
@@ -226,5 +287,28 @@ unsafe fn write_out(text: &[u8], out: *mut u8, cap: u32, out_len: *mut u32) {
 const DEFAULT_SNIPPETS: &str = r##"[
     {"trigger": "/greet", "expand": "你好，我是 AI 秘书，请问有什么可以帮你的？", "desc": "通用问候语"},
     {"trigger": "/sig",   "expand": "Best regards,\nAlice\n$DATE",          "desc": "邮件签名"},
-    {"trigger": "#date",  "expand": "2026-07-23",                             "desc": "今日日期（固定）"}
+    {"trigger": "#date",  "expand": "2026-07-23",                             "desc": "今日日期（固定）"},
+    {"trigger": "#wait",  "expand": "__WAIT_DEMO__",                          "desc": "异步 preedit demo"}
 ]"##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::{CStr, CString};
+
+    #[test]
+    fn ffi_roundtrip_init_process_reset() {
+        let ctx = 1usize as *const std::ffi::c_void;
+        let path = CString::new("").unwrap();
+        assert_eq!(swift_ime_init(path.as_ptr()), 0);
+        let mut buf = vec![0u8; 256];
+        let mut len: u32 = 0;
+        let a = swift_ime_process_key(ctx, '/' as u32, buf.as_mut_ptr(), 256, &mut len);
+        assert_eq!(a, ImeActionFFI::Preedit);
+        swift_ime_reset(ctx);
+        let mut buf2 = vec![0u8; 256];
+        let mut len2: u32 = 0;
+        let a2 = swift_ime_process_key(ctx, '/' as u32, buf2.as_mut_ptr(), 256, &mut len2);
+        assert_eq!(a2, ImeActionFFI::Preedit);
+    }
+}

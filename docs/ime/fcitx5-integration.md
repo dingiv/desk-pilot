@@ -284,3 +284,67 @@ if (event.key().checkKeyList(*config_.commitRawInput)) {
 | `fcitx5/src/lib/fcitx/inputcontextproperty.h` | InputContextProperty + FactoryFor 模板 |
 | `fcitx5/src/lib/fcitx/candidatelist.h` | CommonCandidateList + PageableCandidateList |
 | `fcitx5/src/lib/fcitx/inputpanel.h` | InputPanel(setClientPreedit/setCandidateList) |
+
+## 9. 候选窗 UI 控制能力
+
+fcitx5 的候选窗由 **引擎**(填数据) 和 **UI addon**(画像素) 分离协作。引擎通过 `InputPanel` 控制显示什么,UI addon(classicui/kimpanel)负责渲染。
+
+### 9.1 InputPanel 布局
+
+```
+┌─── AuxUp ───────────────────┐   setAuxUp("nihao")       ← 候选上方的拼音
+│                             │
+│  1.你好  2.泥壕  3.尼...     │   setCandidateList(...)    ← 候选列表
+│                             │
+└─── AuxDown ─────────────────┘   setAuxDown("提示")        ← 候选下方(罕见)
+```
+
+### 9.2 CommonCandidateList 内置交互
+
+| 能力 | API | 说明 |
+|---|---|---|
+| 分页 | `setPageSize(7)` | 每页 7 个,`-`/`=` 翻页 |
+| 翻页后光标归位 | `setCursorPositionAfterPaging(ResetToFirst)` | 翻页后高亮第一候选 |
+| 数字键选词 | `setSelectionKey(keys)` | 默认 1-9,不设自动绑定 |
+| 候选间移动 | `toCursorMovable()->nextCandidate()` | 上下箭头移动高亮 |
+| 自定义标签 | `setLabels({"①","②",...})` | 替换数字标签 |
+| 布局方向 | `setLayoutHint(Vertical/Horizontal)` | 横排或竖排 |
+| 右键菜单 | `setActionableImpl(...)` | 每候选可加操作(fcitx5 ≥ 5.1.10) |
+
+### 9.3 引擎控制 vs 需要自写 UI
+
+| 能力 | 框架提供 | 需要自写 UI addon |
+|---|---|---|
+| 候选内容(文字、顺序) | ✅ 引擎完全控制 | — |
+| 拼音显示(AuxUp) | ✅ `setAuxUp` | — |
+| 数字键选词 | ✅ 内置(1-9) | — |
+| 翻页(`-`/`=` PgUp/PgDn) | ✅ 内置(`setPageSize`) | — |
+| 方向键移动候选光标 | ✅ 内置 | — |
+| 候选颜色/字体/大小 | ❌ | 自写 `UserInterface` addon |
+| 候选窗位置/形状 | ❌ | 自写 UI addon |
+| 候选上图标/emoji/富文本 | ❌ | 自写 UI addon |
+| snippet 展开预览 | ❌ | 自写 UI addon 或走 familiar socket |
+| #asr 语音缓冲状态 | ❌ | 同上 |
+| 候选右键菜单 | ⚠️ `ActionableCandidateList`(5.1.10) | 框架原生,需 ≥5.1.10 |
+
+### 9.4 自写 UI addon 框架
+
+如需自定义外观,可写独立 `UserInterface` addon(`.so`):
+
+```cpp
+class MyUI : public UserInterface {
+    void update(UserInterfaceComponent c, InputContext *ic) override {
+        // 拿到 InputPanel 全部数据(auxUp, auxDown, preedit, candidateList)
+        // 用任意工具渲染: GTK4, egui, Skia, QML...
+    }
+    bool available() override;
+    void suspend() override;
+    void resume() override;
+};
+```
+
+参考实现:
+- fcitx5 classicui: ~4000 行 C++/XCB 渲染
+- fcitx5 kimpanel: KDE 面板风格,DBus 通信
+
+**策略**:Phase 1-2 用框架内置 UI(CommonCandidateList 已覆盖中文输入基础体验)。Phase 3 如需自定义外观/emoji/语音状态,写 Rust + GTK4 UI addon(和 familiar 同栈)。

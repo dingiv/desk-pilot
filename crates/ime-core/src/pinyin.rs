@@ -12,7 +12,7 @@ pub struct InputxPinyin(inputx_pinyin::PinyinEngine);
 
 impl InputxPinyin {
     pub fn new() -> Self {
-        Self(inputx_pinyin::PinyinEngine::new())
+        Self(inputx_pinyin::PinyinEngine::with_fuzzy(inputx_pinyin::FuzzyConfig::permissive()))
     }
 }
 
@@ -27,11 +27,24 @@ impl PinyinEngine for InputxPinyin {
         if pinyin.is_empty() {
             return Vec::new();
         }
+        // Step 1: exact syllable match (with fuzzy expansion).
         let mut session = inputx_pinyin::Session::new(&self.0);
         for c in pinyin.chars() {
             session.input_char(c);
         }
-        session.candidates().iter().take(16).cloned().collect()
+        let exact = session.candidates();
+        if !exact.is_empty() {
+            return exact.iter().take(72).cloned().collect();
+        }
+        // Step 2: prefix fallback — the input has a trailing incomplete syllable
+        // (e.g. "zhengz"). The dict scans all words whose pinyin starts with this
+        // prefix, which is how "zhengz" finds 政治(zhengzhi)/正在(zhengzai)/挣扎(zhengzha).
+        let prefix: Vec<String> = self.0.dict().prefix(pinyin)
+            .into_iter()
+            .map(|(_py, word)| word)
+            .take(72)
+            .collect();
+        prefix
     }
 }
 

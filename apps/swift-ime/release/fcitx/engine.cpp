@@ -1,7 +1,4 @@
 // swift-ime fcitx5 addon — engine implementation
-//
-// Thin C++ glue: each fcitx5 callback calls the Rust C ABI → executes the action.
-// Verified against fcitx5 5.1.14 API.
 
 #include "engine.h"
 
@@ -9,11 +6,72 @@
 #include <fcitx/inputpanel.h>
 #include <fcitx/candidatelist.h>
 #include <fcitx/userinterfacemanager.h>
+#include <fcitx/instance.h>
 #include <fcitx-utils/key.h>
+#include <fcitx-utils/event.h>
 #include <memory>
+#include <time.h>
+
+// 全局单例锁
+static bool initialized = false;
+
+// ── Engine constructor ────────────────────────────────────────────────────
+
+SwiftImeEngine::SwiftImeEngine(fcitx::Instance *instance)
+    : instance_(instance) {
+    fcitx::KeySym syms[] = {
+        FcitxKey_1, FcitxKey_2, FcitxKey_3, FcitxKey_4, FcitxKey_5,
+        FcitxKey_6, FcitxKey_7, FcitxKey_8, FcitxKey_9, FcitxKey_0};
+    for (auto sym : syms) {
+        selectionKeys_.emplace_back(sym, fcitx::KeyStates());
+    }
+}
+
+// ── Async poll timer (for #wait / #asr background updates) ────────────────
+
+void SwiftImeEngine::startAsyncPoll() {
+    if (pollTimer_) return;
+    pollTimer_ = instance_->eventLoop().addTimeEvent(
+        CLOCK_MONOTONIC, 0, 100000,
+        [this](fcitx::EventSourceTime *source, uint64_t) {
+            // Try each known ctx in the Rust CONTEXTS map. For the demo,
+            // we rely on swift_ime_poll_async returning 0 for idle contexts
+            // and 1/2 for active ones. Walk through a small fixed set.
+            // In production, the Rust side would expose an iterator.
+            for (uintptr_t probe = 1; probe < 1024; probe++) {
+                void *ctx = (void *)probe;
+                char buf[256] = {0};
+                unsigned int len = 0;
+                int r = swift_ime_poll_async(ctx, (uint8_t *)buf, sizeof(buf), &len);
+                if (r == 0) continue;
+                // Validate: find the InputContext for this pointer.
+                // fcitx5 doesn't expose a "get IC by pointer" API, so for the
+                // demo we approximate: any raw context pointer in the Rust map
+                // came from a real InputContext* in keyEvent. We cast back.
+                auto *ic = reinterpret_cast<fcitx::InputContext *>(ctx);
+                if (r == 2) {
+                    // Sequence complete: commit and clear.
+                    ic->inputPanel().reset();
+                    ic->commitString(std::string(buf, len));
+                    ic->updatePreedit();
+                    ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+                    pollTimer_.reset();
+                    (void)source;
+                    return false;
+                }
+                // r == 1: preedit update.
+                auto text = fcitx::Text(std::string(buf, len));
+                text.setCursor(len);
+                ic->inputPanel().setClientPreedit(text);
+                ic->inputPanel().setAuxUp(text);
+                ic->updatePreedit();
+                break; // one update per tick
+            }
+            return true; // keep polling
+        });
+}
 
 // ── Candidate word — one entry in the pinyin candidate window ────────────
-// (defined early so keyEvent can append it to the candidate list)
 
 class SwiftCandidateWord : public fcitx::CandidateWord {
 public:
@@ -27,6 +85,7 @@ public:
         inputContext->inputPanel().reset();
         inputContext->commitString(std::string(out, len));
         inputContext->updatePreedit();
+        inputContext->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
     }
 
 private:
@@ -47,12 +106,8 @@ void SwiftImeEngine::deactivate(const fcitx::InputMethodEntry &entry,
     auto *ic = event.inputContext();
     if (!ic) return;
     if (event.type() != fcitx::EventType::InputContextSwitchInputMethod) {
-        // FocusOut (window defocus / window close): keep composition state
-        // alive so the user can switch back and continue typing.
         return;
     }
-    // IM-switch (user explicitly chose another input method): commit the
-    // in-progress text so nothing is lost, then clean up the context.
     char out[4096] = {0};
     unsigned int len = 0;
     swift_ime_commit_pending((void *)ic, out, sizeof(out), &len);
@@ -73,59 +128,109 @@ void SwiftImeEngine::reset(const fcitx::InputMethodEntry &entry,
 void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
                                fcitx::KeyEvent &keyEvent) {
     FCITX_UNUSED(entry);
-
     if (keyEvent.isRelease()) return;
 
-    // Key symbol → Unicode scalar value.
-    auto sym = keyEvent.key().sym();
-    uint32_t ch = fcitx::Key::keySymToUnicode(sym);
-    if (ch == 0) return; // non-printable key
-
-    // ── Call the Rust engine ──
-    char out_text[4096] = {0};
-    unsigned int out_len = 0;
     auto *ic = keyEvent.inputContext();
     if (!ic) return;
+
+    // ── Candidate-list navigation ──
+    auto candList = ic->inputPanel().candidateList();
+    if (candList && !candList->empty()) {
+        if (auto maybeIdx = keyEvent.key().keyListIndex(selectionKeys_);
+            maybeIdx >= 0 && maybeIdx < candList->size()) {
+            candList->candidate(maybeIdx).select(ic);
+            keyEvent.filterAndAccept();
+            return;
+        }
+        if (auto *movable = candList->toCursorMovable()) {
+            if (keyEvent.key().check(FcitxKey_Up)) {
+                movable->prevCandidate();
+                ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+                keyEvent.filterAndAccept(); return;
+            }
+            if (keyEvent.key().check(FcitxKey_Down)) {
+                movable->nextCandidate();
+                ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+                keyEvent.filterAndAccept(); return;
+            }
+        }
+        if (auto *pageable = candList->toPageable()) {
+            if (keyEvent.key().check(FcitxKey_minus)
+                || keyEvent.key().check(FcitxKey_Page_Up)
+                || keyEvent.key().check(FcitxKey_Left)) {
+                if (pageable->hasPrev()) {
+                    pageable->prev();
+                    ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+                }
+                keyEvent.filterAndAccept(); return;
+            }
+            if (keyEvent.key().check(FcitxKey_equal)
+                || keyEvent.key().check(FcitxKey_Page_Down)
+                || keyEvent.key().check(FcitxKey_Right)) {
+                if (pageable->hasNext()) {
+                    pageable->next();
+                    ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+                }
+                keyEvent.filterAndAccept(); return;
+            }
+        }
+        if (keyEvent.key().check(FcitxKey_Escape)) {
+            swift_ime_reset((void *)ic);
+            ic->inputPanel().reset();
+            ic->updatePreedit();
+            ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+            keyEvent.filterAndAccept(); return;
+        }
+    }
+
+    auto sym = keyEvent.key().sym();
+    uint32_t ch = fcitx::Key::keySymToUnicode(sym);
+    if (ch == 0) return;
+
+    char out_text[4096] = {0};
+    unsigned int out_len = 0;
 
     int action = swift_ime_process_key(
         (void *)ic, ch, out_text, sizeof(out_text), &out_len);
 
-    // ── Execute the returned action ──
     switch (action) {
-    case 0: // PassThrough — key goes to the application.
-        break;
+    case 0: break; // PassThrough
 
-    case 1: { // Preedit — show composing text inline.
+    case 1: { // Preedit
         keyEvent.filterAndAccept();
+        // If #wait just fired, start the async poll timer.
+        if (!pollTimer_) SwiftImeEngine::startAsyncPoll();
         auto text = fcitx::Text(std::string(out_text, out_len));
-        text.setCursor(out_len);  // cursor at end (Text constructor defaults to 0)
+        text.setCursor(out_len);
         ic->inputPanel().setClientPreedit(text);
         ic->inputPanel().setAuxUp(text);
         ic->updatePreedit();
         break;
     }
 
-    case 2: { // Commit — final text replaces any preedit.
+    case 2: { // Commit
         keyEvent.filterAndAccept();
-        ic->inputPanel().reset();  // clear stale preedit before commit
+        ic->inputPanel().reset();
         ic->commitString(std::string(out_text, out_len));
         ic->updatePreedit();
+        ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
         break;
     }
 
-    case 3: { // Candidates — build the fcitx5 LookupTable from the pinyin engine.
+    case 3: { // Candidates
         keyEvent.filterAndAccept();
         auto text = fcitx::Text(std::string(out_text, out_len));
         text.setCursor(out_len);
-        // Inline preedit in the application (underlined composing text).
         ic->inputPanel().setClientPreedit(text);
-        // Pinyin string shown ABOVE the candidate list in the IME panel.
         ic->inputPanel().setAuxUp(text);
-        // Fetch candidate list from Rust.
         SwiftImeCandidateFFI items[SWIFT_IME_MAX_CANDIDATES];
         unsigned int n = swift_ime_candidates((void *)ic, items, SWIFT_IME_MAX_CANDIDATES);
         if (n > 0) {
             auto list = std::make_unique<fcitx::CommonCandidateList>();
+            list->setSelectionKey(selectionKeys_);
+            list->setPageSize(7);
+            list->setCursorPositionAfterPaging(
+                fcitx::CursorPositionAfterPaging::ResetToFirst);
             for (unsigned int i = 0; i < n; i++) {
                 std::string text(items[i].text);
                 list->append<SwiftCandidateWord>(text, (int)i);
@@ -137,22 +242,18 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
         break;
     }
 
-    default:
-        break;
+    default: break;
     }
 }
 
 // ── Factory ──────────────────────────────────────────────────────────────
-
-static bool initialized = false;
-
 fcitx::AddonInstance *SwiftImeFactory::create(fcitx::AddonManager *manager) {
     FCITX_UNUSED(manager);
     if (!initialized) {
-        swift_ime_init(nullptr);  // nullptr = use built-in snippets
+        swift_ime_init(nullptr);
         initialized = true;
     }
-    return new SwiftImeEngine;
+    return new SwiftImeEngine(manager->instance());
 }
 
 FCITX_ADDON_FACTORY(SwiftImeFactory);
