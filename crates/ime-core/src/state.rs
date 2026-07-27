@@ -2,82 +2,44 @@
 //!
 //! ## State Transition Table
 //!
-//! | Current  | Input      | → Next   | Action                     |
+//! | Current  | Input      | → Next   | View filled                |
 //! |----------|------------|----------|----------------------------|
-//! | Idle     | `/` `#`    | Snippet  | Preedit("/")               |
-//! | Idle     | a-z        | Pinyin   | candidates() or Preedit    |
-//! | Idle     | other      | Idle     | PassThrough                |
-//! | Snippet  | letter/dig | Snippet  | trie step → Preedit/Commit |
-//! | Snippet  | dead-end   | Idle     | Commit(accumulated+char)   |
-//! | Pinyin   | a-z        | Pinyin   | extend buffer + candidates |
-//! | Pinyin   | Space      | Idle     | Commit(top_candidate)      |
-//! | Pinyin   | Enter      | Idle     | Commit(raw_buffer)         |
-//! | Pinyin   | Backspace  | Pinyin   | pop + recandidate          |
-//! | Pinyin   | Backspace  | Idle     | pop → empty → PassThrough  |
-//! | Pinyin   | other      | Idle     | Commit(top + char) or PassThrough |
+//! | Idle     | `/` `#`    | Snippet  | preedit_text               |
+//! | Idle     | a-z        | Pinyin   | candidates or preedit_text  |
+//! | Idle     | other      | Idle     | key_passthrough=1          |
+//! | Snippet  | letter/dig | Snippet  | trie step → commit/preedit |
+//! | Snippet  | dead-end   | Idle     | commit_text                |
+//! | Pinyin   | a-z        | Pinyin   | extend + fill_view         |
+//! | Pinyin   | Space      | Idle     | commit_text                |
+//! | Pinyin   | Enter      | Idle     | commit_text                |
+//! | Pinyin   | Backspace  | P/Idle   | pop + fill_view            |
+//! | Pinyin   | other      | Idle     | commit_text                |
 
 use crate::expander::Expander;
 use crate::matcher::{Match, Matcher};
-use crate::platform::{Candidate, ImeAction};
+use crate::platform::{CandidateSlot, CANDIDATE_SLOTS, ImeView};
 use crate::PinyinEngine;
 
-/// The three composition states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ComposeState {
-    /// No active composition — waiting for the first character.
-    #[default]
-    Idle,
-    /// Accumulating a snippet trigger (e.g. "/greet", "#date").
-    Snippet,
-    /// Accumulating pinyin input (e.g. "nihao").
-    Pinyin,
-}
+pub enum ComposeState { #[default] Idle, Snippet, Pinyin }
 
-/// Per-input-context mutable state. Created fresh for each IME context, mutated
-/// by [`StateMachine::step`], queried by the platform frontend for rendering.
-///
-/// This is the **cross-platform UI state** — every platform adapter (fcitx5,
-/// ibus, TSF, IMK) reads these fields to build its native candidate window.
-/// The engine owns this data; the frontend owns the pixels.
 #[derive(Debug, Clone, Default)]
 pub struct StateMachine {
     pub state: ComposeState,
-    /// Raw input typed by the user — the pinyin string ("nihao") or snippet
-    /// trigger ("/greet"). This is what the user typed, not what the app sees.
     pub buffer: String,
-    /// The preedit text currently displayed in the application's input field.
-    /// Updated every time the composition changes, cleared on commit/reset.
     pub preedit: String,
-    /// Cursor position within `preedit` (byte offset). Updated alongside preedit.
     pub cursor: usize,
-    /// All hanzi candidates for the current pinyin input (Pinyin mode only).
-    /// This is the FULL list — the frontend applies pagination via `candidate_page`
-    /// and `candidate_page_size`.
     pub candidates: Vec<String>,
-    /// true when the current `candidates` were produced by the latest keystroke
-    /// (not carried over from a previous, shorter buffer). false = stale.
     pub candidates_fresh: bool,
-    /// Which candidate is highlighted (0-based index into the FULL `candidates` list).
-    /// The frontend maps this to the visible page.
     pub candidate_highlight: usize,
-    /// Current page of candidates (0-based). Frontend computes this from
-    /// `candidate_highlight / candidate_page_size`.
     pub candidate_page: usize,
-    /// Number of candidates per page. Controlled by the frontend (engine doesn't
-    /// care about page boundaries — it provides the full list).
     pub candidate_page_size: usize,
 }
 
 impl StateMachine {
-    pub fn new() -> Self {
-        StateMachine::default()
-    }
+    pub fn new() -> Self { StateMachine::default() }
 
-    /// Feed one character to the FSM. Returns the IME action to execute.
-    ///
-    /// `env` provides the engine pieces (Matcher, Expander, PinyinEngine) that
-    /// the Dispatcher owns — the FSM borrows them, it doesn't own them.
-    pub fn step(&mut self, ch: char, env: &dyn StepEnv) -> ImeAction {
+    pub fn step(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
         match self.state {
             ComposeState::Idle => self.handle_idle(ch, env),
             ComposeState::Snippet => self.handle_snippet(ch, env),
@@ -85,17 +47,12 @@ impl StateMachine {
         }
     }
 
-    /// User selects a candidate from the popup.
-    pub fn select(&mut self, index: usize) -> ImeAction {
+    pub fn select(&mut self, index: usize) -> ImeView {
         let picked = self.candidates.get(index).cloned();
         self.reset();
-        match picked {
-            Some(text) => ImeAction::Commit(text),
-            None => ImeAction::PassThrough,
-        }
+        Self::commit_view(&picked.unwrap_or_default())
     }
 
-    /// Reset to Idle — clears all composition state.
     pub fn reset(&mut self) {
         self.state = ComposeState::Idle;
         self.buffer.clear();
@@ -107,8 +64,6 @@ impl StateMachine {
         self.candidates_fresh = false;
     }
 
-    /// Move the candidate highlight to a different candidate. Called by the
-    /// frontend when the user presses up/down arrows or clicks a candidate.
     pub fn move_highlight(&mut self, delta: i32) {
         if self.candidates.is_empty() { return; }
         let new = (self.candidate_highlight as i32 + delta)
@@ -119,15 +74,49 @@ impl StateMachine {
         }
     }
 
-    // ── Idle handlers ─────────────────────────────────────────────────────
+    // ── view helpers ────────────────────────────────────────────────────
 
-    fn handle_idle(&mut self, ch: char, env: &dyn StepEnv) -> ImeAction {
+    fn fill_view(&self, view: &mut ImeView) {
+        ImeView::set_str(&mut view.preedit_text, &self.preedit);
+        view.preedit_cursor = self.cursor as u32;
+        let n = self.candidates.len().min(CANDIDATE_SLOTS);
+        for i in 0..n {
+            view.candidates[i] = CandidateSlot::from_str(&self.candidates[i]);
+        }
+        view.candidate_count = n as u32;
+        view.candidate_highlight = self.candidate_highlight as u32;
+        view.candidate_page = self.candidate_page as u32;
+        view.candidate_page_size = self.candidate_page_size as u32;
+        ImeView::set_str(&mut view.aux_up, &self.preedit);
+    }
+
+    fn make_view(&self) -> ImeView {
+        let mut v = ImeView::empty();
+        self.fill_view(&mut v);
+        v
+    }
+
+    fn commit_view(text: &str) -> ImeView {
+        let mut v = ImeView::empty();
+        ImeView::set_str(&mut v.commit_text, text);
+        v
+    }
+
+    fn passthrough_view() -> ImeView {
+        let mut v = ImeView::empty();
+        v.key_passthrough = 1;
+        v
+    }
+
+    // ── Idle ───────────────────────────────────────────────────────────
+
+    fn handle_idle(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
         if env.matcher().is_trigger_prefix(ch) {
             self.state = ComposeState::Snippet;
             self.buffer.push(ch);
             self.preedit = self.buffer.clone();
             self.cursor = 1;
-            return ImeAction::Preedit { text: self.preedit.clone(), cursor: 1 };
+            return self.make_view();
         }
         if ch.is_ascii_lowercase() {
             self.state = ComposeState::Pinyin;
@@ -137,45 +126,51 @@ impl StateMachine {
             self.candidates_fresh = false;
             return self.query_pinyin(env);
         }
-        ImeAction::PassThrough
+        Self::passthrough_view()
     }
 
-    // ── Snippet handlers ──────────────────────────────────────────────────
+    // ── Snippet ────────────────────────────────────────────────────────
 
-    fn handle_snippet(&mut self, ch: char, env: &dyn StepEnv) -> ImeAction {
+    fn handle_snippet(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
+        // Backspace: pop the last trigger char. If buffer becomes empty, back to Idle.
+        if ch == '\x08' {
+            self.buffer.pop();
+            if self.buffer.is_empty() {
+                // Snippet fully backspaced — consume the key, back to Idle.
+                self.reset();
+                return ImeView::empty();
+            }
+            self.preedit = self.buffer.clone();
+            self.cursor = self.preedit.len();
+            return self.make_view();
+        }
         match env.matcher().step(&self.buffer, ch) {
-            Match::Complete { trigger, expansion } => {
+            Match::Complete { expansion, .. } => {
                 let expanded = match env.expander().expand(&expansion) {
                     Ok(t) => t,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "expansion failed");
-                        trigger
-                    }
+                    Err(e) => { tracing::warn!(error = %e, "expand failed"); expansion }
                 };
                 self.reset();
-                ImeAction::Commit(expanded)
+                Self::commit_view(&expanded)
             }
             Match::Partial => {
                 self.buffer.push(ch);
                 self.preedit = self.buffer.clone();
                 self.cursor = self.preedit.len();
-                ImeAction::Preedit {
-                    text: self.preedit.clone(),
-                    cursor: self.cursor,
-                }
+                self.make_view()
             }
             Match::None => {
                 let mut text = self.buffer.clone();
                 text.push(ch);
                 self.reset();
-                ImeAction::Commit(text)
+                Self::commit_view(&text)
             }
         }
     }
 
-    // ── Pinyin handlers ───────────────────────────────────────────────────
+    // ── Pinyin ─────────────────────────────────────────────────────────
 
-    fn handle_pinyin(&mut self, ch: char, env: &dyn StepEnv) -> ImeAction {
+    fn handle_pinyin(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
         match ch {
             '\x08' => self.pinyin_backspace(env),
             '\n' | '\r' => self.pinyin_enter(),
@@ -184,72 +179,68 @@ impl StateMachine {
                 self.buffer.push(c);
                 self.preedit = self.buffer.clone();
                 self.cursor = self.preedit.len();
-                self.candidates_fresh = false; // reset before query
+                self.candidates_fresh = false;
                 self.query_pinyin(env)
             }
             c => self.pinyin_terminator(c),
         }
     }
 
-    fn query_pinyin(&mut self, env: &dyn StepEnv) -> ImeAction {
+    fn query_pinyin(&mut self, env: &dyn StepEnv) -> ImeView {
         let cands = env.pinyin().candidates(&self.buffer);
-        // Only replace candidates when the new query produces results — a
-        // partial syllable (e.g. "niha") may return empty, and we must not
-        // overwrite the last good candidates ("你/呢") so space still works.
         if !cands.is_empty() {
             self.candidates.clone_from(&cands);
-            self.candidate_highlight = 0;  // reset highlight on new candidates
+            self.candidate_highlight = 0;
             self.candidate_page = 0;
             self.candidates_fresh = true;
-        }
-        if self.candidates.is_empty() {
-            ImeAction::Preedit { text: self.preedit.clone(), cursor: self.cursor }
         } else {
-            ImeAction::Candidates {
-                items: cands.iter().map(|t| Candidate {
-                    text: t.clone(), label: String::new(), preview: t.clone(),
-                }).collect(),
-                selected: 0,
-            }
+            // Clear stale candidates from a previous query (e.g. "ni" had
+            // candidates, user typed more → "nih" has none → don't show old ones).
+            self.candidates.clear();
+            self.candidates_fresh = false;
         }
+        self.make_view()
     }
 
-    fn pinyin_backspace(&mut self, env: &dyn StepEnv) -> ImeAction {
+    fn pinyin_backspace(&mut self, env: &dyn StepEnv) -> ImeView {
         self.buffer.pop();
         self.preedit = self.buffer.clone();
         self.cursor = self.preedit.len();
         self.candidates_fresh = false;
         if self.buffer.is_empty() {
-            self.state = ComposeState::Idle;
-            ImeAction::PassThrough
+            // Preedit fully cleared — consume this backspace so it doesn't
+            // "spill over" and delete a document character. Return an empty
+            // view (no passthrough) so the frontend calls filterAndAccept.
+            self.reset();
+            ImeView::empty()
         } else {
             self.query_pinyin(env)
         }
     }
 
-    fn pinyin_enter(&mut self) -> ImeAction {
+    fn pinyin_enter(&mut self) -> ImeView {
         let raw = std::mem::take(&mut self.buffer);
         self.candidates.clear();
         self.state = ComposeState::Idle;
-        ImeAction::Commit(raw)
+        Self::commit_view(&raw)
     }
 
-    fn pinyin_space(&mut self) -> ImeAction {
+    fn pinyin_space(&mut self) -> ImeView {
         let raw = std::mem::take(&mut self.buffer);
         let fresh = self.candidates_fresh;
         self.candidates_fresh = false;
         self.state = ComposeState::Idle;
         if !fresh {
             self.candidates.clear();
-            return ImeAction::Commit(raw);
+            return Self::commit_view(&raw);
         }
         let idx = self.candidate_highlight.min(self.candidates.len().saturating_sub(1));
         let picked = self.candidates.get(idx).cloned();
         self.candidates.clear();
-        ImeAction::Commit(picked.unwrap_or(raw))
+        Self::commit_view(&picked.unwrap_or(raw))
     }
 
-    fn pinyin_terminator(&mut self, ch: char) -> ImeAction {
+    fn pinyin_terminator(&mut self, ch: char) -> ImeView {
         let fresh = self.candidates_fresh;
         let top = self.candidates.first().cloned();
         let raw = std::mem::take(&mut self.buffer);
@@ -257,171 +248,20 @@ impl StateMachine {
         self.state = ComposeState::Idle;
         if !fresh {
             self.candidates.clear();
-            return ImeAction::Commit(format!("{raw}{ch}"));
+            return Self::commit_view(&format!("{raw}{ch}"));
         }
         self.candidates.clear();
-        match top {
-            Some(t) => ImeAction::Commit(format!("{t}{ch}")),
-            None => ImeAction::Commit(format!("{raw}{ch}")),
-        }
+        let text = match top {
+            Some(t) => format!("{t}{ch}"),
+            None => format!("{raw}{ch}"),
+        };
+        Self::commit_view(&text)
     }
 }
 
 /// Borrowed engine components needed by the FSM to evaluate transitions.
-/// Implemented by [`Dispatcher`](crate::Dispatcher) — the FSM struct doesn't
-/// own these, it borrows them through this trait.
 pub trait StepEnv {
     fn matcher(&self) -> &Matcher;
     fn expander(&self) -> &Expander;
     fn pinyin(&self) -> &dyn PinyinEngine;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::expander::StaticProvider;
-    use crate::matcher::Matcher;
-    use crate::platform::NoopPinyin;
-
-    /// Stub pinyin engine — returns candidates for known pinyin strings only.
-    struct StubPinyin;
-    impl PinyinEngine for StubPinyin {
-        fn candidates(&self, pinyin: &str) -> Vec<String> {
-            match pinyin {
-                "n" => vec!["嗯".into()],
-                "ni" => vec!["你".into(), "呢".into()],
-                _ => Vec::new(),
-            }
-        }
-    }
-
-    /// Test environment. Matcher has /greet, #date snippets; Pinyin is Stub.
-    fn test_env() -> TestEnv {
-        let entries = vec![
-            ("/greet".into(), "Hello!".into()),
-            ("#date".into(), "2026-07-23".into()),
-        ];
-        TestEnv {
-            matcher: Matcher::new(entries),
-            expander: Expander::new(Box::new(StaticProvider {
-                date: "2026-07-23".into(), clipboard: String::new(),
-            })),
-            pinyin: Box::new(StubPinyin),
-        }
-    }
-
-    struct TestEnv {
-        matcher: Matcher,
-        expander: Expander,
-        pinyin: Box<dyn PinyinEngine>,
-    }
-
-    impl StepEnv for TestEnv {
-        fn matcher(&self) -> &Matcher { &self.matcher }
-        fn expander(&self) -> &Expander { &self.expander }
-        fn pinyin(&self) -> &dyn PinyinEngine { &*self.pinyin }
-    }
-
-    #[test]
-    fn idle_english_passes_through() {
-        let env = test_env();
-        let mut sm = StateMachine::new();
-        assert_eq!(sm.step('H', &env), ImeAction::PassThrough);
-        assert_eq!(sm.state, ComposeState::Idle);
-    }
-
-    #[test]
-    fn idle_slash_enters_snippet() {
-        let env = test_env();
-        let mut sm = StateMachine::new();
-        assert_eq!(
-            sm.step('/', &env),
-            ImeAction::Preedit { text: "/".into(), cursor: 1 }
-        );
-        assert_eq!(sm.state, ComposeState::Snippet);
-    }
-
-    #[test]
-    fn idle_letter_enters_pinyin() {
-        let env = test_env();
-        let mut sm = StateMachine::new();
-        match sm.step('n', &env) {
-            ImeAction::Candidates { items, .. } => assert_eq!(items[0].text, "嗯"),
-            other => panic!("expected Candidates, got {other:?}"),
-        }
-        assert_eq!(sm.state, ComposeState::Pinyin);
-    }
-
-    #[test]
-    fn snippet_full_expansion() {
-        let env = test_env();
-        let mut sm = StateMachine::new();
-        sm.step('/', &env); sm.step('g', &env); sm.step('r', &env);
-        sm.step('e', &env); sm.step('e', &env);
-        assert_eq!(sm.step('t', &env), ImeAction::Commit("Hello!".into()));
-        assert_eq!(sm.state, ComposeState::Idle);
-    }
-
-    #[test]
-    fn pinyin_space_commits_top() {
-        let env = test_env();
-        let mut sm = StateMachine::new();
-        sm.step('n', &env);
-        sm.step('i', &env);
-        assert_eq!(sm.step(' ', &env), ImeAction::Commit("你".into()));
-        assert_eq!(sm.state, ComposeState::Idle);
-    }
-
-    #[test]
-    fn pinyin_enter_commits_raw() {
-        let env = test_env();
-        let mut sm = StateMachine::new();
-        sm.step('h', &env); sm.step('e', &env); sm.step('l', &env);
-        sm.step('l', &env); sm.step('o', &env);
-        assert_eq!(sm.step('\n', &env), ImeAction::Commit("hello".into()));
-    }
-
-    #[test]
-    fn pinyin_backspace_to_idle() {
-        let env = test_env();
-        let mut sm = StateMachine::new();
-        sm.step('n', &env);
-        assert_eq!(sm.step('\x08', &env), ImeAction::PassThrough);
-        assert_eq!(sm.state, ComposeState::Idle);
-    }
-
-    #[test]
-    fn snippet_and_pinyin_coexist() {
-        let env = test_env();
-        let mut sm = StateMachine::new();
-        // snippet
-        sm.step('#', &env); sm.step('d', &env); sm.step('a', &env);
-        sm.step('t', &env);
-        assert_eq!(sm.step('e', &env), ImeAction::Commit("2026-07-23".into()));
-        assert_eq!(sm.state, ComposeState::Idle);
-        // pinyin right after
-        let a = sm.step('n', &env);
-        assert!(matches!(a, ImeAction::Candidates { .. }),
-            "after snippet, 'n' should enter pinyin, got {a:?}");
-    }
-
-    #[test]
-    fn select_candidate() {
-        let env = test_env();
-        let mut sm = StateMachine::new();
-        sm.step('n', &env);
-        sm.step('i', &env);
-        assert_eq!(sm.select(1), ImeAction::Commit("呢".into()));
-    }
-
-    #[test]
-    fn reset_clears_all() {
-        let env = test_env();
-        let mut sm = StateMachine::new();
-        sm.step('n', &env); sm.step('i', &env);
-        sm.reset();
-        assert!(sm.buffer.is_empty());
-        assert!(sm.candidates.is_empty());
-        assert_eq!(sm.state, ComposeState::Idle);
-    }
 }

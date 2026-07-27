@@ -55,7 +55,7 @@ fn main() -> Result<()> {
         }
 
         "mock" => {
-            info!("mock backend — reading stdin, type /greet or /sig to test");
+            info!("mock backend — reading stdin, type /greet or #date to test");
             run_mock(&cli.config)?;
         }
 
@@ -68,7 +68,7 @@ fn main() -> Result<()> {
 }
 
 fn run_mock(config_path: &str) -> Result<()> {
-    use ime_core::{Dispatcher, Expander, Matcher, SnippetStore};
+    use ime_core::{Dispatcher, Expander, Matcher, SnippetStore, ImeView};
     use ime_core::expander::StaticProvider;
     use ime_core::state::StateMachine;
     use std::io::{self, Write};
@@ -100,24 +100,37 @@ fn run_mock(config_path: &str) -> Result<()> {
         }
         let mut sm = StateMachine::new();
         for ch in input.trim_end_matches(['\n', '\r']).chars() {
-            match dispatcher.process_key(ch, &mut sm) {
-                ime_core::ImeAction::PassThrough => {}
-                ime_core::ImeAction::Preedit { text, .. } => {
-                    print!("[{text}]");
-                    io::stdout().flush()?;
+            let view = dispatcher.process_key(ch, &mut sm);
+
+            if view.key_passthrough != 0 {
+                // key passes through to app
+                continue;
+            }
+
+            let commit = ImeView::str_field(&view.commit_text);
+            if !commit.is_empty() {
+                println!(" → {commit}");
+                continue;
+            }
+
+            let preedit = ImeView::str_field(&view.preedit_text);
+            if view.candidate_count > 0 {
+                let mut cands = String::new();
+                for i in 0..view.candidate_count as usize {
+                    if i > 0 { cands.push('/'); }
+                    cands.push_str(ImeView::str_field(&view.candidates[i].text));
                 }
-                ime_core::ImeAction::Commit(text) => {
-                    println!(" → {text}");
-                }
-                ime_core::ImeAction::Candidates { items, .. } => {
-                    let joined: Vec<&str> = items.iter().map(|c| c.text.as_str()).collect();
-                    print!("[{} → {}]", sm.buffer, joined.join("/"));
-                    io::stdout().flush()?;
-                }
+                print!("[{preedit} → {cands}]");
+                io::stdout().flush()?;
+            } else if !preedit.is_empty() {
+                print!("[{preedit}]");
+                io::stdout().flush()?;
             }
         }
         if !sm.buffer.is_empty() {
             println!(" → {}", sm.buffer);
+        } else {
+            println!();
         }
     }
     Ok(())

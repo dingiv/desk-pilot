@@ -13,5 +13,5 @@ pub mod state;
 pub use dispatcher::Dispatcher;
 pub use expander::Expander;
 pub use matcher::Matcher;
-pub use platform::{ImeAction, PinyinEngine};
+pub use platform::{ImeView, CandidateSlot, CANDIDATE_SLOTS, PinyinEngine};
 pub use snippet_store::SnippetStore;
