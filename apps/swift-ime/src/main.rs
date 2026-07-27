@@ -67,26 +67,12 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_mock(config_path: &str) -> Result<()> {
-    use ime_core::{Dispatcher, Expander, Matcher, SnippetStore, ImeView};
-    use ime_core::expander::StaticProvider;
-    use ime_core::state::StateMachine;
+fn run_mock(_config_path: &str) -> Result<()> {
+    use ime_core::engine::{ImeEngine, InputEvent};
+    use ime_core::ImeView;
     use std::io::{self, Write};
 
-    let store = std::fs::read_to_string(config_path)
-        .ok()
-        .and_then(|s| SnippetStore::from_json(&s).ok())
-        .unwrap_or_else(|| {
-            SnippetStore::from_json(DEFAULT_SNIPPETS).unwrap_or_else(|_| SnippetStore::new())
-        });
-
-    let matcher = Matcher::new(store.entries());
-    let expander = Expander::new(Box::new(StaticProvider {
-        date: "2026-07-23".into(),
-        clipboard: String::new(),
-    }));
-    eprintln!("loading pinyin dictionary …");
-    let dispatcher = Dispatcher::new(matcher, expander);
+    let mut engine = ImeEngine::new();
     println!("swift-ime mock — type a line and press Enter. Trigger prefixes: / and #");
     println!("Type /greet, #date, or pinyin (ni, nihao) to test. Ctrl-C to exit.\n");
 
@@ -96,14 +82,12 @@ fn run_mock(config_path: &str) -> Result<()> {
         print!("> ");
         io::stdout().flush()?;
         if io::stdin().read_line(&mut input)? == 0 {
-            break;
+            break Ok(());
         }
-        let mut sm = StateMachine::new();
         for ch in input.trim_end_matches(['\n', '\r']).chars() {
-            let view = dispatcher.process_key(ch, &mut sm);
+            let view = engine.predict(InputEvent::char(ch));
 
             if view.key_passthrough != 0 {
-                // key passes through to app
                 continue;
             }
 
@@ -127,17 +111,13 @@ fn run_mock(config_path: &str) -> Result<()> {
                 io::stdout().flush()?;
             }
         }
-        if !sm.buffer.is_empty() {
-            println!(" → {}", sm.buffer);
+        // Commit any remaining buffer (emulates Enter at end of line).
+        let tail = engine.buffer();
+        if !tail.is_empty() {
+            println!(" → {tail}");
+            engine.predict(InputEvent::enter());
         } else {
             println!();
         }
     }
-    Ok(())
 }
-
-const DEFAULT_SNIPPETS: &str = r##"[
-    {"trigger": "/greet", "expand": "你好，我是 AI 秘书，请问有什么可以帮你的？", "desc": "通用问候语"},
-    {"trigger": "/sig", "expand": "Best regards,\nAlice\n$DATE", "desc": "邮件签名"},
-    {"trigger": "#date", "expand": "2026-07-23", "desc": "今日日期（固定）"}
-]"##;

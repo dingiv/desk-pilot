@@ -3,8 +3,11 @@
 //! Zero OS dependencies — cross-compilable and fully unit-testable.
 
 pub mod dispatcher;
+pub mod engine;
 pub mod expander;
+pub mod family;
 pub mod matcher;
+pub mod phrase_book;
 pub mod pinyin;
 pub mod platform;
 pub mod snippet_store;

@@ -1,0 +1,295 @@
+//! Candidate family system — pluggable prediction sources with unified
+//! weight-based ranking.
+//!
+//! ## Architecture
+//!
+//! Each [`CandidateFamily`] independently generates scored candidates from
+//! user input. The [`UnifiedScorer`] collects candidates from all enabled
+//! families, applies inter-family priority weighting, deduplicates, and
+//! returns a globally ranked list.
+//!
+//! ```text
+//! Input → PinyinFamily (priority=100) → [候选A:0.95, 候选B:0.80, ...]
+//!       → JianpinFamily (priority=85)  → [候选C:0.72, ...]
+//!       → EnglishFamily (priority=60)  → [black:0.88, ...]
+//!       → MagicFamily  (priority=95)   → [#date:1.0, ...]
+//!       → SnippetFamily (priority=75)  → [/greet:1.0, ...]
+//!                    ↓
+//!       UnifiedScorer::rank()
+//!         → final_score = raw_score × (priority / 100)
+//!         → sort desc, dedup
+//!                    ↓
+//!            [最终排序列表]
+//! ```
+
+use std::collections::HashSet;
+
+// ── ScoredCandidate ─────────────────────────────────────────────────────
+
+/// A candidate word with its family origin and internal score.
+#[derive(Debug, Clone)]
+pub struct ScoredCandidate {
+    /// The candidate text (hanzi, English word, snippet expansion, etc.).
+    pub text: String,
+    /// Which family produced this candidate.
+    pub family: &'static str,
+    /// Family-internal score in [0.0, 1.0]. Higher = better match.
+    pub raw_score: f64,
+}
+
+// ── InputContext ────────────────────────────────────────────────────────
+
+/// Short-term input context — what the user recently committed.
+/// Passed to every family's `predict` so they can adjust rankings
+/// based on what came before.
+#[derive(Debug, Clone, Default)]
+pub struct InputContext {
+    /// Last few committed characters (up to ~20 chars).
+    pub recent_text: String,
+    /// Last committed word (single word boundary).
+    pub last_word: String,
+}
+
+impl InputContext {
+    pub fn new() -> Self { InputContext::default() }
+
+    pub fn update(&mut self, text: &str) {
+        self.last_word = text.to_string();
+        self.recent_text.push_str(text);
+        // Keep only the last 20 characters.
+        if self.recent_text.chars().count() > 20 {
+            let skip = self.recent_text.chars().count() - 20;
+            self.recent_text = self.recent_text.chars().skip(skip).collect();
+        }
+    }
+}
+
+// ── CandidateFamily trait ───────────────────────────────────────────────
+
+/// A pluggable prediction source. Each family is an independent engine
+/// that generates candidates from the raw input buffer.
+pub trait CandidateFamily: Send + Sync {
+    /// Unique family identifier (e.g., "pinyin", "jianpin").
+    fn name(&self) -> &'static str;
+
+    /// Inter-family priority (0–100). Higher-priority families get a
+    /// larger multiplier in the final ranking.
+    fn priority(&self) -> u32;
+
+    /// Whether this family is currently active. Disabled families are
+    /// skipped entirely by the [`UnifiedScorer`].
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    /// How many top candidates this family sends to the inter-family
+    /// competition. Default: 8.
+    fn top_n(&self) -> usize {
+        8
+    }
+
+    /// Generate scored candidates from the raw input buffer.
+    fn predict(&self, input: &str) -> Vec<ScoredCandidate>;
+
+    /// Generate context-aware candidates. Default implementation delegates
+    /// to [`predict`]. Families that support context (e.g. PinyinFamily
+    /// boosting based on the previous character, AIFamily generating full
+    /// sentences) override this method.
+    fn predict_with_context(&self, input: &str, _ctx: &InputContext) -> Vec<ScoredCandidate> {
+        self.predict(input)
+    }
+}
+
+// ── UnifiedScorer ───────────────────────────────────────────────────────
+
+/// Collects candidates from all enabled families and returns a globally
+/// ranked, deduplicated list.
+pub struct UnifiedScorer {
+    families: Vec<Box<dyn CandidateFamily>>,
+}
+
+impl UnifiedScorer {
+    pub fn new(families: Vec<Box<dyn CandidateFamily>>) -> Self {
+        UnifiedScorer { families }
+    }
+
+    /// Build with the standard five families.
+    #[cfg(test)]
+    pub fn with_defaults(
+        pinyin: Box<dyn CandidateFamily>,
+        snippet: Box<dyn CandidateFamily>,
+        magic: Box<dyn CandidateFamily>,
+        english: Box<dyn CandidateFamily>,
+        jianpin: Box<dyn CandidateFamily>,
+    ) -> Self {
+        UnifiedScorer {
+            families: vec![pinyin, jianpin, magic, snippet, english],
+        }
+    }
+
+    /// Rank all candidates from all enabled families (context-free).
+    pub fn rank(&self, input: &str) -> Vec<String> {
+        self.rank_with_context(input, &InputContext::new())
+    }
+
+    /// Rank candidates with short-term context awareness.
+    ///
+    /// Algorithm:
+    /// 1. Each family generates candidates via `predict()`.
+    /// 2. Within each family, sort by `raw_score` desc, take `top_n()`.
+    /// 3. Compute `final_score = raw_score × (family.priority() / 100)`.
+    /// 4. Globally sort all candidates by `final_score` desc.
+    /// 5. Deduplicate — first occurrence (higher score) wins.
+    ///
+    /// Returns deduplicated candidate texts in rank order.
+    pub fn rank_with_context(&self, input: &str, ctx: &InputContext) -> Vec<String> {
+        if input.is_empty() {
+            return Vec::new();
+        }
+
+        let mut scored: Vec<(f64, String)> = Vec::new();
+
+        for family in &self.families {
+            if !family.enabled() {
+                continue;
+            }
+            let priority_bonus = family.priority() as f64 / 100.0;
+            let mut candidates = family.predict_with_context(input, ctx);
+
+            // Intra-family: sort by raw_score descending.
+            candidates.sort_by(|a, b| {
+                b.raw_score
+                    .partial_cmp(&a.raw_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            // Take top N representatives from this family.
+            let top_n = family.top_n();
+            for c in candidates.into_iter().take(top_n) {
+                let final_score = c.raw_score * priority_bonus;
+                scored.push((final_score, c.text));
+            }
+        }
+
+        // Global: sort by final_score descending.
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Dedup: keep only the first occurrence of each text
+        // (already highest-scoring due to sort).
+        let mut seen = HashSet::new();
+        scored
+            .into_iter()
+            .filter_map(|(_, text)| {
+                if seen.insert(text.clone()) {
+                    Some(text)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Number of registered families (including disabled ones).
+    pub fn family_count(&self) -> usize {
+        self.families.len()
+    }
+
+    /// Access a family by name.
+    pub fn family(&self, name: &str) -> Option<&dyn CandidateFamily> {
+        self.families.iter().find(|f| f.name() == name).map(|f| &**f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct StubFamily {
+        name: &'static str,
+        priority: u32,
+        candidates: Vec<(&'static str, f64)>,
+    }
+
+    impl CandidateFamily for StubFamily {
+        fn name(&self) -> &'static str { self.name }
+        fn priority(&self) -> u32 { self.priority }
+        fn predict(&self, _input: &str) -> Vec<ScoredCandidate> {
+            self.candidates.iter().map(|(t, s)| ScoredCandidate {
+                text: t.to_string(), family: self.name, raw_score: *s,
+            }).collect()
+        }
+    }
+
+    #[test]
+    fn higher_priority_wins_tie() {
+        let fam_a = StubFamily { name: "A", priority: 100, candidates: vec![("word", 0.5)] };
+        let fam_b = StubFamily { name: "B", priority: 50, candidates: vec![("word", 0.5)] };
+        let scorer = UnifiedScorer::new(vec![Box::new(fam_a), Box::new(fam_b)]);
+        let result = scorer.rank("test");
+        assert_eq!(result.len(), 1); // deduped to one
+        assert_eq!(result[0], "word");
+    }
+
+    #[test]
+    fn higher_score_within_family_wins() {
+        let fam = StubFamily { name: "P", priority: 100, candidates: vec![
+            ("low", 0.3), ("high", 0.9), ("mid", 0.6),
+        ]};
+        let scorer = UnifiedScorer::new(vec![Box::new(fam)]);
+        let result = scorer.rank("test");
+        assert_eq!(&result[..3], &["high", "mid", "low"]);
+    }
+
+    #[test]
+    fn cross_family_ranking() {
+        let pinyin = StubFamily { name: "pinyin", priority: 100, candidates: vec![
+            ("候选A", 0.7),
+        ]};
+        let english = StubFamily { name: "english", priority: 60, candidates: vec![
+            ("black", 1.0),  // raw 1.0 × 0.60 = 0.60 final
+        ]};
+        let scorer = UnifiedScorer::new(vec![Box::new(pinyin), Box::new(english)]);
+        let result = scorer.rank("bla");
+        // 候选A: 0.7 × 1.0 = 0.70, black: 1.0 × 0.6 = 0.60
+        assert_eq!(result[0], "候选A");
+        assert_eq!(result[1], "black");
+    }
+
+    #[test]
+    fn disabled_family_skipped() {
+        struct DisabledFamily;
+        impl CandidateFamily for DisabledFamily {
+            fn name(&self) -> &'static str { "disabled" }
+            fn priority(&self) -> u32 { 100 }
+            fn enabled(&self) -> bool { false }
+            fn predict(&self, _: &str) -> Vec<ScoredCandidate> {
+                vec![ScoredCandidate { text: "nope".into(), family: "disabled", raw_score: 1.0 }]
+            }
+        }
+        let fam = StubFamily { name: "ok", priority: 50, candidates: vec![("yes", 0.5)] };
+        let scorer = UnifiedScorer::new(vec![Box::new(DisabledFamily), Box::new(fam)]);
+        let result = scorer.rank("x");
+        assert_eq!(result, vec!["yes"]);
+    }
+
+    #[test]
+    fn empty_input_returns_empty() {
+        let fam = StubFamily { name: "P", priority: 100, candidates: vec![("x", 0.5)] };
+        let scorer = UnifiedScorer::new(vec![Box::new(fam)]);
+        assert!(scorer.rank("").is_empty());
+    }
+}
+
+// ── Submodule declarations ──────────────────────────────────────────────
+
+pub mod ai;
+pub mod emoji;
+pub mod english;
+pub mod jianpin;
+pub mod magic;
+pub mod pinyin;
+pub mod snippet;
+

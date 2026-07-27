@@ -1,7 +1,18 @@
 //! Dispatcher — holds the engine pieces and implements [`StepEnv`] for the FSM.
 //! The stateful composition logic lives in [`state::StateMachine`].
+//!
+//! Candidate generation is delegated to the [`UnifiedScorer`], which collects
+//! and ranks candidates from all enabled prediction families.
 
 use crate::expander::Expander;
+use crate::family::ai::AiFamily;
+use crate::family::emoji::EmojiFamily;
+use crate::family::english::EnglishFamily;
+use crate::family::jianpin::JianpinFamily;
+use crate::family::magic::MagicFamily;
+use crate::family::pinyin::PinyinFamily;
+use crate::family::snippet::SnippetFamily;
+use crate::family::UnifiedScorer;
 use crate::matcher::Matcher;
 use crate::pinyin::InputxPinyin;
 use crate::platform::ImeView;
@@ -12,16 +23,49 @@ pub struct Dispatcher {
     matcher: Matcher,
     expander: Expander,
     pinyin: Box<dyn PinyinEngine>,
+    scorer: UnifiedScorer,
 }
 
 impl Dispatcher {
     pub fn new(matcher: Matcher, expander: Expander) -> Self {
-        Dispatcher { matcher, expander, pinyin: Box::new(InputxPinyin::new()) }
+        let pinyin_family = PinyinFamily::new();
+        let snippet_family = SnippetFamily::new(matcher.clone(), expander.clone());
+        let magic_family = MagicFamily::new();
+        let english_family = EnglishFamily::new();
+        let jianpin_family = JianpinFamily::new();
+        let emoji_family = EmojiFamily::new();
+        let ai_family = AiFamily::new();
+
+        // Build in priority order.
+        let scorer = UnifiedScorer::new(vec![
+            Box::new(pinyin_family),
+            Box::new(magic_family),
+            Box::new(jianpin_family),
+            Box::new(snippet_family),
+            Box::new(english_family),
+            Box::new(emoji_family),
+            Box::new(ai_family),
+        ]);
+
+        Dispatcher {
+            matcher,
+            expander,
+            pinyin: Box::new(InputxPinyin::new()),
+            scorer,
+        }
     }
 
     #[cfg(test)]
-    pub fn new_for_test(matcher: Matcher, expander: Expander, pinyin: Box<dyn PinyinEngine>) -> Self {
-        Dispatcher { matcher, expander, pinyin }
+    pub fn new_for_test(
+        matcher: Matcher,
+        expander: Expander,
+        pinyin: Box<dyn PinyinEngine>,
+    ) -> Self {
+        // Minimal scorer for tests — just the pinyin family.
+        let pinyin_only = PinyinFamily::new();
+        let scorer = UnifiedScorer::new(vec![Box::new(pinyin_only)]);
+
+        Dispatcher { matcher, expander, pinyin, scorer }
     }
 
     pub fn process_key(&self, ch: char, sm: &mut StateMachine) -> ImeView {
@@ -29,7 +73,7 @@ impl Dispatcher {
     }
 
     pub fn select_candidate(&self, index: usize, sm: &mut StateMachine) -> ImeView {
-        sm.select(index)
+        sm.select(index, self)
     }
 
     pub fn reset(&self, sm: &mut StateMachine) {
@@ -45,6 +89,16 @@ impl StepEnv for Dispatcher {
     fn matcher(&self) -> &Matcher { &self.matcher }
     fn expander(&self) -> &Expander { &self.expander }
     fn pinyin(&self) -> &dyn PinyinEngine { &*self.pinyin }
+    fn scorer(&self) -> &UnifiedScorer { &self.scorer }
+    fn first_syllable(&self, pinyin: &str) -> Option<String> {
+        self.pinyin.first_syllable(pinyin)
+    }
+    fn record_pick(&self, pinyin: &str, word: &str) {
+        self.pinyin.record_pick(pinyin, word);
+    }
+    fn learn_phrase(&self, pinyin: &str, hanzi: &str) {
+        self.pinyin.learn_phrase(pinyin, hanzi);
+    }
 }
 
 #[cfg(test)]
@@ -54,6 +108,16 @@ mod tests {
 
     struct StubPinyin;
     impl PinyinEngine for StubPinyin {
+        fn first_syllable(&self, pinyin: &str) -> Option<String> {
+            let cand = &pinyin[..pinyin.len().min(2)];
+            if cand.chars().all(|c| c.is_ascii_lowercase()) {
+                Some(cand.to_string())
+            } else {
+                None
+            }
+        }
+        fn record_pick(&self, _pinyin: &str, _word: &str) {}
+        fn learn_phrase(&self, _pinyin: &str, _hanzi: &str) {}
         fn candidates(&self, pinyin: &str) -> Vec<String> {
             match pinyin { "n" => vec!["嗯".into()], "ni" => vec!["你".into(), "呢".into()], _ => Vec::new() }
         }

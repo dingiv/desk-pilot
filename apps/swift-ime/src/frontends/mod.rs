@@ -8,8 +8,8 @@ pub mod ibus;
 pub mod tsf;
 pub mod imk;
 
-// Re-export ImeView types from ime-core — no more ImeActionFFI/CandidateFFI wrappers.
-pub use ime_core::{ImeView, CandidateSlot, CANDIDATE_SLOTS};
+// Re-export ImeView from ime-core for use by frontend adapters.
+pub use ime_core::ImeView;
 
 /// Per-platform adapter interface.
 ///

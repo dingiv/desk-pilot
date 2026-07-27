@@ -70,6 +70,8 @@ impl App for GalleryApp {
     fn render(&self, _out: &mut Canvas) {}
 
     fn view(&self) -> View {
+        // Opaque background so the alpha-click-through scan covers the whole
+        // window (gallery needs ALL pixels interactive, unlike the pet).
         Column(vec![
             // ── Title ──
             Text("UI Gallery").color(Color::WHITE).size(22.0),
@@ -158,6 +160,7 @@ impl App for GalleryApp {
             .min_height(100.0),
         ])
         .spacing(8.0)
+        .background(Color::rgba(0x1a, 0x1a, 0x2a, 0xff)) // opaque dark bg
     }
 
     fn update(&mut self, msg: Msg) {

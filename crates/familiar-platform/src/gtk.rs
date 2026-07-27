@@ -7,6 +7,14 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+
+/// Preedit text from the IM context (ibus/fcitx). Written by the
+/// `preedit-changed` signal handler, read by the egui tick callback to render
+/// preedit inline in the focused TextEdit. Thread-local because all GTK
+/// callbacks + the egui tick run on the GTK main thread.
+thread_local! {
+    static PREEDIT: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+}
 #[cfg(not(feature = "egui"))]
 use std::time::Duration;
 
@@ -232,6 +240,14 @@ fn build_window(gtk_app: &Application, app: &Rc<RefCell<Box<dyn App>>>) {
             win.add_controller(motion);
         }
 
+        // IM context — auto-detects ibus/fcitx/etc. Created here (shared by
+        // the keyboard handler + the tick callback for cursor positioning).
+        let im = IMMulticontext::new();
+        im.set_client_widget(Some(&win));
+        im.set_use_preedit(true);
+        im.focus_in();
+        let im_for_cursor = im.clone();
+
         // Keyboard → egui, routed through GtkIMContext for IME (ibus/fcitx)
         // support. The IM context intercepts key events; when an IME is active
         // (e.g. Chinese pinyin), it shows its own candidate popup and commits
@@ -242,18 +258,38 @@ fn build_window(gtk_app: &Application, app: &Rc<RefCell<Box<dyn App>>>) {
             let surf_for_im = Rc::clone(&surface);
             let surf_for_key = Rc::clone(&surface);
 
-            // IM context — auto-detects ibus/fcitx/etc. via the desktop session.
-            let im = IMMulticontext::new();
-            im.set_client_widget(Some(&win));
-            im.set_use_preedit(true);
-            im.focus_in();
-
             // commit signal: IME committed text → forward to egui as Text event.
             let im_commit_surf = Rc::clone(&surf_for_im);
             im.connect_commit(move |_ctx, text| {
+                eprintln!("[ime] commit: text={text:?}");
                 if let Some(s) = im_commit_surf.borrow().as_ref() {
                     s.push_event(egui::Event::Text(text.to_string()));
                 }
+            });
+
+            // preedit signals: store the in-progress pinyin/etc so we can show
+            // it inline in the focused TextEdit (with a background highlight).
+            let im_preedit_surf = Rc::clone(&surf_for_im);
+            im.connect_preedit_changed(move |ctx| {
+                let (text, _attrs, cursor) = ctx.preedit_string();
+                eprintln!("[ime] preedit_changed: text={text:?} cursor={cursor}");
+                PREEDIT.with(|p| *p.borrow_mut() = text.to_string());
+                // Trigger a re-render so the preedit is visible this frame
+                // (demand-driven rendering skips when no events arrived).
+                if let Some(s) = im_preedit_surf.borrow().as_ref() {
+                    s.push_event(egui::Event::PointerMoved(egui::pos2(0.0, 0.0)));
+                }
+            });
+            let im_preedit_end_surf = Rc::clone(&surf_for_im);
+            im.connect_preedit_end(move |_| {
+                eprintln!("[ime] preedit_end — clearing");
+                PREEDIT.with(|p| p.borrow_mut().clear());
+                if let Some(s) = im_preedit_end_surf.borrow().as_ref() {
+                    s.push_event(egui::Event::PointerMoved(egui::pos2(0.0, 0.0)));
+                }
+            });
+            im.connect_preedit_start(move |_| {
+                eprintln!("[ime] preedit_start");
             });
 
             let im_for_key = im.clone();
@@ -261,9 +297,13 @@ fn build_window(gtk_app: &Application, app: &Rc<RefCell<Box<dyn App>>>) {
             ec.connect_key_pressed(move |controller, key, _code, mods| {
                 // Try IM context first (for IME: pinyin, Japanese, etc.)
                 if let Some(event) = controller.current_event() {
-                    if im_for_key.filter_keypress(&event) {
+                    let consumed = im_for_key.filter_keypress(&event);
+                    eprintln!("[ime] filter_keypress: key={key:?} consumed={consumed}");
+                    if consumed {
                         return Propagation::Stop; // IM consumed it
                     }
+                } else {
+                    eprintln!("[ime] filter_keypress: NO current_event!");
                 }
 
                 // IM didn't consume → direct egui key mapping (English, shortcuts)
@@ -320,6 +360,9 @@ fn build_window(gtk_app: &Application, app: &Rc<RefCell<Box<dyn App>>>) {
             let scratch = Rc::clone(&scratch);
             let win_cb = win.clone();
             let last_alpha = RefCell::new(None::<Vec<(i32, i32, i32, i32)>>);
+            let focused_rect = Rc::new(RefCell::new(None::<egui::Rect>));
+            let focused_id = Rc::new(RefCell::new(None::<ui::Id>));
+            let im_for_cursor = im_for_cursor.clone();
             win.add_tick_callback(move |_win, _clock| {
                 let mut surf = surface.borrow_mut();
                 if surf.is_none() {
@@ -333,6 +376,12 @@ fn build_window(gtk_app: &Application, app: &Rc<RefCell<Box<dyn App>>>) {
                 let out_msgs_c = Rc::clone(&out_msgs);
                 let scratch_c = Rc::clone(&scratch);
                 let img_cache_c = Rc::clone(&img_cache);
+                let focused_c = Rc::clone(&focused_rect);
+                focused_c.borrow_mut().take(); // clear before render
+                // Read the current preedit text from the IM context (written by
+                // the preedit-changed signal handler).
+                let preedit = PREEDIT.with(|p| p.borrow().clone());
+                let focused_id_c = Rc::clone(&focused_id);
                 let rgba = surf.as_mut().unwrap().render(|ctx, rects| {
                     *out_msgs_c.borrow_mut() = render::egui_view::render_view(
                         ctx,
@@ -340,15 +389,27 @@ fn build_window(gtk_app: &Application, app: &Rc<RefCell<Box<dyn App>>>) {
                         &mut scratch_c.borrow_mut(),
                         rects,
                         &mut img_cache_c.borrow_mut(),
+                        &mut focused_c.borrow_mut(),
+                        &preedit,
+                        &mut focused_id_c.borrow_mut(),
                     );
                 });
                 drop(surf);
+                // Update IME cursor location so candidate popup appears at the
+                // focused TextEdit, not at a default corner.
+                if let Some(r) = focused_c.borrow().as_ref() {
+                    let area = gdk::Rectangle::new(
+                        r.min.x as i32,
+                        r.min.y as i32,
+                        (r.max.x - r.min.x) as i32,
+                        (r.max.y - r.min.y) as i32,
+                    );
+                    im_for_cursor.set_cursor_location(&area);
+                }
                 for m in out_msgs.borrow_mut().drain(..) {
                     app.borrow_mut().update(m);
                 }
                 set_picture_bytes(&picture, &rgba, cw, ch);
-                // Irregular click-through: capture input only where the pet's
-                // rendered alpha is opaque; transparent areas pass through.
                 let region = alpha_input_region(&rgba, cw, ch);
                 apply_input_region(&win_cb, &region, &mut *last_alpha.borrow_mut());
                 ControlFlow::Continue

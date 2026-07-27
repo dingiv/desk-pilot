@@ -42,13 +42,14 @@ impl VariableProvider for StaticProvider {
 }
 
 /// The expander holds a [`VariableProvider`] and expands template strings.
+#[derive(Clone)]
 pub struct Expander {
-    provider: Box<dyn VariableProvider>,
+    provider: std::sync::Arc<dyn VariableProvider>,
 }
 
 impl Expander {
     pub fn new(provider: Box<dyn VariableProvider>) -> Self {
-        Expander { provider }
+        Expander { provider: std::sync::Arc::from(provider) }
     }
 
     /// Expand a template string. Variables are `$NAME` or `${NAME}`.

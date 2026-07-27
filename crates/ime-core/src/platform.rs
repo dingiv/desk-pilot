@@ -6,6 +6,17 @@
 pub trait PinyinEngine: Send + Sync {
     /// Given a pinyin string, return candidate hanzi strings (empty if no match).
     fn candidates(&self, pinyin: &str) -> Vec<String>;
+
+    /// Extract the first valid pinyin syllable from the input.
+    /// E.g., "lizhengming" → Some("li"), "kuifa" → Some("kui").
+    fn first_syllable(&self, pinyin: &str) -> Option<String>;
+
+    /// Record a user pick in inputx-pinyin's L0 layer for frequency boosting.
+    /// After 3 picks the word auto-pins to the top.
+    fn record_pick(&self, pinyin: &str, word: &str);
+
+    /// Learn a new phrase — save it for future sessions (PhraseBook).
+    fn learn_phrase(&self, pinyin: &str, hanzi: &str);
 }
 
 // ── ImeView: the cross-platform UI state snapshot ─────────────────────────

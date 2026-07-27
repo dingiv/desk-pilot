@@ -26,12 +26,15 @@ pub fn render_view(
     scratch: &mut HashMap<Id, String>,
     rects: &mut Vec<egui::Rect>,
     img_cache: &mut HashMap<ImgKey, egui::TextureHandle>,
+    focused_rect: &mut Option<egui::Rect>,
+    preedit: &str,
+    focused_id: &mut Option<Id>,
 ) -> Vec<Msg> {
     let mut msgs = Vec::new();
     let mut frame = egui::Frame::default();
     frame.fill = egui::Color32::TRANSPARENT;
     egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-        render_node(ui, ctx, view, scratch, rects, &mut msgs, img_cache);
+        render_node(ui, ctx, view, scratch, rects, &mut msgs, img_cache, focused_rect, preedit, focused_id);
     });
     msgs
 }
@@ -54,6 +57,9 @@ fn render_node(
     rects: &mut Vec<egui::Rect>,
     msgs: &mut Vec<Msg>,
     img_cache: &mut HashMap<ImgKey, egui::TextureHandle>,
+    focused_rect: &mut Option<egui::Rect>,
+    preedit: &str,
+    focused_id: &mut Option<Id>,
 ) {
     match view {
         // ── display ──────────────────────────────────────────────────────
@@ -97,29 +103,92 @@ fn render_node(
         }
         View::TextEdit { id, text, multiline, desired_rows, .. } => {
             let entry = scratch.entry(*id).or_insert_with(|| text.clone());
-            let r = if *multiline {
-                ui.add(
-                    egui::TextEdit::multiline(entry)
-                        .desired_rows(*desired_rows)
-                        .desired_width(ui.available_width()),
-                )
-            } else {
-                ui.add(egui::TextEdit::singleline(entry))
+            let real_len = entry.len();
+            let has_preedit = *focused_id == Some(*id) && !preedit.is_empty();
+            if has_preedit {
+                eprintln!("[ime] render: injecting preedit={preedit:?} at len={real_len} (focused_id={:?} this_id={id})", *focused_id);
+                entry.push_str(preedit);
+            }
+            // Build a preedit-aware layouter (must outlive `te`).
+            // Capture egui's default text style so the non-preedit portion
+            // renders identically to when no layouter is used.
+            let text_color = ui.visuals().widgets.active.text_color();
+            let body_style = ui.style().text_styles.get(&egui::TextStyle::Body);
+            let font_id = body_style
+                .map(|s| egui::FontId::new(s.size, s.family.clone()))
+                .unwrap_or_else(|| egui::FontId::proportional(14.0));
+            eprintln!("[ime] layouter style: text_color={:?} font_id={:?} body_style={:?}",
+                text_color, font_id, body_style.map(|s| (s.size, &s.family)));
+            let split = real_len;
+            let mut preedit_layouter = move |ui: &egui::Ui, text: &str, _: f32| -> std::sync::Arc<egui::Galley> {
+                let mut job = egui::text::LayoutJob::default();
+                let split = split.min(text.len());
+                eprintln!("[ime] layouter called: text={text:?} split={split} text_color={text_color:?} font={font_id:?}");
+                if split > 0 {
+                    // Real text — match egui's default style exactly.
+                    job.append(&text[..split], 0.0, egui::TextFormat {
+                        font_id: font_id.clone(),
+                        color: text_color,
+                        ..Default::default()
+                    });
+                }
+                if split < text.len() {
+                    // Preedit text — same font/color + highlighted background.
+                    job.append(&text[split..], 0.0, egui::TextFormat {
+                        font_id: font_id.clone(),
+                        color: text_color,
+                        background: egui::Color32::from_rgb(0x3a, 0x5a, 0x8a),
+                        ..Default::default()
+                    });
+                }
+                ui.fonts(|f| f.layout_job(job))
             };
-            if r.changed() {
+
+            let mut te = if *multiline {
+                egui::TextEdit::multiline(entry)
+                    .desired_rows(*desired_rows)
+                    .desired_width(ui.available_width())
+            } else {
+                egui::TextEdit::singleline(entry)
+            };
+            if has_preedit {
+                te = te.layouter(&mut preedit_layouter);
+            }
+            let output = te.show(ui);
+            // Strip the preedit text we temporarily appended — the real text
+            // stays intact for the model; only the rendered frame showed it.
+            if has_preedit {
+                entry.truncate(real_len);
+            }
+            let r = &output.response;
+            if r.changed() && !has_preedit {
                 msgs.push(Msg::TextChanged(*id, entry.clone()));
-            } else if entry.as_str() != text.as_str() {
+            } else if entry.as_str() != text.as_str() && !has_preedit {
                 *entry = text.clone();
             }
             rects.push(r.rect);
+            if r.has_focus() {
+                if *focused_id != Some(*id) {
+                    eprintln!("[ime] focus gained: id={id}, setting focused_id");
+                }
+                *focused_id = Some(*id);
+                if let Some(cr) = &output.cursor_range {
+                    let caret = output.galley.pos_from_cursor(&cr.primary);
+                    let abs_min = output.galley_pos + caret.min.to_vec2();
+                    *focused_rect = Some(egui::Rect::from_min_size(
+                        abs_min,
+                        egui::vec2(1.0, caret.height()),
+                    ));
+                } else {
+                    *focused_rect = Some(r.rect);
+                }
+            }
         }
-
-        // ── layout ───────────────────────────────────────────────────────
         View::Column { children, spacing } => {
-            render_flex(ui, ctx, children, *spacing, true, scratch, rects, msgs, img_cache);
+            render_flex(ui, ctx, children, *spacing, true, scratch, rects, msgs, img_cache, focused_rect, preedit, focused_id);
         }
         View::Row { children, spacing } => {
-            render_flex(ui, ctx, children, *spacing, false, scratch, rects, msgs, img_cache);
+            render_flex(ui, ctx, children, *spacing, false, scratch, rects, msgs, img_cache, focused_rect, preedit, focused_id);
         }
         View::Container { color, padding, child } => {
             let mut frame = egui::Frame::default();
@@ -127,12 +196,12 @@ fn render_node(
                 frame.fill = to_color32(*c);
             }
             frame.inner_margin = egui::Margin::symmetric(*padding, *padding);
-            frame.show(ui, |ui| render_node(ui, ctx, child, scratch, rects, msgs, img_cache));
+            frame.show(ui, |ui| render_node(ui, ctx, child, scratch, rects, msgs, img_cache, focused_rect, preedit, focused_id));
         }
         View::Sized { style, child } => {
             // Apply size constraints (flex_grow is handled by the parent flex).
             apply_constraints(ui, style);
-            render_node(ui, ctx, child, scratch, rects, msgs, img_cache);
+            render_node(ui, ctx, child, scratch, rects, msgs, img_cache, focused_rect, preedit, focused_id);
         }
         View::Decorated { decoration, child } => {
             let mut frame = egui::Frame::default();
@@ -148,7 +217,7 @@ fn render_node(
             if decoration.padding > 0.0 {
                 frame.inner_margin = egui::Margin::symmetric(decoration.padding, decoration.padding);
             }
-            frame.show(ui, |ui| render_node(ui, ctx, child, scratch, rects, msgs, img_cache));
+            frame.show(ui, |ui| render_node(ui, ctx, child, scratch, rects, msgs, img_cache, focused_rect, preedit, focused_id));
         }
         View::ScrollView { child, stick_to_bottom } => {
             let mut area = egui::ScrollArea::vertical().auto_shrink([false; 2]);
@@ -156,7 +225,7 @@ fn render_node(
                 area = area.stick_to_bottom(true);
             }
             area.show(ui, |ui| {
-                render_node(ui, ctx, child, scratch, rects, msgs, img_cache);
+                render_node(ui, ctx, child, scratch, rects, msgs, img_cache, focused_rect, preedit, focused_id);
             });
         }
     }
@@ -174,6 +243,9 @@ fn render_flex(
     rects: &mut Vec<egui::Rect>,
     msgs: &mut Vec<Msg>,
     img_cache: &mut HashMap<ImgKey, egui::TextureHandle>,
+    focused_rect: &mut Option<egui::Rect>,
+    preedit: &str,
+    focused_id: &mut Option<Id>,
 ) {
     // Peel flex styles from all children upfront.
     let peeled: Vec<(FlexStyle, &View)> = children.iter().map(peel_flex).collect();
@@ -213,12 +285,12 @@ fn render_flex(
                 };
                 ui.allocate_ui_with_layout(size, layout, |ui| {
                     apply_constraints(ui, style);
-                    render_node(ui, ctx, child, scratch, rects, msgs, img_cache);
+                    render_node(ui, ctx, child, scratch, rects, msgs, img_cache, focused_rect, preedit, focused_id);
                 });
             } else {
                 // Fixed child — apply width/height constraints + render normally.
                 apply_constraints(ui, style);
-                render_node(ui, ctx, child, scratch, rects, msgs, img_cache);
+                render_node(ui, ctx, child, scratch, rects, msgs, img_cache, focused_rect, preedit, focused_id);
             }
         }
     });
