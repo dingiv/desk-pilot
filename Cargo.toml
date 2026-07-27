@@ -30,6 +30,7 @@ members = [
 
     # swift-ime (input method)
     "crates/ime-core",
+    "crates/fileloader",
     "apps/swift-ime",
 
     # geek-familiar (sprite engine)
@@ -60,6 +61,7 @@ scout-drivers = { path = "crates/scout-drivers" }
 # implementation lives in binaries via shared::init_tracing (see crates/shared).
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+fileloader = { path = "crates/fileloader" }
 ime-core = { path = "crates/ime-core" }
 # familiar-* crates use short dep keys (core/render/platform/ui/fs) internally;
 # the `package` field maps them to the actual crate names.

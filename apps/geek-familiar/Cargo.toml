@@ -7,33 +7,22 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-core = { workspace = true }
-render = { workspace = true }
-platform = { workspace = true }
-ui = { workspace = true }
+iced = { version = "0.14", features = ["wgpu", "image"] }
 fs = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 
+# Wayland input region support (Checkpoint B)
+wayland-client = "0.31"
+raw-window-handle = "0.6"
+
 [build-dependencies]
 fs = { workspace = true }
 
-# FileLoader namespace: dev reads this crate's dir, prod reads ~/.desk-pilot/.
-# `fs.read_str("CONF::familiar.yaml")` resolves accordingly.
+# FileLoader namespaces (consumed by build.rs → fs::loader!()).
+# CONF: runtime config — dev reads this crate's dir, prod reads ~/.desk-pilot/.
+# SKIN: skin assets — dev reads this crate's assets/skins/, prod reads ~/.geek-familiar/skins/.
 [package.metadata.shared]
 CONF = { dev = ".", prod = "~/.desk-pilot" }
-
-[features]
-default = []
-# Select the GTK4 backend (no-op stub until M1; real build needs libgtk-4-dev).
-gtk = ["platform/gtk"]
-# Render the pet UI with egui (offscreen wgpu → RGBA8). Use together with `gtk`;
-# needs a Vulkan GPU (set VK_ICD_FILENAMES).
-egui = ["gtk", "platform/egui"]
-
-# UI component gallery / playground — standalone window for testing all View
-# variants + flex layout, decoupled from the pet's business logic.
-[[example]]
-name = "ui_gallery"
-required-features = ["egui"]
+SKIN = { dev = "assets/skins", prod = "~/.geek-familiar/skins" }

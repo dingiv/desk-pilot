@@ -1,5 +1,8 @@
-use geek_familiar::PetApp;
-use platform::PlatformBackend;
+//! geek-familiar entry — loads `familiar.yaml` (FileLoader), resolves the skin,
+//! and runs the pet as an iced application (transparent + borderless window).
+
+use geek_familiar::{skin_source, PetApp};
+use iced::window;
 
 /// Runtime config parsed from `familiar.yaml` (FileLoader CONF namespace).
 #[derive(serde::Deserialize)]
@@ -7,7 +10,7 @@ use platform::PlatformBackend;
 struct FamiliarConfig {
     /// audio-aura daemon SSE address.
     aura_addr: String,
-    /// Pet skin asset (resolved via ui::skin_source).
+    /// Pet skin asset (resolved via [`geek_familiar::skin_source`]).
     skin: String,
 }
 
@@ -20,7 +23,7 @@ impl Default for FamiliarConfig {
     }
 }
 
-fn main() {
+pub fn main() -> iced::Result {
     // Load familiar.yaml via FileLoader (dev: this crate's dir, prod: ~/.desk-pilot/).
     let fs = fs::loader!();
     let cfg: FamiliarConfig = match fs.read_str("CONF::familiar.yaml") {
@@ -34,17 +37,27 @@ fn main() {
         }
     };
 
-    let app = PetApp::with_config(&cfg.aura_addr, &cfg.skin);
+    let skin = skin_source(&cfg.skin);
+    let aura_addr = cfg.aura_addr;
+    let token = format!("geek-familiar-{}", std::process::id());
 
-    #[cfg(feature = "gtk")]
-    {
-        let mut backend = platform::gtk::GtkBackend::new();
-        backend.run(Box::new(app));
-    }
-
-    #[cfg(not(feature = "gtk"))]
-    {
-        let mut backend = platform::HeadlessBackend::default();
-        backend.run(Box::new(app));
-    }
+    iced::application(
+        move || PetApp::new(aura_addr.clone(), skin.clone(), token.clone()),
+        PetApp::update,
+        PetApp::view,
+    )
+    .title(PetApp::title)
+    .theme(PetApp::theme)
+    .subscription(PetApp::subscription)
+    .window(window::Settings {
+        transparent: true,
+        decorations: false,
+        resizable: false,
+        size: iced::Size::new(260.0, 380.0),
+        // Wayland ignores AlwaysOnTop (winit no-op); gnome-layer-ext handles it.
+        level: window::Level::AlwaysOnTop,
+        exit_on_close_request: true,
+        ..Default::default()
+    })
+    .run()
 }
