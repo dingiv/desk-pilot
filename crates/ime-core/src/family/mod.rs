@@ -98,6 +98,16 @@ pub trait CandidateFamily: Send + Sync {
     fn predict_with_context(&self, input: &str, _ctx: &InputContext) -> Vec<ScoredCandidate> {
         self.predict(input)
     }
+
+    /// Load an external dictionary file into this family's vocabulary.
+    fn load_dict(&self, _path: &str) -> std::io::Result<usize> {
+        Ok(0)
+    }
+
+    /// Load dictionary entries from raw TSV bytes (for embedded dicts).
+    fn load_dict_bytes(&self, _data: &[u8]) -> usize {
+        0
+    }
 }
 
 // ── UnifiedScorer ───────────────────────────────────────────────────────
@@ -200,6 +210,11 @@ impl UnifiedScorer {
     /// Access a family by name.
     pub fn family(&self, name: &str) -> Option<&dyn CandidateFamily> {
         self.families.iter().find(|f| f.name() == name).map(|f| &**f)
+    }
+
+    /// Load an external dictionary into the named family.
+    pub fn load_dict_to(&self, family_name: &str, path: &str) -> Option<std::io::Result<usize>> {
+        self.family(family_name).map(|f| f.load_dict(path))
     }
 }
 

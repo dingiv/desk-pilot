@@ -32,6 +32,10 @@ struct Cli {
     /// Path to snippet config JSON (default: ime.json in current dir)
     #[arg(long, default_value = "ime.json")]
     config: String,
+
+    /// Path to external pinyin dictionary TSV (pinyin\\tword).
+    #[arg(long)]
+    dict: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -56,7 +60,7 @@ fn main() -> Result<()> {
 
         "mock" => {
             info!("mock backend — reading stdin, type /greet or #date to test");
-            run_mock(&cli.config)?;
+            run_mock(&cli.config, cli.dict.as_deref())?;
         }
 
         other => {
@@ -67,12 +71,34 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_mock(_config_path: &str) -> Result<()> {
+fn load_dict_file(engine: &ime_core::engine::ImeEngine, loader: &shared::FileLoader, path: &str) -> std::io::Result<usize> {
+    match loader.resolve(path) {
+        Some(p) => engine.load_dict(&p.to_string_lossy()),
+        None => Err(std::io::Error::new(std::io::ErrorKind::NotFound,
+            format!("dict not found: {path}"))),
+    }
+}
+
+fn run_mock(_config_path: &str, dict_path: Option<&str>) -> Result<()> {
     use ime_core::engine::{ImeEngine, InputEvent};
     use ime_core::ImeView;
     use std::io::{self, Write};
 
     let mut engine = ImeEngine::new();
+
+    // Load rime-ice dictionary via FileLoader (dev: assets/dict, prod: /usr/share/swift-ime/dict).
+    let loader = shared::loader!("assets");
+    if let Ok(n) = load_dict_file(&mut engine, &loader, "DICT::rime-ice.tsv") {
+        eprintln!("loaded {n} entries from rime-ice dictionary");
+    }
+
+    // Load additional user-specified dictionary if provided.
+    if let Some(path) = dict_path {
+        match engine.load_dict(path) {
+            Ok(n) => eprintln!("loaded {n} entries from {path}"),
+            Err(e) => eprintln!("warning: could not load dict: {e}"),
+        }
+    }
     println!("swift-ime mock — type a line and press Enter. Trigger prefixes: / and #");
     println!("Type /greet, #date, or pinyin (ni, nihao) to test. Ctrl-C to exit.\n");
 

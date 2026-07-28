@@ -2,20 +2,23 @@
 //! embedded dictionary + bigram Viterbi composition + PhraseBook recall.
 
 use super::{CandidateFamily, InputContext, ScoredCandidate};
+use crate::large_dict::LargeDict;
 use crate::phrase_book::PhraseBook;
 use std::sync::Mutex;
 
 /// Full-pinyin prediction family.
 ///
 /// Scoring:
-/// - PhraseBook exact match: `raw_score = 1.0`
-/// - Viterbi composition (inputx top_k_compositions): normalized log-likelihood
-/// - Session lookup: `raw_score = 0.5` per entry
-/// - Prefix fallback: `raw_score = 0.3` (partial match)
+/// - LargeDict exact match: `raw_score = 1.0` (900K+ entries, O(1))
+/// - PhraseBook exact match: `raw_score = 0.95` (small, user-custom)
+/// - Viterbi composition: normalized log-likelihood → [0.3, 0.95]
+/// - Session lookup: `raw_score = 0.5`
+/// - Prefix fallback: `raw_score = 0.3`
 /// - PhraseBook prefix: `raw_score = 0.85`
 pub struct PinyinFamily {
     engine: inputx_pinyin::PinyinEngine,
     phrase_book: Mutex<PhraseBook>,
+    large_dict: Mutex<LargeDict>,
     enabled: bool,
 }
 
@@ -26,6 +29,7 @@ impl PinyinFamily {
                 inputx_pinyin::FuzzyConfig::permissive(),
             ),
             phrase_book: Mutex::new(PhraseBook::default_phrases()),
+            large_dict: Mutex::new(LargeDict::new()),
             enabled: true,
         }
     }
@@ -36,83 +40,83 @@ impl PinyinFamily {
                 inputx_pinyin::FuzzyConfig::permissive(),
             ),
             phrase_book: Mutex::new(phrase_book),
+            large_dict: Mutex::new(LargeDict::new()),
             enabled: true,
         }
     }
 
-    pub fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
-    }
+    pub fn set_enabled(&mut self, enabled: bool) { self.enabled = enabled; }
 
-    /// Access the phrase book for learning new phrases.
     pub fn learn_phrase(&self, pinyin: &str, hanzi: &str) {
         let mut book = self.phrase_book.lock().unwrap();
-        let existing = book.exact(pinyin);
-        if !existing.contains(&hanzi.to_string()) {
+        if !book.exact(pinyin).contains(&hanzi.to_string()) {
             book.insert(pinyin, hanzi);
         }
     }
 
-    /// Record a pick in inputx-pinyin's L0 user model.
     pub fn record_pick(&self, pinyin: &str, word: &str) {
         self.engine.dict().record_pick(pinyin, word);
     }
 
-    /// Access the underlying inputx engine (for first_syllable, etc.).
-    pub fn engine(&self) -> &inputx_pinyin::PinyinEngine {
-        &self.engine
-    }
+    pub fn engine(&self) -> &inputx_pinyin::PinyinEngine { &self.engine }
+    pub fn phrase_count(&self) -> usize { self.phrase_book.lock().unwrap().len() }
+    pub fn large_dict_len(&self) -> usize { self.large_dict.lock().unwrap().len() }
 }
 
 impl Default for PinyinFamily {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl CandidateFamily for PinyinFamily {
-    fn name(&self) -> &'static str {
-        "pinyin"
+    fn name(&self) -> &'static str { "pinyin" }
+    fn priority(&self) -> u32 { 100 }
+    fn enabled(&self) -> bool { self.enabled }
+    fn top_n(&self) -> usize { 8 }
+
+    fn load_dict_bytes(&self, data: &[u8]) -> usize {
+        // Load into LargeDict for large dictionaries, PhraseBook for small ones.
+        // base.tsv (~5KB) goes to PhraseBook, rime-ice.tsv (~24MB) goes to LargeDict.
+        if data.len() > 100_000 {
+            self.large_dict.lock().unwrap().load_from_tsv_bytes(data)
+        } else {
+            self.phrase_book.lock().unwrap().load_from_tsv_bytes(data)
+        }
     }
 
-    fn priority(&self) -> u32 {
-        100
-    }
-
-    fn enabled(&self) -> bool {
-        self.enabled
-    }
-
-    fn top_n(&self) -> usize {
-        8
+    fn load_dict(&self, path: &str) -> std::io::Result<usize> {
+        if path.ends_with(".json") {
+            let json = std::fs::read_to_string(path)?;
+            let mut book = self.phrase_book.lock().unwrap();
+            book.load_from_json_str(&json)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        } else {
+            // Large TSV files go to LargeDict for O(1) exact lookup.
+            let meta = std::fs::metadata(path)?;
+            if meta.len() > 100_000 {
+                self.large_dict.lock().unwrap().load_from_tsv_file(path)
+            } else {
+                self.phrase_book.lock().unwrap().load_from_tsv(path)
+            }
+        }
     }
 
     fn predict(&self, input: &str) -> Vec<ScoredCandidate> {
-        if input.is_empty() {
-            return Vec::new();
-        }
+        if input.is_empty() { return Vec::new(); }
 
         let dict = self.engine.dict();
         let mut out = Vec::new();
 
-        // Layer 1: For single valid syllables, use direct lookup.
-        // Don't use top_k_compositions — it decomposes "ming" into "mi+n"
-        // when "ming" is a perfectly valid single syllable.
         let is_single_syllable = inputx_pinyin::is_valid_syllable(input);
-
         if is_single_syllable {
             let words = dict.lookup(input);
             let total = words.len().max(1) as f64;
             for (i, word) in words.into_iter().enumerate() {
-                let score = 1.0 - (i as f64 / total) * 0.6; // 1.0 → 0.4
                 out.push(ScoredCandidate {
-                    text: word,
-                    family: "pinyin",
-                    raw_score: score.clamp(0.0, 1.0),
+                    text: word, family: "pinyin",
+                    raw_score: (1.0 - (i as f64 / total) * 0.6).clamp(0.0, 1.0),
                 });
             }
         } else {
-            // Multi-syllable: Viterbi bigram composition.
             let comps = dict.top_k_compositions(input, 24);
             if !comps.is_empty() {
                 let scores: Vec<f64> = comps.iter().map(|(s, _)| *s).collect();
@@ -122,72 +126,56 @@ impl CandidateFamily for PinyinFamily {
                 for (score, word) in comps {
                     let normalized = 0.3 + 0.65 * ((score - min_s) / range);
                     out.push(ScoredCandidate {
-                        text: word,
-                        family: "pinyin",
+                        text: word, family: "pinyin",
                         raw_score: normalized.clamp(0.0, 1.0),
                     });
                 }
             }
         }
 
-        // Layer 2: Session phrase-level lookup.
         let mut session = inputx_pinyin::Session::new(&self.engine);
-        for c in input.chars() {
-            session.input_char(c);
-        }
+        for c in input.chars() { session.input_char(c); }
         for w in session.candidates() {
             let w = w.clone();
             if !out.iter().any(|c| c.text == w) {
-                out.push(ScoredCandidate {
-                    text: w,
-                    family: "pinyin",
-                    raw_score: 0.5,
-                });
+                out.push(ScoredCandidate { text: w, family: "pinyin", raw_score: 0.5 });
             }
         }
 
-        // Layer 3: PhraseBook exact match — top priority.
         {
             let book = self.phrase_book.lock().unwrap();
             for w in book.exact(input) {
-                // Remove any earlier occurrence and push to front later.
                 out.retain(|c| c.text != w);
-                out.push(ScoredCandidate {
-                    text: w,
-                    family: "pinyin",
-                    raw_score: 1.0,
-                });
+                out.push(ScoredCandidate { text: w, family: "pinyin", raw_score: 1.0 });
+            }
+        }
+        // LargeDict: 900K+ entries, O(1) exact match. Lower score than
+        // PhraseBook so user-custom phrases always win.
+        {
+            let ld = self.large_dict.lock().unwrap();
+            for w in ld.exact(input).into_iter().take(8) {
+                if !out.iter().any(|c| c.text == w) {
+                    out.push(ScoredCandidate { text: w, family: "pinyin", raw_score: 0.95 });
+                }
             }
         }
 
-        // Early return if we have results.
         if !out.is_empty() {
             out.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap());
             return out;
         }
 
-        // Layer 4: Prefix fallback (incomplete final syllable).
-        let prefix_results = dict.prefix(input);
-        for (_py, word) in prefix_results.into_iter().take(72) {
+        for (_py, word) in dict.prefix(input).into_iter().take(72) {
             if !out.iter().any(|c| c.text == word) {
-                out.push(ScoredCandidate {
-                    text: word,
-                    family: "pinyin",
-                    raw_score: 0.3,
-                });
+                out.push(ScoredCandidate { text: word, family: "pinyin", raw_score: 0.3 });
             }
         }
 
-        // Layer 5: PhraseBook prefix.
         {
             let book = self.phrase_book.lock().unwrap();
             for w in book.prefix(input) {
                 out.retain(|c| c.text != w);
-                out.push(ScoredCandidate {
-                    text: w,
-                    family: "pinyin",
-                    raw_score: 0.85,
-                });
+                out.push(ScoredCandidate { text: w, family: "pinyin", raw_score: 0.85 });
             }
         }
 
@@ -201,12 +189,8 @@ impl CandidateFamily for PinyinFamily {
         if last.is_empty() || candidates.is_empty() || last.chars().count() != 1 {
             return candidates;
         }
-
-        // Context boost: for each candidate, check if last_char + candidate
-        // forms a known dictionary phrase by combining their pinyin readings.
         let last_char = last.chars().next().unwrap();
         let dict = self.engine.dict();
-
         for c in &mut candidates {
             if let Some(cand_char) = c.text.chars().next() {
                 for py_last in inputx_pinyin::char_to_pinyin(last_char) {
@@ -220,7 +204,6 @@ impl CandidateFamily for PinyinFamily {
                 }
             }
         }
-
         candidates.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap());
         candidates
     }
@@ -250,8 +233,8 @@ mod tests {
         let fam = PinyinFamily::new();
         fam.learn_phrase("lisa", "丽萨");
         let cands = fam.predict("lisa");
-        let top = &cands[0].text;
-        assert_eq!(top, "丽萨", "learned phrase should be top, got {:?}", cands.iter().map(|c| &c.text).take(5).collect::<Vec<_>>());
+        assert_eq!(&cands[0].text, "丽萨",
+            "learned phrase should be top, got {:?}", cands.iter().map(|c| &c.text).take(5).collect::<Vec<_>>());
     }
 
     #[test]
@@ -259,8 +242,7 @@ mod tests {
         let fam = PinyinFamily::new();
         let cands = fam.predict("nihao");
         for c in &cands {
-            assert!(c.raw_score >= 0.0 && c.raw_score <= 1.0,
-                "score {} out of range", c.raw_score);
+            assert!(c.raw_score >= 0.0 && c.raw_score <= 1.0);
             assert_eq!(c.family, "pinyin");
         }
     }

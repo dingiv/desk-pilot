@@ -58,6 +58,10 @@ pub struct StateMachine {
     partial_commit_indices: Vec<bool>,
     /// Short-term input context — accumulates recently committed text.
     pub context: crate::family::InputContext,
+    /// Pending snippet/magic expansion text. When set, the expansion is
+    /// shown as a candidate rather than auto-committed. Space/digit to
+    /// commit, Enter to force raw text.
+    pending_expansion: Option<String>,
 }
 
 impl StateMachine {
@@ -138,6 +142,7 @@ impl StateMachine {
         self.committed_pinyin_buf.clear();
         self.full_comp_count = 0;
         self.partial_commit_indices.clear();
+        self.pending_expansion = None;
     }
 
     pub fn move_highlight(&mut self, delta: i32) {
@@ -217,8 +222,10 @@ impl StateMachine {
     // ── Snippet ────────────────────────────────────────────────────────
 
     fn handle_snippet(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
+        // Backspace: pop last char from trigger.
         if ch == '\x08' {
             self.buffer.pop();
+            self.pending_expansion = None;
             if self.buffer.is_empty() {
                 self.reset();
                 return ImeView::empty();
@@ -227,19 +234,54 @@ impl StateMachine {
             self.cursor = self.preedit.len();
             return self.make_view();
         }
-        match env.matcher().step(&self.buffer, ch) {
-            Match::Complete { expansion, .. } => {
+
+        // Enter: force raw text, ignore any pending expansion.
+        if ch == '\n' || ch == '\r' {
+            let raw = std::mem::take(&mut self.buffer);
+            self.reset();
+            return Self::commit_view(&raw);
+        }
+
+        // Space: commit the pending expansion if one exists, otherwise
+        // commit the raw trigger text.
+        if ch == ' ' {
+            if let Some(expansion) = self.pending_expansion.take() {
                 let expanded = match env.expander().expand(&expansion) {
                     Ok(t) => t,
                     Err(e) => { tracing::warn!(error = %e, "expand failed"); expansion }
                 };
                 self.reset();
-                Self::commit_view(&expanded)
+                return Self::commit_view(&expanded);
+            }
+            let raw = std::mem::take(&mut self.buffer);
+            self.reset();
+            return Self::commit_view(&raw);
+        }
+
+        match env.matcher().step(&self.buffer, ch) {
+            Match::Complete { expansion, .. } => {
+                // Store the expansion as a pending candidate — don't auto-expand.
+                self.buffer.push(ch);
+                self.preedit = self.buffer.clone();
+                self.cursor = self.preedit.len();
+                // Show expansion as candidate.
+                let expanded = match env.expander().expand(&expansion) {
+                    Ok(t) => t,
+                    Err(e) => { tracing::warn!(error = %e, "expand failed"); expansion.clone() }
+                };
+                self.pending_expansion = Some(expansion);
+                self.candidates = vec![expanded];
+                self.candidates_fresh = true;
+                self.candidate_highlight = 0;
+                self.full_comp_count = 1;
+                self.partial_commit_indices = vec![false];
+                self.make_view()
             }
             Match::Partial => {
                 self.buffer.push(ch);
                 self.preedit = self.buffer.clone();
                 self.cursor = self.preedit.len();
+                self.pending_expansion = None;
                 self.make_view()
             }
             Match::None => {

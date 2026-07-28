@@ -14,7 +14,18 @@ use ime_core::platform::ImeView;
 
 #[no_mangle]
 pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngine {
-    Box::into_raw(Box::new(ImeEngine::new()))
+    let engine = ImeEngine::new();
+
+    // Load rime-ice via FileLoader (dev: assets/dict, prod: /usr/share/swift-ime/dict).
+    let loader = shared::loader!("assets");
+    if let Some(p) = loader.resolve("DICT::rime-ice.tsv") {
+        match engine.load_dict(&p.to_string_lossy()) {
+            Ok(n) => tracing::info!(n, path = %p.display(), "loaded rime-ice dictionary"),
+            Err(e) => tracing::warn!(path = %p.display(), error = %e, "failed to load rime-ice"),
+        }
+    }
+
+    Box::into_raw(Box::new(engine))
 }
 
 #[no_mangle]

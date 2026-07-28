@@ -48,12 +48,22 @@ fn incremental_composition_full_flow() {
 fn snippet_slash_greet() {
     let mut eng = ImeEngine::new();
     for c in "/greet".chars() {
-        let v = eng.predict(InputEvent::char(c));
-        if commit(&v) == "你好，我是 AI 秘书，请问有什么可以帮你的？" {
-            return;
-        }
+        eng.predict(InputEvent::char(c));
     }
-    panic!("snippet should expand");
+    // Completing the trigger shows a candidate; space commits it.
+    let v = eng.predict(InputEvent::space());
+    assert_eq!(commit(&v), "你好，我是 AI 秘书，请问有什么可以帮你的？");
+}
+
+#[test]
+fn snippet_enter_commits_raw_trigger() {
+    let mut eng = ImeEngine::new();
+    for c in "/greet".chars() {
+        eng.predict(InputEvent::char(c));
+    }
+    // Enter should commit the raw trigger text, not expand.
+    let v = eng.predict(InputEvent::enter());
+    assert_eq!(commit(&v), "/greet");
 }
 
 #[test]

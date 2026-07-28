@@ -6,6 +6,7 @@ pub mod dispatcher;
 pub mod engine;
 pub mod expander;
 pub mod family;
+pub mod large_dict;
 pub mod matcher;
 pub mod phrase_book;
 pub mod pinyin;

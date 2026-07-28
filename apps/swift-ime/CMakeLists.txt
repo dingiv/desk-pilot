@@ -48,7 +48,13 @@ install(FILES "${CMAKE_SOURCE_DIR}/release/fcitx/swift-ime.conf"
         DESTINATION "${FCITX_INSTALL_PKGDATADIR}/inputmethod")
 
 # Install the Rust shared library alongside the addon.
-# Use GNUInstallDirs for standard paths (not affected by fcitx5's cmake module).
 include(GNUInstallDirs)
 install(FILES "${RUST_BUILD_DIR}/libswift_ime.so"
         DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+
+# ── Install dictionaries ─────────────────────────────────────────────────────
+set(SWIFT_IME_DICT_DIR "${CMAKE_INSTALL_DATADIR}/swift-ime/dict")
+install(FILES assets/dict/base.tsv
+        DESTINATION "${SWIFT_IME_DICT_DIR}")
+install(FILES assets/dict/rime-ice.tsv
+        DESTINATION "${SWIFT_IME_DICT_DIR}")

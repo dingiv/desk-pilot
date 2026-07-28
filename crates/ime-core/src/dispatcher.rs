@@ -142,8 +142,12 @@ mod tests {
     #[test]
     fn snippet_expansion() {
         let d = d(); let mut s = sm();
+        // Type /greet — shows expansion as candidate, doesn't auto-expand.
         d.process_key('/', &mut s); d.process_key('g', &mut s); d.process_key('r', &mut s); d.process_key('e', &mut s); d.process_key('e', &mut s);
-        assert_eq!(ImeView::str_field(&d.process_key('t', &mut s).commit_text), "你好,我是 AI 秘书");
+        let view = d.process_key('t', &mut s);
+        assert!(view.candidate_count > 0, "should show expansion as candidate, got {view:?}");
+        // Space commits the expansion.
+        assert_eq!(ImeView::str_field(&d.process_key(' ', &mut s).commit_text), "你好,我是 AI 秘书");
     }
 
     #[test]
@@ -163,8 +167,11 @@ mod tests {
     #[test]
     fn pinyin_and_snippet_coexist() {
         let d = d(); let mut s = sm();
+        // Type #date — shows candidate, space commits.
         d.process_key('#', &mut s); d.process_key('d', &mut s); d.process_key('a', &mut s); d.process_key('t', &mut s);
-        assert_eq!(ImeView::str_field(&d.process_key('e', &mut s).commit_text), "2026-07-23");
+        d.process_key('e', &mut s);
+        assert_eq!(ImeView::str_field(&d.process_key(' ', &mut s).commit_text), "2026-07-23");
+        // After snippet, typing a letter enters pinyin.
         let a = d.process_key('n', &mut s);
         assert!(a.candidate_count > 0, "after snippet, should enter pinyin, got {a:?}");
     }

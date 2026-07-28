@@ -30,7 +30,7 @@ use std::time::Instant;
 use crate::dispatcher::Dispatcher;
 use crate::family::InputContext;
 use crate::platform::ImeView;
-use crate::state::StateMachine;
+use crate::state::{StateMachine, StepEnv};
 
 // ── InputEvent ──────────────────────────────────────────────────────────
 
@@ -83,8 +83,8 @@ pub struct ImeEngine {
 }
 
 impl ImeEngine {
-    /// Create a new engine with all default prediction families and
-    /// built-in snippet triggers.
+    /// Create a new engine with all default prediction families, built-in
+    /// snippet triggers, and the embedded base phrase dictionary.
     pub fn new() -> Self {
         let entries: Vec<(String, String)> = vec![
             ("/greet".into(), "你好，我是 AI 秘书，请问有什么可以帮你的？".into()),
@@ -96,12 +96,23 @@ impl ImeEngine {
         let expander = crate::Expander::new(Box::new(
             crate::expander::StaticProvider { date: String::from("2026-07-27"), clipboard: String::new() },
         ));
-        ImeEngine {
+        let engine = ImeEngine {
             dispatcher: Dispatcher::new(matcher, expander),
             contexts: Mutex::new(HashMap::new()),
             async_waits: Mutex::new(HashMap::new()),
+        };
+        // Load embedded base dictionary (5KB, compiled into binary).
+        let count = engine.dispatcher.scorer().family("pinyin")
+            .map(|f| f.load_dict_bytes(Self::EMBEDDED_BASE_DICT))
+            .unwrap_or(0);
+        if count > 0 {
+            tracing::info!(count, "loaded embedded base dictionary");
         }
+        engine
     }
+
+    /// Embedded base phrase dictionary (TSV format), compiled into the binary.
+    const EMBEDDED_BASE_DICT: &[u8] = include_bytes!("../../../apps/swift-ime/assets/dict/base.tsv");
 
     // ── ctx helpers ─────────────────────────────────────────────────────
 
@@ -234,6 +245,15 @@ impl ImeEngine {
         self.contexts.lock().unwrap()
             .entry(DEFAULT_CTX).or_default()
             .text_context.update(text);
+    }
+
+    /// Load an external dictionary into the PinyinFamily's phrase book.
+    /// Supports TSV (`pinyin\tword`) and JSON (`[{"pinyin":"...","text":"..."}]`).
+    /// Returns number of entries loaded.
+    pub fn load_dict(&self, path: &str) -> std::io::Result<usize> {
+        self.dispatcher.scorer().load_dict_to("pinyin", path)
+            .unwrap_or_else(|| Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound, "pinyin family not found")))
     }
 
     /// Commit pending text in the default context.
