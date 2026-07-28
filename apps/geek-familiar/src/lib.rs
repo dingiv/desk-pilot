@@ -11,8 +11,8 @@
 //! beneath the dock — `Chat` shows the ASR transcript, `Settings` shows the settings panel.
 
 mod asr;
-// Alpha click-through (wl_surface input region) is deferred — module kept on disk for later.
-// mod input_region;
+mod gnome_ext;
+mod input_region;
 
 use iced::widget::{button, column, container, image, mouse_area, row, scrollable, text, text_input};
 use iced::widget::image::Handle;
@@ -53,6 +53,12 @@ pub enum Message {
     TabPressed(Panel),
     ImeInput(String),
     ToggleAutoMove,
+    /// Captured window frame (for computing the click-through input region).
+    ScreenshotReady(iced::window::screenshot::Screenshot),
+    PassthroughApplied(usize),
+    /// Periodic tick — re-screenshot + re-apply the input region so it tracks the
+    /// rendered content (catches late image decode, panel toggles, ASR growth).
+    RescanTick,
 }
 
 #[derive(Default)]
@@ -76,7 +82,10 @@ impl PetApp {
             auto_move: false,
         };
         let token_for_task = app.token.clone();
-        let handshake = Task::perform(handshake(token_for_task), Message::HandshakeDone);
+        let handshake = Task::perform(
+            gnome_ext::handshake(token_for_task, "geek-familiar"),
+            Message::HandshakeDone,
+        );
         (app, handshake)
     }
 
@@ -116,7 +125,11 @@ impl PetApp {
                     self.asr.interim.clear();
                 }
             },
-            Message::HandshakeDone(ok) => eprintln!("[geek-familiar] gnome-layer-ext handshake ok={ok}"),
+            Message::HandshakeDone(ok) => {
+                eprintln!("[geek-familiar] gnome-layer-ext handshake ok={ok}");
+                // The periodic RescanTick subscription handles the first capture
+                // (after the skin image has decoded + uploaded).
+            }
             Message::DragStarted => {
                 // Ask the compositor to move the (oldest = main) window.
                 return window::oldest().then(|id| match id {
@@ -127,34 +140,59 @@ impl PetApp {
             Message::TabPressed(p) => {
                 // Toggle: open the clicked tab, or close it if it's already open.
                 self.active_panel = if self.active_panel == Some(p) { None } else { Some(p) };
+                // Layout changed (panel opened/closed) → re-compute the input region.
+                return screenshot_oldest();
             }
             Message::ImeInput(s) => self.ime_input = s,
             Message::ToggleAutoMove => self.auto_move = !self.auto_move,
+            Message::ScreenshotReady(s) => {
+                // Step 2: full alpha scan — every transparent PIXEL passes through
+                // (sprite corners, panel rounded corners, gaps, margins); only opaque
+                // pixels (sprite body, text, panel body) catch.
+                let scale = s.scale_factor;
+                let mut rects =
+                    input_region::alpha_rects(&s.rgba, s.size.width, s.size.height, 30);
+                // Screenshot is physical pixels; wl_surface input region is surface-local (logical).
+                if scale != 1.0 {
+                    for r in &mut rects {
+                        r.x = (r.x as f32 / scale).round() as i32;
+                        r.y = (r.y as f32 / scale).round() as i32;
+                        r.w = (r.w as f32 / scale).round() as i32;
+                        r.h = (r.h as f32 / scale).round() as i32;
+                    }
+                }
+                eprintln!(
+                    "[passthrough] {} rects from {}x{} scale {}",
+                    rects.len(), s.size.width, s.size.height, scale
+                );
+                return apply_input_region(rects);
+            }
+            Message::PassthroughApplied(n) => eprintln!("[passthrough] applied {n} rect(s)"),
+            Message::RescanTick => return screenshot_oldest(),
         }
         Task::none()
     }
 
-    /// ASR SSE client as a passive subscription — iced wakes on each event.
-    /// `run_with(addr, recipe)` keys the subscription on the daemon address and
-    /// rebuilds the stream (boxed, since `run_with` takes a `fn` pointer).
+    /// ASR SSE stream + a periodic re-scan tick (keeps the click-through input
+    /// region tracking the rendered content).
     pub fn subscription(&self) -> Subscription<Message> {
-        Subscription::run_with(self.aura_addr.clone(), asr_stream)
+        Subscription::batch([
+            Subscription::run_with(self.aura_addr.clone(), asr_stream),
+            Subscription::run_with("rescan".to_string(), rescan_stream),
+        ])
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        // ── Pet sprite = drag handle (grab the pet to move the window). ──
-        let sprite = mouse_area(
-            image(self.skin.clone())
-                .width(160)
-                .height(160)
-                .content_fit(ContentFit::Contain),
-        )
-        .on_press(Message::DragStarted)
-        .interaction(mouse::Interaction::Grab);
+        // ── Pet sprite (display-only; drag via the dedicated dock button). ──
+        let sprite = image(self.skin.clone())
+            .width(160)
+            .height(160)
+            .content_fit(ContentFit::Contain);
 
-        // ── Button dock: rounded row; hover a button to expand its panel. ──
+        // ── Button dock: drag handle + tab buttons. ──
         let dock = container(
             row![
+                drag_button(),
                 dock_button("💬 chat", Panel::Chat, self.active_panel == Some(Panel::Chat)),
                 dock_button("⚙ 设置", Panel::Settings, self.active_panel == Some(Panel::Settings)),
             ]
@@ -180,7 +218,7 @@ impl PetApp {
     }
 
     /// Chat panel: ASR status + live interim + scrollable transcript + text input.
-    fn chat_panel(&self) -> Element<Message> {
+    fn chat_panel(&self) -> Element<'_, Message> {
         let (dot, label, color) = if self.asr.connected {
             ("●", "ASR live", Color::from_rgb8(0x4f, 0xef, 0x6f))
         } else {
@@ -221,11 +259,11 @@ impl PetApp {
                 .into(),
         );
 
-        column(rows).spacing(4).padding(6).into()
+        column(rows).spacing(4).padding(6).width(Length::Fixed(220.0)).into()
     }
 
     /// Settings panel (stub): a couple of toggles. Real settings wired later.
-    fn settings_panel(&self) -> Element<Message> {
+    fn settings_panel(&self) -> Element<'_, Message> {
         column![
             text("设置").color(Color::WHITE).size(14),
             button(text(if self.auto_move { "☑ 自动游走" } else { "☐ 自动游走" }).color(Color::WHITE))
@@ -235,8 +273,24 @@ impl PetApp {
         ]
         .spacing(4)
         .padding(6)
+        .width(Length::Fixed(220.0))
         .into()
     }
+}
+
+/// The dedicated drag handle in the dock. Hover → grab cursor; press → compositor
+/// move. (The pet sprite is display-only now.)
+fn drag_button() -> Element<'static, Message> {
+    mouse_area(
+        container(text("⠿").size(15).color(Color::from_rgb8(0xcc, 0xcc, 0xcc)))
+            .width(36.0)
+            .align_x(iced::alignment::Horizontal::Center)
+            .padding([4, 0])
+            .style(move |_theme| pill_style(false)),
+    )
+    .on_press(Message::DragStarted)
+    .interaction(mouse::Interaction::Grab)
+    .into()
 }
 
 /// A rounded dock tab button. `active` highlights the open tab. Click toggles it.
@@ -287,6 +341,71 @@ fn asr_stream(addr: &String) -> std::pin::Pin<Box<dyn iced::futures::Stream<Item
     }))
 }
 
+/// A ~2 s periodic tick stream so the click-through input region re-scans the
+/// rendered frame (catches late skin decode, panel toggles, ASR-history growth).
+fn rescan_stream(_id: &String) -> std::pin::Pin<Box<dyn iced::futures::Stream<Item = Message> + Send>> {
+    Box::pin(iced::stream::channel::<Message>(4, |sender: iced::futures::channel::mpsc::Sender<Message>| async move {
+        std::thread::spawn(move || {
+            let mut sender = sender;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(2000));
+                let _ = sender.try_send(Message::RescanTick);
+            }
+        });
+    }))
+}
+
+// ── click-through helpers ────────────────────────────────────────────────────
+
+/// Capture the main window's frame so we can compute its opaque region.
+fn screenshot_oldest() -> Task<Message> {
+    window::oldest().then(|id| match id {
+        Some(id) => window::screenshot(id).map(Message::ScreenshotReady),
+        None => Task::none(),
+    })
+}
+
+/// Set `rects` as the wl_surface input region of the main window.
+fn apply_input_region(rects: Vec<input_region::Rect>) -> Task<Message> {
+    window::oldest().then(move |id| match id {
+        Some(id) => {
+            // `.then` is FnMut → clone the Vec for the inner FnOnce window::run closure.
+            let rects = rects.clone();
+            window::run(id, move |w| {
+                apply_to_window(w, &rects);
+                Message::PassthroughApplied(rects.len())
+            })
+        }
+        None => Task::none(),
+    })
+}
+
+/// Extract the raw Wayland surface/display pointers from an iced window and apply
+/// the input region. No-op on non-Wayland.
+fn apply_to_window(w: &dyn iced::Window, rects: &[input_region::Rect]) {
+    let (Some(wh), Some(dh)) = (w.window_handle().ok(), w.display_handle().ok()) else {
+        eprintln!("[passthrough] no window/display handle");
+        return;
+    };
+    let (raw_window_handle::RawWindowHandle::Wayland(sh), raw_window_handle::RawDisplayHandle::Wayland(dh)) =
+        (wh.as_raw(), dh.as_raw())
+    else {
+        eprintln!("[passthrough] not a Wayland window");
+        return;
+    };
+    let (surf, disp) = (sh.surface.as_ptr(), dh.display.as_ptr());
+    eprintln!("[passthrough] FFI apply {} rect(s) surf={:p} disp={:p}", rects.len(), surf, disp);
+    // SAFETY: surf/disp come from a live iced Wayland window; apply does not
+    // destroy the foreign surface (mem::forget inside).
+    unsafe {
+        input_region::apply(
+            surf as *mut std::ffi::c_void,
+            disp as *mut std::ffi::c_void,
+            rects,
+        );
+    }
+}
+
 /// Resolve the skin image via FileLoader (`SKIN::<rel>`), fall back to bundled bytes.
 pub fn skin_source(rel: &str) -> Handle {
     let loader = fs::loader!();
@@ -299,27 +418,5 @@ pub fn skin_source(rel: &str) -> Handle {
             eprintln!("[geek-familiar] skin: {rel} not found, bundled fallback");
             Handle::from_bytes(IDLE_PNG)
         }
-    }
-}
-
-/// One-shot gnome-layer-ext handshake over a Unix socket (async, runs once at boot).
-async fn handshake(token: String) -> bool {
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
-
-    let sock = std::env::var("XDG_RUNTIME_DIR")
-        .map(|d| format!("{d}/gnome-layer-ext.sock"))
-        .unwrap_or_else(|_| "/run/user/1000/gnome-layer-ext.sock".into());
-    match UnixStream::connect(&sock) {
-        Ok(mut s) => {
-            let req = format!("{{\"v\":1,\"token\":\"{token}\",\"app_id\":\"geek-familiar\"}}\n");
-            if s.write_all(req.as_bytes()).is_err() {
-                return false;
-            }
-            let mut resp = String::new();
-            let _ = s.read_to_string(&mut resp);
-            resp.contains("\"ok\":true")
-        }
-        Err(_) => false,
     }
 }

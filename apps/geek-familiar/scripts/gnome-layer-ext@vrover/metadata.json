@@ -1,0 +1,7 @@
+{
+  "uuid": "gnome-layer-ext@vrover",
+  "name": "Desktop Pet on Top",
+  "description": "Keep the geek-familiar desktop-pet window always above other windows and out of Activities/taskbar/Alt-Tab, via Meta.Window.make_above() + skip_taskbar/pager.",
+  "shell-version": ["49"],
+  "session-modes": ["user"]
+}
