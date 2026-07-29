@@ -1,0 +1,13 @@
+# desk-pilot-manager configuration
+# Dev: apps/desk-pilot-manager/manager.yaml
+# Prod: ~/.desk-pilot/manager.yaml
+
+# Window size (pixels). If unset, the window manager decides.
+# width: 860
+# height: 620
+
+# Workspace root — auto-detected in dev; override here if needed
+workspace_root: null
+
+# Default build profile
+build_profile: "release"

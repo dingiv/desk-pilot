@@ -1,0 +1,25 @@
+name: geek-familiar
+display_name: "Geek Familiar"
+description: "Desktop pet companion with voice interaction, ASR support, and customizable skins"
+version: "0.1.0"
+
+build:
+  system: cargo
+  package: geek-familiar
+  binary: "geek-familiar"
+  features: []
+  default_profile: "release"
+
+exec:
+  binary_relative: "target/release/geek-familiar"
+  args: []
+  env: {}
+
+config:
+  file_loader_ns: "CONF::familiar.yaml"
+  default_config:
+    aura_addr: "127.0.0.1:9091"
+    skin: "default/idle.png"
+
+system_deps:
+  - wayland

@@ -1,0 +1,25 @@
+[package]
+name = "dp-box"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Desk Pilot Box — GUI launcher, configurator, and monitor for desk-pilot apps"
+
+[[bin]]
+name = "dp-box"
+path = "src/main.rs"
+
+[dependencies]
+iced = { version = "0.14", features = ["wgpu", "image"] }
+fs = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+[build-dependencies]
+fs = { workspace = true }
+
+[package.metadata.shared]
+CONF = { dev = ".", prod = "~/.desk-pilot" }
+MANIFESTS = { dev = "manifests", prod = "~/.desk-pilot/manifests" }
