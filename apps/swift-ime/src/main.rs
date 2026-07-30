@@ -15,6 +15,7 @@
 //! cargo run -p swift-ime -- --backend ibus
 //! ```
 
+mod config;
 mod frontends;
 mod bridge;
 
@@ -84,19 +85,28 @@ fn run_mock(_config_path: &str, dict_path: Option<&str>) -> Result<()> {
     use ime_core::ImeView;
     use std::io::{self, Write};
 
+    let cfg = config::SwiftImeConfig::load();
     let mut engine = ImeEngine::new();
 
-    // Load rime-ice dictionary via FileLoader (dev: assets/dict, prod: /usr/share/swift-ime/dict).
-    let loader = shared::loader!("assets");
-    if let Ok(n) = load_dict_file(&mut engine, &loader, "DICT::rime-ice.tsv") {
-        eprintln!("loaded {n} entries from rime-ice dictionary");
+    // Restore user model (pins + pick counters).
+    let l0_loader = shared::loader!(".");
+    if let Some(l0_path) = l0_loader.resolve("CONF::swift-ime-l0.json") {
+        engine.init_l0(&l0_path.to_string_lossy());
+    }
+
+    // Load rime-ice if enabled in config.
+    if cfg.dicts.rime_ice {
+        let loader = shared::loader!("assets");
+        if let Ok(n) = load_dict_file(&mut engine, &loader, "DICT::rime-ice.tsv") {
+            eprintln!("[swift-ime] loaded {n} entries from rime-ice dictionary");
+        }
     }
 
     // Load additional user-specified dictionary if provided.
     if let Some(path) = dict_path {
         match engine.load_dict(path) {
-            Ok(n) => eprintln!("loaded {n} entries from {path}"),
-            Err(e) => eprintln!("warning: could not load dict: {e}"),
+            Ok(n) => eprintln!("[swift-ime] loaded {n} entries from {path}"),
+            Err(e) => eprintln!("[swift-ime] warning: could not load dict: {e}"),
         }
     }
     println!("swift-ime mock — type a line and press Enter. Trigger prefixes: / and #");

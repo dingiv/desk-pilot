@@ -80,6 +80,7 @@ pub struct ImeEngine {
     dispatcher: Dispatcher,
     contexts: Mutex<HashMap<usize, PerContext>>,
     async_waits: Mutex<HashMap<usize, WaitState>>,
+    l0_path: Mutex<Option<String>>,
 }
 
 impl ImeEngine {
@@ -100,6 +101,7 @@ impl ImeEngine {
             dispatcher: Dispatcher::new(matcher, expander),
             contexts: Mutex::new(HashMap::new()),
             async_waits: Mutex::new(HashMap::new()),
+            l0_path: Mutex::new(None),
         };
         // Load embedded base dictionary (5KB, compiled into binary).
         let count = engine.dispatcher.scorer().family("pinyin")
@@ -160,6 +162,7 @@ impl ImeEngine {
             let committed = ImeView::str_field(&view.commit_text);
             if !committed.is_empty() {
                 pc.text_context.update(committed);
+                self.save_l0(); // persist user picks
             }
             view
         })
@@ -254,6 +257,27 @@ impl ImeEngine {
         self.dispatcher.scorer().load_dict_to("pinyin", path)
             .unwrap_or_else(|| Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound, "pinyin family not found")))
+    }
+
+    /// Set the L0 user model persistence path and load existing data.
+    pub fn init_l0(&self, path: &str) {
+        *self.l0_path.lock().unwrap() = Some(path.to_string());
+        if let Ok(json) = std::fs::read_to_string(path) {
+            if let Some(fam) = self.dispatcher.scorer().family("pinyin") {
+                let n = fam.import_l0_json(&json);
+                if n > 0 { eprintln!("[swift-ime] restored {n} L0 pins from {path}"); }
+            }
+        }
+    }
+
+    /// Save L0 user model to the configured path.
+    pub fn save_l0(&self) {
+        let path = self.l0_path.lock().unwrap();
+        let Some(ref p) = *path else { return };
+        if let Some(fam) = self.dispatcher.scorer().family("pinyin") {
+            let json = fam.export_l0_json();
+            let _ = std::fs::write(p, &json);
+        }
     }
 
     /// Commit pending text in the default context.

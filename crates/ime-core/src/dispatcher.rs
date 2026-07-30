@@ -8,7 +8,6 @@ use crate::expander::Expander;
 use crate::family::ai::AiFamily;
 use crate::family::emoji::EmojiFamily;
 use crate::family::english::EnglishFamily;
-use crate::family::jianpin::JianpinFamily;
 use crate::family::magic::MagicFamily;
 use crate::family::pinyin::PinyinFamily;
 use crate::family::snippet::SnippetFamily;
@@ -32,7 +31,6 @@ impl Dispatcher {
         let snippet_family = SnippetFamily::new(matcher.clone(), expander.clone());
         let magic_family = MagicFamily::new();
         let english_family = EnglishFamily::new();
-        let jianpin_family = JianpinFamily::new();
         let emoji_family = EmojiFamily::new();
         let ai_family = AiFamily::new();
 
@@ -40,7 +38,6 @@ impl Dispatcher {
         let scorer = UnifiedScorer::new(vec![
             Box::new(pinyin_family),
             Box::new(magic_family),
-            Box::new(jianpin_family),
             Box::new(snippet_family),
             Box::new(english_family),
             Box::new(emoji_family),
@@ -94,10 +91,15 @@ impl StepEnv for Dispatcher {
         self.pinyin.first_syllable(pinyin)
     }
     fn record_pick(&self, pinyin: &str, word: &str) {
-        self.pinyin.record_pick(pinyin, word);
+        // Route through PinyinFamily (via scorer) for per-family auto-learning.
+        if let Some(fam) = self.scorer.family("pinyin") {
+            fam.record_pick(pinyin, word);
+        }
     }
     fn learn_phrase(&self, pinyin: &str, hanzi: &str) {
-        self.pinyin.learn_phrase(pinyin, hanzi);
+        if let Some(fam) = self.scorer.family("pinyin") {
+            fam.learn_phrase(pinyin, hanzi);
+        }
     }
 }
 

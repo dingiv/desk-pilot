@@ -14,16 +14,19 @@ path = "src/main.rs"
 
 [dependencies]
 ime-core = { workspace = true }
+inputx-fsa = "1"
 shared = { path = "../../crates/shared", features = ["log"] }
 tracing = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 anyhow = "1"
 
 [build-dependencies]
 shared = { path = "../../crates/shared" }
 
-# Dict file resolution: dev = relative to CARGO_MANIFEST_DIR; prod = installed system path.
+# Dict + Config resolution: dev = relative to CARGO_MANIFEST_DIR; prod = installed paths.
 [package.metadata.shared]
 DICT = { dev = "assets/dict", prod = "/usr/share/swift-ime/dict" }
+CONF = { dev = ".", prod = "~/.desk-pilot" }

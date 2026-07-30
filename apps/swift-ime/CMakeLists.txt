@@ -56,5 +56,9 @@ install(FILES "${RUST_BUILD_DIR}/libswift_ime.so"
 set(SWIFT_IME_DICT_DIR "${CMAKE_INSTALL_DATADIR}/swift-ime/dict")
 install(FILES assets/dict/base.tsv
         DESTINATION "${SWIFT_IME_DICT_DIR}")
-install(FILES assets/dict/rime-ice.tsv
+install(FILES assets/dict/rime-ice.fst assets/dict/rime-ice.tsv
         DESTINATION "${SWIFT_IME_DICT_DIR}")
+
+# ── Install default config ────────────────────────────────────────────────────
+install(FILES swift-ime.yaml
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/swift-ime")

@@ -13,10 +13,16 @@
 
 use std::collections::HashMap;
 
+#[derive(Debug, Clone)]
+struct Phrase {
+    text: String,
+    order: i32, // 0 = highest priority (fcitx5 CustomPhrase convention)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PhraseBook {
     /// pinyin (no spaces) → list of hanzi phrases
-    entries: HashMap<String, Vec<String>>,
+    entries: HashMap<String, Vec<Phrase>>,
     /// All pinyin keys, longest first — for prefix matching during typing.
     keys_by_len: Vec<String>,
 }
@@ -51,34 +57,41 @@ impl PhraseBook {
         Ok(book)
     }
 
-    /// Add one phrase. If the pinyin key already exists, appends to its list.
+    /// Add one phrase with default highest priority (order=0).
     pub fn insert(&mut self, pinyin: &str, text: &str) {
-        self.entries
-            .entry(pinyin.to_string())
-            .or_default()
-            .push(text.to_string());
+        self.insert_with_order(pinyin, text, 0);
     }
 
-    /// Exact match — only returns candidates when the full pinyin matches.
+    /// Add one phrase with a specific priority order (0 = highest).
+    pub fn insert_with_order(&mut self, pinyin: &str, text: &str, order: i32) {
+        let list = self.entries.entry(pinyin.to_string()).or_default();
+        // Remove existing entry with same text, then insert at order position.
+        list.retain(|p| p.text != text);
+        list.push(Phrase { text: text.to_string(), order });
+        list.sort_by_key(|p| p.order);
+    }
+
+    /// Exact match — candidates sorted by order (0 = highest first).
     pub fn exact(&self, pinyin: &str) -> Vec<String> {
-        self.entries.get(pinyin).cloned().unwrap_or_default()
+        let mut list: Vec<&Phrase> = self.entries.get(pinyin)
+            .map(|v| v.iter().collect()).unwrap_or_default();
+        list.sort_by_key(|p| p.order);
+        list.into_iter().map(|p| p.text.clone()).collect()
     }
 
-    /// Prefix match — returns candidates whose pinyin starts with `prefix`.
-    /// Useful during typing: "xiay" → matches "xiayige" → shows "下一个".
+    /// Prefix match — candidates sorted by order (0 = highest first).
     pub fn prefix(&self, prefix: &str) -> Vec<String> {
-        if prefix.is_empty() {
-            return Vec::new();
-        }
-        let mut out = Vec::new();
+        if prefix.is_empty() { return Vec::new(); }
+        let mut all: Vec<&Phrase> = Vec::new();
         for (py, texts) in &self.entries {
             if py.starts_with(prefix) {
-                for t in texts {
-                    if !out.contains(t) {
-                        out.push(t.clone());
-                    }
-                }
+                all.extend(texts.iter());
             }
+        }
+        all.sort_by_key(|p| p.order);
+        let mut out = Vec::new();
+        for p in all {
+            if !out.contains(&p.text) { out.push(p.text.clone()); }
         }
         out
     }
@@ -153,9 +166,9 @@ impl PhraseBook {
     pub fn load_from_json_str(&mut self, json: &str) -> Result<usize, serde_json::Error> {
         let book = PhraseBook::from_json(json)?;
         let count = book.len();
-        for (pinyin, words) in book.entries {
-            for word in words {
-                self.insert(&pinyin, &word);
+        for (pinyin, phrases) in book.entries {
+            for p in phrases {
+                self.insert_with_order(&pinyin, &p.text, p.order);
             }
         }
         Ok(count)

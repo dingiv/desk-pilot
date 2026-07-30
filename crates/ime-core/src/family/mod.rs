@@ -108,6 +108,18 @@ pub trait CandidateFamily: Send + Sync {
     fn load_dict_bytes(&self, _data: &[u8]) -> usize {
         0
     }
+
+    /// Record a user pick for frequency boosting (per-family auto-learning).
+    fn record_pick(&self, _pinyin: &str, _word: &str) {}
+
+    /// Learn a new phrase for future recall.
+    fn learn_phrase(&self, _pinyin: &str, _word: &str) {}
+
+    /// Export L0 user model as JSON (pins + pick counters).
+    fn export_l0_json(&self) -> String { String::new() }
+
+    /// Import L0 user model from JSON. Returns pins restored.
+    fn import_l0_json(&self, _json: &str) -> usize { 0 }
 }
 
 // ── UnifiedScorer ───────────────────────────────────────────────────────
@@ -303,7 +315,6 @@ mod tests {
 pub mod ai;
 pub mod emoji;
 pub mod english;
-pub mod jianpin;
 pub mod magic;
 pub mod pinyin;
 pub mod snippet;

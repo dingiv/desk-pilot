@@ -10,6 +10,7 @@ pub mod large_dict;
 pub mod matcher;
 pub mod phrase_book;
 pub mod pinyin;
+pub mod user_bigram;
 pub mod platform;
 pub mod snippet_store;
 pub mod state;

@@ -14,15 +14,49 @@ use ime_core::platform::ImeView;
 
 #[no_mangle]
 pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngine {
+    let cfg = crate::config::SwiftImeConfig::load();
     let engine = ImeEngine::new();
 
-    // Load rime-ice via FileLoader (dev: assets/dict, prod: /usr/share/swift-ime/dict).
-    let loader = shared::loader!("assets");
-    if let Some(p) = loader.resolve("DICT::rime-ice.tsv") {
-        match engine.load_dict(&p.to_string_lossy()) {
-            Ok(n) => tracing::info!(n, path = %p.display(), "loaded rime-ice dictionary"),
-            Err(e) => tracing::warn!(path = %p.display(), error = %e, "failed to load rime-ice"),
+    // Load rime-ice if enabled in config.
+    if cfg.dicts.rime_ice {
+        let loader = shared::loader!("assets");
+        // Try FST first (fast load), fall back to TSV.
+        let mut paths: Vec<std::path::PathBuf> = vec![
+            "/usr/share/swift-ime/dict/rime-ice.fst".into(),
+            "/usr/local/share/swift-ime/dict/rime-ice.fst".into(),
+            "/usr/share/swift-ime/dict/rime-ice.tsv".into(),
+        ];
+
+        let log_dir = std::env::var("HOME").unwrap_or_default();
+        let log_path = format!("{log_dir}/.desk-pilot/swift-ime-dict.log");
+        let _ = std::fs::create_dir_all(std::path::Path::new(&log_path).parent().unwrap());
+
+        let mut loaded = false;
+        for p in &paths {
+            let exists = p.exists();
+            let _ = std::fs::write(&log_path, format!("probe: {} (exists={exists})", p.display()));
+            if exists {
+                match engine.load_dict(&p.to_string_lossy()) {
+                    Ok(n) => {
+                        let _ = std::fs::write(&log_path, format!("OK: {n} entries from {}", p.display()));
+                        loaded = true; break;
+                    }
+                    Err(e) => {
+                        let _ = std::fs::write(&log_path, format!("ERROR: {e}"));
+                    }
+                }
+            }
         }
+        if !loaded {
+            let tried: Vec<_> = paths.iter().map(|p| format!("{} (e={})", p.display(), p.exists())).collect();
+            let _ = std::fs::write(&log_path, format!("NOT FOUND. tried: {tried:?}"));
+        }
+    }
+
+    // Restore user model from disk (pins + pick counters → per-family ranking).
+    let l0_loader = shared::loader!(".");
+    if let Some(l0_path) = l0_loader.resolve("CONF::swift-ime-l0.json") {
+        engine.init_l0(&l0_path.to_string_lossy());
     }
 
     Box::into_raw(Box::new(engine))

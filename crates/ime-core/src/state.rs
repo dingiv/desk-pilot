@@ -324,11 +324,12 @@ impl StateMachine {
         // Interleave: a few top full comps, then single-char options.
         if let Some(first_syl) = env.first_syllable(&self.buffer) {
             if first_syl.len() < self.buffer.len() {
-                let max_full = 6usize; // show at most 6 full comps on first page
+                let max_full = 8usize.min(cands.len());
+                let max_chars = (CANDIDATE_SLOTS - max_full).min(8);
                 let char_cands: Vec<String> = env.pinyin().candidates(&first_syl)
                     .into_iter()
                     .filter(|c| c.chars().count() == 1 && !merged.contains(c))
-                    .take(CANDIDATE_SLOTS)
+                    .take(max_chars)
                     .collect();
 
                 if !char_cands.is_empty() {

@@ -1,0 +1,66 @@
+# swift-ime configuration
+# Dev: <repo>/apps/swift-ime/swift-ime.yaml
+# Prod: ~/.desk-pilot/swift-ime.yaml
+
+# ── Dictionaries ────────────────────────────────────────────────────────
+dicts:
+  base: true          # embedded base dictionary (compiled into binary)
+  rime_ice: true      # rime-ice large dictionary (loaded from disk at startup)
+
+# ── Prediction families ─────────────────────────────────────────────────
+families:
+  pinyin:   true      # full pinyin + jianpin (Viterbi + LargeDict + PhraseBook)
+  english:  true      # English word prefix matching
+  magic:    true      # #date, #asr, #password commands
+  snippet:  true      # /greet user-defined text expansion
+  emoji:    false     # emoji shorthand (reserved)
+  ai:       false     # LLM sentence prediction (reserved)
+
+# ── Input ───────────────────────────────────────────────────────────────
+input:
+  fuzzy: true         # fuzzy pinyin (z/zh, c/ch, s/sh, n/l, etc.)
+  page_size: 7        # candidates per page
+
+# ── Weights (scoring parameters for each prediction layer) ──────────────
+weights:
+  # Family priorities (0-100, higher = more weight in global ranking)
+  family_priority:
+    pinyin: 100
+    magic: 95
+    snippet: 75
+    english: 60
+    emoji: 50
+    ai: 40
+
+  # Pinyin family internal scores (0.0-1.0)
+  pinyin:
+    phrase_book: 1.0        # user-learned phrases (always top)
+    large_dict: 0.90        # rime-ice exact match
+    viterbi_base: 0.3       # Viterbi min score
+    viterbi_scale: 0.65     # Viterbi score range (max = base + scale = 0.95)
+    session: 0.5            # inputx session lookup
+    prefix: 0.3             # prefix fallback (incomplete syllable)
+    phrase_book_prefix: 0.85 # PhraseBook prefix match
+    jianpin: 0.70           # initials-only match (nh → 你好)
+    single_syl_decay: 0.6   # score decay per position in single-syllable lookup
+    context_boost: 0.15     # bonus for bigram match with previous word
+
+  # Snippet family internal scores
+  snippet:
+    exact: 1.0              # exact trigger match
+    partial: 0.5            # partial trigger (still typing)
+
+  # Magic family internal scores
+  magic:
+    exact: 1.0              # exact command match
+    prefix: 0.9             # prefix command match
+
+  # English family internal scores
+  english:
+    exact: 1.0              # exact word match
+    prefix_ratio: 0.7       # max score for prefix match (scaled by match ratio)
+
+  # Candidate display
+  display:
+    max_full_comps: 8       # scorer entries on first page
+    max_char_cands: 8       # single-char options on first page

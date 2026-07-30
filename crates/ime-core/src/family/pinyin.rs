@@ -4,6 +4,7 @@
 use super::{CandidateFamily, InputContext, ScoredCandidate};
 use crate::large_dict::LargeDict;
 use crate::phrase_book::PhraseBook;
+use crate::user_bigram::UserBigram;
 use std::sync::Mutex;
 
 /// Full-pinyin prediction family.
@@ -19,7 +20,46 @@ pub struct PinyinFamily {
     engine: inputx_pinyin::PinyinEngine,
     phrase_book: Mutex<PhraseBook>,
     large_dict: Mutex<LargeDict>,
+    bigram: Mutex<UserBigram>,
     enabled: bool,
+    weights: PinyinWeights,
+}
+
+/// Chinese function words — Viterbi compositions made entirely of these
+/// get penalised (e.g. "diyige → 的一个" is nonsense).
+fn all_stopwords(word: &str) -> bool {
+    const SET: &[char] = &[
+        '的', '了', '是', '在', '和', '个', '有', '不', '这', '也',
+        '就', '都', '还', '要', '会', '能', '可', '以', '及', '与',
+        '着', '被', '把', '让', '向', '从', '到', '对', '为', '所',
+        '而', '且', '或', '但', '于', '由', '因', '虽', '然', '则',
+    ];
+    !word.is_empty() && word.chars().all(|c| SET.contains(&c))
+}
+
+/// Configurable scoring weights for the pinyin family.
+#[derive(Debug, Clone)]
+pub struct PinyinWeights {
+    pub phrase_book: f64,
+    pub large_dict: f64,   // default 0.90 — exact dict match, above most Viterbi
+    pub viterbi_base: f64,
+    pub viterbi_scale: f64,
+    pub session: f64,
+    pub prefix: f64,
+    pub phrase_book_prefix: f64,
+    pub jianpin: f64,
+    pub single_syl_decay: f64,
+    pub context_boost: f64,
+}
+
+impl Default for PinyinWeights {
+    fn default() -> Self {
+        PinyinWeights {
+            phrase_book: 1.0, large_dict: 0.95, viterbi_base: 0.3, viterbi_scale: 0.65,
+            session: 0.5, prefix: 0.3, phrase_book_prefix: 0.85, jianpin: 0.70,
+            single_syl_decay: 0.6, context_boost: 0.15,
+        }
+    }
 }
 
 impl PinyinFamily {
@@ -30,9 +70,13 @@ impl PinyinFamily {
             ),
             phrase_book: Mutex::new(PhraseBook::default_phrases()),
             large_dict: Mutex::new(LargeDict::new()),
+            bigram: Mutex::new(UserBigram::new()),
             enabled: true,
+            weights: PinyinWeights::default(),
         }
     }
+
+    pub fn set_weights(&mut self, w: PinyinWeights) { self.weights = w; }
 
     pub fn with_phrase_book(phrase_book: PhraseBook) -> Self {
         PinyinFamily {
@@ -41,17 +85,24 @@ impl PinyinFamily {
             ),
             phrase_book: Mutex::new(phrase_book),
             large_dict: Mutex::new(LargeDict::new()),
+            bigram: Mutex::new(UserBigram::new()),
             enabled: true,
+            weights: PinyinWeights::default(),
         }
     }
 
     pub fn set_enabled(&mut self, enabled: bool) { self.enabled = enabled; }
 
-    pub fn learn_phrase(&self, pinyin: &str, hanzi: &str) {
-        let mut book = self.phrase_book.lock().unwrap();
-        if !book.exact(pinyin).contains(&hanzi.to_string()) {
-            book.insert(pinyin, hanzi);
-        }
+    pub fn record_bigram(&self, prev: &str, next: &str) {
+        self.bigram.lock().unwrap().record(prev, next);
+    }
+
+    pub fn bigram_json(&self) -> String {
+        self.bigram.lock().unwrap().export_json()
+    }
+
+    pub fn import_bigram_json(&self, json: &str) {
+        self.bigram.lock().unwrap().import_json(json);
     }
 
     pub fn record_pick(&self, pinyin: &str, word: &str) {
@@ -63,6 +114,15 @@ impl PinyinFamily {
     pub fn large_dict_len(&self) -> usize { self.large_dict.lock().unwrap().len() }
 }
 
+/// Extract initials from a raw (concatenated) pinyin string.
+/// "shengnengshengqiao" → "snsq", "nihao" → "nh".
+pub fn initials_from_pinyin(raw: &str) -> String {
+    let segs = inputx_pinyin::segment(raw);
+    segs.first()
+        .map(|seg| seg.syllables.iter().filter_map(|s| s.chars().next()).collect())
+        .unwrap_or_default()
+}
+
 impl Default for PinyinFamily {
     fn default() -> Self { Self::new() }
 }
@@ -71,7 +131,45 @@ impl CandidateFamily for PinyinFamily {
     fn name(&self) -> &'static str { "pinyin" }
     fn priority(&self) -> u32 { 100 }
     fn enabled(&self) -> bool { self.enabled }
-    fn top_n(&self) -> usize { 8 }
+    fn top_n(&self) -> usize { 128 }
+
+    fn record_pick(&self, pinyin: &str, word: &str) {
+        self.engine.dict().record_pick(pinyin, word);
+        self.learn_phrase(pinyin, word);
+    }
+
+    fn learn_phrase(&self, pinyin: &str, hanzi: &str) {
+        let mut book = self.phrase_book.lock().unwrap();
+        if !book.exact(pinyin).contains(&hanzi.to_string()) {
+            book.insert(pinyin, hanzi);
+        }
+    }
+
+    fn export_l0_json(&self) -> String {
+        let snap = self.engine.dict().export_l0();
+        let mut json = String::from("{\"pins\":[");
+        for (i, (py, w)) in snap.pins.iter().enumerate() {
+            if i > 0 { json.push(','); }
+            json.push_str(&format!("[\"{py}\",\"{w}\"]"));
+        }
+        json.push_str("],\"picks\":[");
+        let mut first = true;
+        for (py, w, c) in &snap.pick_counts {
+            if !first { json.push(','); } first = false;
+            json.push_str(&format!("[\"{py}\",\"{w}\",{c}]"));
+        }
+        json.push_str("]}");
+        json
+    }
+
+    fn import_l0_json(&self, json: &str) -> usize {
+        #[derive(serde::Deserialize)]
+        struct L0Json { pins: Vec<(String, String)>, #[serde(default)] picks: Vec<(String, String, u32)> }
+        if let Ok(data) = serde_json::from_str::<L0Json>(json) {
+            let snap = inputx_pinyin::L0Snapshot { pins: data.pins, pick_counts: data.picks };
+            self.engine.dict().import_l0(snap)
+        } else { 0 }
+    }
 
     fn load_dict_bytes(&self, data: &[u8]) -> usize {
         // Load into LargeDict for large dictionaries, PhraseBook for small ones.
@@ -107,24 +205,38 @@ impl CandidateFamily for PinyinFamily {
         let mut out = Vec::new();
 
         let is_single_syllable = inputx_pinyin::is_valid_syllable(input);
+
+        // Layer 0: LargeDict exact match (0.95) — only for multi-syllable.
+        // For single syllables, inputx's dict.lookup() has better frequency
+        // ordering. Rime-ice's single-character frequencies are unreliable.
+        if !is_single_syllable {
+            let ld = self.large_dict.lock().unwrap();
+            for w in ld.exact(input).into_iter().take(96) {
+                out.push(ScoredCandidate { text: w, family: "pinyin", raw_score: self.weights.large_dict });
+            }
+        }
         if is_single_syllable {
             let words = dict.lookup(input);
             let total = words.len().max(1) as f64;
             for (i, word) in words.into_iter().enumerate() {
                 out.push(ScoredCandidate {
                     text: word, family: "pinyin",
-                    raw_score: (1.0 - (i as f64 / total) * 0.6).clamp(0.0, 1.0),
+                    raw_score: (1.0 - (i as f64 / total) * self.weights.single_syl_decay).clamp(0.0, 1.0),
                 });
             }
         } else {
-            let comps = dict.top_k_compositions(input, 24);
+            let comps = dict.top_k_compositions(input, 48);
             if !comps.is_empty() {
                 let scores: Vec<f64> = comps.iter().map(|(s, _)| *s).collect();
                 let min_s = scores.iter().cloned().fold(f64::INFINITY, f64::min);
                 let max_s = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 let range = (max_s - min_s).max(1.0);
                 for (score, word) in comps {
-                    let normalized = 0.3 + 0.65 * ((score - min_s) / range);
+                    let mut normalized = self.weights.viterbi_base + self.weights.viterbi_scale * ((score - min_s) / range);
+                    // Penalise all-stopword compositions (e.g. diyige → 的一个).
+                    if all_stopwords(&word) {
+                        normalized *= 0.5;
+                    }
                     out.push(ScoredCandidate {
                         text: word, family: "pinyin",
                         raw_score: normalized.clamp(0.0, 1.0),
@@ -138,7 +250,7 @@ impl CandidateFamily for PinyinFamily {
         for w in session.candidates() {
             let w = w.clone();
             if !out.iter().any(|c| c.text == w) {
-                out.push(ScoredCandidate { text: w, family: "pinyin", raw_score: 0.5 });
+                out.push(ScoredCandidate { text: w, family: "pinyin", raw_score: self.weights.session });
             }
         }
 
@@ -146,17 +258,38 @@ impl CandidateFamily for PinyinFamily {
             let book = self.phrase_book.lock().unwrap();
             for w in book.exact(input) {
                 out.retain(|c| c.text != w);
-                out.push(ScoredCandidate { text: w, family: "pinyin", raw_score: 1.0 });
+                out.push(ScoredCandidate { text: w, family: "pinyin", raw_score: self.weights.phrase_book });
             }
         }
-        // LargeDict: 900K+ entries, O(1) exact match. Lower score than
-        // PhraseBook so user-custom phrases always win.
+        // Jianpin (initials-only) fallback — "nh" → "你好".
+        // Activated when input is 2-6 chars and looks like initials.
+        if input.len() >= 2 && input.len() <= 6
+            && !inputx_pinyin::is_valid_syllable(input)
+            && input.chars().all(|c| c.is_ascii_lowercase())
         {
             let ld = self.large_dict.lock().unwrap();
-            for w in ld.exact(input).into_iter().take(8) {
+            for w in ld.jianpin(input).into_iter().take(8) {
                 if !out.iter().any(|c| c.text == w) {
-                    out.push(ScoredCandidate { text: w, family: "pinyin", raw_score: 0.95 });
+                    out.push(ScoredCandidate { text: w, family: "pinyin", raw_score: self.weights.jianpin });
                 }
+            }
+        }
+        // ── Post-merge ranking boost ──
+        // Candidates confirmed by both LargeDict + Viterbi get a bonus,
+        // and shorter (more likely intended) words get a slight boost.
+        {
+            // Collect texts seen in LargeDict (Layer 0) vs Viterbi (Layer 1).
+            let ld_set: std::collections::HashSet<String> = out.iter()
+                .filter(|c| c.raw_score > 0.90 && c.raw_score < 1.0)
+                .map(|c| c.text.clone()).collect();
+            let v_set: std::collections::HashSet<String> = out.iter()
+                .filter(|c| c.raw_score > 0.3 && c.raw_score < 0.90)
+                .map(|c| c.text.clone()).collect();
+            for c in &mut out {
+                if ld_set.contains(&c.text) && v_set.contains(&c.text) {
+                    c.raw_score = (c.raw_score + 0.05).min(1.0);
+                }
+                if c.text.chars().count() == 2 { c.raw_score = (c.raw_score + 0.02).min(1.0); }
             }
         }
 
@@ -165,9 +298,9 @@ impl CandidateFamily for PinyinFamily {
             return out;
         }
 
-        for (_py, word) in dict.prefix(input).into_iter().take(72) {
+        for (_py, word) in dict.prefix(input).into_iter().take(256) {
             if !out.iter().any(|c| c.text == word) {
-                out.push(ScoredCandidate { text: word, family: "pinyin", raw_score: 0.3 });
+                out.push(ScoredCandidate { text: word, family: "pinyin", raw_score: self.weights.prefix });
             }
         }
 
@@ -175,35 +308,60 @@ impl CandidateFamily for PinyinFamily {
             let book = self.phrase_book.lock().unwrap();
             for w in book.prefix(input) {
                 out.retain(|c| c.text != w);
-                out.push(ScoredCandidate { text: w, family: "pinyin", raw_score: 0.85 });
+                out.push(ScoredCandidate { text: w, family: "pinyin", raw_score: self.weights.phrase_book_prefix });
             }
         }
 
+        // Same post-merge boost as the early-return path.
+        for c in &mut out {
+            if c.text.chars().count() == 2 { c.raw_score = (c.raw_score + 0.02).min(1.0); }
+        }
         out.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap());
         out
     }
 
     fn predict_with_context(&self, input: &str, ctx: &InputContext) -> Vec<ScoredCandidate> {
         let mut candidates = self.predict(input);
-        let last = &ctx.last_word;
-        if last.is_empty() || candidates.is_empty() || last.chars().count() != 1 {
-            return candidates;
-        }
-        let last_char = last.chars().next().unwrap();
+        if candidates.is_empty() { return candidates; }
+
         let dict = self.engine.dict();
-        for c in &mut candidates {
-            if let Some(cand_char) = c.text.chars().next() {
-                for py_last in inputx_pinyin::char_to_pinyin(last_char) {
-                    for py_cand in inputx_pinyin::char_to_pinyin(cand_char) {
-                        let combined_py = format!("{py_last}{py_cand}");
-                        let combined_word: String = [last_char, cand_char].into_iter().collect();
-                        if dict.lookup(&combined_py).iter().any(|w| *w == combined_word) {
-                            c.raw_score = (c.raw_score + 0.15).min(1.0);
+        let bigram = self.bigram.lock().unwrap();
+        let ctx_words: Vec<String> = ctx.recent_text.split_whitespace()
+            .chain(std::iter::once(ctx.last_word.as_str()))
+            .filter(|w| !w.is_empty())
+            .map(|w| w.to_string())
+            .collect();
+        if !bigram.is_empty() {
+            for c in &mut candidates {
+                let boost = bigram.boost(&ctx_words, &c.text);
+                c.raw_score = (c.raw_score * boost).min(1.0);
+            }
+        }
+
+        // ── HistoryBigram-style word-level boosting ────
+        // For each word in the recent context, boost candidates that form
+        // known bigrams with that word. This mirrors libime's UserLanguageModel.
+        for ctx_word in ctx.recent_text.split_whitespace().chain(
+            std::iter::once(ctx.last_word.as_str())
+        ) {
+            if ctx_word.is_empty() || ctx_word.chars().count() < 1 { continue; }
+            for c in &mut candidates {
+                // Check if ctx_word + candidate[0] forms a known word.
+                let first_c = c.text.chars().next().unwrap_or('\0');
+                if first_c == '\0' { continue; }
+                let combined: String = ctx_word.chars().chain(std::iter::once(first_c)).collect();
+                // Quick check: look up the combined word in the dictionary.
+                for py_ctx in inputx_pinyin::char_to_pinyin(ctx_word.chars().next().unwrap()) {
+                    for py_cand in inputx_pinyin::char_to_pinyin(first_c) {
+                        let combined_py = format!("{py_ctx}{py_cand}");
+                        if dict.lookup(&combined_py).iter().any(|w| w.starts_with(&combined)) {
+                            c.raw_score = (c.raw_score + self.weights.context_boost).min(1.0);
                         }
                     }
                 }
             }
         }
+
         candidates.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap());
         candidates
     }

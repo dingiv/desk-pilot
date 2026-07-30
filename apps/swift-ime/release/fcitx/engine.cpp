@@ -207,6 +207,12 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
     // ── Candidate-list navigation (local) ──
     auto candList = ic->inputPanel().candidateList();
     if (candList && !candList->empty()) {
+        // Space: select the first visible candidate on the current page.
+        if (keyEvent.key().check(FcitxKey_space)) {
+            candList->candidate(0).select(ic);
+            keyEvent.filterAndAccept();
+            return;
+        }
         if (auto idx = keyEvent.key().keyListIndex(selectionKeys_);
             idx >= 0 && idx < (int)candList->size()) {
             candList->candidate(idx).select(ic);
