@@ -8,3 +8,34 @@ aura_addr: "127.0.0.1:9091"
 
 # Pet skin asset (resolved via the ui crate's SKIN namespace).
 skin: "default/idle.png"
+
+# Base font size in logical pixels. Dock labels, panel text, and the IME input
+# are all derived from this (≈ 0.85× for smaller labels, 1.0× for body).
+font_size: 14.0
+
+# Which side of the desktop the pet docks to.  "left" (default) left-aligns the
+# whole UI column; "right" right-aligns it (sprites / buttons / panel edges on
+# a common vertical axis).  The resize grip corner mirrors accordingly.
+# Pet sprite display size in logical pixels (square).  Bigger → smoother downscale
+# from the source image (1088×1088).  Default 180.
+sprite_size: 272
+sprite_filter: "nearest"
+
+docking_preference: "right"
+
+# Colour theme overrides.  Delete this whole section for built-in defaults.
+# Gradient pills: angle°, start_rgba, end_rgba (all 0..1).
+# Shadow: colour rgba + offset [x,y] + blur (pixels).  Omit shadow_blur for none.
+style:
+  card_bg:           [0.18, 0.18, 0.26, 0.5]     # frosted-glass card bg
+  shadow_color:      [0.0, 0.0, 0.1, 0.20]         # soft dark shadow
+  shadow_offset:     [1.0, 3.0]                     # shadow direction
+  shadow_blur:       12.0                            # blur radius
+  pill_accent:       [0.30, 0.50, 0.90, 1.0]       # solid fallback
+  pill_neutral:      [0.18, 0.18, 0.28, 0.85]      # idle pill
+  # accent gradient — angle=135°, start→end blue-purple
+  pill_accent_gradient: [135, 0.30, 0.50, 0.90, 1.0, 0.55, 0.35, 0.85, 1.0]
+
+# Window background colour. Format: "r, g, b, a" (comma-separated 0..1).
+# Omit or delete for fully transparent (default). Dev: opaque white.
+# window_bg: "1.0, 1.0, 1.0, 1.0"

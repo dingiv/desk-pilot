@@ -15,10 +15,21 @@ use serde_json::Value;
 /// A transcript update reported from the SSE client thread.
 #[derive(Debug, Clone)]
 pub enum AsrUpdate {
+    Hello,
     Interim(String),
-    Final { text: String, intent: String },
+    Final { text: String, intent: String, reply: String, seq: u64 },
+    Status(bool),
     Connected,
     Disconnected,
+}
+
+/// One complete conversation turn (user utterance → aura reply).
+#[derive(Debug, Clone)]
+pub struct ConversationTurn {
+    pub seq: u64,
+    pub user_text: String,   // calibrated transcript
+    pub intent: String,       // "chat" or "task"
+    pub reply: String,        // LLM reply text
 }
 
 /// Spawn the aura SSE loop on a background thread, invoking `on_update` per
@@ -49,10 +60,12 @@ pub fn spawn(addr: String, mut on_update: impl FnMut(AsrUpdate) + Send + 'static
         });
 }
 
-/// Extract a transcript [`AsrUpdate`] from a TurnEvent JSON value (or `None`).
+/// Extract an [`AsrUpdate`] from an aura SSE JSON event (or `None`).
 fn parse_sse_event(v: &Value) -> Option<AsrUpdate> {
     let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match ty {
+        "hello" => Some(AsrUpdate::Hello),
+        "status" => v.get("connected").and_then(|c| c.as_bool()).map(AsrUpdate::Status),
         "interim" => v
             .get("partial")
             .and_then(|p| p.as_str())
@@ -66,10 +79,12 @@ fn parse_sse_event(v: &Value) -> Option<AsrUpdate> {
                 .and_then(|t| t.as_str())
                 .unwrap_or("");
             let intent = v.get("intent").and_then(|i| i.as_str()).unwrap_or("");
+            let reply = v.get("reply").and_then(|r| r.as_str()).unwrap_or("");
+            let seq = v.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
             if text.is_empty() {
                 None
             } else {
-                Some(AsrUpdate::Final { text: text.to_string(), intent: intent.to_string() })
+                Some(AsrUpdate::Final { text: text.to_string(), intent: intent.to_string(), reply: reply.to_string(), seq })
             }
         }
         _ => None,
