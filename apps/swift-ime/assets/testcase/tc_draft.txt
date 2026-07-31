@@ -1,0 +1,22 @@
+# 从 draft.board 整理的测试用例
+# 格式: pinyin expected_word
+
+# 用户报告的权重失衡词
+limian 里面
+xinxi 信息
+zugou 足够
+zhichi 支持
+ceshi 测试
+jishi 即使
+qianyi 迁移
+huoqu 获取
+gongzuoqu 工作区
+chushi 初始
+yijing 已经
+piandi 偏低
+diyige 第一个
+xuanxiang 选项
+shuzhi 数值
+
+# draft.board 中的短语
+shiguangrenran 时光荏苒

@@ -75,7 +75,7 @@ impl CandidateFamily for SnippetFamily {
                         .unwrap_or_else(|_| expansion);
                     return vec![ScoredCandidate {
                         text: expanded,
-                        family: "snippet",
+                        family: "snippet", source: "exact",
                         raw_score: 1.0,
                     }];
                 }
@@ -95,7 +95,7 @@ impl CandidateFamily for SnippetFamily {
         if prefix.len() > 1 {
             return vec![ScoredCandidate {
                 text: prefix.clone(),
-                family: "snippet",
+                family: "snippet", source: "partial",
                 raw_score: 0.5,
             }];
         }

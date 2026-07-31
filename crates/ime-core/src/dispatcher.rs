@@ -13,7 +13,7 @@ use crate::family::pinyin::PinyinFamily;
 use crate::family::snippet::SnippetFamily;
 use crate::family::UnifiedScorer;
 use crate::matcher::Matcher;
-use crate::pinyin::InputxPinyin;
+use crate::family::pinyin::engine::InputxPinyin;
 use crate::platform::ImeView;
 use crate::state::{StateMachine, StepEnv};
 use crate::PinyinEngine;
@@ -27,7 +27,15 @@ pub struct Dispatcher {
 
 impl Dispatcher {
     pub fn new(matcher: Matcher, expander: Expander) -> Self {
-        let pinyin_family = PinyinFamily::new();
+        Self::with_pinyin_weights(matcher, expander, crate::family::pinyin::PinyinWeights::default())
+    }
+
+    pub fn with_pinyin_weights(
+        matcher: Matcher,
+        expander: Expander,
+        weights: crate::family::pinyin::PinyinWeights,
+    ) -> Self {
+        let pinyin_family = PinyinFamily::with_weights(weights);
         let snippet_family = SnippetFamily::new(matcher.clone(), expander.clone());
         let magic_family = MagicFamily::new();
         let english_family = EnglishFamily::new();

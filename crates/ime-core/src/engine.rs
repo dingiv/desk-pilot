@@ -31,6 +31,7 @@ use crate::dispatcher::Dispatcher;
 use crate::family::InputContext;
 use crate::platform::ImeView;
 use crate::state::{StateMachine, StepEnv};
+use crate::weight_store::WeightStore;
 
 // ── InputEvent ──────────────────────────────────────────────────────────
 
@@ -80,13 +81,18 @@ pub struct ImeEngine {
     dispatcher: Dispatcher,
     contexts: Mutex<HashMap<usize, PerContext>>,
     async_waits: Mutex<HashMap<usize, WaitState>>,
-    l0_path: Mutex<Option<String>>,
+    store: Mutex<Option<WeightStore>>,
 }
 
 impl ImeEngine {
     /// Create a new engine with all default prediction families, built-in
     /// snippet triggers, and the embedded base phrase dictionary.
     pub fn new() -> Self {
+        Self::with_pinyin_weights(crate::family::pinyin::PinyinWeights::default())
+    }
+
+    /// Create engine with custom pinyin family weights (from config file).
+    pub fn with_pinyin_weights(weights: crate::family::pinyin::PinyinWeights) -> Self {
         let entries: Vec<(String, String)> = vec![
             ("/greet".into(), "你好，我是 AI 秘书，请问有什么可以帮你的？".into()),
             ("/sig".into(), "Best regards,\nAlice".into()),
@@ -98,10 +104,10 @@ impl ImeEngine {
             crate::expander::StaticProvider { date: String::from("2026-07-27"), clipboard: String::new() },
         ));
         let engine = ImeEngine {
-            dispatcher: Dispatcher::new(matcher, expander),
+            dispatcher: Dispatcher::with_pinyin_weights(matcher, expander, weights),
             contexts: Mutex::new(HashMap::new()),
             async_waits: Mutex::new(HashMap::new()),
-            l0_path: Mutex::new(None),
+            store: Mutex::new(None),
         };
         // Load embedded base dictionary (5KB, compiled into binary).
         let count = engine.dispatcher.scorer().family("pinyin")
@@ -161,8 +167,9 @@ impl ImeEngine {
             let view = disp.select_candidate(index, &mut pc.sm);
             let committed = ImeView::str_field(&view.commit_text);
             if !committed.is_empty() {
+                let prev = pc.text_context.last_word.clone();
                 pc.text_context.update(committed);
-                self.save_l0(); // persist user picks
+                self.record_bigram(&prev, committed);
             }
             view
         })
@@ -235,6 +242,18 @@ impl ImeEngine {
             .get(&DEFAULT_CTX).map(|pc| pc.sm.candidates.clone()).unwrap_or_default()
     }
 
+    /// Current candidates with full detail (source, score) for debugging.
+    /// Re-runs the scorer on the current buffer to get member-level traceability.
+    pub fn candidates_detailed(&self) -> Vec<crate::family::RankedCandidate> {
+        let map = self.contexts.lock().unwrap();
+        let Some(pc) = map.get(&DEFAULT_CTX) else { return Vec::new() };
+        let ctx = pc.text_context.clone();
+        let buffer = pc.sm.buffer.clone();
+        drop(map);
+        use crate::state::StepEnv;
+        self.dispatcher.scorer().rank_detailed(&buffer, &ctx)
+    }
+
     /// Short-term text context for the default context.
     pub fn context_text(&self) -> String {
         self.contexts.lock().unwrap()
@@ -259,25 +278,21 @@ impl ImeEngine {
                 std::io::ErrorKind::NotFound, "pinyin family not found")))
     }
 
-    /// Set the L0 user model persistence path and load existing data.
-    pub fn init_l0(&self, path: &str) {
-        *self.l0_path.lock().unwrap() = Some(path.to_string());
-        if let Ok(json) = std::fs::read_to_string(path) {
-            if let Some(fam) = self.dispatcher.scorer().family("pinyin") {
-                let n = fam.import_l0_json(&json);
-                if n > 0 { eprintln!("[swift-ime] restored {n} L0 pins from {path}"); }
+    /// Initialize the SQLite-backed weight store. Call once at startup.
+    pub fn init_store(&self, path: &str) {
+        match WeightStore::open(path) {
+            Ok(store) => {
+                let pins = store.pin_count();
+                if pins > 0 { eprintln!("[swift-ime] weight store: {pins} pins from {path}"); }
+                *self.store.lock().unwrap() = Some(store);
             }
+            Err(e) => eprintln!("[swift-ime] weight store open failed: {e}"),
         }
     }
 
-    /// Save L0 user model to the configured path.
-    pub fn save_l0(&self) {
-        let path = self.l0_path.lock().unwrap();
-        let Some(ref p) = *path else { return };
-        if let Some(fam) = self.dispatcher.scorer().family("pinyin") {
-            let json = fam.export_l0_json();
-            let _ = std::fs::write(p, &json);
-        }
+    /// Record a bigram to the weight store.
+    pub fn record_bigram(&self, prev: &str, next: &str) {
+        if let Some(ref s) = *self.store.lock().unwrap() { s.record_bigram(prev, next); }
     }
 
     /// Commit pending text in the default context.

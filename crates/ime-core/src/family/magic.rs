@@ -96,7 +96,7 @@ impl CandidateFamily for MagicFamily {
                 if let Some(expansion) = self.resolve(trigger) {
                     out.push(ScoredCandidate {
                         text: expansion,
-                        family: "magic",
+                        family: "magic", source: "exact",
                         raw_score: 1.0,
                     });
                 }
@@ -104,7 +104,7 @@ impl CandidateFamily for MagicFamily {
                 // Prefix match — show the trigger as a hint.
                 out.push(ScoredCandidate {
                     text: trigger.to_string(),
-                    family: "magic",
+                    family: "magic", source: "prefix",
                     raw_score: 0.9,
                 });
             }

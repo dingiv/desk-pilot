@@ -33,8 +33,24 @@ pub struct ScoredCandidate {
     pub text: String,
     /// Which family produced this candidate.
     pub family: &'static str,
+    /// Which member within the family produced this candidate
+    /// (e.g., "dict", "viterbi", "session", "phrase", "jianpin", "prefix").
+    pub source: &'static str,
     /// Family-internal score in [0.0, 1.0]. Higher = better match.
     pub raw_score: f64,
+}
+
+/// A final-ranked candidate after global scoring and dedup.
+/// Returned by [`UnifiedScorer::rank_detailed`].
+#[derive(Debug, Clone)]
+pub struct RankedCandidate {
+    pub text: String,
+    /// Final score after family priority weighting.
+    pub score: f64,
+    /// Which family ("pinyin", "english", ...).
+    pub family: &'static str,
+    /// Which member within the family ("dict", "viterbi", "session", ...).
+    pub source: &'static str,
 }
 
 // ── InputContext ────────────────────────────────────────────────────────
@@ -149,68 +165,50 @@ impl UnifiedScorer {
         }
     }
 
-    /// Rank all candidates from all enabled families (context-free).
+    /// Rank all candidates (context-free). Returns deduplicated texts.
     pub fn rank(&self, input: &str) -> Vec<String> {
         self.rank_with_context(input, &InputContext::new())
     }
 
-    /// Rank candidates with short-term context awareness.
-    ///
-    /// Algorithm:
-    /// 1. Each family generates candidates via `predict()`.
-    /// 2. Within each family, sort by `raw_score` desc, take `top_n()`.
-    /// 3. Compute `final_score = raw_score × (family.priority() / 100)`.
-    /// 4. Globally sort all candidates by `final_score` desc.
-    /// 5. Deduplicate — first occurrence (higher score) wins.
-    ///
-    /// Returns deduplicated candidate texts in rank order.
+    /// Rank candidates with context. Returns deduplicated texts.
     pub fn rank_with_context(&self, input: &str, ctx: &InputContext) -> Vec<String> {
-        if input.is_empty() {
-            return Vec::new();
-        }
+        self.rank_detailed(input, ctx).into_iter().map(|d| d.text).collect()
+    }
 
-        let mut scored: Vec<(f64, String)> = Vec::new();
+    /// Rank with full detail — each result includes source and score.
+    /// This is the core ranking algorithm; `rank` / `rank_with_context`
+    /// delegate here and strip the metadata.
+    pub fn rank_detailed(&self, input: &str, ctx: &InputContext) -> Vec<RankedCandidate> {
+        if input.is_empty() { return Vec::new(); }
+
+        let mut scored: Vec<(f64, RankedCandidate)> = Vec::new();
 
         for family in &self.families {
-            if !family.enabled() {
-                continue;
-            }
+            if !family.enabled() { continue; }
             let priority_bonus = family.priority() as f64 / 100.0;
             let mut candidates = family.predict_with_context(input, ctx);
 
-            // Intra-family: sort by raw_score descending.
             candidates.sort_by(|a, b| {
-                b.raw_score
-                    .partial_cmp(&a.raw_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                b.raw_score.partial_cmp(&a.raw_score).unwrap_or(std::cmp::Ordering::Equal)
             });
 
-            // Take top N representatives from this family.
-            let top_n = family.top_n();
-            for c in candidates.into_iter().take(top_n) {
+            for c in candidates.into_iter().take(family.top_n()) {
                 let final_score = c.raw_score * priority_bonus;
-                scored.push((final_score, c.text));
+                scored.push((final_score, RankedCandidate {
+                    text: c.text,
+                    score: final_score,
+                    family: c.family,
+                    source: c.source,
+                }));
             }
         }
 
-        // Global: sort by final_score descending.
-        scored.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Dedup: keep only the first occurrence of each text
-        // (already highest-scoring due to sort).
         let mut seen = HashSet::new();
-        scored
-            .into_iter()
-            .filter_map(|(_, text)| {
-                if seen.insert(text.clone()) {
-                    Some(text)
-                } else {
-                    None
-                }
-            })
+        scored.into_iter()
+            .filter(|(_, rc)| seen.insert(rc.text.clone()))
+            .map(|(_, rc)| rc)
             .collect()
     }
 
@@ -245,7 +243,7 @@ mod tests {
         fn priority(&self) -> u32 { self.priority }
         fn predict(&self, _input: &str) -> Vec<ScoredCandidate> {
             self.candidates.iter().map(|(t, s)| ScoredCandidate {
-                text: t.to_string(), family: self.name, raw_score: *s,
+                text: t.to_string(), family: self.name, source: "stub", raw_score: *s,
             }).collect()
         }
     }
@@ -293,7 +291,7 @@ mod tests {
             fn priority(&self) -> u32 { 100 }
             fn enabled(&self) -> bool { false }
             fn predict(&self, _: &str) -> Vec<ScoredCandidate> {
-                vec![ScoredCandidate { text: "nope".into(), family: "disabled", raw_score: 1.0 }]
+                vec![ScoredCandidate { text: "nope".into(), family: "disabled", source: "stub", raw_score: 1.0 }]
             }
         }
         let fam = StubFamily { name: "ok", priority: 50, candidates: vec![("yes", 0.5)] };

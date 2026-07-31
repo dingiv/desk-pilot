@@ -35,7 +35,7 @@ weights:
   # Pinyin family internal scores (0.0-1.0)
   pinyin:
     phrase_book: 1.0        # user-learned phrases (always top)
-    large_dict: 0.90        # rime-ice exact match
+    large_dict: 0.95        # rime-ice exact match
     viterbi_base: 0.3       # Viterbi min score
     viterbi_scale: 0.65     # Viterbi score range (max = base + scale = 0.95)
     session: 0.5            # inputx session lookup
@@ -44,6 +44,13 @@ weights:
     jianpin: 0.70           # initials-only match (nh → 你好)
     single_syl_decay: 0.6   # score decay per position in single-syllable lookup
     context_boost: 0.15     # bonus for bigram match with previous word
+    stopword_penalty: 0.5   # multiplier for all-stopword compositions (diyige→的一个)
+    confirm_bonus: 0.05     # bonus when word appears in both dict and viterbi
+    short_word_bonus: 0.02  # bonus for 2-char words (most common target)
+    large_dict_take: 96     # max LargeDict candidates per query
+    viterbi_take: 48        # max Viterbi compositions per query
+    jianpin_take: 8         # max jianpin candidates per query
+    prefix_take: 256        # max prefix fallback candidates
 
   # Snippet family internal scores
   snippet:

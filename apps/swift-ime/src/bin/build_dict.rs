@@ -17,6 +17,19 @@ fn main() {
     let input = args.get(1).expect("usage: build_dict <input.tsv> [output.fst]");
     let output = args.get(2).map(|s| s.as_str()).unwrap_or("rime-ice.fst");
 
+    // Cache check: skip rebuild if TSV hasn't changed since FST was built.
+    if let (Ok(tsv_meta), Ok(fst_meta)) = (
+        std::fs::metadata(input),
+        std::fs::metadata(output),
+    ) {
+        if let (Ok(tsv_mtime), Ok(fst_mtime)) = (tsv_meta.modified(), fst_meta.modified()) {
+            if tsv_mtime <= fst_mtime {
+                eprintln!("FST cache hit: {output} is newer than {input}, skipping rebuild.");
+                return;
+            }
+        }
+    }
+
     eprintln!("Loading {input}...");
     let data = std::fs::read_to_string(input).expect("read input");
 
@@ -37,12 +50,11 @@ fn main() {
 
     eprintln!("Building FST from {} entries...", entries.len());
 
-    // Build FST: key = pinyin\x00word, value = frequency.
-    let mut builder = inputx_fsa::Builder::new();
+    // Build FST via DictBuilder: code=pinyin, item=word, value=frequency.
+    let mut builder = inputx_fsa::DictBuilder::new();
     for (pinyin, word) in &entries {
-        let key = format!("{}\x00{}", pinyin, word);
         let score = *freq.get(word).unwrap_or(&1) as u64;
-        builder.insert(key.as_bytes(), score);
+        builder.insert(pinyin.as_bytes(), word.as_bytes(), score);
     }
 
     let fst_bytes = builder.finish();

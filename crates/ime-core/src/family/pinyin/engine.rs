@@ -13,7 +13,7 @@
 
 use std::sync::Mutex;
 
-use crate::phrase_book::PhraseBook;
+use crate::family::pinyin::phrase::PhraseBook;
 use crate::PinyinEngine;
 
 pub struct InputxPinyin {

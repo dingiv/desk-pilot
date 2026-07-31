@@ -87,14 +87,14 @@ impl CandidateFamily for EnglishFamily {
             if *word == input_lower {
                 out.push(ScoredCandidate {
                     text: word.to_string(),
-                    family: "english",
+                    family: "english", source: "exact",
                     raw_score: 1.0,
                 });
             } else if word.starts_with(&input_lower) {
                 let score = input_lower.len() as f64 / word.len() as f64;
                 out.push(ScoredCandidate {
                     text: word.to_string(),
-                    family: "english",
+                    family: "english", source: "prefix",
                     raw_score: score.clamp(0.3, 0.95),
                 });
             }

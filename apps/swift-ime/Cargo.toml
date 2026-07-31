@@ -3,6 +3,7 @@ name = "swift-ime"
 version = "0.1.0"
 edition = "2021"
 description = "swift-ime — DeskPilot input method engine (fcitx5 addon .so + ibus DBus engine)"
+default-run = "swift-ime"
 
 [lib]
 name = "swift_ime"
