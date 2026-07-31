@@ -16,28 +16,62 @@
 //! Install the extension on the GNOME host: `apps/geek-familiar/scripts/install-ext.sh`
 //! (source: `apps/geek-familiar/scripts/gnome-layer-ext@vrover/`).
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
+use std::time::Duration;
 
 /// One-shot handshake over the gnome-layer-ext socket.
-///
-/// Returns `true` if the extension replied `{"ok":true}` (window pinned). The
-/// caller must have already set the window title to `desktop-pet#<token>` so the
-/// extension can find the window.
 pub async fn handshake(token: String, app_id: &str) -> bool {
-    let sock = std::env::var("XDG_RUNTIME_DIR")
-        .map(|d| format!("{d}/gnome-layer-ext.sock"))
-        .unwrap_or_else(|_| "/run/user/1000/gnome-layer-ext.sock".into());
+    let sock = socket_path();
     match UnixStream::connect(&sock) {
         Ok(mut s) => {
             let req = format!("{{\"v\":1,\"token\":\"{token}\",\"app_id\":\"{app_id}\"}}\n");
-            if s.write_all(req.as_bytes()).is_err() {
-                return false;
-            }
+            if s.write_all(req.as_bytes()).is_err() { return false; }
             let mut resp = String::new();
             let _ = s.read_to_string(&mut resp);
             resp.contains("\"ok\":true")
         }
         Err(_) => false,
     }
+}
+
+/// Persistent socket connection for clipboard push from the extension.
+/// The extension reads the clipboard content host-side (the pet runs in a
+/// container and can't access it directly) and pushes
+/// `{"type":"clipboard","text":"..."}\n` on each change.
+pub fn subscribe_clipboard(
+    token: String, mut on_text: impl FnMut(String) + Send + 'static,
+) {
+    let sock = socket_path();
+    let req = format!("{{\"v\":1,\"token\":\"{token}\",\"app_id\":\"geek-familiar\",\"subscribe_clipboard\":true}}\n");
+    eprintln!("[geek-familiar] clipboard: subscribing via socket {sock}");
+    let _ = std::thread::Builder::new().name("familiar-clipboard".into()).spawn(move || {
+        loop {
+            if let Ok(mut s) = UnixStream::connect(&sock) {
+                eprintln!("[geek-familiar] clipboard: socket connected");
+                let _ = s.write_all(req.as_bytes());
+                for line in BufReader::new(&mut s).lines() {
+                    match line {
+                        Ok(l) if l.contains("\"type\":\"clipboard\"") => {
+                            if let Some(text) = serde_json::from_str::<serde_json::Value>(&l).ok()
+                                .and_then(|v| v.get("text")?.as_str().map(|s| s.to_string()))
+                            {
+                                eprintln!("[geek-familiar] clipboard: received from ext len={}", text.len());
+                                on_text(text);
+                            }
+                        }
+                        Ok(l) => eprintln!("[geek-familiar] clipboard: recv {l}"),
+                        Err(_) => { eprintln!("[geek-familiar] clipboard: socket disconnected, retrying..."); break; }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
+}
+
+fn socket_path() -> String {
+    std::env::var("XDG_RUNTIME_DIR")
+        .map(|d| format!("{d}/gnome-layer-ext.sock"))
+        .unwrap_or_else(|_| "/run/user/1000/gnome-layer-ext.sock".into())
 }

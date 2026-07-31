@@ -14,8 +14,6 @@ members = [
     "crates/dp-models",
 
     # audio-aura (voice)
-    "crates/aura-dcl",
-    "crates/aura-store",
     "crates/aura-core",
     "crates/aura-asr",
     "crates/aura-tts",
@@ -34,6 +32,9 @@ members = [
 
     # geek-familiar (sprite engine)
     "apps/geek-familiar",
+
+    # desk-pilot-manager (GUI desktop manager)
+    "apps/dp-box",
 ]
 
 [workspace.package]

@@ -15,6 +15,7 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
+import St from 'gi://St';
 import * as Workspace from 'resource:///org/gnome/shell/ui/workspace.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
@@ -70,6 +71,7 @@ export default class PetOnTopExtension extends Extension {
 
         this._pending = new Set();
         this._pinned  = new Set();
+        this._clipSubs = new Set();  // persistent connections for clipboard push
 
         // Mutter-layer hints on window-created
         this._winCreatedId = global.display.connect('window-created', (_d, w) => {
@@ -78,6 +80,30 @@ export default class PetOnTopExtension extends Extension {
             // Show on all workspaces.
             if (typeof w.stick === 'function') w.stick();
         });
+
+        // ── Clipboard change subscription ─────────────────────────
+        // On clipboard change, read the actual content and push it
+        // to subscribed clients (the pet runs in a container and
+        // cannot access the host clipboard directly).
+        try {
+            this._clipboard = St.Clipboard.get_default();
+            const sel = global.display.get_selection();
+            const CLIP = Meta.SelectionType?.SELECTION_CLIPBOARD ?? 1;
+            this._clipSelId = sel.connect('owner-changed', (_s, type, _src) => {
+                if (type !== CLIP) return;
+                print(`[gnome-layer-ext] clipboard changed, subs=${this._clipSubs.size}`);
+                this._clipboard.get_text(St.ClipboardType.CLIPBOARD, (_c, text) => {
+                    const t = text || '';
+                    print(`[gnome-layer-ext] clipboard text="${t.substring(0,40)}"`);
+                    const payload = JSON.stringify({type:'clipboard',text:t}) + '\n';
+                    for (const conn of this._clipSubs) {
+                        try { conn.get_output_stream().write_bytes(new TextEncoder().encode(payload), null); }
+                        catch (_) { this._clipSubs.delete(conn); }
+                    }
+                });
+            });
+            print('[gnome-layer-ext] clipboard subscription active');
+        } catch (e) { log(`[gnome-layer-ext] clipboard subscription failed: ${e}`); }
 
         // Socket server
         try { GLib.unlink(SOCK); } catch (_) {}
@@ -88,12 +114,14 @@ export default class PetOnTopExtension extends Extension {
         this._incId = this._service.connect('incoming', (_s, c) => {
             const input = Gio.DataInputStream.new(c.get_input_stream());
             input.read_line_async(GLib.PRIORITY_DEFAULT, null, (stream, res) => {
-                let token = null;
+                let token = null, subscribe = false;
                 try {
                     const r = stream.read_line_finish(res);
                     const bytes = Array.isArray(r) ? r[0] : r;
                     const line = bytes ? new TextDecoder().decode(bytes) : '';
-                    token = (JSON.parse(line.trim()) ?? {}).token ?? null;
+                    const obj = JSON.parse(line.trim()) ?? {};
+                    token = obj.token ?? null;
+                    subscribe = obj.subscribe_clipboard === true;
                 } catch (_) { token = null; }
                 let ok = !!token;
                 if (token) {
@@ -111,7 +139,15 @@ export default class PetOnTopExtension extends Extension {
                 const out = c.get_output_stream();
                 out.write_all_async(new TextEncoder().encode(`{"ok":${ok}}\n`),
                     GLib.PRIORITY_DEFAULT, null, (o, r) => {
-                        try { o.write_all_finish(r); } catch (_) {} c.close(null); });
+                        try { o.write_all_finish(r); } catch (_) {}
+                        if (subscribe && ok) {
+                            // Keep connection open for clipboard push.
+                            this._clipSubs.add(c);
+                            print('[gnome-layer-ext] clipboard subscriber added');
+                        } else {
+                            c.close(null);
+                        }
+                    });
             });
         });
         print('[gnome-layer-ext] enabled');
@@ -120,9 +156,12 @@ export default class PetOnTopExtension extends Extension {
     disable() {
         _unpatch();
         if (this._winCreatedId) { global.display.disconnect(this._winCreatedId); this._winCreatedId = null; }
+        if (this._clipSelId) { global.display.get_selection().disconnect(this._clipSelId); this._clipSelId = null; }
         if (this._incId && this._service) { this._service.disconnect(this._incId); this._incId = null; }
         if (this._service) { this._service.stop(); this._service = null; }
         try { GLib.unlink(SOCK); } catch (_) {}
+        for (const c of this._clipSubs) { try { c.close(null); } catch (_) {} }
+        this._clipSubs.clear();
         for (const actor of global.get_window_actors()) {
             const w = actor.meta_window;
             if (w && this._pinned.has(_tokenOf(w))) {

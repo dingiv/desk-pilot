@@ -13,7 +13,6 @@ use iced::alignment::Vertical;
 use iced::widget::image::Handle;
 use iced::widget::svg::Handle as SvgHandle;
 use iced::{Color, ContentFit, Element, Length, Subscription, Task, alignment, window};
-use crate::view::card_style;
 
 pub(crate) use crate::model::{AsrState, ConversationTurn, DockingPreference, Message, Panel, StyleConfig};
 pub(crate) use crate::service::asr::AsrUpdate;
@@ -22,6 +21,8 @@ pub(crate) use crate::service::asr::AsrUpdate;
 const IDLE_PNG: &[u8] = include_bytes!("../assets/skins/default/idle.png");
 /// Resize-grip icon (four-pointed star, embedded SVG).
 const RESIZOR_SVG: &[u8] = include_bytes!("../assets/skins/default/resizor.dio.svg");
+
+const RESCAN_TICK :u64 = 5000;
 
 // ── PetApp (composition root) ─────────────────────────────────────────────────
 
@@ -40,6 +41,8 @@ pub struct PetApp {
     pub(crate) style: StyleConfig,
     window_bg: Option<String>,
     docking: DockingPreference,
+    /// Clipboard history, newest first.
+    pub(crate) clipboard: Vec<String>,
 }
 
 impl PetApp {
@@ -52,6 +55,12 @@ impl PetApp {
             aura_addr, skin, token, font_size, sprite_size, sprite_filter, style, window_bg, docking,
             asr: AsrState::default(),
             active_panel: None, ime_input: String::new(), auto_move: false,
+            clipboard: vec![
+                "📋 剪贴板监听已启动 — 复制任意文字试试".into(),
+                "你好，世界！".into(),
+                "The quick brown fox jumps over the lazy dog".into(),
+                "Lorem ipsum dolor sit amet, consectetur adipiscing elit.".into(),
+            ],
             resize_handle: SvgHandle::from_memory(RESIZOR_SVG),
         };
         let token_for_task = app.token.clone();
@@ -117,7 +126,7 @@ impl PetApp {
                         r.h = (r.h as f32 / scale).round() as i32;
                     }
                 }
-                eprintln!("[passthrough] {} rects from {}x{} scale {}", rects.len(), s.size.width, s.size.height, scale);
+                // eprintln!("[passthrough] {} rects from {}x{} scale {}", rects.len(), s.size.width, s.size.height, scale);
                 return apply_input_region(rects);
             }
             Message::PassthroughApplied(n) => eprintln!("[passthrough] applied {n} rect(s)"),
@@ -132,6 +141,26 @@ impl PetApp {
                 );
             }
             Message::RecordingToggled => {}
+            Message::ClipboardPoll => {
+                return iced::clipboard::read().map(|opt| {
+                    Message::ClipboardUpdate(opt.unwrap_or_default())
+                });
+            }
+            Message::ClipboardUpdate(s) => {
+                if s.is_empty() { return Task::none(); }
+                if self.clipboard.first().map_or(true, |last| last != &s) {
+                    eprintln!("[geek-familiar] clipboard update: {} chars (new)", s.len());
+                    self.clipboard.insert(0, s);
+                    if self.clipboard.len() > 50 { self.clipboard.truncate(50); }
+                } else {
+                    eprintln!("[geek-familiar] clipboard update: dup, skipped");
+                }
+            }
+            Message::ClipboardPoll => {
+                return iced::clipboard::read().map(|opt| {
+                    Message::ClipboardUpdate(opt.unwrap_or_default())
+                });
+            }
             Message::Quit => {
                 return window::oldest().then(|id| match id {
                     Some(id) => window::close::<Message>(id),
@@ -159,6 +188,8 @@ impl PetApp {
         Subscription::batch([
             Subscription::run_with(self.aura_addr.clone(), asr_stream),
             Subscription::run_with("rescan".to_string(), rescan_stream),
+            Subscription::run_with(self.token.clone(), clipboard_stream),
+            Subscription::run_with("clip_poll".to_string(), clipboard_poll_stream),
         ])
     }
 
@@ -176,7 +207,6 @@ impl PetApp {
             });
 
         let dock = row![
-            crate::view::recording_button(self.asr.connected, fs, style.clone()),
             crate::view::dock_button("💬", Panel::Chat, self.active_panel == Some(Panel::Chat), fs, style.clone()),
             crate::view::dock_button("⚙", Panel::Settings, self.active_panel == Some(Panel::Settings), fs, style.clone()),
             crate::view::drag_button(fs, style.clone()),
@@ -261,7 +291,7 @@ fn rescan_stream(_id: &String) -> std::pin::Pin<Box<dyn iced::futures::Stream<It
         std::thread::spawn(move || {
             let mut sender = sender;
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(2000));
+                std::thread::sleep(std::time::Duration::from_millis(RESCAN_TICK));
                 let _ = sender.try_send(Message::RescanTick);
             }
         });
@@ -269,6 +299,26 @@ fn rescan_stream(_id: &String) -> std::pin::Pin<Box<dyn iced::futures::Stream<It
 }
 
 /// Resolve the skin image via FileLoader (`SKIN::<rel>`), fall back to bundled bytes.
+fn clipboard_stream(token: &String) -> std::pin::Pin<Box<dyn iced::futures::Stream<Item = Message> + Send>> {
+    let token = token.clone();
+    Box::pin(iced::stream::channel::<Message>(8, move |mut sender: iced::futures::channel::mpsc::Sender<Message>| async move {
+        crate::service::gnome_ext::subscribe_clipboard(token, move |text| {
+            let _ = sender.try_send(Message::ClipboardUpdate(text));
+        });
+    }))
+}
+
+fn clipboard_poll_stream(_id: &String) -> std::pin::Pin<Box<dyn iced::futures::Stream<Item = Message> + Send>> {
+    Box::pin(iced::stream::channel::<Message>(4, |mut sender: iced::futures::channel::mpsc::Sender<Message>| async move {
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(3000));
+                let _ = sender.try_send(Message::ClipboardPoll);
+            }
+        });
+    }))
+}
+
 pub fn skin_source(rel: &str) -> Handle {
     let loader = fs::loader!();
     match loader.resolve(&format!("SKIN::{rel}")).filter(|p| p.exists()) {

@@ -77,6 +77,10 @@ pub enum Message {
     HealthCheck(bool),
     #[allow(unused)]
     RecordingToggled,
+    /// Clipboard content from GNOME extension push OR iced poll.
+    ClipboardUpdate(String),
+    /// Periodic poll fallback (no extension / native run).
+    ClipboardPoll,
 
     // ── interaction ──
     DragStarted,
