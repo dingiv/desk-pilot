@@ -13,18 +13,32 @@
 
 use std::collections::HashMap;
 
+use super::initials_from_pinyin;
+
 #[derive(Debug, Clone)]
 struct Phrase {
     text: String,
     order: i32, // 0 = highest priority (fcitx5 CustomPhrase convention)
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PhraseBook {
     /// pinyin (no spaces) → list of hanzi phrases
     entries: HashMap<String, Vec<Phrase>>,
+    /// Initials index: "lzm" → ["李正明", ...] for jianpin recall.
+    initials_index: HashMap<String, Vec<Phrase>>,
     /// All pinyin keys, longest first — for prefix matching during typing.
     keys_by_len: Vec<String>,
+}
+
+impl Default for PhraseBook {
+    fn default() -> Self {
+        PhraseBook {
+            entries: HashMap::new(),
+            initials_index: HashMap::new(),
+            keys_by_len: Vec::new(),
+        }
+    }
 }
 
 impl PhraseBook {
@@ -64,16 +78,35 @@ impl PhraseBook {
 
     /// Add one phrase with a specific priority order (0 = highest).
     pub fn insert_with_order(&mut self, pinyin: &str, text: &str, order: i32) {
+        let phrase = Phrase { text: text.to_string(), order };
+        // Full pinyin index.
         let list = self.entries.entry(pinyin.to_string()).or_default();
-        // Remove existing entry with same text, then insert at order position.
         list.retain(|p| p.text != text);
-        list.push(Phrase { text: text.to_string(), order });
+        list.push(phrase.clone());
         list.sort_by_key(|p| p.order);
+        // Initials index for jianpin recall (lzm → 李正明).
+        let initials = initials_from_pinyin(pinyin);
+        if initials.len() >= 2 {
+            let init_list = self.initials_index.entry(initials).or_default();
+            init_list.retain(|p| p.text != text);
+            init_list.push(phrase);
+            init_list.sort_by_key(|p| p.order);
+        }
     }
 
     /// Exact match — candidates sorted by order (0 = highest first).
     pub fn exact(&self, pinyin: &str) -> Vec<String> {
         let mut list: Vec<&Phrase> = self.entries.get(pinyin)
+            .map(|v| v.iter().collect()).unwrap_or_default();
+        list.sort_by_key(|p| p.order);
+        list.into_iter().map(|p| p.text.clone()).collect()
+    }
+
+    /// Initials (jianpin) match — candidates sorted by order.
+    /// "lzm" → ["李正明", ...] (from previously learned lizhengming→李正明).
+    pub fn by_initials(&self, initials: &str) -> Vec<String> {
+        if initials.is_empty() || initials.len() < 2 { return Vec::new(); }
+        let mut list: Vec<&Phrase> = self.initials_index.get(initials)
             .map(|v| v.iter().collect()).unwrap_or_default();
         list.sort_by_key(|p| p.order);
         list.into_iter().map(|p| p.text.clone()).collect()
@@ -227,5 +260,26 @@ mod tests {
         let r = book.exact("ceshi");
         assert!(r.contains(&"测试".to_string()));
         assert!(r.contains(&"侧室".to_string()));
+    }
+
+    #[test]
+    fn initials_lookup_lzm() {
+        let mut book = PhraseBook::new();
+        book.insert("lizhengming", "李正明");
+        // Full pinyin exact match.
+        assert_eq!(book.exact("lizhengming"), vec!["李正明"]);
+        // Initials match: lzm → 李正明.
+        let r = book.by_initials("lzm");
+        assert!(r.contains(&"李正明".to_string()),
+            "lzm should find 李正明, got {:?}", r);
+    }
+
+    #[test]
+    fn initials_lookup_multiple() {
+        let mut book = PhraseBook::new();
+        book.insert("lizhengming", "李正明");
+        book.insert("lizhongming", "李中明");
+        let r = book.by_initials("lzm");
+        assert_eq!(r.len(), 2, "lzm should find both 李正明 and 李中明, got {:?}", r);
     }
 }

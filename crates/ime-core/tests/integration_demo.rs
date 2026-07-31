@@ -220,3 +220,25 @@ fn phrase_persistence_across_sessions() {
 
     let _ = std::fs::remove_file(&db_path);
 }
+
+#[test]
+fn phrase_initials_recall() {
+    let mut eng = ImeEngine::new();
+
+    // Compose "李正明" from "lizhengming".
+    for c in "lizhengming".chars() { eng.predict(InputEvent::char(c)); }
+    let li = eng.candidates().iter().position(|c| *c == "李").unwrap();
+    eng.select_candidate(li);
+    let zheng = eng.candidates().iter().position(|c| *c == "正").unwrap();
+    eng.select_candidate(zheng);
+    let ming = eng.candidates().iter().position(|c| *c == "明").unwrap();
+    let v = eng.select_candidate(ming);
+    assert_eq!(commit(&v), "李正明");
+
+    // Now type initials "lzm" — should recall 李正明.
+    for c in "lzm".chars() { eng.predict(InputEvent::char(c)); }
+    let cands = eng.candidates();
+    eprintln!("lzm recall: {:?}", &cands.iter().take(5).collect::<Vec<_>>());
+    assert!(cands.contains(&"李正明".to_string()),
+        "lzm should recall 李正明, got {:?}", &cands.iter().take(5).collect::<Vec<_>>());
+}

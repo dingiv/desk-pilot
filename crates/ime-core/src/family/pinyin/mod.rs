@@ -335,6 +335,15 @@ impl CandidateFamily for PinyinFamily {
                 out.retain(|c| c.text != w);
                 out.push(ScoredCandidate { text: w, family: "pinyin", source: "phrase", raw_score: self.weights.phrase_book });
             }
+            // ── PhraseBook initials match (lzm → 李正明) ──
+            for w in book.by_initials(input) {
+                if !out.iter().any(|c| c.text == w) {
+                    out.push(ScoredCandidate {
+                        text: w, family: "pinyin", source: "phrase_sp",
+                        raw_score: self.weights.phrase_book * 0.95,
+                    });
+                }
+            }
         }
 
         // ── Short-word bonus ──
