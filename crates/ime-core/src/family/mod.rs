@@ -136,6 +136,22 @@ pub trait CandidateFamily: Send + Sync {
 
     /// Import L0 user model from JSON. Returns pins restored.
     fn import_l0_json(&self, _json: &str) -> usize { 0 }
+
+    /// Record a bigram (prev_word, next_word) co-occurrence in this family's
+    /// user model. Default no-op; PinyinFamily overrides to update its
+    /// in-memory UserBigram for context-aware ranking.
+    fn record_bigram(&self, _prev: &str, _next: &str) {}
+
+    /// Warm the in-memory bigram model from persisted data.
+    /// `entries` is a vec of (prev, next, count) from SQLite.
+    fn warm_bigrams(&self, _entries: Vec<(String, String, u32)>) {}
+
+    /// Attach the weight store for persisting learned phrases.
+    /// Called once at startup after init_store.
+    fn attach_store(&self, _store: std::sync::Arc<crate::weight_store::WeightStore>) {}
+
+    /// Warm the phrase book from persisted SQLite data.
+    fn warm_phrases_from_store(&self) {}
 }
 
 // ── UnifiedScorer ───────────────────────────────────────────────────────

@@ -82,9 +82,25 @@ impl WeightStore {
         1.0 + (total as f64 / max.max(1) as f64) * 0.25
     }
 
-    /// Get max bigram count (internal, caller must NOT hold the lock).
-    #[allow(dead_code)]
-    fn max_bigram_count(&self) -> u32 {
+    /// Export all bigrams as a vec of (prev, next, count).
+    /// Used to warm the in-memory UserBigram on startup.
+    pub fn load_all_bigrams(&self) -> Vec<(String, String, u32)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT prev, next, count FROM bigrams ORDER BY count DESC") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get(2)?))
+        })
+        .ok()
+        .into_iter()
+        .flat_map(|rows| rows.filter_map(|r| r.ok()))
+        .collect()
+    }
+
+    /// Get max bigram count (internal).
+    pub fn max_bigram_count(&self) -> u32 {
         self.conn.lock().unwrap()
             .query_row("SELECT COALESCE(MAX(count), 1) FROM bigrams", [], |r| r.get(0))
             .unwrap_or(1)
@@ -139,6 +155,22 @@ impl WeightStore {
                 .ok().into_iter().flat_map(|rows| rows.filter_map(|r| r.ok())).collect()
         }).unwrap_or_default()
     }
+
+    /// Load all user-learned phrases for startup warm.
+    pub fn load_all_phrases(&self) -> Vec<(String, String, i32)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT pinyin, word, priority FROM phrases ORDER BY pinyin, priority") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get(2)?))
+        })
+        .ok()
+        .into_iter()
+        .flat_map(|rows| rows.filter_map(|r| r.ok()))
+        .collect()
+    }
 }
 
 #[cfg(test)]
@@ -176,5 +208,19 @@ mod tests {
         s.record_phrase("ceshi", "侧室", 1);
         let phrases = s.phrases_for("ceshi");
         assert_eq!(phrases[0].0, "测试"); // priority 0 first
+    }
+
+    #[test]
+    fn load_all_bigrams_roundtrip() {
+        let s = temp_store();
+        s.record_bigram("大", "陆");
+        s.record_bigram("大", "陆");
+        s.record_bigram("大", "路");
+        s.record_bigram("中", "国");
+        let all = s.load_all_bigrams();
+        assert_eq!(all.len(), 3);
+        // Find the 大陆 entry.
+        let dalu = all.iter().find(|(p, n, _)| p == "大" && n == "陆").expect("大陆 not found");
+        assert_eq!(dalu.2, 2, "大陆 count should be 2, got {}", dalu.2);
     }
 }

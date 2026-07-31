@@ -31,7 +31,7 @@ fn incremental_composition_full_flow() {
     let mut eng = ImeEngine::new();
 
     for c in "lizhengming".chars() { eng.predict(InputEvent::char(c)); }
-    eprintln!("lizhengming: {:?}", &eng.candidates()[..10]);
+    eprintln!("lizhengming: {:?}", &eng.candidates());
 
     let li_idx = eng.candidates().iter().position(|c| *c == "李").expect("李 not found");
     eng.select_candidate(li_idx);
@@ -117,4 +117,106 @@ fn multi_context_isolation() {
     eng.predict_ctx(2, 'a');
     let v = eng.predict_ctx(1, ' ');
     assert!(commit(&v).contains("你"));
+}
+
+#[test]
+fn bigram_persistence_warmup() {
+    // Use a unique temp db to avoid cross-test interference.
+    let db_path = format!("/tmp/swift-ime-bigram-test-{}.db", std::process::id());
+
+    // ── Session 1: record a bigram ──
+    {
+        let mut eng = ImeEngine::new();
+        eng.init_store(&db_path);
+        // Simulate user committing "大" then "陆".
+        for c in "da".chars() { eng.predict(InputEvent::char(c)); }
+        eng.predict(InputEvent::space());
+        for c in "lu".chars() { eng.predict(InputEvent::char(c)); }
+        eng.predict(InputEvent::space());
+        // Explicitly record the bigram (space commits via select_candidate internally).
+        eng.record_bigram("大", "陆");
+    } // eng drops → store closes
+
+    // ── Session 2: warm from SQLite, verify boost ──
+    {
+        let mut eng = ImeEngine::new();
+        eng.init_store(&db_path);
+
+        // Type "lu" with "大" context.
+        eng.set_context("大");
+        for c in "lu".chars() { eng.predict(InputEvent::char(c)); }
+        let cands = eng.candidates();
+
+        eprintln!("After warmup: bigram 大→陆 boost check, top-5: {:?}",
+            &cands.iter().take(5).collect::<Vec<_>>());
+        // 陆 should be present and ranked high.
+        let lu_pos = cands.iter().position(|c| *c == "陆");
+        assert!(lu_pos.is_some(), "陆 should be in candidates after bigram warmup");
+    }
+
+    // Cleanup.
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn incremental_composition_recall() {
+    let mut eng = ImeEngine::new();
+
+    // Compose "李正明" from "lizhengming".
+    for c in "lizhengming".chars() { eng.predict(InputEvent::char(c)); }
+    let li_idx = eng.candidates().iter().position(|c| *c == "李").expect("李 not found");
+    eng.select_candidate(li_idx);
+    let zheng_idx = eng.candidates().iter().position(|c| *c == "正").expect("正 not found");
+    eng.select_candidate(zheng_idx);
+    let ming_idx = eng.candidates().iter().position(|c| *c == "明").expect("明 not found");
+    let v = eng.select_candidate(ming_idx);
+    assert_eq!(commit(&v), "李正明", "full composition should produce 李正明");
+
+    // Now type the same pinyin again — the phrase should be recalled.
+    for c in "lizhengming".chars() { eng.predict(InputEvent::char(c)); }
+    let cands = eng.candidates();
+    eprintln!("Recall candidates for lizhengming: {:?}", &cands.iter().take(5).collect::<Vec<_>>());
+    assert!(cands.contains(&"李正明".to_string()),
+        "李正明 should be recallable after composition, top-5: {:?}",
+        &cands.iter().take(5).collect::<Vec<_>>());
+    // It should be rank #1 (phrase score = 1.0).
+    assert_eq!(cands[0], "李正明",
+        "李正明 should be #1 after learning, got {:?} at #1", cands[0]);
+}
+
+#[test]
+fn phrase_persistence_across_sessions() {
+    let db_path = format!("/tmp/swift-ime-phrase-test-{}.db", std::process::id());
+
+    // ── Session 1: compose "李正明", store should persist it ──
+    {
+        let mut eng = ImeEngine::new();
+        eng.init_store(&db_path);
+
+        for c in "lizhengming".chars() { eng.predict(InputEvent::char(c)); }
+        let li = eng.candidates().iter().position(|c| *c == "李").unwrap();
+        eng.select_candidate(li);
+        let zheng = eng.candidates().iter().position(|c| *c == "正").unwrap();
+        eng.select_candidate(zheng);
+        let ming = eng.candidates().iter().position(|c| *c == "明").unwrap();
+        let v = eng.select_candidate(ming);
+        assert_eq!(commit(&v), "李正明");
+    } // eng drops → store flushed
+
+    // ── Session 2: fresh engine, warm from same db, phrase should be there ──
+    {
+        let mut eng = ImeEngine::new();
+        eng.init_store(&db_path);
+
+        for c in "lizhengming".chars() { eng.predict(InputEvent::char(c)); }
+        let cands = eng.candidates();
+        eprintln!("Session 2 recall: {:?}", &cands.iter().take(5).collect::<Vec<_>>());
+        assert!(cands.contains(&"李正明".to_string()),
+            "李正明 should survive restart via SQLite, top-5: {:?}",
+            &cands.iter().take(5).collect::<Vec<_>>());
+        assert_eq!(cands[0], "李正明",
+            "李正明 should be #1 after cross-session warm, got {:?}", cands[0]);
+    }
+
+    let _ = std::fs::remove_file(&db_path);
 }

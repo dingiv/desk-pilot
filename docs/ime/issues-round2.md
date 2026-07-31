@@ -46,10 +46,24 @@ Top-1 未命中的最后 2 条。可能需要：
 
 ### 3. 用户 Bigram 模型升级
 
-**现状**: `UserBigram` 已实现内存中的 (prev_word, next_word) 计数 + `bigram_boost()`。
-**差距**: 
-- 未接入 fcitx5 的 commit 回调（每次上屏应调用 `record_bigram`）
-- 持久化走 SQLite `weight_store`，但 fcitx5 C++ 侧未调用保存
+**现状**: ✅ 已闭合持久化回路。
+- 每次 commit 时，`ImeEngine::record_bigram(prev, next)` **双写** SQLite + 内存 `UserBigram`
+- 启动时 `init_store()` 从 SQLite 加载全部 bigram → 内存，实现跨会话记忆
+- `predict_with_context` 实时查询内存 bigram 进行上下文加权
+
+**数据流**:
+```
+commit "大陆" (prev="大", next="陆")
+  → record_bigram("大", "陆")
+    → WeightStore::record_bigram() → SQLite (持久)
+    → PinyinFamily::record_bigram() → UserBigram (内存, 即时生效)
+    
+下次启动:
+  → init_store()
+    → WeightStore::load_all_bigrams() → Vec<(prev, next, count)>
+    → PinyinFamily::warm_bigrams() → UserBigram::load_bulk()
+    → predict_with_context 立即可用
+```
 
 ### 4. L1 FST 词典注入
 
@@ -57,7 +71,7 @@ Top-1 未命中的最后 2 条。可能需要：
 
 ### 5. 输入框切换时状态残留
 
-一个输入框的 preedit 残留到另一个输入框。需要 C++ 侧在 focus_out 时调 `swift_ime_reset()`。
+**已修复**: `reset()` 和 `deactivate()` 回调现在在清理 Rust 状态后，显式清除 fcitx5 InputPanel UI（`inputPanel().reset()` + `updatePreedit()` + `updateUserInterface()`）+ 擦除 `lastViews_` 防止 diff 残留。`activate()` 也加了 `lastViews_.erase()` 安全网。
 
 ## 📋 行动计划
 
@@ -69,9 +83,9 @@ Top-1 未命中的最后 2 条。可能需要：
 | P0 | dict/viterbi/jianpin 三套独立 | ✅ 已统一为 LatticeDecoder |
 | P1 | `jishi→即使` #2 | 🔧 待优化 |
 | P1 | `chushi→初始` #2 | 🔧 待优化 |
-| P1 | 造词权重 | 🔧 部分完成 |
+| P1 | 造词权重 | ✅ 已闭合持久化回路（PhraseBook → SQLite → warm 跨会话） |
 | P1 | 候选数量 | 🔧 待实现 |
 | P1 | 统一 L1 词典 | 🔧 待实现 |
-| P2 | 用户 Bigram 模型 | 🔧 部分完成 |
+| P2 | 用户 Bigram 模型 | ✅ 已闭合持久化回路（双写 SQLite + 内存，跨会话 warm） |
 | P2 | 惰性加载 | 🔧 待实现 |
-| P2 | 输入框切换状态残留 | 🔧 待修复 |
+| P2 | 输入框切换状态残留 | ✅ 已修复（reset/deactivate/activate 均清除 UI + lastViews） |

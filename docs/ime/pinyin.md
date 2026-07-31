@@ -13,16 +13,13 @@
 | `lattice_mix` | LatticeDecoder 混写 | freq_to_score(weight) | 全拼+首字母混合 | gyinsjian→光阴似箭 |
 | `lattice_jp` | LatticeDecoder 简拼 | freq_to_score(weight) | 纯首字母 | gysj→光阴似箭 |
 | `decomp` | Viterbi 分解 | 0.40 | 多音节兜底 | 造词 |
-| `session` | inputx Session | 0.5 | 始终 | 短语匹配 |
 | `phrase` | PhraseBook | 1.0 | 用户自造词 | 置顶 |
-| `prefix` | inputx `dict.prefix()` | 0.3 | 兜底 | 末音节不完整 |
-| `phrase_prefix` | PhraseBook 前缀 | 0.85 | 兜底 | 用户词前缀 |
 
 ### 查询顺序
 
 ```
-single-syllable:  single → session → phrase → prefix → phrase_prefix
-multi-syllable:   lattice (全拼/混写/简拼) → decomp (Viterbi fallback) → session → phrase → prefix → phrase_prefix
+single-syllable:  single → phrase
+multi-syllable:   lattice (全拼/混写/简拼) → decomp (Viterbi fallback) → phrase
 ```
 
 ## LatticeDecoder 统一引擎

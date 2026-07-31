@@ -11,7 +11,9 @@ pub mod lattice;
 pub mod phrase;
 
 use dict::LargeDict;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use crate::weight_store::WeightStore;
 
 /// Full-pinyin prediction family.
 ///
@@ -30,6 +32,7 @@ pub struct PinyinFamily {
     bigram: Mutex<UserBigram>,
     enabled: bool,
     weights: PinyinWeights,
+    store: Mutex<Option<Arc<WeightStore>>>,
 }
 
 /// Configurable scoring weights for the pinyin family.
@@ -41,9 +44,6 @@ pub struct PinyinWeights {
     pub large_dict: f64,
     pub viterbi_base: f64,
     pub viterbi_scale: f64,
-    pub session: f64,
-    pub prefix: f64,
-    pub phrase_book_prefix: f64,
     pub jianpin: f64,
     pub single_syl_decay: f64,
     pub context_boost: f64,
@@ -55,7 +55,6 @@ pub struct PinyinWeights {
     pub large_dict_take: usize,
     pub viterbi_take: usize,
     pub jianpin_take: usize,
-    pub prefix_take: usize,
 }
 
 impl Default for PinyinWeights {
@@ -63,12 +62,11 @@ impl Default for PinyinWeights {
         PinyinWeights {
             phrase_book: 1.0, large_dict: 0.95,
             viterbi_base: 0.3, viterbi_scale: 0.65,
-            session: 0.5, prefix: 0.3,
-            phrase_book_prefix: 0.85, jianpin: 0.70,
+            jianpin: 0.70,
             single_syl_decay: 0.6, context_boost: 0.15,
             stopword_penalty: 0.5, confirm_bonus: 0.05, short_word_bonus: 0.02,
             large_dict_take: 96, viterbi_take: 48,
-            jianpin_take: 8, prefix_take: 256,
+            jianpin_take: 8,
         }
     }
 }
@@ -85,6 +83,7 @@ impl PinyinFamily {
             bigram: Mutex::new(UserBigram::new()),
             enabled: true,
             weights: PinyinWeights::default(),
+            store: Mutex::new(None),
         }
     }
 
@@ -99,6 +98,7 @@ impl PinyinFamily {
             bigram: Mutex::new(UserBigram::new()),
             enabled: true,
             weights,
+            store: Mutex::new(None),
         }
     }
 
@@ -115,6 +115,27 @@ impl PinyinFamily {
             bigram: Mutex::new(UserBigram::new()),
             enabled: true,
             weights: PinyinWeights::default(),
+            store: Mutex::new(None),
+        }
+    }
+
+    /// Attach the weight store for persisting learned phrases.
+    pub fn set_store(&self, store: Arc<WeightStore>) {
+        *self.store.lock().unwrap() = Some(store);
+    }
+
+    /// Warm the phrase book from persisted SQLite data (internal helper).
+    fn do_warm_phrases(&self) {
+        let guard = self.store.lock().unwrap();
+        if let Some(ref store) = *guard {
+            let entries = store.load_all_phrases();
+            if !entries.is_empty() {
+                let mut book = self.phrase_book.lock().unwrap();
+                for (pinyin, word, priority) in &entries {
+                    book.insert_with_order(pinyin, word, *priority);
+                }
+                eprintln!("[ime-core] pinyin: warmed {} phrases from store", entries.len());
+            }
         }
     }
 
@@ -169,6 +190,10 @@ impl CandidateFamily for PinyinFamily {
         let mut book = self.phrase_book.lock().unwrap();
         if !book.exact(pinyin).contains(&hanzi.to_string()) {
             book.insert(pinyin, hanzi);
+            // Persist to SQLite if store is attached.
+            if let Some(ref store) = *self.store.lock().unwrap() {
+                store.record_phrase(pinyin, hanzi, 0);
+            }
         }
     }
 
@@ -198,6 +223,26 @@ impl CandidateFamily for PinyinFamily {
         } else { 0 }
     }
 
+    fn record_bigram(&self, prev: &str, next: &str) {
+        self.bigram.lock().unwrap().record(prev, next);
+    }
+
+    fn warm_bigrams(&self, entries: Vec<(String, String, u32)>) {
+        if !entries.is_empty() {
+            let count = entries.len();
+            self.bigram.lock().unwrap().load_bulk(entries);
+            eprintln!("[ime-core] pinyin: warmed {count} bigrams from store");
+        }
+    }
+
+    fn attach_store(&self, store: std::sync::Arc<WeightStore>) {
+        *self.store.lock().unwrap() = Some(store);
+    }
+
+    fn warm_phrases_from_store(&self) {
+        self.do_warm_phrases();
+    }
+
     fn load_dict_bytes(&self, data: &[u8]) -> usize {
         if data.len() > 100_000 {
             let n = self.large_dict.lock().unwrap().load_from_tsv_bytes(data);
@@ -217,12 +262,11 @@ impl CandidateFamily for PinyinFamily {
             book.load_from_json_str(&json)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         } else if path.ends_with(".fst") {
-            // FST: load into both LargeDict and LatticeDecoder.
+            // FST: load and build LatticeDecoder, passing path for .idx cache.
             let data = std::fs::read(path)?;
             let dict = inputx_fsa::Dict::new(data)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
-            // Build lattice directly from the FST.
-            *self.lattice.lock().unwrap() = Some(lattice::LatticeDecoder::new(dict));
+            *self.lattice.lock().unwrap() = Some(lattice::LatticeDecoder::new(dict, path));
             Ok(0) // size not tracked for FST
         } else {
             let meta = std::fs::metadata(path)?;
@@ -269,27 +313,18 @@ impl CandidateFamily for PinyinFamily {
                         raw_score: score,
                     });
                 }
-                // Viterbi fallback: decompose into single chars for 造词.
-                let comps = dict.top_k_compositions(input, self.weights.viterbi_take);
-                for (_s, word) in comps.iter().take(16) {
-                    if !out.iter().any(|c| c.text == *word) {
-                        out.push(ScoredCandidate {
-                            text: word.clone(), family: "pinyin", source: "decomp",
-                            raw_score: 0.4,
-                        });
-                    }
-                }
             }
             drop(lattice_guard);
-        }
 
-        // ── Session: additional phrase matches ──
-        let mut session = inputx_pinyin::Session::new(&self.engine);
-        for c in input.chars() { session.input_char(c); }
-        for w in session.candidates() {
-            let w = w.clone();
-            if !out.iter().any(|c| c.text == w) {
-                out.push(ScoredCandidate { text: w, family: "pinyin", source: "session", raw_score: self.weights.session });
+            // Viterbi decomposition — always runs as fallback (造词).
+            let comps = dict.top_k_compositions(input, self.weights.viterbi_take);
+            for (_s, word) in comps.iter().take(16) {
+                if !out.iter().any(|c| c.text == *word) {
+                    out.push(ScoredCandidate {
+                        text: word.clone(), family: "pinyin", source: "decomp",
+                        raw_score: 0.4,
+                    });
+                }
             }
         }
 
@@ -312,21 +347,6 @@ impl CandidateFamily for PinyinFamily {
         if !out.is_empty() {
             out.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap());
             return out;
-        }
-
-        // ── Prefix fallback ──
-        for (_py, word) in dict.prefix(input).into_iter().take(self.weights.prefix_take) {
-            if !out.iter().any(|c| c.text == word) {
-                out.push(ScoredCandidate { text: word, family: "pinyin", source: "prefix", raw_score: self.weights.prefix });
-            }
-        }
-
-        {
-            let book = self.phrase_book.lock().unwrap();
-            for w in book.prefix(input) {
-                out.retain(|c| c.text != w);
-                out.push(ScoredCandidate { text: w, family: "pinyin", source: "phrase_prefix", raw_score: self.weights.phrase_book_prefix });
-            }
         }
 
         out.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap());

@@ -167,7 +167,11 @@ void SwiftCandidateWord::select(
 void SwiftImeEngine::activate(const fcitx::InputMethodEntry &entry,
                                fcitx::InputContextEvent &event) {
     FCITX_UNUSED(entry);
-    swift_ime_activate(handle_, (void *)event.inputContext());
+    auto *ic = event.inputContext();
+    if (!ic) return;
+    // Safety: ensure no stale lastView carries over from a previous session.
+    lastViews_.erase(ic);
+    swift_ime_activate(handle_, (void *)ic);
 }
 
 void SwiftImeEngine::deactivate(const fcitx::InputMethodEntry &entry,
@@ -176,22 +180,33 @@ void SwiftImeEngine::deactivate(const fcitx::InputMethodEntry &entry,
     auto *ic = event.inputContext();
     if (!ic) return;
 
-    // Always commit pending and clean up — regardless of event type.
-    // Skipping FocusOut leaves dangling pointers when the InputContext
-    // is later destroyed (window closed).
+    // Commit pending before deactivating.
     ImeView view;
     swift_ime_commit_pending(handle_, (void *)ic, &view);
     if (view.commit_text[0] != 0) {
         ic->commitString(std::string(view.commit_text));
     }
     swift_ime_deactivate(handle_, (void *)ic);
+
+    // Clear the UI unconditionally — even if nothing to commit,
+    // the input panel may still show stale preedit/candidates.
+    ic->inputPanel().reset();
+    ic->updatePreedit();
+    ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
     lastViews_.erase(ic);
 }
 
 void SwiftImeEngine::reset(const fcitx::InputMethodEntry &entry,
                             fcitx::InputContextEvent &event) {
     FCITX_UNUSED(entry);
-    swift_ime_reset(handle_, (void *)event.inputContext());
+    auto *ic = event.inputContext();
+    if (!ic) return;
+    swift_ime_reset(handle_, (void *)ic);
+    // Clear the UI so preedit/candidates don't linger after focus change.
+    ic->inputPanel().reset();
+    ic->updatePreedit();
+    ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+    lastViews_.erase(ic);
 }
 
 // ── Key event ───────────────────────────────────────────────────────────

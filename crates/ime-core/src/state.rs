@@ -102,7 +102,8 @@ impl StateMachine {
             } else {
                 format!("{}{}", self.committed_pinyin(), self.buffer)
             };
-            env.record_pick(&full_pinyin, &picked);
+            // Record the FULL composed word, not just the last character.
+            env.record_pick(&full_pinyin, &final_text);
             // Always save to PhraseBook — L0 only boosts words already in
             // the dictionary; Viterbi-composed words need PhraseBook recall.
             env.learn_phrase(&full_pinyin, &final_text);

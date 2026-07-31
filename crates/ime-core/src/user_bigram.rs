@@ -67,6 +67,19 @@ impl UserBigram {
             }
         }
     }
+
+    /// Bulk-load from a vec of (prev, next, count). Merges with existing data.
+    /// Used on startup to warm the model from SQLite.
+    pub fn load_bulk(&mut self, entries: Vec<(String, String, u32)>) {
+        for (prev, next, count) in entries {
+            let c = self.counts.entry((prev, next)).or_insert(0);
+            *c = (*c).max(count); // take the max (SQLite is authoritative)
+            self.max_count = self.max_count.max(*c);
+        }
+    }
+
+    /// Number of bigram entries.
+    pub fn len(&self) -> usize { self.counts.len() }
 }
 
 #[cfg(test)]

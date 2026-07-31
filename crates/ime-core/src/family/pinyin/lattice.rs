@@ -1,7 +1,7 @@
 //! LatticeDecoder — unified pinyin matching via initials-boundary segmentation.
 //!
 //! Replaces the separate `dict` (exact match), `viterbi` (bigram composition),
-//! and `jianpin` (initials index) members with a single engine.
+//! and `jianpin` (initials index) with a single engine.
 //!
 //! Algorithm:
 //! 1. Greedy-parse input by initial-consonant boundaries (声母切分).
@@ -124,21 +124,30 @@ pub struct LatticeDecoder {
     /// Initials index: "gysj" → [(pinyin, word, freq), ...].
     /// Stores full pinyin code for pattern verification.
     initials_index: HashMap<String, Vec<(String, String, u64)>>,
+    /// Path to the .fst file, used to derive the .idx cache path.
+    fst_path: String,
 }
 
 impl LatticeDecoder {
-    /// Build from an already-loaded FST.
-    pub fn new(fst: inputx_fsa::Dict<Vec<u8>>) -> Self {
+    /// Build from an already-loaded FST. `fst_path` is the original .fst
+    /// file path, used to derive the `.idx` cache location.
+    pub fn new(fst: inputx_fsa::Dict<Vec<u8>>, fst_path: &str) -> Self {
         let mut decoder = LatticeDecoder {
             fst,
             initials_index: HashMap::new(),
+            fst_path: fst_path.to_string(),
         };
         decoder.build_initials_index();
         decoder
     }
 
+    /// Cache path: `{fst_path}.idx`.
+    fn cache_path(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("{}.idx", self.fst_path))
+    }
+
     /// Build the initials index from the FST, storing (pinyin, word, freq).
-    /// Uses a .fst.jianpin cache file if available and fresh.
+    /// Uses a .fst.idx cache file if available and fresh.
     fn build_initials_index(&mut self) {
         // Try cache first.
         if self.try_load_cache() {
@@ -177,21 +186,8 @@ impl LatticeDecoder {
         self.save_cache();
     }
 
-    /// Cache path: same directory as the dict, with .jianpin extension.
-    fn cache_path() -> Option<std::path::PathBuf> {
-        // Look for the FST file to determine path. We don't have the path,
-        // so try the standard locations for rime-ice.fst.
-        for p in &["apps/swift-ime/assets/dict/rime-ice.fst",
-                    "assets/dict/rime-ice.fst",
-                    "/usr/share/swift-ime/dict/rime-ice.fst"] {
-            let cp = std::path::PathBuf::from(format!("{p}.jianpin"));
-            if std::path::Path::new(p).exists() { return Some(cp); }
-        }
-        None
-    }
-
     fn try_load_cache(&mut self) -> bool {
-        let Some(cp) = Self::cache_path() else { return false };
+        let cp = self.cache_path();
         let Ok(data) = std::fs::read(&cp) else { return false };
         let mut pos = 0;
         let mut count = 0;
@@ -231,7 +227,7 @@ impl LatticeDecoder {
     }
 
     fn save_cache(&self) {
-        let Some(cp) = Self::cache_path() else { return };
+        let cp = self.cache_path();
         let mut buf = Vec::new();
         for (key, entries) in &self.initials_index {
             buf.push(key.len() as u8);

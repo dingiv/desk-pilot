@@ -84,7 +84,7 @@ fn make_engine(args: &Args) -> ImeEngine {
                 Err(e) => swift_ime::ime_log!("dict load error: {e}"),
             }
         } else {
-            swift_ime::ime_log!("rime-ice.fst not found. Run: cargo run --bin build_dict -- assets/dict/rime-ice.tsv assets/dict/rime-ice.fst");
+            swift_ime::ime_log!("rime-ice.fst not found. Run: ./scripts/fetch_dict.sh && cargo run --bin build_dict -- assets/dict/rime-ice.tsv assets/dict/rime-ice.fst");
         }
     }
 

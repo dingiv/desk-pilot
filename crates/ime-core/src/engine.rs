@@ -81,7 +81,7 @@ pub struct ImeEngine {
     dispatcher: Dispatcher,
     contexts: Mutex<HashMap<usize, PerContext>>,
     async_waits: Mutex<HashMap<usize, WaitState>>,
-    store: Mutex<Option<WeightStore>>,
+    store: Mutex<Option<std::sync::Arc<WeightStore>>>,
 }
 
 impl ImeEngine {
@@ -141,10 +141,13 @@ impl ImeEngine {
     pub fn predict_ctx(&self, ctx: usize, ch: char) -> ImeView {
         self.with_ctx(ctx, |disp, pc| {
             pc.sm.context = pc.text_context.clone();
+            let prev = pc.text_context.last_word.clone();
             let mut view = disp.process_key(ch, &mut pc.sm);
             let committed = ImeView::str_field(&view.commit_text);
             if !committed.is_empty() {
                 pc.text_context.update(committed);
+                // Record bigram: prev_word → committed_word (both SQLite + in-memory).
+                self.record_bigram(&prev, committed);
             }
             // #wait demo interceptor.
             if ImeView::str_field(&view.commit_text) == "__WAIT_DEMO__" {
@@ -279,20 +282,35 @@ impl ImeEngine {
     }
 
     /// Initialize the SQLite-backed weight store. Call once at startup.
+    /// Warms the in-memory bigram model AND phrase book from persisted data.
     pub fn init_store(&self, path: &str) {
         match WeightStore::open(path) {
             Ok(store) => {
+                let store = std::sync::Arc::new(store);
+                // Warm the in-memory bigram model from SQLite.
+                let entries = store.load_all_bigrams();
+                if !entries.is_empty() {
+                    self.dispatcher.warm_bigrams(entries);
+                }
+                // Attach store to pinyin family for future phrase persistence,
+                // and warm the phrase book from past sessions.
+                self.dispatcher.set_store(store.clone());
+                self.dispatcher.warm_phrases_from_store();
                 let pins = store.pin_count();
-                if pins > 0 { eprintln!("[swift-ime] weight store: {pins} pins from {path}"); }
+                eprintln!("[swift-ime] weight store: {pins} pins, {} bigrams from {path}",
+                    store.max_bigram_count());
                 *self.store.lock().unwrap() = Some(store);
             }
             Err(e) => eprintln!("[swift-ime] weight store open failed: {e}"),
         }
     }
 
-    /// Record a bigram to the weight store.
+    /// Record a bigram to BOTH the SQLite store (persistence) and the
+    /// in-memory pinyin family model (immediate ranking boost).
     pub fn record_bigram(&self, prev: &str, next: &str) {
+        if prev.is_empty() || next.is_empty() { return; }
         if let Some(ref s) = *self.store.lock().unwrap() { s.record_bigram(prev, next); }
+        self.dispatcher.record_bigram(prev, next);
     }
 
     /// Commit pending text in the default context.

@@ -64,8 +64,6 @@ pub fn freq_to_score(freq: u64) -> f64 {
 | `decomp` | Viterbi 分解 | 0.40 | 造词兜底 |
 | `session` | inputx Session | 0.5 | 始终 |
 | `phrase` | PhraseBook | 1.0 | 用户自造词置顶 |
-| `prefix` | inputx `dict.prefix()` | 0.3 | 前缀兜底 |
-| `phrase_prefix` | PhraseBook 前缀 | 0.85 | 用户词前缀 |
 
 ## 权重配置
 
