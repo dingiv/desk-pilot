@@ -24,7 +24,7 @@ struct Args {
     cases: Option<String>,
 
     /// Top N candidates to display.
-    #[arg(long, default_value = "16")]
+    #[arg(long, default_value = "160")]
     top_n: usize,
 
     /// Show detailed output.

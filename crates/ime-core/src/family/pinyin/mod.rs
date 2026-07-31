@@ -7,6 +7,7 @@ use crate::user_bigram::UserBigram;
 
 pub mod dict;
 pub mod engine;
+pub mod lattice;
 pub mod phrase;
 
 use dict::LargeDict;
@@ -25,22 +26,10 @@ pub struct PinyinFamily {
     engine: inputx_pinyin::PinyinEngine,
     phrase_book: Mutex<PhraseBook>,
     large_dict: Mutex<LargeDict>,
+    lattice: Mutex<Option<lattice::LatticeDecoder>>,
     bigram: Mutex<UserBigram>,
     enabled: bool,
     weights: PinyinWeights,
-}
-
-/// Chinese function words — Viterbi compositions made entirely of these
-/// get penalised (e.g. "diyige → 的一个" is nonsense).
-fn all_stopwords(word: &str) -> bool {
-    const SET: &[char] = &[
-        '的', '了', '是', '在', '和', '个', '不', '这', '也',
-        '就', '都', '还', '要', '会', '能', '以', '及', '与',
-        '着', '被', '把', '让', '向', '从', '到', '对', '为', '所',
-        '而', '且', '或', '但', '于', '由', '因', '虽', '则',
-        '一', '那', '它', '他', '她', '我', '你'
-    ];
-    !word.is_empty() && word.chars().all(|c| SET.contains(&c))
 }
 
 /// Configurable scoring weights for the pinyin family.
@@ -92,6 +81,7 @@ impl PinyinFamily {
             ),
             phrase_book: Mutex::new(PhraseBook::default_phrases()),
             large_dict: Mutex::new(LargeDict::new()),
+            lattice: Mutex::new(None),
             bigram: Mutex::new(UserBigram::new()),
             enabled: true,
             weights: PinyinWeights::default(),
@@ -105,6 +95,7 @@ impl PinyinFamily {
             ),
             phrase_book: Mutex::new(PhraseBook::default_phrases()),
             large_dict: Mutex::new(LargeDict::new()),
+            lattice: Mutex::new(None),
             bigram: Mutex::new(UserBigram::new()),
             enabled: true,
             weights,
@@ -120,6 +111,7 @@ impl PinyinFamily {
             ),
             phrase_book: Mutex::new(phrase_book),
             large_dict: Mutex::new(LargeDict::new()),
+            lattice: Mutex::new(None),
             bigram: Mutex::new(UserBigram::new()),
             enabled: true,
             weights: PinyinWeights::default(),
@@ -207,10 +199,12 @@ impl CandidateFamily for PinyinFamily {
     }
 
     fn load_dict_bytes(&self, data: &[u8]) -> usize {
-        // Load into LargeDict for large dictionaries, PhraseBook for small ones.
-        // base.tsv (~5KB) goes to PhraseBook, rime-ice.tsv (~24MB) goes to LargeDict.
         if data.len() > 100_000 {
-            self.large_dict.lock().unwrap().load_from_tsv_bytes(data)
+            let n = self.large_dict.lock().unwrap().load_from_tsv_bytes(data);
+            // After loading, try to build lattice from the FST.
+            // LargeDict's backend stores the FST; we can't access it directly.
+            // For now, lattice is built when loading from file (load_fst_file).
+            n
         } else {
             self.phrase_book.lock().unwrap().load_from_tsv_bytes(data)
         }
@@ -222,8 +216,15 @@ impl CandidateFamily for PinyinFamily {
             let mut book = self.phrase_book.lock().unwrap();
             book.load_from_json_str(&json)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        } else if path.ends_with(".fst") {
+            // FST: load into both LargeDict and LatticeDecoder.
+            let data = std::fs::read(path)?;
+            let dict = inputx_fsa::Dict::new(data)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
+            // Build lattice directly from the FST.
+            *self.lattice.lock().unwrap() = Some(lattice::LatticeDecoder::new(dict));
+            Ok(0) // size not tracked for FST
         } else {
-            // Large TSV files go to LargeDict for O(1) exact lookup.
             let meta = std::fs::metadata(path)?;
             if meta.len() > 100_000 {
                 self.large_dict.lock().unwrap().load_from_tsv_file(path)
@@ -241,7 +242,7 @@ impl CandidateFamily for PinyinFamily {
 
         let is_single_syllable = inputx_pinyin::is_valid_syllable(input);
 
-        // ── Primary: Viterbi bigram model or single-syllable lookup ──
+        // ── Primary: single-syllable lookup or unified lattice ──
         if is_single_syllable {
             let words = dict.lookup(input);
             let total = words.len().max(1) as f64;
@@ -252,40 +253,37 @@ impl CandidateFamily for PinyinFamily {
                 });
             }
         } else {
-            let comps = dict.top_k_compositions(input, self.weights.viterbi_take);
-            if !comps.is_empty() {
-                let scores: Vec<f64> = comps.iter().map(|(s, _)| *s).collect();
-                let min_s = scores.iter().cloned().fold(f64::INFINITY, f64::min);
-                let max_s = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let range = (max_s - min_s).max(1.0);
-                for (score, word) in comps {
-                    let mut normalized = self.weights.viterbi_base + self.weights.viterbi_scale * ((score - min_s) / range);
-                    // Penalise all-stopword compositions ONLY if not a real dict entry
-                    // (e.g. diyige → 的一个 is nonsense, but yige → 一个 is a real word).
-                    if all_stopwords(&word) {
-                        let ld = self.large_dict.lock().unwrap();
-                        if !ld.exact(input).contains(&word) {
-                            normalized *= self.weights.stopword_penalty;
-                        }
-                    }
+            // Unified lattice: handles full pinyin, jianpin, mixed in one pass.
+            let lattice_guard = self.lattice.lock().unwrap();
+            if let Some(ref lat) = *lattice_guard {
+                let results = lat.predict(input, self.weights.large_dict_take);
+                for r in results {
+                    let score = lattice::LatticeDecoder::freq_to_score(r.freq_score as u64);
+                    let source = match r.match_type {
+                        lattice::MatchType::Full => "lattice",
+                        lattice::MatchType::Mixed => "lattice_mix",
+                        lattice::MatchType::Initials => "lattice_jp",
+                    };
                     out.push(ScoredCandidate {
-                        text: word, family: "pinyin", source: "viterbi",
-                        raw_score: normalized.clamp(0.0, 1.0),
+                        text: r.text, family: "pinyin", source,
+                        raw_score: score,
                     });
                 }
-            }
-        }
-
-        // ── LargeDict: fill gaps — words Viterbi/single didn't find ──
-        if !is_single_syllable {
-            let ld = self.large_dict.lock().unwrap();
-            for w in ld.exact(input).into_iter().take(self.weights.large_dict_take) {
-                if !out.iter().any(|c| c.text == w) {
-                    out.push(ScoredCandidate { text: w, family: "pinyin", source: "dict", raw_score: self.weights.large_dict });
+                // Viterbi fallback: decompose into single chars for 造词.
+                let comps = dict.top_k_compositions(input, self.weights.viterbi_take);
+                for (_s, word) in comps.iter().take(16) {
+                    if !out.iter().any(|c| c.text == *word) {
+                        out.push(ScoredCandidate {
+                            text: word.clone(), family: "pinyin", source: "decomp",
+                            raw_score: 0.4,
+                        });
+                    }
                 }
             }
+            drop(lattice_guard);
         }
 
+        // ── Session: additional phrase matches ──
         let mut session = inputx_pinyin::Session::new(&self.engine);
         for c in input.chars() { session.input_char(c); }
         for w in session.candidates() {
@@ -295,6 +293,7 @@ impl CandidateFamily for PinyinFamily {
             }
         }
 
+        // ── PhraseBook: user phrases always win (score 1.0) ──
         {
             let book = self.phrase_book.lock().unwrap();
             for w in book.exact(input) {
@@ -302,20 +301,8 @@ impl CandidateFamily for PinyinFamily {
                 out.push(ScoredCandidate { text: w, family: "pinyin", source: "phrase", raw_score: self.weights.phrase_book });
             }
         }
-        // Jianpin (initials-only) fallback — "nh" → "你好".
-        // Activated when input is 2-6 chars and looks like initials.
-        if input.len() >= 2 && input.len() <= 6
-            && !inputx_pinyin::is_valid_syllable(input)
-            && input.chars().all(|c| c.is_ascii_lowercase())
-        {
-            let ld = self.large_dict.lock().unwrap();
-            for w in ld.jianpin(input).into_iter().take(self.weights.jianpin_take) {
-                if !out.iter().any(|c| c.text == w) {
-                    out.push(ScoredCandidate { text: w, family: "pinyin", source: "jianpin", raw_score: self.weights.jianpin });
-                }
-            }
-        }
-        // ── Short-word preference (2-char words are most common targets) ──
+
+        // ── Short-word bonus ──
         for c in &mut out {
             if c.text.chars().count() == 2 {
                 c.raw_score = (c.raw_score + self.weights.short_word_bonus).min(1.0);
@@ -327,6 +314,7 @@ impl CandidateFamily for PinyinFamily {
             return out;
         }
 
+        // ── Prefix fallback ──
         for (_py, word) in dict.prefix(input).into_iter().take(self.weights.prefix_take) {
             if !out.iter().any(|c| c.text == word) {
                 out.push(ScoredCandidate { text: word, family: "pinyin", source: "prefix", raw_score: self.weights.prefix });
@@ -341,10 +329,6 @@ impl CandidateFamily for PinyinFamily {
             }
         }
 
-        // Same post-merge boost as the early-return path.
-        for c in &mut out {
-            if c.text.chars().count() == 2 { c.raw_score = (c.raw_score + 0.02).min(1.0); }
-        }
         out.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap());
         out
     }

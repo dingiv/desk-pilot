@@ -1,6 +1,4 @@
 build
 tmp
 
-
-*.tsv
-*.fst
+assets/dict

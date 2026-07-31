@@ -9,7 +9,6 @@
 //! The resulting .fst file is loaded by PinyinFamily at startup for
 //! unified L1 frequency-based scoring — same model as fcitx5's sc.dict.
 
-use std::collections::HashMap;
 use std::io::Write;
 
 fn main() {
@@ -33,28 +32,45 @@ fn main() {
     eprintln!("Loading {input}...");
     let data = std::fs::read_to_string(input).expect("read input");
 
-    // Pass 1: count word frequencies.
-    let mut freq: HashMap<String, u32> = HashMap::new();
-    let mut entries: Vec<(String, String)> = Vec::new();
+    // Parse TSV. If 3rd column exists, use it as weight.
+    // Otherwise use occurrence count as proxy weight.
+    let has_weights = data.lines().next()
+        .map(|l| l.split('\t').count() >= 3).unwrap_or(false);
+
+    let mut entries: Vec<(String, String, u64)> = Vec::new();
+    let mut occ: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
 
     for line in data.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') { continue; }
-        if let Some((pinyin, word)) = line.split_once('\t') {
-            let key = pinyin.replace(' ', "");
-            if key.is_empty() || word.is_empty() { continue; }
-            *freq.entry(word.to_string()).or_default() += 1;
-            entries.push((key, word.to_string()));
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 2 { continue; }
+        let pinyin = parts[0].replace(' ', "");
+        let word = parts[1].to_string();
+        if has_weights {
+            let weight: u64 = parts.get(2).and_then(|w| w.parse().ok()).unwrap_or(100);
+            if !pinyin.is_empty() && !word.is_empty() {
+                entries.push((pinyin, word, weight));
+            }
+        } else {
+            *occ.entry(word.clone()).or_default() += 1;
+            entries.push((pinyin, word, 0)); // weight filled in pass 2
+        }
+    }
+
+    // Pass 2 for occurrence-based weights: use occurrence count × 100.
+    if !has_weights {
+        for (_, word, weight) in &mut entries {
+            *weight = *occ.get(word).unwrap_or(&1) as u64 * 100;
         }
     }
 
     eprintln!("Building FST from {} entries...", entries.len());
 
-    // Build FST via DictBuilder: code=pinyin, item=word, value=frequency.
+    // Build FST via DictBuilder: code=pinyin, item=word, value=weight.
     let mut builder = inputx_fsa::DictBuilder::new();
-    for (pinyin, word) in &entries {
-        let score = *freq.get(word).unwrap_or(&1) as u64;
-        builder.insert(pinyin.as_bytes(), word.as_bytes(), score);
+    for (pinyin, word, weight) in &entries {
+        builder.insert(pinyin.as_bytes(), word.as_bytes(), *weight);
     }
 
     let fst_bytes = builder.finish();
