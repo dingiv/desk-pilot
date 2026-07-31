@@ -72,6 +72,32 @@ pub fn control_scout(addr: &str, enabled: Option<bool>) -> Result<bool, String> 
         .ok_or_else(|| "missing 'connected' field".to_string())
 }
 
+/// Submit a correction for a turn. `seq` identifies the turn, `raw` is the
+/// original text, `corrected` is the user's fix. Aura feeds this back into
+/// its Stage2 calibration for future utterances.
+pub fn correct(addr: &str, seq: u64, raw: &str, corrected: &str) -> Result<bool, String> {
+    let json = serde_json::json!({"seq": seq, "raw": raw, "corrected": corrected}).to_string();
+    let resp = post_json(addr, "/api/correct", &json)?;
+    let v: Value = serde_json::from_str(&resp).map_err(|e| format!("parse: {e}"))?;
+    Ok(v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false))
+}
+
+/// Fetch TTS audio for a turn as raw bytes (typically WAV).
+pub fn fetch_audio(addr: &str, seq: u64) -> Result<Vec<u8>, String> {
+    let path = format!("/api/audio/{seq}");
+    let mut stream = connect(addr)?;
+    write_req(&mut stream, addr, "GET", &path, None)?;
+    // Read raw bytes after headers (don't treat as UTF-8 body).
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).map_err(|e| format!("read: {e}"))?;
+    // Split at \r\n\r\n to separate headers from body.
+    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        Ok(buf[pos + 4..].to_vec())
+    } else {
+        Ok(buf) // no headers found, assume raw
+    }
+}
+
 /// Fetch recent turn results (up to 100) so the pet can pre-populate its
 /// transcript on startup.
 pub fn results(addr: &str) -> Result<Vec<TurnRecord>, String> {

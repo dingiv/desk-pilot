@@ -74,6 +74,9 @@ pub enum Message {
     Asr(crate::service::asr::AsrUpdate),
     ToggleRecording,
     HandshakeDone(bool),
+    /// Trigger an aura health check (button press).
+    CheckHealth,
+    /// Result of a health check.
     HealthCheck(bool),
     #[allow(unused)]
     RecordingToggled,
@@ -81,11 +84,39 @@ pub enum Message {
     ClipboardUpdate(String),
     /// Periodic poll fallback (no extension / native run).
     ClipboardPoll,
+    /// User editing the scratchpad buffer (multi-line text_editor).
+    ScratchpadEdit(iced::widget::text_editor::Action),
 
     // ── interaction ──
     DragStarted,
     TabPressed(Panel),
     ImeInput(String),
+    /// Right-click on an ASR entry → context menu (index into history).
+    AsrContextMenu(u64),
+    /// [✏ fix] — edit + submit correction for this turn (Step 3).
+    FixTurn(u64),
+    /// [🔊] — play TTS audio for this turn (Step 4).
+    PlayAudio(u64),
+    /// Keystroke in the inline correction text_input.
+    CorrectionEdit(String),
+    /// Submit the correction for this turn to aura.
+    SubmitCorrection(u64),
+    /// Cancel inline editing without submitting.
+    CancelEdit,
+    /// Audio playback result for a turn.
+    AudioPlayed(u64, bool),
+    /// App-level status message (errors, hints, info).
+    AppStatus(String),
+    /// A file was dropped onto the pet window from a file manager.
+    FileDropped(String),
+    /// File drag hovered over the pet window (visual feedback).
+    FileHovered,
+    /// File drag left the pet window (clear visual feedback).
+    FileHoverLeft,
+    /// Take a screenshot (area select, saves to /tmp/).
+    TakeScreenshot,
+    /// Screenshot saved to this path.
+    ScreenshotSaved(String),
     ToggleAutoMove,
 
     // ── click-through ──

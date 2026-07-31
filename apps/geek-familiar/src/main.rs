@@ -45,7 +45,7 @@ struct FamiliarConfig {
 fn default_sprite_size() -> f32 { 180.0 }
 fn default_sprite_filter() -> String { "linear".into() }
 
-fn default_font_size() -> f32 { 14.0 }
+fn default_font_size() -> f32 { 16.0 }
 
 impl Default for FamiliarConfig {
     fn default() -> Self {

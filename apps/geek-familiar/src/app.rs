@@ -8,11 +8,11 @@
 //! [`PetApp`] is the composition root: it owns the state, wires services
 //! into subscriptions and tasks, and delegates rendering to the view layer.
 
-use iced::widget::{column, container, image, mouse_area, row, stack, text};
+use iced::widget::{column, container, image, mouse_area, row, stack, text, text_editor};
 use iced::alignment::Vertical;
 use iced::widget::image::Handle;
 use iced::widget::svg::Handle as SvgHandle;
-use iced::{Color, ContentFit, Element, Length, Subscription, Task, alignment, window};
+use iced::{Background, Border, Color, ContentFit, Element, Length, Subscription, Task, alignment, window};
 
 pub(crate) use crate::model::{AsrState, ConversationTurn, DockingPreference, Message, Panel, StyleConfig};
 pub(crate) use crate::service::asr::AsrUpdate;
@@ -43,6 +43,19 @@ pub struct PetApp {
     docking: DockingPreference,
     /// Clipboard history, newest first.
     pub(crate) clipboard: Vec<String>,
+    pub(crate) scratchpad: text_editor::Content,
+    /// Visual feedback: file drag hover over the window.
+    pub(crate) drop_highlight: bool,
+    /// Latest screenshot file path (for thumbnail display).
+    pub(crate) screenshot_path: Option<String>,
+    /// When Some(idx), turn `idx` is being edited in-place (correction mode).
+    pub(crate) editing_turn: Option<u64>,
+    /// The in-progress correction text for the turn being edited.
+    pub(crate) correction_text: String,
+    /// Submitted corrections (raw → corrected), newest first.
+    pub(crate) corrections: Vec<(String, String)>,
+    /// App-level status messages (errors, info, hints), newest first.
+    pub(crate) status_messages: Vec<String>,
 }
 
 impl PetApp {
@@ -51,16 +64,19 @@ impl PetApp {
         style: StyleConfig, window_bg: Option<String>, docking: DockingPreference,
         sprite_size: f32, sprite_filter: String,
     ) -> (Self, Task<Message>) {
+        let init_status = format!("started — aura: {aura_addr}");
         let app = PetApp {
             aura_addr, skin, token, font_size, sprite_size, sprite_filter, style, window_bg, docking,
             asr: AsrState::default(),
             active_panel: None, ime_input: String::new(), auto_move: false,
-            clipboard: vec![
-                "📋 剪贴板监听已启动 — 复制任意文字试试".into(),
-                "你好，世界！".into(),
-                "The quick brown fox jumps over the lazy dog".into(),
-                "Lorem ipsum dolor sit amet, consectetur adipiscing elit.".into(),
-            ],
+            clipboard: vec![],
+            scratchpad: text_editor::Content::new(),
+            drop_highlight: false,
+            screenshot_path: None,
+            editing_turn: None,
+            correction_text: String::new(),
+            corrections: Vec::new(),
+            status_messages: vec![init_status],
             resize_handle: SvgHandle::from_memory(RESIZOR_SVG),
         };
         let token_for_task = app.token.clone();
@@ -84,18 +100,28 @@ impl PetApp {
     pub fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
             Message::Asr(u) => match u {
-                AsrUpdate::Hello => eprintln!("[geek-familiar] aura SSE hello"),
+                AsrUpdate::Hello => {
+                    self.status_messages.insert(0, "🎙 aura SSE connected".into());
+                    if self.status_messages.len() > 30 { self.status_messages.truncate(30); }
+                }
                 AsrUpdate::Interim(t) => self.asr.interim = t,
                 AsrUpdate::Final { text, intent, reply, seq } => {
                     self.asr.interim.clear();
                     self.asr.history.push(ConversationTurn { seq, user_text: text, intent, reply });
                     if self.asr.history.len() > 20 { self.asr.history.remove(0); }
                 }
-                AsrUpdate::Status(connected) => self.asr.connected = connected,
+                AsrUpdate::Status(connected) => {
+                    self.asr.connected = connected;
+                    let msg = if connected { "🎙 scout enabled" } else { "🎙 scout disabled" };
+                    self.status_messages.insert(0, msg.into());
+                    if self.status_messages.len() > 30 { self.status_messages.truncate(30); }
+                }
                 AsrUpdate::Connected => {}
                 AsrUpdate::Disconnected => {
                     self.asr.connected = false;
                     self.asr.interim.clear();
+                    self.status_messages.insert(0, "⚠ aura SSE disconnected".into());
+                    if self.status_messages.len() > 30 { self.status_messages.truncate(30); }
                 }
             },
             Message::HandshakeDone(ok) => {
@@ -126,7 +152,6 @@ impl PetApp {
                         r.h = (r.h as f32 / scale).round() as i32;
                     }
                 }
-                // eprintln!("[passthrough] {} rects from {}x{} scale {}", rects.len(), s.size.width, s.size.height, scale);
                 return apply_input_region(rects);
             }
             Message::PassthroughApplied(n) => eprintln!("[passthrough] applied {n} rect(s)"),
@@ -134,32 +159,126 @@ impl PetApp {
             Message::ToggleRecording => {
                 let enable = !self.asr.connected;
                 let addr = self.aura_addr.clone();
-                eprintln!("[geek-familiar] recording {}", if enable { "ON" } else { "OFF" });
                 return Task::perform(
                     async move { let _ = crate::service::aura::control_scout(&addr, Some(enable)); },
                     |_| Message::RecordingToggled,
                 );
             }
-            Message::RecordingToggled => {}
-            Message::ClipboardPoll => {
-                return iced::clipboard::read().map(|opt| {
-                    Message::ClipboardUpdate(opt.unwrap_or_default())
-                });
+            Message::RecordingToggled => {
+                // Status updated by AsrUpdate::Status event from SSE.
             }
-            Message::ClipboardUpdate(s) => {
-                if s.is_empty() { return Task::none(); }
-                if self.clipboard.first().map_or(true, |last| last != &s) {
-                    eprintln!("[geek-familiar] clipboard update: {} chars (new)", s.len());
-                    self.clipboard.insert(0, s);
-                    if self.clipboard.len() > 50 { self.clipboard.truncate(50); }
+            Message::ScratchpadEdit(action) => self.scratchpad.perform(action),
+            Message::FileDropped(path) => {
+                eprintln!("[geek-familiar] file dropped: {path}");
+                self.drop_highlight = false;
+                self.scratchpad = text_editor::Content::with_text(&path);
+            }
+            Message::TakeScreenshot => {
+                let path = "/tmp/geek-familiar-screenshot.png".to_string();
+                return Task::perform(
+                    async move {
+                        let status = std::process::Command::new("gnome-screenshot")
+                            .args(["-a", "-f", &path])
+                            .status();
+                        eprintln!("[geek-familiar] gnome-screenshot exit: {status:?}, file exists: {}", std::path::Path::new(&path).exists());
+                        path
+                    },
+                    Message::ScreenshotSaved,
+                );
+            }
+            Message::ScreenshotSaved(p) => {
+                if std::path::Path::new(&p).exists() {
+                    self.screenshot_path = Some(p.clone());
+                    self.scratchpad = text_editor::Content::with_text(&p);
+                    self.status_messages.insert(0, format!("📸 screenshot saved to {p}"));
+                    if self.status_messages.len() > 30 { self.status_messages.truncate(30); }
                 } else {
-                    eprintln!("[geek-familiar] clipboard update: dup, skipped");
+                    self.status_messages.insert(0, format!("⚠ screenshot failed — {p} not found"));
+                    if self.status_messages.len() > 30 { self.status_messages.truncate(30); }
                 }
             }
-            Message::ClipboardPoll => {
-                return iced::clipboard::read().map(|opt| {
-                    Message::ClipboardUpdate(opt.unwrap_or_default())
-                });
+            Message::FileHovered => {
+                eprintln!("[geek-familiar] file drag hover");
+                self.drop_highlight = true;
+            }
+            Message::FileHoverLeft => {
+                eprintln!("[geek-familiar] file drag left");
+                self.drop_highlight = false;
+            }
+            Message::AsrContextMenu(idx) => {
+                // Right-click on an ASR entry: copy its text to the scratchpad buffer
+                // for editing, then dispatch or re-copy.
+                if let Some(turn) = self.asr.history.get(idx as usize) {
+                    self.scratchpad = text_editor::Content::with_text(&turn.user_text);
+                }
+            }
+            Message::FixTurn(idx) => {
+                // Enter inline edit mode: copy the turn's text into correction buffer.
+                if let Some(turn) = self.asr.history.get(idx as usize) {
+                    self.editing_turn = Some(idx);
+                    self.correction_text = turn.user_text.clone();
+                }
+            }
+            Message::PlayAudio(idx) => {
+                eprintln!("[geek-familiar] play audio seq={idx}");
+                let addr = self.aura_addr.clone();
+                return Task::perform(
+                    async move {
+                        let result = crate::service::aura::fetch_audio(&addr, idx);
+                        match result {
+                            Ok(bytes) if !bytes.is_empty() => {
+                                let path = format!("/tmp/geek-familiar-audio-{idx}.wav");
+                                if let Err(e) = std::fs::write(&path, &bytes) {
+                                    eprintln!("[geek-familiar] write audio: {e}");
+                                    return (idx, false);
+                                }
+                                let status = std::process::Command::new("pw-play")
+                                    .arg(&path).status();
+                                eprintln!("[geek-familiar] pw-play exit: {status:?}");
+                                (idx, status.map_or(false, |s| s.success()))
+                            }
+                            Ok(_) => { eprintln!("[geek-familiar] audio empty"); (idx, false) }
+                            Err(e) => { eprintln!("[geek-familiar] fetch audio: {e}"); (idx, false) }
+                        }
+                    },
+                    |(seq, ok)| Message::AudioPlayed(seq, ok),
+                );
+            }
+            Message::AudioPlayed(seq, ok) => {
+                let msg = if ok { format!("🔊 audio seq={seq} played") } else { format!("⚠ audio seq={seq} failed") };
+                self.status_messages.insert(0, msg);
+                if self.status_messages.len() > 30 { self.status_messages.truncate(30); }
+            }
+            Message::CorrectionEdit(s) => self.correction_text = s,
+            Message::SubmitCorrection(idx) => {
+                if let Some(turn) = self.asr.history.get(idx as usize) {
+                    let seq = turn.seq;
+                    let raw = turn.user_text.clone();
+                    let corrected = self.correction_text.clone();
+                    // Record locally
+                    self.corrections.insert(0, (raw.clone(), corrected.clone()));
+                    if self.corrections.len() > 50 { self.corrections.truncate(50); }
+                    let addr = self.aura_addr.clone();
+                    self.editing_turn = None;
+                    self.correction_text.clear();
+                    return Task::perform(
+                        async move {
+                            let _ = crate::service::aura::correct(&addr, seq, &raw, &corrected);
+                        },
+                        |_| Message::RecordingToggled, // reuse as no-op ack
+                    );
+                }
+            }
+            Message::CancelEdit => {
+                self.editing_turn = None;
+                self.correction_text.clear();
+            }
+            Message::ClipboardPoll => return iced::clipboard::read().map(|opt| Message::ClipboardUpdate(opt.unwrap_or_default())),
+            Message::ClipboardUpdate(s) => {
+                if !s.is_empty() && self.clipboard.first().map_or(true, |last| last != &s) {
+                    self.clipboard.insert(0, s);
+                    if self.clipboard.len() > 50 { self.clipboard.truncate(50); }
+                }
             }
             Message::Quit => {
                 return window::oldest().then(|id| match id {
@@ -167,9 +286,21 @@ impl PetApp {
                     None => Task::none(),
                 });
             }
-            Message::HealthCheck(reachable) => eprintln!(
-                "[geek-familiar] aura daemon {}", if reachable { "reachable" } else { "NOT REACHABLE" }
-            ),
+            Message::CheckHealth => {
+                let addr = self.aura_addr.clone();
+                return Task::perform(async move { crate::service::aura::health(&addr) }, Message::HealthCheck);
+            }
+            Message::AppStatus(s) => {
+                eprintln!("[geek-familiar] status: {s}");
+                self.status_messages.insert(0, s);
+                if self.status_messages.len() > 30 { self.status_messages.truncate(30); }
+            }
+            Message::HealthCheck(reachable) => {
+                let msg = if reachable { "aura daemon reachable" } else { "aura daemon NOT reachable" };
+                self.status_messages.insert(0, format!("🔍 {msg}"));
+                if self.status_messages.len() > 30 { self.status_messages.truncate(30); }
+                eprintln!("[geek-familiar] {msg}");
+            }
             Message::DiagonalResizeStart => {
                 let dir = match self.docking {
                     DockingPreference::Left => iced::window::Direction::SouthEast,
@@ -190,63 +321,50 @@ impl PetApp {
             Subscription::run_with("rescan".to_string(), rescan_stream),
             Subscription::run_with(self.token.clone(), clipboard_stream),
             Subscription::run_with("clip_poll".to_string(), clipboard_poll_stream),
+            iced::event::listen_with(|event, _status, _window| match event {
+                iced::Event::Window(iced::window::Event::FileDropped(path)) => Some(Message::FileDropped(path.to_string_lossy().to_string())),
+                iced::Event::Window(iced::window::Event::FileHovered(_)) => Some(Message::FileHovered),
+                iced::Event::Window(iced::window::Event::FilesHoveredLeft) => Some(Message::FileHoverLeft),
+                _ => None,
+            }),
         ])
     }
 
     pub fn view(&self) -> Element<'_, Message> {
         let style = self.style.clone();
         let fs = self.font_size;
-
-        let sprite = image(self.skin.clone())
-            .width(self.sprite_size).height(self.sprite_size)
+        let sprite = image(self.skin.clone()).width(self.sprite_size).height(self.sprite_size)
             .content_fit(ContentFit::Contain)
-            .filter_method(if self.sprite_filter == "nearest" {
-                iced::widget::image::FilterMethod::Nearest
-            } else {
-                iced::widget::image::FilterMethod::Linear
-            });
-
+            .filter_method(if self.sprite_filter == "nearest" { iced::widget::image::FilterMethod::Nearest } else { iced::widget::image::FilterMethod::Linear });
         let dock = row![
+            crate::view::drag_button(fs, style.clone()),
             crate::view::dock_button("💬", Panel::Chat, self.active_panel == Some(Panel::Chat), fs, style.clone()),
             crate::view::dock_button("⚙", Panel::Settings, self.active_panel == Some(Panel::Settings), fs, style.clone()),
-            crate::view::drag_button(fs, style.clone()),
-        ]
-        .spacing(4);
-
-        let (_, grip_align) = match self.docking {
+        ].spacing(4);
+        let (h_align, grip_align) = match self.docking {
             DockingPreference::Left => (iced::alignment::Horizontal::Left, iced::alignment::Horizontal::Right),
             DockingPreference::Right => (iced::alignment::Horizontal::Right, iced::alignment::Horizontal::Left),
         };
-
-        let mut col = column![sprite, dock].align_x(alignment::Horizontal::Center).spacing(6);
-
+        let mut col = column![sprite, dock].align_x(h_align).spacing(6);
         if let Some(panel) = self.active_panel {
             let body: Element<Message> = match panel {
                 Panel::Chat => crate::view::chat_panel(self),
                 Panel::Settings => crate::view::settings_panel(self),
             };
-            col = col.push(
-                container(body).width(Length::Fill)
-                    .style({ let s = style.clone(); move |_theme| crate::view::card_style(&s, 0.92) }),
-            );
+            col = col.push(container(body).width(Length::Fill).height(Length::Fill).style({ let s = style.clone(); move |_theme| crate::view::card_style(&s, 0.92) }));
         }
-
-        // Resize grip — fixed to the window corner via Stack overlay so it's
-        // always reachable even when the window is too short for the content.
         let corner_grip = mouse_area(
             container(iced::widget::svg::Svg::new(self.resize_handle.clone()).width(12).height(20)).padding([2, 4]),
-        )
-        .on_press(Message::DiagonalResizeStart)
-        .interaction(iced::mouse::Interaction::ResizingDiagonallyUp);
-
-        let grip_layer = container(corner_grip)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(grip_align)
-            .align_y(Vertical::Bottom);
-
-        let content_layer = container(col).width(Length::Fill).height(Length::Fill);
-
+        ).on_press(Message::DiagonalResizeStart).interaction(iced::mouse::Interaction::ResizingDiagonallyUp);
+        let grip_layer = container(corner_grip).width(Length::Fill).height(Length::Fill).align_x(grip_align).align_y(Vertical::Bottom);
+        let mut content_layer = container(col).width(Length::Fill).height(Length::Fill);
+        if self.drop_highlight {
+            content_layer = content_layer.style(|_theme| container::Style {
+                background: Some(Background::Color(Color::from_rgba(0.2, 0.3, 0.6, 0.3))),
+                border: Border { color: Color::from_rgba(0.3, 0.5, 0.9, 0.7), width: 2.0, radius: 10.0.into() },
+                ..Default::default()
+            });
+        }
         stack![content_layer, grip_layer].into()
     }
 }
@@ -274,9 +392,7 @@ fn apply_to_window(w: &dyn iced::Window, rects: &[crate::input_region::Rect]) {
     let (Some(wh), Some(dh)) = (w.window_handle().ok(), w.display_handle().ok()) else { return; };
     let (raw_window_handle::RawWindowHandle::Wayland(sh), raw_window_handle::RawDisplayHandle::Wayland(dh)) =
         (wh.as_raw(), dh.as_raw()) else { return; };
-    unsafe {
-        crate::input_region::apply(sh.surface.as_ptr() as _, dh.display.as_ptr() as _, rects);
-    }
+    unsafe { crate::input_region::apply(sh.surface.as_ptr() as _, dh.display.as_ptr() as _, rects); }
 }
 
 fn asr_stream(addr: &String) -> std::pin::Pin<Box<dyn iced::futures::Stream<Item = Message> + Send>> {
@@ -291,14 +407,13 @@ fn rescan_stream(_id: &String) -> std::pin::Pin<Box<dyn iced::futures::Stream<It
         std::thread::spawn(move || {
             let mut sender = sender;
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(RESCAN_TICK));
+                std::thread::sleep(std::time::Duration::from_millis(2000));
                 let _ = sender.try_send(Message::RescanTick);
             }
         });
     }))
 }
 
-/// Resolve the skin image via FileLoader (`SKIN::<rel>`), fall back to bundled bytes.
 fn clipboard_stream(token: &String) -> std::pin::Pin<Box<dyn iced::futures::Stream<Item = Message> + Send>> {
     let token = token.clone();
     Box::pin(iced::stream::channel::<Message>(8, move |mut sender: iced::futures::channel::mpsc::Sender<Message>| async move {
