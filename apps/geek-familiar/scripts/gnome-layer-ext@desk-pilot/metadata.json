@@ -1,0 +1,7 @@
+{
+  "uuid": "gnome-layer-ext@desk-pilot",
+  "name": "Desk Pilot Layer",
+  "description": "Keep the geek-familiar desktop-pet window always above, on all workspaces (sticky), and excluded from Activities Overview. Uses Meta.Window.make_above() + stick() + Shell-level workspace filtering.",
+  "shell-version": ["49"],
+  "session-modes": ["user"]
+}

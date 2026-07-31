@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install gnome-layer-ext@vrover to the GNOME host's per-user extensions dir and
+# Install gnome-layer-ext@desk-pilot to the GNOME host's per-user extensions dir and
 # enable it. The geek-familiar pet pings this extension's socket at boot to get
 # always-on-top + Activities/taskbar/Alt-Tab exclusion on GNOME/Wayland.
 #
@@ -11,7 +11,7 @@
 # pick up changes (X11: Alt+F2 → r; Wayland: relogin). First-time enable is live.
 set -euo pipefail
 
-EXT_UUID="gnome-layer-ext@vrover"
+EXT_UUID="gnome-layer-ext@desk-pilot"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$SCRIPT_DIR/$EXT_UUID"
 
