@@ -53,4 +53,4 @@ onnx = ["dep:sherpa-onnx"]
 all = ["onnx"]
 
 [dev-dependencies]
-audio-aura-store = { path = "../aura-store" }
+audio-aura-core = { path = "../aura-core" }

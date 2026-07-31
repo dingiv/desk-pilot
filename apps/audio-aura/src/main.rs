@@ -37,12 +37,12 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
 use audio_aura_agent::{AddHotwordTool, HotwordManager, SharedHotwordManager, Tool};
-use audio_aura_store::archive::{ArchiveConfig, AudioArchive};
-use audio_aura_store::hub::{FinalTurn, Storage};
+use audio_aura_core::archive::{ArchiveConfig, AudioArchive};
+use audio_aura_core::hub::{FinalTurn, Storage};
 use audio_aura_asr::executor::{OnnxStage1Executor, Stage1Config};
 use audio_aura_core::{Pipeline, TurnEvent};
-use audio_aura_router::calibrator::Stage2CalibratorImpl;
-use audio_aura_router::Calibrator;
+use audio_aura_core::calibrator::Stage2CalibratorImpl;
+use audio_aura_core::Calibrator;
 
 const BASE: &str = "/workspaces/gui_agent/audio-aura/native";
 

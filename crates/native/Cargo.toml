@@ -9,10 +9,10 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-cuda = ["audio-aura-router/cuda"]
+cuda = ["audio-aura-core/cuda"]
 
 [dependencies]
-audio-aura-router = { path = "../aura-dcl" }
+audio-aura-core = { path = "../aura-core" }
 napi = "2"
 napi-derive = "2"
 

@@ -16,8 +16,9 @@ asr_backend: "qwen3-asr"        # sensevoice | whisper | qwen3-asr
 asr_language: "auto"
 asr_provider: "cpu"             # cpu | cuda (cuda 需 GPU sherpa lib + cuDNN 9.25)
 asr_threads: 8                  # onnxruntime intra-op 线程 (8 核甜点)
-asr_kind: "local"               # local | remote (remote → qwen-asr-serve)
-# asr_endpoint: "http://127.0.0.1:8000"  # asr_kind=remote 时
+# asr_kind: "local"               # local | remote (remote → qwen-asr-serve)
+asr_kind: "remote"               # local | remote (remote → qwen-asr-serve)
+asr_endpoint: "http://127.0.0.1:8000"  # asr_kind=remote 时
 
 # ── 种子热词 (流式 recognizer beam bias + Stage2 整流参考) ──
 hotwords: ["Rust", "Bevy", "贪吃蛇"]

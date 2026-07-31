@@ -19,8 +19,7 @@ audio-aura-core = { path = "../../crates/aura-core" }
 audio-aura-agent = { path = "../../crates/aura-agent" }
 audio-aura-asr = { path = "../../crates/aura-asr" }
 dp-models = { workspace = true }
-audio-aura-router = { path = "../../crates/aura-dcl" }
-audio-aura-store = { path = "../../crates/aura-store" }
+# merged into audio-aura-core
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

@@ -13,12 +13,24 @@ required-features = ["asr", "cuda"]
 
 [features]
 default = []
-cuda = ["audio-aura-router/cuda"]
+cuda = ["mistralrs/cuda"]
 # Stage1 local ASR (SenseVoice via audio-aura-asr/onnx).
 asr = ["audio-aura-asr/onnx"]
 
 [dependencies]
-audio-aura-router = { path = "../aura-dcl" }
 audio-aura-asr = { path = "../aura-asr" }
+mistralrs = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+dp-models = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shared = { path = "../shared" }
 anyhow = "1"
 tracing = { workspace = true }
+chrono = "0.4"
+
+[build-dependencies]
+shared = { path = "../shared" }
+
+[package.metadata.shared]
+MODELS = { dev = "../../assets/models", prod = "~/.desk-pilot/models" }
