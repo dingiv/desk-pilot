@@ -13,7 +13,7 @@ use audio_aura_asr::Utterance;
 
 use crate::context::ContextWindow;
 use crate::prompt::PromptBuilder;
-use crate::{parse_decision, Decision};
+use crate::Decision;
 
 /// Turns a finalized utterance into a calibrated Decision. Implementations own their context.
 pub trait Stage2Calibrator: Send {
@@ -85,13 +85,18 @@ impl Stage2Calibrator for Stage2CalibratorImpl {
             pb = pb.corrections(&corrections);
         }
         let (system, user) = pb.build();
+        tracing::debug!(target: "stage2::prompt", system = %system, user = %user, "calibrate prompt");
 
-        // TODO: 调用 calibartor 进行纠正
-        let raw = self.llm.complete(&system, &user).unwrap_or_default();
-        let decision = parse_decision(&raw, route);
+        // LLM returns plain text — no JSON parsing needed.
+        let calibrated = self.llm.complete(&system, &user).unwrap_or_else(|_| route.to_string());
+        let decision = Decision {
+            calibrated_text: calibrated.trim().to_string(),
+            intent: "chat".into(),
+            reply: String::new(),
+            task: None,
+        };
 
-        // Roll the context window: this utterance's (raw→calibrated) becomes a pattern the LLM
-        // can learn from on the next turn.
+        // Roll the context window.
         self.ctx_win.push(route, &decision.calibrated_text, &decision.intent);
         decision
     }
