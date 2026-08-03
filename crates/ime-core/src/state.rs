@@ -65,7 +65,7 @@ pub struct StateMachine {
 }
 
 impl StateMachine {
-    pub fn new() -> Self { StateMachine::default() }
+    pub fn new() -> Self { StateMachine { candidate_page_size: 7, ..StateMachine::default() } }
 
     pub fn step(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
         match self.state {

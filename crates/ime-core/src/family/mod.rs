@@ -131,6 +131,11 @@ pub trait CandidateFamily: Send + Sync {
         Ok(0)
     }
 
+    /// Load a user dictionary (all entries get maximum priority).
+    fn load_user_dict(&self, _path: &str) -> std::io::Result<usize> {
+        Ok(0)
+    }
+
     /// Load dictionary entries from raw TSV bytes (for embedded dicts).
     fn load_dict_bytes(&self, _data: &[u8]) -> usize {
         0

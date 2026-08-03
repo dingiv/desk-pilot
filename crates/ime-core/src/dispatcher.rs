@@ -36,10 +36,22 @@ impl Dispatcher {
         expander: Expander,
         weights: crate::family::pinyin::PinyinWeights,
     ) -> Self {
-        let pinyin_family = PinyinFamily::with_weights(weights);
+        Self::with_config(matcher, expander, weights, 65, crate::family::english::EnglishWeights::default())
+    }
+
+    /// Full constructor with configurable English family settings.
+    pub fn with_config(
+        matcher: Matcher,
+        expander: Expander,
+        pinyin_weights: crate::family::pinyin::PinyinWeights,
+        english_priority: u32,
+        english_weights: crate::family::english::EnglishWeights,
+    ) -> Self {
+        let pinyin_family = PinyinFamily::with_weights(pinyin_weights);
         let snippet_family = SnippetFamily::new(matcher.clone(), expander.clone());
         let magic_family = MagicFamily::new();
-        let english_family = EnglishFamily::with_default_dict();
+        let english_family = EnglishFamily::with_default_dict()
+            .with_config(english_priority, english_weights);
         let emoji_family = EmojiFamily::new();
         let ai_family = AiFamily::new();
 
@@ -119,6 +131,20 @@ impl Dispatcher {
         if let Some(fam) = self.scorer.family("pinyin") {
             fam.warm_phrases_from_store();
         }
+    }
+
+    /// Load an English user dictionary (all words get max priority).
+    pub fn load_en_user_dict(&self, path: &str) -> std::io::Result<usize> {
+        self.scorer.family("english")
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "english family not found"))
+            .and_then(|f| f.load_user_dict(path))
+    }
+
+    /// Load an external English dictionary (auto-detect type, normalize).
+    pub fn load_en_dict(&self, path: &str) -> std::io::Result<usize> {
+        self.scorer.family("english")
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "english family not found"))
+            .and_then(|f| f.load_dict(path))
     }
 
     /// Attach the voice buffer so `#asr` → `__ASR_BUFFER__` resolves to live

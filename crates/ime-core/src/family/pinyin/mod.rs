@@ -62,11 +62,11 @@ pub struct PinyinWeights {
 impl Default for PinyinWeights {
     fn default() -> Self {
         PinyinWeights {
-            phrase_book: 1.0, large_dict: 0.95,
-            viterbi_base: 0.3, viterbi_scale: 0.65,
-            jianpin: 0.70,
-            single_syl_decay: 0.6, context_boost: 0.15,
-            stopword_penalty: 0.5, confirm_bonus: 0.05, short_word_bonus: 0.02,
+            phrase_book: 0.88, large_dict: 0.85,
+            viterbi_base: 0.25, viterbi_scale: 0.55,
+            jianpin: 0.50,
+            single_syl_decay: 0.5, context_boost: 0.12,
+            stopword_penalty: 0.5, confirm_bonus: 0.05, short_word_bonus: 0.01,
             large_dict_take: 96, viterbi_take: 48,
             jianpin_take: 8,
         }
@@ -303,20 +303,23 @@ impl CandidateFamily for PinyinFamily {
             for (i, word) in words.into_iter().enumerate() {
                 out.push(ScoredCandidate {
                     text: word, family: "pinyin", source: "single",
-                    raw_score: (1.0 - (i as f64 / total) * self.weights.single_syl_decay).clamp(0.0, 1.0),
+                    raw_score: (self.weights.large_dict - (i as f64 / total) * self.weights.single_syl_decay).clamp(0.0, 1.0),
                 });
             }
         } else {
             // Unified lattice: handles full pinyin, jianpin, mixed in one pass.
+            // Full pinyin matches keep full freq_to_score; mixed/initials
+            // (简拼/混写) are discounted by the jianpin weight so they
+            // don't drown out English exact matches for ambiguous inputs.
             let lattice_guard = self.lattice.lock().unwrap();
             if let Some(ref lat) = *lattice_guard {
                 let results = lat.predict(input, self.weights.large_dict_take);
                 for r in results {
-                    let score = lattice::LatticeDecoder::freq_to_score(r.freq_score as u64);
-                    let source = match r.match_type {
-                        lattice::MatchType::Full => "lattice",
-                        lattice::MatchType::Mixed => "lattice_mix",
-                        lattice::MatchType::Initials => "lattice_jp",
+                    let base_score = lattice::LatticeDecoder::freq_to_score(r.freq_score as u64);
+                    let (source, score) = match r.match_type {
+                        lattice::MatchType::Full => ("lattice", base_score),
+                        lattice::MatchType::Mixed => ("lattice_mix", base_score * self.weights.jianpin),
+                        lattice::MatchType::Initials => ("lattice_jp", base_score * self.weights.jianpin),
                     };
                     out.push(ScoredCandidate {
                         text: r.text, family: "pinyin", source,

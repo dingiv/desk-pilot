@@ -61,7 +61,25 @@ extern "C" {
     void swift_ime_deactivate(ImeHandle *handle, void *ctx);
     void swift_ime_set_surrounding(ImeHandle *handle, void *ctx,
                                    const char *text);
+    int  swift_ime_special_key(ImeHandle *handle, void *ctx,
+                                int code, ImeView *out_view);
 }
+
+// ── Special key codes (passed to swift_ime_special_key) ─────────────────
+#define SWIFT_KEY_UP           1
+#define SWIFT_KEY_DOWN         2
+#define SWIFT_KEY_LEFT         3
+#define SWIFT_KEY_RIGHT        4
+#define SWIFT_KEY_TAB          5
+#define SWIFT_KEY_PAGEUP       6
+#define SWIFT_KEY_PAGEDOWN     7
+#define SWIFT_KEY_SPACE       10
+#define SWIFT_KEY_ENTER       11
+#define SWIFT_KEY_ESCAPE      12
+#define SWIFT_KEY_BACKSPACE   13
+#define SWIFT_KEY_BRACKET_LEFT  20
+#define SWIFT_KEY_BRACKET_RIGHT 21
+#define SWIFT_KEY_DIGIT(n)    (100 + (n))  // n = 1..9
 
 // ── fcitx5 engine ───────────────────────────────────────────────────────────
 

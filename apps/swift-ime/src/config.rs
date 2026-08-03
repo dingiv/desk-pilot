@@ -36,26 +36,26 @@ pub struct WeightsConfig {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct FamilyPriorityConfig {
-    #[serde(default = "default_100")] pub pinyin: u32,
-    #[serde(default = "default_95")] pub magic: u32,
-    #[serde(default = "default_75")] pub snippet: u32,
-    #[serde(default = "default_60")] pub english: u32,
+    #[serde(default = "default_90")] pub pinyin: u32,
+    #[serde(default = "default_90")] pub magic: u32,
+    #[serde(default = "default_70")] pub snippet: u32,
+    #[serde(default = "default_70")] pub english: u32,
     #[serde(default = "default_50")] pub emoji: u32,
     #[serde(default = "default_40")] pub ai: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct PinyinWeightConfig {
-    #[serde(default = "default_1_0")] pub phrase_book: f64,
-    #[serde(default = "default_0_95")] pub large_dict: f64,
-    #[serde(default = "default_0_3")] pub viterbi_base: f64,
-    #[serde(default = "default_0_65")] pub viterbi_scale: f64,
-    #[serde(default = "default_0_7")] pub jianpin: f64,
-    #[serde(default = "default_0_6")] pub single_syl_decay: f64,
-    #[serde(default = "default_0_15")] pub context_boost: f64,
+    #[serde(default = "default_0_88")] pub phrase_book: f64,
+    #[serde(default = "default_0_85")] pub large_dict: f64,
+    #[serde(default = "default_0_25")] pub viterbi_base: f64,
+    #[serde(default = "default_0_55")] pub viterbi_scale: f64,
+    #[serde(default = "default_0_5")] pub jianpin: f64,
+    #[serde(default = "default_0_5")] pub single_syl_decay: f64,
+    #[serde(default = "default_0_12")] pub context_boost: f64,
     #[serde(default = "default_0_5")] pub stopword_penalty: f64,
     #[serde(default = "default_0_05")] pub confirm_bonus: f64,
-    #[serde(default = "default_0_02")] pub short_word_bonus: f64,
+    #[serde(default = "default_0_01")] pub short_word_bonus: f64,
     #[serde(default = "default_96")] pub large_dict_take: usize,
     #[serde(default = "default_48")] pub viterbi_take: usize,
     #[serde(default = "default_8")] pub jianpin_take: usize,
@@ -84,21 +84,24 @@ impl PinyinWeightConfig {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct SnippetWeightConfig {
-    #[serde(default = "default_1_0")] pub exact: f64,
-    #[serde(default = "default_0_5")] pub partial: f64,
+    #[serde(default = "default_0_92")] pub exact: f64,
+    #[serde(default = "default_0_4")] pub partial: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct MagicWeightConfig {
-    #[serde(default = "default_1_0")] pub exact: f64,
-    #[serde(default = "default_0_9")] pub prefix: f64,
+    #[serde(default = "default_0_92")] pub exact: f64,
+    #[serde(default = "default_0_82")] pub prefix: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct EnglishWeightConfig {
-    #[serde(default = "default_1_0")] pub exact: f64,
-    #[serde(default = "default_0_7")] pub prefix_ratio: f64,
+    #[serde(default = "default_0_88")] pub exact: f64,
+    #[serde(default = "default_0_6")] pub prefix_ratio: f64,
+    #[serde(default = "default_1_0")] pub user_boost: f64,
 }
+
+fn default_1_0() -> f64 { 1.0 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct DisplayConfig {
@@ -106,23 +109,22 @@ pub struct DisplayConfig {
     #[serde(default = "default_8")] pub max_char_cands: usize,
 }
 
-fn default_100() -> u32 { 100 }
-fn default_95() -> u32 { 95 }
-fn default_75() -> u32 { 75 }
-fn default_60() -> u32 { 60 }
+fn default_90() -> u32 { 90 }
+fn default_70() -> u32 { 70 }
 fn default_50() -> u32 { 50 }
 fn default_40() -> u32 { 40 }
-fn default_1_0() -> f64 { 1.0 }
-fn default_0_95() -> f64 { 0.95 }
-fn default_0_9() -> f64 { 0.9 }
-fn default_0_7() -> f64 { 0.7 }
-fn default_0_65() -> f64 { 0.65 }
-fn default_0_6() -> f64 { 0.6 }
+fn default_0_92() -> f64 { 0.92 }
+fn default_0_88() -> f64 { 0.88 }
+fn default_0_85() -> f64 { 0.85 }
+fn default_0_82() -> f64 { 0.82 }
+fn default_0_55() -> f64 { 0.55 }
 fn default_0_5() -> f64 { 0.5 }
-fn default_0_3() -> f64 { 0.3 }
-fn default_0_15() -> f64 { 0.15 }
+fn default_0_4() -> f64 { 0.4 }
+fn default_0_25() -> f64 { 0.25 }
+fn default_0_6() -> f64 { 0.6 }
+fn default_0_12() -> f64 { 0.12 }
 fn default_0_05() -> f64 { 0.05 }
-fn default_0_02() -> f64 { 0.02 }
+fn default_0_01() -> f64 { 0.01 }
 fn default_8() -> usize { 8 }
 fn default_48() -> usize { 48 }
 fn default_96() -> usize { 96 }
@@ -133,17 +135,17 @@ impl Default for WeightsConfig {
     fn default() -> Self {
         WeightsConfig {
             family_priority: FamilyPriorityConfig {
-                pinyin: 100, magic: 95, snippet: 75, english: 60, emoji: 50, ai: 40,
+                pinyin: 90, magic: 90, snippet: 70, english: 70, emoji: 50, ai: 40,
             },
             pinyin: PinyinWeightConfig {
-                phrase_book: 1.0, large_dict: 0.95, viterbi_base: 0.3, viterbi_scale: 0.65,
-                jianpin: 0.70, single_syl_decay: 0.6, context_boost: 0.15,
-                stopword_penalty: 0.5, confirm_bonus: 0.05, short_word_bonus: 0.02,
+                phrase_book: 0.88, large_dict: 0.85, viterbi_base: 0.25, viterbi_scale: 0.55,
+                jianpin: 0.50, single_syl_decay: 0.5, context_boost: 0.12,
+                stopword_penalty: 0.5, confirm_bonus: 0.05, short_word_bonus: 0.01,
                 large_dict_take: 96, viterbi_take: 48, jianpin_take: 8,
             },
-            snippet: SnippetWeightConfig { exact: 1.0, partial: 0.5 },
-            magic: MagicWeightConfig { exact: 1.0, prefix: 0.9 },
-            english: EnglishWeightConfig { exact: 1.0, prefix_ratio: 0.7 },
+            snippet: SnippetWeightConfig { exact: 0.92, partial: 0.4 },
+            magic: MagicWeightConfig { exact: 0.92, prefix: 0.82 },
+            english: EnglishWeightConfig { exact: 0.88, prefix_ratio: 0.6, user_boost: 1.0 },
             display: DisplayConfig { max_full_comps: 8, max_char_cands: 8 },
         }
     }

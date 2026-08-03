@@ -5,6 +5,7 @@
 
 pub mod fcitx5;
 pub mod ibus;
+pub mod mock;
 pub mod tsf;
 pub mod imk;
 

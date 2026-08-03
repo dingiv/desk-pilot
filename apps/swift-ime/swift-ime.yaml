@@ -22,31 +22,34 @@ input:
   page_size: 7        # candidates per page
 
 # ── Weights (scoring parameters for each prediction layer) ──────────────
+# Final score = raw_score × (family_priority / 100), then ranked.
+# All values are intentionally conservative — top candidates land in
+# 0.70–0.85 range, leaving headroom for recency/context boosts.
 weights:
   # Family priorities (0-100, higher = more weight in global ranking)
   family_priority:
-    pinyin: 100
-    magic: 95
-    snippet: 75
-    english: 60
+    pinyin: 90
+    magic: 90
+    snippet: 70
+    english: 70
     emoji: 50
     ai: 40
 
   # Pinyin family internal scores (0.0-1.0)
   pinyin:
-    phrase_book: 1.0        # user-learned phrases (always top)
-    large_dict: 0.95        # rime-ice exact match
-    viterbi_base: 0.3       # Viterbi min score
-    viterbi_scale: 0.65     # Viterbi score range (max = base + scale = 0.95)
+    phrase_book: 0.88       # user-learned phrases
+    large_dict: 0.85        # rime-ice exact match
+    viterbi_base: 0.25      # Viterbi min score
+    viterbi_scale: 0.55     # Viterbi score range (max = base + scale = 0.80)
     session: 0.5            # inputx session lookup
     prefix: 0.3             # prefix fallback (incomplete syllable)
-    phrase_book_prefix: 0.85 # PhraseBook prefix match
-    jianpin: 0.70           # initials-only match (nh → 你好)
-    single_syl_decay: 0.6   # score decay per position in single-syllable lookup
-    context_boost: 0.15     # bonus for bigram match with previous word
-    stopword_penalty: 0.5   # multiplier for all-stopword compositions (diyige→的一个)
+    phrase_book_prefix: 0.80 # PhraseBook prefix match
+    jianpin: 0.50           # initials-only match discount (nh→你好)
+    single_syl_decay: 0.5   # score decay per position in single-syllable lookup
+    context_boost: 0.12     # bonus for bigram match with previous word
+    stopword_penalty: 0.5   # multiplier for all-stopword compositions
     confirm_bonus: 0.05     # bonus when word appears in both dict and viterbi
-    short_word_bonus: 0.02  # bonus for 2-char words (most common target)
+    short_word_bonus: 0.01  # bonus for 2-char words
     large_dict_take: 96     # max LargeDict candidates per query
     viterbi_take: 48        # max Viterbi compositions per query
     jianpin_take: 8         # max jianpin candidates per query
@@ -54,18 +57,18 @@ weights:
 
   # Snippet family internal scores
   snippet:
-    exact: 1.0              # exact trigger match
-    partial: 0.5            # partial trigger (still typing)
+    exact: 0.92             # exact trigger match
+    partial: 0.4            # partial trigger (still typing)
 
   # Magic family internal scores
   magic:
-    exact: 1.0              # exact command match
-    prefix: 0.9             # prefix command match
+    exact: 0.92             # exact command match
+    prefix: 0.82            # prefix command match
 
   # English family internal scores
   english:
-    exact: 1.0              # exact word match
-    prefix_ratio: 0.7       # max score for prefix match (scaled by match ratio)
+    exact: 0.88             # exact word match
+    prefix_ratio: 0.6       # max score for prefix match (scaled by match ratio)
 
   # Candidate display
   display:

@@ -219,78 +219,11 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
     auto *ic = keyEvent.inputContext();
     if (!ic) return;
 
-    // ── Candidate-list navigation (local) ──
-    auto candList = ic->inputPanel().candidateList();
-    if (candList && !candList->empty()) {
-        // Space: select the first visible candidate on the current page.
-        if (keyEvent.key().check(FcitxKey_space)) {
-            candList->candidate(0).select(ic);
-            keyEvent.filterAndAccept();
-            return;
-        }
-        if (auto idx = keyEvent.key().keyListIndex(selectionKeys_);
-            idx >= 0 && idx < (int)candList->size()) {
-            candList->candidate(idx).select(ic);
-            keyEvent.filterAndAccept();
-            return;
-        }
-        if (auto *m = candList->toCursorMovable()) {
-            if (keyEvent.key().check(FcitxKey_Up)) {
-                m->prevCandidate();
-                ic->updateUserInterface(
-                    fcitx::UserInterfaceComponent::InputPanel);
-                keyEvent.filterAndAccept();
-                return;
-            }
-            if (keyEvent.key().check(FcitxKey_Down)) {
-                m->nextCandidate();
-                ic->updateUserInterface(
-                    fcitx::UserInterfaceComponent::InputPanel);
-                keyEvent.filterAndAccept();
-                return;
-            }
-        }
-        if (auto *p = candList->toPageable()) {
-            if (keyEvent.key().check(FcitxKey_minus)
-                || keyEvent.key().check(FcitxKey_Page_Up)
-                || keyEvent.key().check(FcitxKey_Left)) {
-                if (p->hasPrev()) {
-                    p->prev();
-                    ic->updateUserInterface(
-                        fcitx::UserInterfaceComponent::InputPanel);
-                }
-                keyEvent.filterAndAccept();
-                return;
-            }
-            if (keyEvent.key().check(FcitxKey_equal)
-                || keyEvent.key().check(FcitxKey_Page_Down)
-                || keyEvent.key().check(FcitxKey_Right)) {
-                if (p->hasNext()) {
-                    p->next();
-                    ic->updateUserInterface(
-                        fcitx::UserInterfaceComponent::InputPanel);
-                }
-                keyEvent.filterAndAccept();
-                return;
-            }
-        }
-        if (keyEvent.key().check(FcitxKey_Escape)) {
-            swift_ime_reset(handle_, (void *)ic);
-            ic->inputPanel().reset();
-            ic->updatePreedit();
-            ic->updateUserInterface(
-                fcitx::UserInterfaceComponent::InputPanel);
-            keyEvent.filterAndAccept();
-            return;
-        }
-    }
-
     // ── Process key through Rust engine ──
     auto sym = keyEvent.key().sym();
     uint32_t ch = fcitx::Key::keySymToUnicode(sym);
     if (ch == 0) return;
 
-    ImeView view;
     // Feed surrounding text to the engine for context-aware prediction.
     if (ic->capabilityFlags().test(fcitx::CapabilityFlag::SurroundingText)) {
         auto &st = ic->surroundingText();
@@ -300,6 +233,7 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
         }
     }
 
+    ImeView view;
     swift_ime_process_key(handle_, (void *)ic, ch, &view);
 
     if (view.key_passthrough) {

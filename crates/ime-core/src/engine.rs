@@ -30,6 +30,7 @@ use std::time::Instant;
 use crate::dispatcher::Dispatcher;
 use crate::family::InputContext;
 use crate::platform::ImeView;
+use crate::special_key::{handle_special_key, SpecialKey};
 use crate::state::{StateMachine, StepEnv};
 use crate::weight_store::WeightStore;
 
@@ -93,6 +94,15 @@ impl ImeEngine {
 
     /// Create engine with custom pinyin family weights (from config file).
     pub fn with_pinyin_weights(weights: crate::family::pinyin::PinyinWeights) -> Self {
+        Self::with_config(weights, 70, crate::family::english::EnglishWeights::default())
+    }
+
+    /// Create engine with full config (pinyin weights + English priority + English weights).
+    pub fn with_config(
+        pinyin_weights: crate::family::pinyin::PinyinWeights,
+        english_priority: u32,
+        english_weights: crate::family::english::EnglishWeights,
+    ) -> Self {
         let entries: Vec<(String, String)> = vec![
             ("/greet".into(), "你好，我是 AI 秘书，请问有什么可以帮你的？".into()),
             ("/sig".into(), "Best regards,\nAlice".into()),
@@ -108,7 +118,7 @@ impl ImeEngine {
             crate::expander::StaticProvider { date: String::from("2026-07-27"), clipboard: String::new() },
         ));
         let engine = ImeEngine {
-            dispatcher: Dispatcher::with_pinyin_weights(matcher, expander, weights),
+            dispatcher: Dispatcher::with_config(matcher, expander, pinyin_weights, english_priority, english_weights),
             contexts: Mutex::new(HashMap::new()),
             async_waits: Mutex::new(HashMap::new()),
             store: Mutex::new(None),
@@ -141,8 +151,39 @@ impl ImeEngine {
 
     // ── Multi-context API (used by fcitx5 C ABI) ────────────────────────
 
+    /// Process a special key (navigation, commit, selection) for a context.
+    /// Returns the updated ImeView.
+    pub fn special_key_ctx(&self, ctx: usize, key: SpecialKey) -> ImeView {
+        self.with_ctx(ctx, |disp, pc| {
+            handle_special_key(&mut pc.sm, key, disp)
+                .unwrap_or_else(|| ImeView::empty())
+        })
+    }
+
+    /// Process a special key code from the C ABI.
+    pub fn special_key_code_ctx(&self, ctx: usize, code: i32) -> ImeView {
+        match SpecialKey::from_code(code) {
+            Some(key) => self.special_key_ctx(ctx, key),
+            None => ImeView::empty(),
+        }
+    }
+
     /// Process a key for a given input context. Returns the UI snapshot.
     pub fn predict_ctx(&self, ctx: usize, ch: char) -> ImeView {
+        // ── Special key layer ──
+        // Check if the character maps to a special key before prediction.
+        let key_opt = match ch {
+            ' ' => Some(SpecialKey::Space),
+            '\n' | '\r' => Some(SpecialKey::Enter),
+            '\x08' => Some(SpecialKey::Backspace),
+            '\x1b' => Some(SpecialKey::Escape),
+            d @ '1'..='9' => Some(SpecialKey::Digit(d as u8 - b'0')),
+            _ => None,
+        };
+        if let Some(key) = key_opt {
+            return self.special_key_ctx(ctx, key);
+        }
+
         self.with_ctx(ctx, |disp, pc| {
             pc.sm.context = pc.text_context.clone();
             let prev = pc.text_context.last_word.clone();
@@ -247,6 +288,91 @@ impl ImeEngine {
     /// Select a candidate in the default context.
     pub fn select_candidate(&mut self, index: usize) -> ImeView {
         self.select_ctx(DEFAULT_CTX, index)
+    }
+
+    /// Move the candidate highlight by `delta` (±1) in the default context.
+    pub fn move_highlight(&self, delta: i32) {
+        self.move_highlight_ctx(DEFAULT_CTX, delta)
+    }
+
+    /// Move the candidate highlight by `delta` for a specific context.
+    pub fn move_highlight_ctx(&self, ctx: usize, delta: i32) {
+        self.contexts.lock().unwrap()
+            .get_mut(&ctx)
+            .map(|pc| pc.sm.move_highlight(delta));
+    }
+
+    /// Change candidate page by `delta` (-1=prev, +1=next) in the default context.
+    pub fn page(&self, delta: i32) {
+        self.page_ctx(DEFAULT_CTX, delta)
+    }
+
+    /// Change candidate page by `delta` for a specific context.
+    pub fn page_ctx(&self, ctx: usize, delta: i32) {
+        self.contexts.lock().unwrap()
+            .get_mut(&ctx)
+            .map(|pc| {
+                let n = pc.sm.candidates.len();
+                if n == 0 || pc.sm.candidate_page_size == 0 { return; }
+                let total_pages = (n + pc.sm.candidate_page_size - 1) / pc.sm.candidate_page_size;
+                let new_page = (pc.sm.candidate_page as i32 + delta).clamp(0, total_pages as i32 - 1) as usize;
+                if new_page != pc.sm.candidate_page {
+                    pc.sm.candidate_page = new_page;
+                    pc.sm.candidate_highlight = new_page * pc.sm.candidate_page_size;
+                }
+            });
+    }
+
+    /// Go to the previous candidate page in the default context.
+    pub fn page_up(&self) { self.page(-1); }
+
+    /// Go to the next candidate page in the default context.
+    pub fn page_down(&self) { self.page(1); }
+
+    /// Get the full ImeView for a specific context without processing a key.
+    pub fn view_ctx(&self, ctx: usize) -> ImeView {
+        self.contexts.lock().unwrap()
+            .get(&ctx)
+            .map(|pc| {
+                let mut v = ImeView::empty();
+                v.candidate_count = pc.sm.candidates.len().min(16) as u32;
+                v.candidate_highlight = pc.sm.candidate_highlight as u32;
+                v.candidate_page = pc.sm.candidate_page as u32;
+                v.candidate_page_size = pc.sm.candidate_page_size as u32;
+                for (i, c) in pc.sm.candidates.iter().take(16).enumerate() {
+                    ImeView::set_str(&mut v.candidates[i].text, c);
+                }
+                ImeView::set_str(&mut v.preedit_text, &pc.sm.preedit);
+                v.preedit_cursor = pc.sm.cursor as u32;
+                v
+            })
+            .unwrap_or_else(ImeView::empty)
+    }
+
+    /// Poll async state for the default context.
+    pub fn poll_async(&self) -> (i32, ImeView) {
+        self.poll_async_ctx(DEFAULT_CTX)
+    }
+
+    /// Rebuild the ImeView from current state (for display after navigation).
+    /// Returns the full UI snapshot without processing a key event.
+    pub fn view(&self) -> ImeView {
+        self.contexts.lock().unwrap()
+            .get(&DEFAULT_CTX)
+            .map(|pc| {
+                let mut v = ImeView::empty();
+                v.candidate_count = pc.sm.candidates.len().min(16) as u32;
+                v.candidate_highlight = pc.sm.candidate_highlight as u32;
+                v.candidate_page = pc.sm.candidate_page as u32;
+                v.candidate_page_size = pc.sm.candidate_page_size as u32;
+                for (i, c) in pc.sm.candidates.iter().take(16).enumerate() {
+                    ImeView::set_str(&mut v.candidates[i].text, c);
+                }
+                ImeView::set_str(&mut v.preedit_text, &pc.sm.preedit);
+                v.preedit_cursor = pc.sm.cursor as u32;
+                v
+            })
+            .unwrap_or_else(ImeView::empty)
     }
 
     /// Current pinyin buffer for the default context.
@@ -360,6 +486,17 @@ impl ImeEngine {
     /// the SSE client has been spawned.
     pub fn set_asr_buffer(&self, buf: std::sync::Arc<crate::asr_buffer::AsrBuffer>) {
         self.dispatcher.set_asr_buffer(buf);
+    }
+
+    /// Load an English user dictionary from a TSV file.
+    /// All words get max priority (10000).
+    pub fn load_en_user_dict(&self, path: &str) -> std::io::Result<usize> {
+        self.dispatcher.load_en_user_dict(path)
+    }
+
+    /// Load an external English dictionary (auto-detect type, normalize, cache).
+    pub fn load_en_dict(&self, path: &str) -> std::io::Result<usize> {
+        self.dispatcher.load_en_dict(path)
     }
 }
 

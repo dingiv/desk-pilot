@@ -21,7 +21,16 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
 
     let cfg = crate::config::SwiftImeConfig::load();
     let weights = cfg.weights.pinyin.to_engine();
-    let engine = ImeEngine::with_pinyin_weights(weights);
+    let eng_weights = ime_core::family::english::EnglishWeights {
+        exact: cfg.weights.english.exact,
+        prefix_ratio: cfg.weights.english.prefix_ratio,
+        user_boost: cfg.weights.english.user_boost,
+    };
+    let engine = ImeEngine::with_config(
+        weights,
+        cfg.weights.family_priority.english,
+        eng_weights,
+    );
 
     // Load rime-ice FST if enabled in config.
     if cfg.dicts.rime_ice {
@@ -45,6 +54,15 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
     engine.set_asr_buffer(Arc::clone(&asr_buffer));
     crate::bridge::spawn_aura_sse(asr_buffer, None);
     // ──────────────────────────────────────────────────────────────────
+
+    // ── English user dictionary ──
+    let loader = shared::loader!(".");
+    if let Some(p) = loader.resolve("CONF::en_user.tsv") {
+        match engine.load_en_user_dict(&p.to_string_lossy()) {
+            Ok(n) => crate::ime_log!("loaded {n} en user words from {}", p.display()),
+            Err(e) => crate::ime_log!("en user dict load error: {e}"),
+        }
+    }
 
     Box::into_raw(Box::new(engine))
 }
@@ -86,6 +104,19 @@ pub extern "C" fn swift_ime_select_candidate(
 pub extern "C" fn swift_ime_reset(engine: *mut ImeEngine, ctx: *const std::ffi::c_void) {
     if engine.is_null() { return; }
     unsafe { &*engine }.reset_ctx(ctx as usize);
+}
+
+#[no_mangle]
+pub extern "C" fn swift_ime_special_key(
+    engine: *mut ImeEngine,
+    ctx: *const std::ffi::c_void,
+    code: i32,
+    out_view: *mut ImeView,
+) -> i32 {
+    if engine.is_null() || out_view.is_null() { return 0; }
+    let view = unsafe { &*engine }.special_key_code_ctx(ctx as usize, code);
+    unsafe { *out_view = view; }
+    1
 }
 
 #[no_mangle]

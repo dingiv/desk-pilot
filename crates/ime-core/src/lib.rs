@@ -9,6 +9,7 @@ pub mod expander;
 pub mod family;
 pub mod matcher;
 pub mod recency;
+pub mod special_key;
 pub mod user_bigram;
 pub mod weight_store;
 pub mod platform;
