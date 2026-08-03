@@ -39,7 +39,7 @@ impl Dispatcher {
         let pinyin_family = PinyinFamily::with_weights(weights);
         let snippet_family = SnippetFamily::new(matcher.clone(), expander.clone());
         let magic_family = MagicFamily::new();
-        let english_family = EnglishFamily::new();
+        let english_family = EnglishFamily::with_default_dict();
         let emoji_family = EmojiFamily::new();
         let ai_family = AiFamily::new();
 

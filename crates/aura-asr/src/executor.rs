@@ -243,6 +243,7 @@ impl Stage1Executor for OnnxStage1Executor {
         let mut stream_sess = sasr.map(|s| s.create_session());
         let mut last_partial = String::new();
         let mut frames_since_partial = 0u32;
+        let mut ring_empty_since: Option<Instant> = None;
 
         loop {
             // Connection toggle: when the scout connection is paused, skip VAD/ASR (the ingest
@@ -254,12 +255,28 @@ impl Stage1Executor for OnnxStage1Executor {
             // drain one Silero window (512 samples = 32ms) when available
             let frame = {
                 let mut g = self.ring.lock().unwrap();
-                if !g.has_frame(WINDOW) {
+                if g.has_frame(WINDOW) {
+                    ring_empty_since = None;
+                    g.drain(WINDOW)
+                } else {
                     drop(g);
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
+                    // Ring empty: if > 2s AND we have streaming partials (were speaking),
+                    // feed silence to VAD so it fires EOS naturally — prevents the scenario
+                    // where audio source drops mid-utterance and VAD never evaluates silence.
+                    ring_empty_since.get_or_insert_with(Instant::now);
+                    if let Some(since) = ring_empty_since {
+                        if since.elapsed() > Duration::from_secs(2) && !last_partial.is_empty() {
+                            debug!("ring empty > 2s during speech — feeding silence to force VAD EOS");
+                            vec![0i16; WINDOW] // synthetic silence frame → VAD will fire EOS
+                        } else {
+                            std::thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
+                    } else {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
                 }
-                g.drain(WINDOW)
             };
             frames_in += 1;
             if last_diag.elapsed() >= Duration::from_secs(3) {

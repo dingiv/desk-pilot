@@ -11,6 +11,10 @@ publish.workspace = true
 name = "stage12_live"
 required-features = ["asr", "cuda"]
 
+[[example]]
+name = "calibrate_bench"
+required-features = ["asr", "cuda"]
+
 [features]
 default = []
 cuda = ["mistralrs/cuda"]
@@ -24,7 +28,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 dp-models = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-shared = { path = "../shared" }
+shared = { path = "../shared", features = ["log"] }
 anyhow = "1"
 tracing = { workspace = true }
 chrono = "0.4"

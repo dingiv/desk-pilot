@@ -60,19 +60,17 @@ impl Stage2CalibratorImpl {
 impl Stage2Calibrator for Stage2CalibratorImpl {
     fn calibrate(&mut self, utterance: &Utterance) -> Decision {
         let route = utterance.route_text();
-        let ctx = if self.ctx_win.is_empty() {
-            None
-        } else {
-            Some(self.ctx_win.as_pairs())
-        };
+        // ContextWindow disabled — Qwen2.5-3B copies previous calibrated text instead of
+        // using it as reference. Re-enable only with a model >= 7B that follows "不要复读" reliably.
+        // let ctx = if self.ctx_win.is_empty() { None } else { Some(self.ctx_win.as_pairs()) };
+        let ctx: Option<String> = None;
         // Read the latest hotwords (may have grown since last call via Stage3 feedback).
         let hotwords = self.hotwords.lock().unwrap().clone();
 
         let mut pb = PromptBuilder::new(route).hotwords(&hotwords);
-        // Dual-transcript head/tail merge: the batch pass occasionally clips the segment head
-        // (VAD lookback margin); the streaming pass hears everything but with more homophone
-        // errors. Give the LLM both — the builder drops it when empty/identical to `route`.
-        pb = pb.streaming_ref(&utterance.streaming_text);
+        // Streaming ref disabled — Qwen3-1.7B can't reconcile dual transcripts reliably;
+        // batch Qwen3-ASR is already high quality, Stage2 just cleans up minor errors.
+        // pb = pb.streaming_ref(&utterance.streaming_text);
         if let Some(c) = ctx.as_deref() {
             pb = pb.context(c);
         }

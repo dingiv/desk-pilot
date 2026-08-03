@@ -6,7 +6,7 @@ port: 9091                      # daemon socket 端口
 stage3: true                    # 运行进程内 Stage3 规则触发器
 
 # ── Stage2 LLM (mistral.rs Qwen3-1.7B GGUF, local; 或 remote vLLM/sglang) ──
-model: "Qwen3-1.7B-Q8_0.gguf"  # GGUF 文件名 (MODELS namespace 内)
+model: "qwen2.5-3b-instruct-q4_k_m.gguf"
 llm_kind: "local"               # local | remote
 # llm_endpoint: "http://127.0.0.1:8000"  # llm_kind=remote 时 (sglang/vllm)
 # llm_model: "Qwen3-1.7B"                 # remote 时传给 /v1/chat/completions
