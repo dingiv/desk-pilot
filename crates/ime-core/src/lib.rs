@@ -2,11 +2,13 @@
 //! with variable substitution, a middleware dispatch chain, and a hot-reloadable snippet store.
 //! Zero OS dependencies — cross-compilable and fully unit-testable.
 
+pub mod asr_buffer;
 pub mod dispatcher;
 pub mod engine;
 pub mod expander;
 pub mod family;
 pub mod matcher;
+pub mod recency;
 pub mod user_bigram;
 pub mod weight_store;
 pub mod platform;

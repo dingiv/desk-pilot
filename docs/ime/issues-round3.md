@@ -195,6 +195,6 @@ pub struct PhraseBook {
 
 | 优先级 | 任务 | 规模 | 依赖 |
 |--------|------|------|------|
-| P1 | Phrase 声母分词 | 小 (~50行) | 无 |
+| P1 | Phrase 声母分词 | ✅ 已完成 | — |
 | P1 | RecentFamily | 中 (~200行) | WeightStore 扩展 |
 | P2 | 用户自定义词典 FST | 中 (~150行) | 无 |

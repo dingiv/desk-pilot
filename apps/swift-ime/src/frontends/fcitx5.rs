@@ -6,7 +6,9 @@
 //! internally by the engine.
 
 use std::os::raw::c_char;
+use std::sync::Arc;
 
+use ime_core::asr_buffer::AsrBuffer;
 use ime_core::engine::ImeEngine;
 use ime_core::platform::ImeView;
 
@@ -37,6 +39,12 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
     // Initialize SQLite weight store.
     let home = std::env::var("HOME").unwrap_or_default();
     engine.init_store(&format!("{home}/.desk-pilot/swift-ime.db"));
+
+    // ── Voice input: spawn aura SSE client + attach buffer to engine ──
+    let asr_buffer = Arc::new(AsrBuffer::new());
+    engine.set_asr_buffer(Arc::clone(&asr_buffer));
+    crate::bridge::spawn_aura_sse(asr_buffer, None);
+    // ──────────────────────────────────────────────────────────────────
 
     Box::into_raw(Box::new(engine))
 }
@@ -101,6 +109,18 @@ pub extern "C" fn swift_ime_commit_pending(
     let view = unsafe { &*engine }.commit_pending_ctx(ctx as usize);
     unsafe { *out_view = view; }
     1
+}
+
+#[no_mangle]
+pub extern "C" fn swift_ime_set_surrounding(
+    engine: *mut ImeEngine,
+    ctx: *const std::ffi::c_void,
+    text: *const c_char,
+) {
+    if engine.is_null() || text.is_null() { return; }
+    let s = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy();
+    if s.is_empty() { return; }
+    unsafe { &*engine }.set_surrounding(ctx as usize, &s);
 }
 
 #[no_mangle]

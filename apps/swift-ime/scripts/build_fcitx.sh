@@ -60,28 +60,14 @@ echo "   install:    $DO_INSTALL"
 echo "═══════════════════════════════════════════════"
 echo ""
 
-# ── Step 1: Build the Rust cdylib + build_dict tool ───────────────────────
-echo "── [1/5] Building Rust cdylib + dict tool …"
+# ── Step 1: Build the Rust cdylib ──────────────────────────────────────
+echo "── [1/4] Building Rust cdylib …"
 cargo build -p swift-ime --lib $CARGO_FLAGS
-cargo build -p swift-ime --bin build_dict $CARGO_FLAGS
 echo "   → $RUST_BUILD_DIR/libswift_ime.so"
 echo ""
 
-# ── Step 2: Build rime-ice FST dictionary ─────────────────────────────────
-echo "── [2/5] Building rime-ice.fst …"
-DICT_DIR="$PROJECT_DIR/assets/dict"
-if [ -f "$DICT_DIR/rime-ice.tsv" ]; then
-    RUST_BUILD_DIR_REL="${CARGO_FLAGS:+release/}debug"
-    [ "$BUILD_TYPE" = "Release" ] && RUST_BUILD_DIR_REL="release"
-    "./../../target/$RUST_BUILD_DIR_REL/build_dict" "$DICT_DIR/rime-ice.tsv" "$DICT_DIR/rime-ice.fst"
-    echo "   → $DICT_DIR/rime-ice.fst"
-else
-    echo "   ⚠  rime-ice.tsv not found, skipping FST build"
-fi
-echo ""
-
-# ── Step 3: CMake configure ───────────────────────────────────────────────
-echo "── [3/5] Configuring CMake …"
+# ── Step 2: CMake configure ───────────────────────────────────────────────
+echo "── [2/4] Configuring CMake …"
 BUILD_DIR="$PROJECT_DIR/build"
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
@@ -92,13 +78,13 @@ cmake -S "$PROJECT_DIR" -B "$BUILD_DIR" \
     -DRUST_BUILD_DIR="$RUST_BUILD_DIR"
 echo ""
 
-# ── Step 4: Build the C++ addon ───────────────────────────────────────────
-echo "── [4/5] Building fcitx5 addon (swift-ime.so) …"
+# ── Step 3: Build the C++ addon ───────────────────────────────────────────
+echo "── [3/4] Building fcitx5 addon (swift-ime.so) …"
 cmake --build "$BUILD_DIR" -j"$(nproc)"
 echo "   → $BUILD_DIR/release/fcitx/swift-ime.so"
 echo ""
 
-# ── Step 5 (optional): Install ────────────────────────────────────────────
+# ── Step 4 (optional): Install ────────────────────────────────────────────
 if [ "$DO_INSTALL" = true ]; then
     echo "── [install] Installing to /usr …"
     cmake --install "$BUILD_DIR"
@@ -106,9 +92,9 @@ if [ "$DO_INSTALL" = true ]; then
     echo ""
 fi
 
-# ── Step 5 (optional): Debian package ─────────────────────────────────────
+# ── Step 4 (optional): Debian package ─────────────────────────────────────
 if [ "$DO_DEB" = true ]; then
-    echo "── [5/5] Building .deb package …"
+    echo "── [4/4] Building .deb package …"
 
     if ! command -v dpkg-buildpackage &>/dev/null; then
         echo "   ⚠  dpkg-buildpackage not found (apt install dpkg-dev)"

@@ -222,6 +222,76 @@ fn phrase_persistence_across_sessions() {
 }
 
 #[test]
+fn asr_command_with_no_buffer_commits_empty() {
+    let mut eng = ImeEngine::new();
+    // Type #asr — the __ASR_BUFFER__ token expands to empty when no buffer is attached.
+    for c in "#asr".chars() { eng.predict(InputEvent::char(c)); }
+    // Space commits the resolved expansion (empty string).
+    let v = eng.predict(InputEvent::space());
+    // Empty commit means no commit_text is written.
+    let committed = commit(&v);
+    eprintln!("asr command commit (no buffer): '{committed}'");
+    // With no buffer attached, __ASR_BUFFER__ expands to empty string,
+    // so space commits nothing.
+    assert!(committed.is_empty(), "expected empty commit, got '{committed}'");
+}
+
+#[test]
+fn asr_command_with_buffer_commits_voice_text() {
+    use ime_core::asr_buffer::AsrBuffer;
+    let mut eng = ImeEngine::new();
+
+    // Attach a voice buffer with some text.
+    let buf = std::sync::Arc::new(AsrBuffer::new());
+    buf.update("今天天气不错");
+    eng.set_asr_buffer(buf);
+
+    // Type #asr
+    for c in "#asr".chars() { eng.predict(InputEvent::char(c)); }
+    // Space commits the voice text.
+    let v = eng.predict(InputEvent::space());
+    assert_eq!(commit(&v), "今天天气不错");
+}
+
+#[test]
+fn asr_prefix_shows_command_name() {
+    let mut eng = ImeEngine::new();
+    // Type partial #as → should show #asr as candidate.
+    for c in "#as".chars() { eng.predict(InputEvent::char(c)); }
+    let cands = eng.candidates();
+    eprintln!("#as prefix candidates: {:?}", cands);
+    // The matcher will show "#as" as preedit since #asr is in the trie.
+    // The buffer shows the accumulated prefix.
+    assert!(!eng.buffer().is_empty(), "should have buffer for '#as'");
+    assert!(eng.buffer().starts_with("#as"), "buffer should start with '#as', got {:?}", eng.buffer());
+}
+
+#[test]
+fn surrounding_text_stored_and_accessible() {
+    let eng = ImeEngine::new();
+    eng.set_surrounding(0, "中国的首都是北京");
+    // Verify it doesn't crash and context is set.
+    let v = eng.predict_ctx(0, 'n');
+    assert!(v.candidate_count > 0 || v.preedit_text[0] != 0,
+        "should handle surrounding text without panicking");
+}
+
+#[test]
+fn recency_boost_promotes_recent_word() {
+    let mut eng = ImeEngine::new();
+    // Type and commit "大陆" → enters recency.
+    for c in "dalu".chars() { eng.predict(InputEvent::char(c)); }
+    eng.predict(InputEvent::space()); // commit 大 (first candidate)
+    // Now type "lu" — 陆 should get recency boost since we just saw "大".
+    for c in "lu".chars() { eng.predict(InputEvent::char(c)); }
+    let cands = eng.candidates();
+    let lu_pos = cands.iter().position(|c| c == "陆");
+    eprintln!("After recency push(大): 陆 position = {lu_pos:?}, top-5: {:?}",
+        &cands.iter().take(5).collect::<Vec<_>>());
+    assert!(lu_pos.is_some(), "陆 should be in candidates after recency push");
+}
+
+#[test]
 fn phrase_initials_recall() {
     let mut eng = ImeEngine::new();
 

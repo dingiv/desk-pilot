@@ -93,6 +93,13 @@ impl Dispatcher {
         }
     }
 
+    /// Record a committed word for recency boosting.
+    pub fn record_commit(&self, word: &str) {
+        if let Some(fam) = self.scorer.family("pinyin") {
+            fam.record_commit(word);
+        }
+    }
+
     /// Warm the pinyin family's in-memory bigram model from persisted SQLite data.
     pub fn warm_bigrams(&self, entries: Vec<(String, String, u32)>) {
         if let Some(fam) = self.scorer.family("pinyin") {
@@ -112,6 +119,12 @@ impl Dispatcher {
         if let Some(fam) = self.scorer.family("pinyin") {
             fam.warm_phrases_from_store();
         }
+    }
+
+    /// Attach the voice buffer so `#asr` → `__ASR_BUFFER__` resolves to live
+    /// voice recognition text from the aura daemon SSE stream.
+    pub fn set_asr_buffer(&self, buf: std::sync::Arc<crate::asr_buffer::AsrBuffer>) {
+        self.expander.set_asr_buffer(buf);
     }
 
     pub fn reload_matcher(&mut self, entries: Vec<(String, String)>) {

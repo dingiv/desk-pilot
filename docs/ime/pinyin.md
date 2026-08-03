@@ -13,13 +13,14 @@
 | `lattice_mix` | LatticeDecoder 混写 | freq_to_score(weight) | 全拼+首字母混合 | gyinsjian→光阴似箭 |
 | `lattice_jp` | LatticeDecoder 简拼 | freq_to_score(weight) | 纯首字母 | gysj→光阴似箭 |
 | `decomp` | Viterbi 分解 | 0.40 | 多音节兜底 | 造词 |
-| `phrase` | PhraseBook | 1.0 | 用户自造词 | 置顶 |
+| `phrase` | PhraseBook 全拼 | 1.0 | 用户自造词 | 置顶 |
+| `phrase_sp` | PhraseBook 声母 | 0.95 | 用户词简拼 | lzm→李正明 |
 
 ### 查询顺序
 
 ```
-single-syllable:  single → phrase
-multi-syllable:   lattice (全拼/混写/简拼) → decomp (Viterbi fallback) → phrase
+single-syllable:  single → phrase + phrase_sp
+multi-syllable:   lattice (全拼/混写/简拼) → decomp (Viterbi fallback) → phrase + phrase_sp
 ```
 
 ## LatticeDecoder 统一引擎
@@ -54,10 +55,23 @@ Input: "guangyinsj"
 
 - 全拼路径: `FST.get()` O(1) 查找，极快
 - 简拼/混写路径: `initials_index` HashMap O(1) + `pattern_match` 逐条校验
-- 启动: 首次构建 initials_index ~47s（全表扫描 900K 词条），之后读 `.fst.jianpin` 缓存 ~50ms
+- 启动: 首次构建 initials_index ~47s（全表扫描 900K 词条），之后读 `.fst.idx` 缓存 ~50ms
 
 ### 数据
 
 - rime-ice 900K 词条，3 列 TSV（pinyin, word, weight）
 - `build_dict.rs` 编译为 inputx_fsa FST
 - 权重范围 100-500266，`freq_to_score` log₂ 归一化到 [0.25, 0.90]
+
+
+### 模糊音支持
+
+
+### 拼写纠偏功能
+
+qiangzhuang
+
+qinagzhaung
+
+
+

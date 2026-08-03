@@ -1,21 +1,11 @@
 # swift-ime — DeskPilot input method engine for fcitx5
 #
-# Builds libswift-ime.so (the fcitx5 addon) by:
-#   1. Compiling the C++ thin glue (glue/engine.cpp) → object
-#   2. Linking against Fcitx5::Core + our Rust libime_core.so (pre-built via cargo)
-#
-# Prerequisites:
-#   sudo apt install fcitx5-modules-dev libfcitx5core-dev cmake cargo
-#   cargo build -p ime-core-ffi --release
+# Builds the fcitx5 addon (.so) by:
+#   1. Compiling the C++ thin glue (release/fcitx/engine.cpp)
+#   2. Linking against Fcitx5::Core + libswift_ime.so (pre-built by cargo)
 #
 # Build:
-#   mkdir -p build && cd build
-#   cmake .. -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release
-#   make -j$(nproc)
-#   sudo make install
-#
-# Debian package:
-#   dpkg-buildpackage -us -uc -b
+#   ./scripts/build_fcitx.sh [--release|--debug] [--no-deb] [--install]
 
 cmake_minimum_required(VERSION 3.21)
 project(swift-ime VERSION 0.1.0 LANGUAGES CXX)
@@ -24,9 +14,7 @@ project(swift-ime VERSION 0.1.0 LANGUAGES CXX)
 find_package(Fcitx5Core REQUIRED)
 include("${FCITX_INSTALL_CMAKECONFIG_DIR}/Fcitx5Utils/Fcitx5CompilerSettings.cmake")
 
-# Path to the Rust shared library (pre-built by cargo).
-# In dev: target/release/libime_core_ffi.so
-# In deb: /usr/lib/x86_64-linux-gnu/libime_core_ffi.so
+# Path to the Rust cdylib (pre-built by cargo).
 set(RUST_BUILD_DIR "${CMAKE_SOURCE_DIR}/../../target/release"
     CACHE PATH "Directory containing libswift_ime.so")
 
@@ -57,6 +45,8 @@ set(SWIFT_IME_DICT_DIR "${CMAKE_INSTALL_DATADIR}/swift-ime/dict")
 install(FILES assets/dict/base.tsv
         DESTINATION "${SWIFT_IME_DICT_DIR}")
 install(FILES assets/dict/rime-ice.fst
+        DESTINATION "${SWIFT_IME_DICT_DIR}")
+install(FILES assets/dict/rime-ice.fst.idx
         DESTINATION "${SWIFT_IME_DICT_DIR}")
 
 # ── Install default config ────────────────────────────────────────────────────

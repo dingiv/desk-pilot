@@ -244,7 +244,9 @@ impl StateMachine {
         }
 
         // Space: commit the pending expansion if one exists, otherwise
-        // commit the raw trigger text.
+        // commit the raw trigger text. Preview placeholders (tokens that
+        // resolved to text ending with "...") commit an empty string —
+        // the real voice data hasn't arrived yet.
         if ch == ' ' {
             if let Some(expansion) = self.pending_expansion.take() {
                 let expanded = match env.expander().expand(&expansion) {
@@ -252,6 +254,10 @@ impl StateMachine {
                     Err(e) => { tracing::warn!(error = %e, "expand failed"); expansion }
                 };
                 self.reset();
+                // Preview candidates ("语音识别中...") commit empty.
+                if expanded.ends_with("...") {
+                    return Self::commit_view("");
+                }
                 return Self::commit_view(&expanded);
             }
             let raw = std::mem::take(&mut self.buffer);

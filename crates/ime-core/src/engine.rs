@@ -97,6 +97,10 @@ impl ImeEngine {
             ("/greet".into(), "你好，我是 AI 秘书，请问有什么可以帮你的？".into()),
             ("/sig".into(), "Best regards,\nAlice".into()),
             ("#date".into(), "2026-07-27".into()),
+            ("#asr".into(), "__ASR_BUFFER__".into()),
+            ("#flush".into(), "__ASR_BUFFER__".into()),
+            ("#submit".into(), "__ASR_SUBMIT__".into()),
+            ("#password".into(), "[password manager — not yet implemented]".into()),
             ("#wait".into(), "__WAIT_DEMO__".into()),
         ];
         let matcher = crate::Matcher::new(entries);
@@ -148,6 +152,7 @@ impl ImeEngine {
                 pc.text_context.update(committed);
                 // Record bigram: prev_word → committed_word (both SQLite + in-memory).
                 self.record_bigram(&prev, committed);
+                self.dispatcher.record_commit(committed);
             }
             // #wait demo interceptor.
             if ImeView::str_field(&view.commit_text) == "__WAIT_DEMO__" {
@@ -173,6 +178,7 @@ impl ImeEngine {
                 let prev = pc.text_context.last_word.clone();
                 pc.text_context.update(committed);
                 self.record_bigram(&prev, committed);
+                self.dispatcher.record_commit(committed);
             }
             view
         })
@@ -186,6 +192,16 @@ impl ImeEngine {
     /// Deactivate (clean up) a context — removes its state and async waits.
     pub fn deactivate_ctx(&self, ctx: usize) {
         self.remove_ctx(ctx);
+    }
+
+    /// Set surrounding text from the application (fcitx5 callback).
+    /// The text is stored in per-context `InputContext` and used by
+    /// prediction families for broader context matching.
+    pub fn set_surrounding(&self, ctx: usize, text: &str) {
+        let mut map = self.contexts.lock().unwrap();
+        if let Some(pc) = map.get_mut(&ctx) {
+            pc.text_context.set_surrounding(text);
+        }
     }
 
     /// Commit any pending composition for a context.
@@ -246,10 +262,23 @@ impl ImeEngine {
     }
 
     /// Current candidates with full detail (source, score) for debugging.
-    /// Re-runs the scorer on the current buffer to get member-level traceability.
+    /// When the state machine is in Snippet state with fresh candidates, those
+    /// are returned directly (they were produced by the Matcher→Expander path,
+    /// not the scorer). Otherwise re-runs the scorer on the current buffer.
     pub fn candidates_detailed(&self) -> Vec<crate::family::RankedCandidate> {
         let map = self.contexts.lock().unwrap();
         let Some(pc) = map.get(&DEFAULT_CTX) else { return Vec::new() };
+        // Snippet state: candidates come from the Matcher trie, not the scorer.
+        // Return them directly so #asr / #date expansions appear correctly.
+        if pc.sm.state == crate::state::ComposeState::Snippet && pc.sm.candidates_fresh {
+            let source = if pc.sm.buffer.starts_with('#') { "magic" } else { "snippet" };
+            return pc.sm.candidates.iter().map(|c| crate::family::RankedCandidate {
+                text: c.clone(),
+                score: 1.0,
+                family: source,
+                source: "exact",
+            }).collect();
+        }
         let ctx = pc.text_context.clone();
         let buffer = pc.sm.buffer.clone();
         drop(map);
@@ -324,6 +353,13 @@ impl ImeEngine {
             });
             Some(text.to_string())
         }
+    }
+
+    /// Attach the voice buffer so `#asr` resolves to live voice recognition
+    /// text from the aura daemon SSE stream. Call once at startup after
+    /// the SSE client has been spawned.
+    pub fn set_asr_buffer(&self, buf: std::sync::Arc<crate::asr_buffer::AsrBuffer>) {
+        self.dispatcher.set_asr_buffer(buf);
     }
 }
 

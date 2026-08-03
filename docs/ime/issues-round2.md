@@ -85,5 +85,7 @@ commit "大陆" (prev="大", next="陆")
 | P1 | 候选数量 | 🔧 待实现 |
 | P1 | 统一 L1 词典 | 🔧 待实现 |
 | P2 | 用户 Bigram 模型 | ✅ 已闭合持久化回路（双写 SQLite + 内存，跨会话 warm） |
-| P2 | 惰性加载 | 🔧 待实现 |
+| P2 | 惰性加载 | → 延后至后续轮次 |
 | P2 | 输入框切换状态残留 | ✅ 已修复（reset/deactivate/activate 均清除 UI + lastViews） |
+
+> **第二轮收尾。** 新增任务见 [第三轮 →](issues-round3.md)

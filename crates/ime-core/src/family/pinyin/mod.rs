@@ -3,6 +3,7 @@
 
 use super::{CandidateFamily, InputContext, ScoredCandidate};
 use self::phrase::PhraseBook;
+use crate::recency::RecencyStore;
 use crate::user_bigram::UserBigram;
 
 pub mod dict;
@@ -30,6 +31,7 @@ pub struct PinyinFamily {
     large_dict: Mutex<LargeDict>,
     lattice: Mutex<Option<lattice::LatticeDecoder>>,
     bigram: Mutex<UserBigram>,
+    recency: Mutex<RecencyStore>,
     enabled: bool,
     weights: PinyinWeights,
     store: Mutex<Option<Arc<WeightStore>>>,
@@ -81,6 +83,7 @@ impl PinyinFamily {
             large_dict: Mutex::new(LargeDict::new()),
             lattice: Mutex::new(None),
             bigram: Mutex::new(UserBigram::new()),
+            recency: Mutex::new(RecencyStore::new()),
             enabled: true,
             weights: PinyinWeights::default(),
             store: Mutex::new(None),
@@ -96,6 +99,7 @@ impl PinyinFamily {
             large_dict: Mutex::new(LargeDict::new()),
             lattice: Mutex::new(None),
             bigram: Mutex::new(UserBigram::new()),
+            recency: Mutex::new(RecencyStore::new()),
             enabled: true,
             weights,
             store: Mutex::new(None),
@@ -113,6 +117,7 @@ impl PinyinFamily {
             large_dict: Mutex::new(LargeDict::new()),
             lattice: Mutex::new(None),
             bigram: Mutex::new(UserBigram::new()),
+            recency: Mutex::new(RecencyStore::new()),
             enabled: true,
             weights: PinyinWeights::default(),
             store: Mutex::new(None),
@@ -143,6 +148,11 @@ impl PinyinFamily {
 
     pub fn record_bigram(&self, prev: &str, next: &str) {
         self.bigram.lock().unwrap().record(prev, next);
+    }
+
+    /// Record a committed word for recency boosting.
+    pub fn record_commit(&self, word: &str) {
+        self.recency.lock().unwrap().push(word);
     }
 
     pub fn bigram_json(&self) -> String {
@@ -366,10 +376,22 @@ impl CandidateFamily for PinyinFamily {
         let mut candidates = self.predict(input);
         if candidates.is_empty() { return candidates; }
 
+        // ── Layer 1: Recency boost (short-term memory) ──
+        let recency = self.recency.lock().unwrap();
+        if !recency.is_empty() {
+            for c in &mut candidates {
+                c.raw_score = (c.raw_score + recency.boost(&c.text)).min(1.0);
+            }
+        }
+        drop(recency);
+
         let dict = self.engine.dict();
         let bigram = self.bigram.lock().unwrap();
+        // Build context word list: recent commits + last word + surrounding text.
+        let surr_words: Vec<&str> = ctx.surrounding.split_whitespace().collect();
         let ctx_words: Vec<String> = ctx.recent_text.split_whitespace()
             .chain(std::iter::once(ctx.last_word.as_str()))
+            .chain(surr_words.iter().copied())
             .filter(|w| !w.is_empty())
             .map(|w| w.to_string())
             .collect();

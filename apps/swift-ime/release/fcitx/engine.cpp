@@ -291,6 +291,15 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
     if (ch == 0) return;
 
     ImeView view;
+    // Feed surrounding text to the engine for context-aware prediction.
+    if (ic->capabilityFlags().test(fcitx::CapabilityFlag::SurroundingText)) {
+        auto &st = ic->surroundingText();
+        if (st.isValid()) {
+            swift_ime_set_surrounding(handle_, (void *)ic,
+                                      st.text().c_str());
+        }
+    }
+
     swift_ime_process_key(handle_, (void *)ic, ch, &view);
 
     if (view.key_passthrough) {
