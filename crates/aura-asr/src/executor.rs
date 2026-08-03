@@ -21,7 +21,10 @@ use anyhow::Result;
 use tracing::debug;
 
 use crate::buffer::AudioRing;
-use crate::onnx::{AsrBackend, AsrConfig, OnnxRuntimeManager, StreamingAsrConfig, VadConfig, WINDOW};
+use crate::onnx::{
+    AsrBackend, AsrConfig, OnlineAsr, OnnxRuntimeManager, StreamingAsrConfig, StreamingSession,
+    VadConfig, WINDOW,
+};
 use crate::scout::ScoutAudioSource;
 use crate::{Stage1Event, Utterance, VadEventKind};
 use dp_models::{http::HttpAsr, AsrProvider, ProviderKind};
@@ -43,6 +46,12 @@ pub struct Stage1Config {
     /// Batch ASR backend: `Local` (lib sherpa OnnxAsr) or `Remote` (HTTP, OpenAI-compatible).
     /// Streaming ASR + VAD stay local sherpa regardless (real-time partials need low latency).
     pub asr_kind: ProviderKind,
+    /// ★Segment-merge gap (seconds). VAD fires EOS on every pause ≥ `min_silence`; the
+    /// [`SegmentMerger`] then absorbs a following segment into the pending utterance when the
+    /// inter-speech silence is < this, and only emits a Final when the utterance settles (a gap
+    /// ≥ this, or no new speech for this long). Decouples "VAD sensitivity" from "what's one
+    /// utterance" — VAD stays reactive, merging repairs the fragmentation. 0 → no merging.
+    pub merge_gap_s: f64,
     /// Shared connection toggle (see [`ScoutAudioSource::with_active`]). Flip to false to stop
     /// ingesting from scout (does NOT kill scout). Defaults to true.
     pub active: Arc<AtomicBool>,
@@ -84,6 +93,7 @@ impl Stage1Config {
             },
             ring_cap_samples: DEFAULT_RING_CAP,
             asr_kind: ProviderKind::Local,
+            merge_gap_s: 1.5,
             active: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -153,6 +163,8 @@ pub struct OnnxStage1Executor {
     /// stay in `mgr` (always local sherpa).
     batch_asr: Arc<dyn AsrProvider>,
     ring: Arc<Mutex<AudioRing>>,
+    /// Segment-merge gap (s) — see [`Stage1Config::merge_gap_s`].
+    merge_gap_s: f64,
     active: Arc<AtomicBool>,
 }
 
@@ -184,7 +196,7 @@ impl OnnxStage1Executor {
         mgr.warm();
         let ring = Arc::new(Mutex::new(AudioRing::new(cfg.ring_cap_samples)));
         spawn_ingest(Arc::clone(&ring), &cfg.scout_addr, Arc::clone(&cfg.active))?;
-        Ok(Self { mgr, ring, active: cfg.active, batch_asr })
+        Ok(Self { mgr, ring, merge_gap_s: cfg.merge_gap_s, active: cfg.active, batch_asr })
     }
 
     /// Use an already-loaded [`OnnxRuntimeManager`] (e.g. shared with another stage); spawns the
@@ -198,7 +210,7 @@ impl OnnxStage1Executor {
         };
         let ring = Arc::new(Mutex::new(AudioRing::new(cfg.ring_cap_samples)));
         spawn_ingest(Arc::clone(&ring), &cfg.scout_addr, Arc::clone(&cfg.active))?;
-        Ok(Self { mgr, ring, active: cfg.active, batch_asr })
+        Ok(Self { mgr, ring, merge_gap_s: cfg.merge_gap_s, active: cfg.active, batch_asr })
     }
 
     /// Access the underlying ONNX model manager (e.g. for diagnostics / direct ASR calls).
@@ -226,6 +238,178 @@ fn spawn_ingest(
     Ok(())
 }
 
+// ── Segment merging: stitch VAD fragments split by short pauses into one utterance ───────
+// R2 from docs/aura/real-world-speech-design.md §1 (停顿碎片化). VAD fires EOS on every pause
+// ≥ min_silence; the merger absorbs a following segment into the pending utterance when the
+// inter-speech silence is < `merge_gap_s`. Each absorbed fragment re-runs batch ASR on the
+// accumulated PCM and emits a `Revise` (provisional, same seq — Stage2 recalibrates
+// incrementally, the UI updates in place); the utterance only `Final`s when it settles (a gap
+// ≥ merge_gap_s, or no new speech for merge_gap_s). So the UI sees one growing utterance instead
+// of N fragments — "fragment anxiety" (R3) solved for free — and Stage2's calibrated text appears
+// live (per fragment), not delayed until settle.
+
+/// Accumulated audio + timing for an utterance that may still absorb more segments.
+struct MergeAccum {
+    pcm: Vec<i16>,
+    /// Wall-clock (s since executor start) of the FIRST segment's SOS — the utterance's `at_s`.
+    start_at: f64,
+    /// Wall-clock of the LAST absorbed segment's speech end (its SOS + duration). The gap to the
+    /// next segment's SOS is measured from here — the TRUE inter-speech silence, independent of
+    /// `min_silence_duration` (EOS fires min_silence into the silence; SOS fires at onset).
+    last_seg_end_at: f64,
+}
+
+/// A reference to a (possibly merged) audio buffer + its utterance start — what the caller
+/// transcribes (batch ASR) to produce a Revise or Final.
+struct MergeRef {
+    pcm: Vec<i16>,
+    start_at: f64,
+}
+
+/// What [`SegmentMerger::on_eos`] produced: optionally a *settled* previous utterance (emit
+/// Final), plus always the *current* in-progress utterance's accumulated audio (emit Revise).
+struct EosOutcome {
+    /// The previous utterance settled (gap ≥ merge_gap_s) — transcribe + emit Final. `None` when
+    /// this segment was absorbed into the current utterance (or it's the first ever segment).
+    settled: Option<MergeRef>,
+    /// The current utterance's accumulated audio so far — transcribe + emit Revise (provisional).
+    provisional: MergeRef,
+}
+
+/// Turns a VAD SOS/EOS stream into provisional Revise events + settled Finals, merging fragments
+/// whose inter-speech silence is shorter than `merge_gap_s`. Pure + unit-testable (no I/O). The
+/// executor drives it: `on_sos`/`on_eos` per VAD event, `check_settle` every tick.
+struct SegmentMerger {
+    merge_gap_s: f64,
+    sample_rate: f32,
+    accum: Option<MergeAccum>,
+    pending_sos: Option<f64>,
+    /// A segment is in progress (SOS seen, EOS pending). The settle timeout is suppressed while
+    /// true, so a long following segment isn't mistaken for "no continuation" and force-split.
+    speaking: bool,
+}
+
+impl SegmentMerger {
+    fn new(merge_gap_s: f64, sample_rate: u32) -> Self {
+        Self {
+            merge_gap_s,
+            sample_rate: sample_rate as f32,
+            accum: None,
+            pending_sos: None,
+            speaking: false,
+        }
+    }
+
+    /// VAD StartOfSpeech at wall-clock `at` (s).
+    fn on_sos(&mut self, at: f64) {
+        self.pending_sos = Some(at);
+        self.speaking = true;
+    }
+
+    /// VAD EndOfSpeech with the segment's PCM. Returns the settled previous utterance (if the gap
+    /// ≥ merge_gap_s) plus the current utterance's accumulated audio (always — every EOS starts
+    /// or extends a pending utterance, so there's always a provisional to emit). `eos_at` is the
+    /// wall-clock when EOS fired.
+    fn on_eos(&mut self, pcm: Vec<i16>, eos_at: f64) -> EosOutcome {
+        self.speaking = false;
+        let seg_dur = (pcm.len() as f32 / self.sample_rate) as f64;
+        let sos = self.pending_sos.take().unwrap_or_else(|| (eos_at - seg_dur).max(0.0));
+        let seg_end = sos + seg_dur;
+
+        let absorb = self
+            .accum
+            .as_ref()
+            .map(|acc| sos - acc.last_seg_end_at < self.merge_gap_s)
+            .unwrap_or(false);
+
+        let settled = if absorb {
+            // same utterance: grow the accumulator. Nothing settles.
+            let acc = self.accum.as_mut().unwrap();
+            acc.pcm.extend(&pcm);
+            acc.last_seg_end_at = seg_end;
+            None
+        } else {
+            // gap too big (or first ever segment): settle the previous, start a new accumulator
+            // from this segment.
+            let prev = self.accum.take().map(|p| MergeRef { pcm: p.pcm, start_at: p.start_at });
+            self.accum = Some(MergeAccum { pcm, start_at: sos, last_seg_end_at: seg_end });
+            prev
+        };
+
+        let provisional = {
+            let acc = self.accum.as_ref().expect("accum just set");
+            MergeRef { pcm: acc.pcm.clone(), start_at: acc.start_at }
+        };
+        EosOutcome { settled, provisional }
+    }
+
+    /// Settle-timeout probe (call every loop tick with the current wall-clock). If the pending
+    /// utterance has been silent (no active speech) for ≥ merge_gap_s, finalize it. Suppressed
+    /// while a segment is in progress (`speaking`).
+    fn check_settle(&mut self, now: f64) -> Option<MergeRef> {
+        if self.speaking {
+            return None;
+        }
+        let acc = self.accum.as_ref()?;
+        if now - acc.last_seg_end_at >= self.merge_gap_s {
+            let acc = self.accum.take().unwrap();
+            Some(MergeRef { pcm: acc.pcm, start_at: acc.start_at })
+        } else {
+            None
+        }
+    }
+}
+
+/// Provisional transcript of an in-progress (merging) utterance: batch-recognize the accumulated
+/// PCM only (the streaming session is still live — do NOT finalize it). Returns `None` when the
+/// batch result is empty (silence/noise). `seq` is left 0 for the caller (`idx + 1`).
+fn transcribe_provisional(
+    pcm: &[i16],
+    start_at: f64,
+    batch_asr: &dyn AsrProvider,
+    sr: u32,
+) -> Option<Utterance> {
+    let raw_text = batch_asr.recognize(pcm, sr).unwrap_or_default();
+    if raw_text.trim().is_empty() {
+        return None;
+    }
+    let duration_ms = (pcm.len() as f32 / sr as f32) * 1000.0;
+    Some(Utterance {
+        seq: 0,
+        raw_text,
+        streaming_text: String::new(),
+        duration_ms,
+        at_s: start_at,
+        pcm: pcm.to_vec(),
+    })
+}
+
+/// Final transcript of a settled utterance: finalize the streaming session (which spans the whole
+/// merged utterance) → hotword-biased `streaming_text`, then batch-recognize the merged PCM →
+/// authoritative `raw_text`, and start a fresh streaming session for the next utterance (a reset
+/// would bleed encoder context across boundaries). Returns `None` when both transcripts are empty.
+/// `seq` is left 0 for the caller (`idx`).
+fn transcribe_final(
+    pcm: Vec<i16>,
+    start_at: f64,
+    batch_asr: &dyn AsrProvider,
+    sasr: Option<&OnlineAsr>,
+    stream_sess: &mut Option<StreamingSession>,
+    sr: u32,
+) -> Option<Utterance> {
+    let streaming_text = match (sasr, stream_sess.as_ref()) {
+        (Some(s), Some(sess)) => s.finalize_and_result(sess),
+        _ => String::new(),
+    };
+    *stream_sess = sasr.map(|s| s.create_session());
+    let raw_text = batch_asr.recognize(&pcm, sr).unwrap_or_default();
+    if raw_text.trim().is_empty() && streaming_text.trim().is_empty() {
+        return None;
+    }
+    let duration_ms = (pcm.len() as f32 / sr as f32) * 1000.0;
+    Some(Utterance { seq: 0, raw_text, streaming_text, duration_ms, at_s: start_at, pcm })
+}
+
 impl Stage1Executor for OnnxStage1Executor {
     // TODO: 该函数静默阻塞线程，使用睡眠轮询的方式；需要整改成异步非阻塞模式；
     fn run(&self, on_event: &mut dyn FnMut(Stage1Event)) -> ! {
@@ -235,15 +419,20 @@ impl Stage1Executor for OnnxStage1Executor {
         let mut frames_in = 0u64;
         let mut idx = 0u64;
 
-        // Streaming session for the two-pass live path. Replaced (not reset) at each VAD EOS —
-        // `reset` leaves encoder context that bleeds across segment boundaries; a fresh session
-        // starts with zero context. Decoding is `is_ready`-gated inside `decode_and_result`, so a
-        // fresh session is safe to poll immediately (no warmup dance needed).
+        // Streaming session for the two-pass live path. Spans a whole MERGED utterance (it is NOT
+        // reset on each VAD EOS anymore — that would chop partials at every pause); it is replaced
+        // with a fresh session only when the utterance SETTLES (inside `transcribe_merged`). `reset`
+        // would leave encoder context that bleeds across boundaries; a fresh session starts clean.
+        // Decoding is `is_ready`-gated inside `decode_and_result`, so a fresh session is safe to
+        // poll immediately (no warmup dance needed).
         let sasr = self.mgr.streaming_asr();
         let mut stream_sess = sasr.map(|s| s.create_session());
         let mut last_partial = String::new();
         let mut frames_since_partial = 0u32;
         let mut ring_empty_since: Option<Instant> = None;
+        // Segment merger — absorbs VAD fragments split by short pauses (< merge_gap_s) into one
+        // utterance; a Final is emitted only when the utterance settles. See [`SegmentMerger`].
+        let mut merger = SegmentMerger::new(self.merge_gap_s, sr);
 
         loop {
             // Connection toggle: when the scout connection is paused, skip VAD/ASR (the ingest
@@ -251,6 +440,29 @@ impl Stage1Executor for OnnxStage1Executor {
             if !self.active.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
+            }
+            // Settle any pending utterance whose trailing silence has exceeded the merge gap — no
+            // follow-up segment came, so the utterance is done. (Suppressed while speech is in
+            // progress inside the merger.) Runs every active tick; this is how the *trailing*
+            // utterance finalizes (every other utterance settles when the next segment's gap ≥
+            // merge_gap). The wait is unavoidable — you must observe the gap to know it ended —
+            // but the streaming partial + provisional Revise results have been showing live text
+            // throughout, so it doesn't lag.
+            let now_s = start.elapsed().as_secs_f64();
+            if let Some(settled) = merger.check_settle(now_s) {
+                if let Some(mut u) = transcribe_final(
+                    settled.pcm,
+                    settled.start_at,
+                    &*self.batch_asr,
+                    sasr,
+                    &mut stream_sess,
+                    sr,
+                ) {
+                    idx += 1;
+                    u.seq = idx;
+                    on_event(Stage1Event::Final(u));
+                    last_partial.clear();
+                }
             }
             // drain one Silero window (512 samples = 32ms) when available
             let frame = {
@@ -306,42 +518,130 @@ impl Stage1Executor for OnnxStage1Executor {
                 }
             }
 
-            // (2) VAD segment boundary → batch final → emit Final(Utterance)
+            // (2) VAD segment boundaries → SegmentMerger → batch provisional (Revise) + settle Final.
+            //     Each absorbed fragment re-runs batch ASR on the accumulated PCM → Revise (provisional,
+            //     same seq, Stage2 recalibrates incrementally). When the gap ≥ merge_gap the previous
+            //     utterance settles → Final (authoritative). Streaming partials + Revise keep the same
+            //     seq across the whole merge, so the UI sees one growing utterance, not N fragments.
+            //     The streaming session spans the whole merged utterance (NOT reset per EOS); it's
+            //     finalized only at settle (inside `transcribe_final`).
             for ev in self.mgr.vad().unwrap().push_frame(&frame) {
-                if !matches!(ev.kind, VadEventKind::EndOfSpeech) {
-                    continue;
+                match ev.kind {
+                    VadEventKind::StartOfSpeech => {
+                        merger.on_sos(start.elapsed().as_secs_f64());
+                    }
+                    VadEventKind::EndOfSpeech => {
+                        let eos_at = start.elapsed().as_secs_f64();
+                        let outcome = merger.on_eos(ev.pcm.clone(), eos_at);
+                        // (a) previous utterance settled (gap ≥ merge_gap) → authoritative Final.
+                        if let Some(prev) = outcome.settled {
+                            if let Some(mut u) = transcribe_final(
+                                prev.pcm,
+                                prev.start_at,
+                                &*self.batch_asr,
+                                sasr,
+                                &mut stream_sess,
+                                sr,
+                            ) {
+                                idx += 1;
+                                u.seq = idx;
+                                on_event(Stage1Event::Final(u));
+                                last_partial.clear();
+                            }
+                        }
+                        // (b) current utterance's accumulated audio → provisional Revise (seq = idx+1,
+                        //     the in-progress utterance's prospective seq, matching the Interim partials).
+                        if let Some(mut u) = transcribe_provisional(
+                            &outcome.provisional.pcm,
+                            outcome.provisional.start_at,
+                            &*self.batch_asr,
+                            sr,
+                        ) {
+                            u.seq = idx + 1;
+                            on_event(Stage1Event::Revise(u));
+                        }
+                    }
                 }
-                let at_s = start.elapsed().as_secs_f64();
-                let duration_ms = (ev.pcm.len() as f32 / sr as f32) * 1000.0;
-
-                // capture streaming final (hotword-biased) for comparison — `finalize_and_result`
-                // flushes end-of-input + drains every pending chunk, so the tail is complete —
-                // then replace the session with a FRESH one (reset leaves encoder context that
-                // bleeds across segment boundaries — a new session starts clean).
-                let streaming_text = if let (Some(s), Some(sess)) = (sasr, stream_sess.as_ref()) {
-                    s.finalize_and_result(sess)
-                } else {
-                    String::new()
-                };
-                stream_sess = sasr.map(|s| s.create_session());
-
-                // batch final (authoritative) — what Stage2 routes on
-                let raw_text = self.batch_asr.recognize(&ev.pcm, sr).unwrap_or_default();
-
-                if raw_text.trim().is_empty() && streaming_text.trim().is_empty() {
-                    continue;
-                }
-                idx += 1;
-                on_event(Stage1Event::Final(Utterance {
-                    seq: idx,
-                    raw_text,
-                    streaming_text,
-                    duration_ms,
-                    at_s,
-                    pcm: ev.pcm.clone(),
-                }));
-                last_partial.clear();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `dur_s` seconds of zero PCM at 16 kHz (content is irrelevant to the merger — only the
+    /// sample COUNT drives segment duration / gap math).
+    fn pcm(dur_s: f64) -> Vec<i16> {
+        vec![0i16; (16000.0 * dur_s) as usize]
+    }
+
+    #[test]
+    fn absorbs_short_gap_settles_on_long_gap_and_timeout() {
+        let mut m = SegmentMerger::new(1.5, 16000);
+        // seg1: sos 0.0, 0.5s speech → provisional = seg1, nothing settled.
+        m.on_sos(0.0);
+        let o = m.on_eos(pcm(0.5), 0.5);
+        assert!(o.settled.is_none(), "first segment settles nothing");
+        assert_eq!(o.provisional.pcm.len(), 8000);
+
+        // seg2: sos 1.0 → gap 0.5 < 1.5 → absorb. Provisional = merged seg1+seg2.
+        m.on_sos(1.0);
+        let o = m.on_eos(pcm(0.5), 1.5);
+        assert!(o.settled.is_none(), "short gap absorbs, nothing settles");
+        assert_eq!(o.provisional.pcm.len(), 16000, "provisional grew to seg1+seg2");
+
+        // seg3: sos 4.0 → gap 4.0−1.5 = 2.5 ≥ 1.5 → settle merged seg1+seg2, start seg3.
+        m.on_sos(4.0);
+        let o = m.on_eos(pcm(0.5), 4.5);
+        let settled = o.settled.expect("long gap settles the previous utterance");
+        assert_eq!(settled.start_at, 0.0, "settled utterance keeps the FIRST segment's start");
+        assert_eq!(settled.pcm.len(), 16000, "settled = seg1+seg2 merged");
+        assert_eq!(o.provisional.pcm.len(), 8000, "provisional is the new seg3");
+        assert_eq!(o.provisional.start_at, 4.0);
+
+        // seg3 pending (start 4.0, end 4.5); settle-timeout finalizes it.
+        assert!(m.check_settle(5.0).is_none(), "5.0 − 4.5 = 0.5 < 1.5, not yet");
+        let settled = m.check_settle(6.0).expect("6.0 − 4.5 = 1.5 ≥ merge_gap → settle");
+        assert_eq!(settled.pcm.len(), 8000);
+        assert_eq!(settled.start_at, 4.0);
+    }
+
+    #[test]
+    fn speaking_suppresses_settle_during_long_following_segment() {
+        // Regression guard: without the `speaking` flag, a long following segment would trip the
+        // settle timeout mid-segment and wrongly split one utterance in two.
+        let mut m = SegmentMerger::new(1.5, 16000);
+        m.on_sos(0.0);
+        m.on_eos(pcm(0.5), 0.5);
+        m.on_sos(1.0); // gap will be 0.5 < 1.5 → absorb; but EOS hasn't come yet (speaking)
+        assert!(m.check_settle(100.0).is_none(), "speaking ⇒ settle suppressed even at t=100");
+        let o = m.on_eos(pcm(0.5), 1.5);
+        assert!(o.settled.is_none(), "absorbed, not split");
+    }
+
+    #[test]
+    fn long_gap_splits_into_two_utterances() {
+        let mut m = SegmentMerger::new(1.5, 16000);
+        m.on_sos(0.0);
+        m.on_eos(pcm(0.5), 0.5);
+        m.on_sos(3.0); // gap 3.0 − 0.5 = 2.5 ≥ 1.5 → settle seg1, start seg2
+        let o = m.on_eos(pcm(0.5), 3.5);
+        let settled = o.settled.expect("gap ≥ merge_gap must settle");
+        assert_eq!(settled.pcm.len(), 8000);
+        assert_eq!(settled.start_at, 0.0);
+    }
+
+    #[test]
+    fn merge_gap_zero_disables_merging() {
+        // 0 ⇒ the gap is never < 0, so nothing absorbs — every segment settles at the next EOS.
+        let mut m = SegmentMerger::new(0.0, 16000);
+        m.on_sos(0.0);
+        let o = m.on_eos(pcm(0.5), 0.5);
+        assert!(o.settled.is_none(), "first segment settles nothing");
+        m.on_sos(0.6);
+        let o = m.on_eos(pcm(0.5), 1.1);
+        assert!(o.settled.is_some(), "merge_gap=0 ⇒ every gap settles the previous");
     }
 }

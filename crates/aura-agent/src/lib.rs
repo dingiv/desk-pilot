@@ -17,10 +17,18 @@
 //! [`AddHotwordTool`]; the other capability traits are defined but stubbed.
 
 pub mod capability;
+pub mod client;
 pub mod tool;
+pub mod view;
 
 pub use capability::{
     ContextSummarizer, CorrectionSample, FineTuneHandle, FineTuner, HotwordManager,
     SharedHotwordManager, StubContextSummarizer, StubFineTuner, StubMemoryStore, MemoryStore,
 };
 pub use tool::{AddHotwordTool, Tool};
+
+// ── daemon↔client wire contract + async HTTP/SSE client SDK ──────────────────────────────
+// Light on purpose (no mistralrs/asr): upper layers (desktop-pet, visual-rover, …) depend on
+// THIS crate to talk to the aura-daemon without pulling the GPU inference stack.
+pub use client::AuraClient;
+pub use view::{AuraStateView, ConfigView, CorrectionView, FinalView, UtteranceView, VadView};

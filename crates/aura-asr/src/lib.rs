@@ -67,6 +67,11 @@ pub enum Stage1Event {
     /// consumers can group partials with their utterance even when events from different
     /// pipeline threads interleave.
     Interim { seq: u64, partial: String, at_s: f64 },
+    /// A provisional (in-progress) batch result for an utterance still absorbing fragments —
+    /// the SegmentMerger re-runs batch ASR on the accumulated PCM at each absorbed fragment and
+    /// emits this so Stage2 can recalibrate incrementally. Same `seq` as the Interim/Final of
+    /// this utterance (it updates in place, never starts a new one). `seq` = last Final's seq + 1.
+    Revise(Utterance),
     /// A finalized utterance ready for Stage2 calibration.
     Final(Utterance),
 }

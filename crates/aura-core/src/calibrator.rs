@@ -17,7 +17,16 @@ use crate::Decision;
 
 /// Turns a finalized utterance into a calibrated Decision. Implementations own their context.
 pub trait Stage2Calibrator: Send {
+    /// Authoritative calibration of a SETTLED utterance — commits the (raw→calibrated) pair to
+    /// the ContextWindow so subsequent utterances can reference it.
     fn calibrate(&mut self, utterance: &Utterance) -> Decision;
+    /// Provisional calibration of an IN-PROGRESS utterance (a `Revise` from an absorbed fragment)
+    /// — same calibration logic, but does NOT commit to the ContextWindow. A growing utterance's
+    /// intermediate states must not pollute the window; only its settle `Final` enters context.
+    /// Default delegates to [`calibrate`](Self::calibrate) for impls that don't track context.
+    fn calibrate_provisional(&mut self, utterance: &Utterance) -> Decision {
+        self.calibrate(utterance)
+    }
 }
 
 /// Default Stage2 calibrator over the local Qwen calibrator. Holds a rolling (raw,calibrated) pairs
@@ -59,6 +68,18 @@ impl Stage2CalibratorImpl {
 
 impl Stage2Calibrator for Stage2CalibratorImpl {
     fn calibrate(&mut self, utterance: &Utterance) -> Decision {
+        self.calibrate_inner(utterance, true)
+    }
+    fn calibrate_provisional(&mut self, utterance: &Utterance) -> Decision {
+        self.calibrate_inner(utterance, false)
+    }
+}
+
+impl Stage2CalibratorImpl {
+    /// Shared calibration core. `commit` controls whether the (raw→calibrated) pair enters the
+    /// ContextWindow — only the settled `Final` commits; provisionals (`Revise`) do not, so a
+    /// growing utterance's intermediate states don't pollute the window.
+    fn calibrate_inner(&mut self, utterance: &Utterance, commit: bool) -> Decision {
         let route = utterance.route_text();
         // ContextWindow disabled — Qwen2.5-3B copies previous calibrated text instead of
         // using it as reference. Re-enable only with a model >= 7B that follows "不要复读" reliably.
@@ -83,7 +104,7 @@ impl Stage2Calibrator for Stage2CalibratorImpl {
             pb = pb.corrections(&corrections);
         }
         let (system, user) = pb.build();
-        tracing::debug!(target: "stage2::prompt", system = %system, user = %user, "calibrate prompt");
+        tracing::debug!(target: "stage2::prompt", commit, system = %system, user = %user, "calibrate prompt");
 
         // LLM returns plain text — no JSON parsing needed.
         let calibrated = self.llm.complete(&system, &user).unwrap_or_else(|_| route.to_string());
@@ -94,8 +115,10 @@ impl Stage2Calibrator for Stage2CalibratorImpl {
             task: None,
         };
 
-        // Roll the context window.
-        self.ctx_win.push(route, &decision.calibrated_text, &decision.intent);
+        // Roll the context window ONLY for committed (settled) calibrations.
+        if commit {
+            self.ctx_win.push(route, &decision.calibrated_text, &decision.intent);
+        }
         decision
     }
 }

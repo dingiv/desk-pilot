@@ -229,7 +229,9 @@ mod tests {
     #[test]
     fn bare_minimum() {
         let (sys, usr) = PromptBuilder::new("你好").build();
-        assert!(sys.contains("# 角色"));
+        // ROLE_TASK is now a single lead sentence (no "# 角色" header — the prompt was trimmed so
+        // a small model follows it better than prose).
+        assert!(sys.contains("纠偏助手"), "ROLE_TASK lead sentence present");
         assert!(sys.contains("# 输出"));
         assert!(!sys.contains("- Bevy"), "no hotword entries when empty");
         assert!(!usr.contains("最近对话"), "no context in user when empty");
@@ -239,7 +241,6 @@ mod tests {
         // 1.6 XML envelope
         assert!(usr.contains("<raw_transcript>"), "raw wrapped in XML envelope");
         assert!(usr.contains("你好"), "raw text present");
-        assert!(usr.contains("/no_think"));
     }
 
     #[test]
@@ -296,11 +297,14 @@ mod tests {
     }
 
     #[test]
-    fn prompt_carries_content_preservation_and_term_rules() {
-        // P3 regressions from 真麦 test: #6 deleted "测试语料一", #8 kept 代办, #9 mangled ubernet.
+    fn output_lists_calibration_rules() {
+        // The simplified OUTPUT section enumerates 4 explicit calibration rules (the prompt was
+        // trimmed from long prose instructions to a 1-sentence role + these — small models follow
+        // enumerated rules better).
         let (sys, _usr) = PromptBuilder::new("x").build();
-        assert!(sys.contains("不得删除"), "content-preservation rule present");
-        assert!(sys.contains("待办事项"), "代办→待办 pattern present");
-        assert!(sys.contains("原样保留"), "unknown-English keep-as-is rule present");
+        assert!(sys.contains("加标点"), "punctuation rule present");
+        assert!(sys.contains("去口语"), "filler-removal rule present");
+        assert!(sys.contains("修错字"), "homophone rule present");
+        assert!(sys.contains("英文规范"), "CJK/English formatting rule present");
     }
 }

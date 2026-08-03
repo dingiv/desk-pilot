@@ -1,27 +1,31 @@
 //! aura-daemon — the audio-aura binary entry point. Composes the [`Pipeline`] (Stage1→Stage2),
-//! runs an in-process **Stage3 rule trigger**, and exposes a socket for the desktop-pet / web UI:
-//! a scout-connection toggle (`POST /api/control/scout`), a live SSE stream of Stage1 Interim
-//! partials + Final utterances (`GET /api/stream`), and status (`GET /api/status`).
+//! runs an in-process **Stage3 rule trigger**, and exposes a snapshot-sync socket for the
+//! desktop-pet / web UI:
+//! - `GET /api/state` — the complete [`AuraStateView`] snapshot (one source of truth).
+//! - `GET /api/stream?state_changed_frequency=<ms>` — SSE: `hello`, then `state_changed` pings
+//!   (throttled ≥250ms) whenever `version` advances. The client re-GETs /api/state on a ping.
+//! - `POST /api/control/scout` (toggle), `POST /api/correct` (user correction), `GET /api/audio/:seq`.
 //!
 //! Threading: the Pipeline runs Stage1 on a dedicated **std thread** (it blocks forever) and
 //! Stage2 on its own internal `aura-stage2` worker (so partials never freeze behind a 1-2s LLM
 //! route); the axum socket runs on a multi-thread tokio runtime on the main thread. The
-//! Pipeline's `on_turn` callback (invoked from both pipeline threads) serializes each
-//! [`TurnEvent`] to owned JSON and publishes it on a `broadcast::Sender<Value>` — the SSE
-//! handler subscribes and streams it. Events carry their utterance `seq`; an interim for
-//! utterance N+1 may arrive before the final of N (consumers group by seq, not arrival order).
+//! Pipeline's `on_turn` callback mutates the shared utterance timeline (`Arc<RwLock<...>>`) and
+//! bumps a global `version: AtomicU64` — no event bus. Each mutation site (pipeline / scout
+//! toggle / correction / Stage3 hotword) bumps `version`; the SSE handler ticks at the client's
+//! rate and pings only when `version` advanced since its last tick.
 //!
 //! Run: cargo run -p aura-daemon --features asr,cuda -- 127.0.0.1:7879
-//! Config precedence: CLI (high-frequency knobs, see `Cli`) > `aura.json` (full surface, dev:
+//! Config precedence: CLI (high-frequency knobs, see `Cli`) > `aura.yaml` (full surface, dev:
 //! this crate's dir, prod: ~/.desk-pilot/) > built-in defaults. No env vars.
 
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::Result;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
@@ -30,8 +34,7 @@ use clap::Parser;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{error, info, instrument, warn};
-use tokio::sync::broadcast;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::IntervalStream;
 use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
@@ -56,6 +59,29 @@ const SEED_HOTWORDS: &[&str] = &[
     "Rust", "Bevy", "Docker", "GitHub", "Kubernetes", "API", "Markdown", "PDF", "Agent",
     "README", "贪吃蛇", "蛇身", "计分器",
 ];
+
+/// VAD / segmentation overrides from `aura.yaml`'s `vad:` section. All optional — an unset
+/// field falls back to the built-in [`audio_aura_asr`] default (mirrors `VadConfig::default` /
+/// `Stage1Config::merge_gap_s`). Precedence: config file > built-in default (no CLI for these).
+#[derive(Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+struct VadConf {
+    /// Silero speech-probability threshold (default 0.5). Higher = less sensitive (fewer false
+    /// triggers, may clip soft onsets); lower = more sensitive (may catch breath as speech).
+    threshold: Option<f32>,
+    /// Seconds of trailing silence to end a segment / fire EOS (default 1.0). Pauses shorter
+    /// than this never split.
+    min_silence: Option<f32>,
+    /// Segments shorter than this are discarded by Silero's state machine (default 0.3).
+    min_speech: Option<f32>,
+    /// Force-split backstop for very long utterances, seconds (default 28.0).
+    max_speech: Option<f32>,
+    /// ★Segment-merge gap, seconds (default 1.5). VAD fragments whose inter-speech silence <
+    /// this absorb into one utterance (batch ASR re-runs on the concatenated PCM, same seq);
+    /// ≥ this settles the previous utterance. Decoupled from `min_silence` — VAD stays
+    /// sensitive, merging repairs the fragmentation. 0 disables merging.
+    merge_gap: Option<f64>,
+}
 
 /// Runtime config (`CONF::aura.json` via the shared FileLoader — dev: this crate's dir;
 /// prod: the unified `~/.desk-pilot/` folder). Every field is optional; precedence is
@@ -99,6 +125,8 @@ struct AuraConf {
     /// Recordings base dir override (default: DATA::recordings — dev: this crate's data/,
     /// prod: ~/.desk-pilot/data/). Clips land in per-day subdirs (`<YYYY-MM-DD>/`).
     recordings_dir: Option<String>,
+    /// VAD / segmentation overrides (see [`VadConf`]). All-None by default.
+    vad: Option<VadConf>,
 }
 
 impl AuraConf {
@@ -154,6 +182,17 @@ struct Cli {
     no_stage3: bool,
 }
 
+/// Fully-resolved VAD settings (config value, else built-in default). Mirrors the fields of
+/// [`VadConf`] but concrete — `resolve` fills every field, so `main` applies them unconditionally.
+#[derive(Debug, PartialEq)]
+struct VadResolved {
+    threshold: f32,
+    min_silence: f32,
+    min_speech: f32,
+    max_speech: f32,
+    merge_gap: f64,
+}
+
 /// Fully-resolved runtime settings (what `main` actually runs on).
 #[derive(Debug, PartialEq)]
 struct Settings {
@@ -173,11 +212,23 @@ struct Settings {
     hotwords: Vec<String>,
     web_dist: Option<String>,
     recordings_dir: Option<String>,
+    vad: VadResolved,
 }
 
 /// Pure merge: CLI > `aura.json` > built-in default. (`--no-stage3` wins over the file;
-/// model / hotwords / web_dist are config-file-only — low-frequency knobs.)
+/// model / hotwords / web_dist / vad are config-file-only — low-frequency knobs.)
 fn resolve(cli: Cli, conf: AuraConf) -> Settings {
+    // VAD: each field is the config value or the built-in default (mirrors VadConfig::default /
+    // Stage1Config::merge_gap_s — single source of truth lives in aura-asr; if those defaults
+    // change, update the fallbacks here too).
+    let v = conf.vad.unwrap_or_default();
+    let vad = VadResolved {
+        threshold: v.threshold.unwrap_or(0.5),
+        min_silence: v.min_silence.unwrap_or(1.0),
+        min_speech: v.min_speech.unwrap_or(0.3),
+        max_speech: v.max_speech.unwrap_or(28.0),
+        merge_gap: v.merge_gap.unwrap_or(1.5),
+    };
     Settings {
         scout_addr: cli
             .scout_addr
@@ -200,8 +251,20 @@ fn resolve(cli: Cli, conf: AuraConf) -> Settings {
             .unwrap_or_else(|| SEED_HOTWORDS.iter().map(|s| s.to_string()).collect()),
         web_dist: conf.web_dist,
         recordings_dir: conf.recordings_dir,
+        vad,
     }
 }
+
+// The AuraStateView snapshot + sub-types (ConfigView / VadView / CorrectionView / FinalView /
+// UtteranceView) live in `audio_aura_agent::view` — the consumer-facing crate — shared with the
+// `audio_aura_agent::client` SDK so server and Rust clients can't drift. The daemon constructs
+// them; this module just imports.
+use audio_aura_agent::{
+    AuraStateView, ConfigView, CorrectionView, FinalView, UtteranceView, VadView,
+};
+
+/// Cap on the in-memory utterance timeline (oldest evicted). Bounds the /api/state payload.
+const MAX_UTTERANCES: usize = 200;
 
 /// Shared daemon state surfaced over the socket.
 #[derive(Clone)]
@@ -210,16 +273,44 @@ struct DaemonState {
     corrections: Arc<Mutex<Vec<(String, String)>>>,
     /// Scout-connection toggle (shared with Stage1Executor's ingest + run loop).
     active: Arc<AtomicBool>,
-    /// Event bus bridging the Pipeline thread → SSE clients.
-    bus: broadcast::Sender<Value>,
+    /// The utterance timeline — the pipeline thread writes, GET /api/state reads.
+    utterances: Arc<RwLock<Vec<UtteranceView>>>,
+    /// Bumped on ANY state change (utterance / connected / hotword / correction). The SSE
+    /// handler ticks at the client's rate and pings only when this advances.
+    version: Arc<AtomicU64>,
+    config: ConfigView,
+    stage3_on: bool,
     /// The Storage supervisor: audio archive (hot replay + date-named WAV flush) +
-    /// per-turn day log + recent ring (backs /api/audio, /api/recordings, /results).
+    /// per-turn day log + recent ring (backs /api/audio, /api/recordings).
     storage: Arc<Storage>,
 }
 
 impl DaemonState {
-    fn emit(&self, ev: Value) {
-        let _ = self.bus.send(ev); // Err only when there are no receivers (fine).
+    /// Assemble the full [`AuraStateView`] snapshot — lock each source, clone, release. Called by
+    /// GET /api/state (every change). No lock is held across an await (clones are synchronous).
+    fn snapshot(&self) -> AuraStateView {
+        let utterances = self.utterances.read().unwrap().clone();
+        let hotwords = self.hotwords.lock().unwrap().clone();
+        let corrections = self
+            .corrections
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(r, c)| CorrectionView { raw: r.clone(), corrected: c.clone() })
+            .collect();
+        AuraStateView {
+            connected: self.active.load(Ordering::Relaxed),
+            stage3_on: self.stage3_on,
+            config: self.config.clone(),
+            hotwords,
+            corrections,
+            utterances,
+        }
+    }
+
+    /// Signal that state changed — the SSE handler's next eligible tick will ping clients.
+    fn bump(&self) {
+        self.version.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -228,11 +319,21 @@ fn main() -> Result<()> {
     // (dev: human-readable; release: JSON lines; RUST_LOG filter, default info).
     shared::init_tracing();
     let s = resolve(Cli::parse(), AuraConf::load());
-    let Settings { scout_addr, port, stage3_on, model, asr_backend, asr_language, asr_provider, asr_threads, asr_kind, asr_endpoint, llm_kind, llm_endpoint, llm_model, hotwords: seed_hotwords, web_dist, recordings_dir } = s;
+    let Settings { scout_addr, port, stage3_on, model, asr_backend, asr_language, asr_provider, asr_threads, asr_kind, asr_endpoint, llm_kind, llm_endpoint, llm_model, hotwords: seed_hotwords, web_dist, recordings_dir, vad } = s;
 
-    // Connection toggle + event bus, shared across the Pipeline thread + socket handlers.
+    // Connection toggle + shared snapshot state, shared across the Pipeline thread + socket
+    // handlers. (No event bus — SSE pings off the `version` counter; data lives in the snapshot.)
     let active = Arc::new(AtomicBool::new(true));
-    let (bus, _rx) = broadcast::channel::<Value>(1024);
+    let utterances: Arc<RwLock<Vec<UtteranceView>>> = Arc::new(RwLock::new(Vec::new()));
+    let version = Arc::new(AtomicU64::new(0));
+    let config = ConfigView {
+        asr_backend: asr_backend.clone(),
+        asr_kind: asr_kind.clone(),
+        asr_provider: asr_provider.clone(),
+        llm_kind: llm_kind.clone(),
+        model: model.clone(),
+        vad: VadView { threshold: vad.threshold, min_silence: vad.min_silence, merge_gap: vad.merge_gap },
+    };
 
     // Shared hotword store = the Stage3→Stage2 feedback channel (seeded from the config /
     // built-in list; Stage3 grows it at runtime).
@@ -260,6 +361,18 @@ fn main() -> Result<()> {
     info!("loading Stage1 (ONNX) + Stage2 (Qwen calibrator) …");
     let mut cfg = Stage1Config::new(scout_addr.clone());
     cfg.active = Arc::clone(&active); // share the toggle with the executor
+    // VAD / segmentation (configurable via aura.yaml `vad:`; defaults live in aura-asr).
+    cfg.vad.threshold = vad.threshold;
+    cfg.vad.min_silence_duration = vad.min_silence;
+    cfg.vad.min_speech_duration = vad.min_speech;
+    cfg.vad.max_speech_duration = vad.max_speech;
+    cfg.merge_gap_s = vad.merge_gap;
+    info!(
+        threshold = vad.threshold,
+        min_silence_s = vad.min_silence,
+        merge_gap_s = vad.merge_gap,
+        "VAD: min_silence 切段 + merge_gap 合并碎片 (解耦)"
+    );
     // Bake the seed hotwords into the streaming recognizer (beam-search biasing).
     cfg.streaming.hotwords = seed_hotwords;
     // Select batch ASR backend from config (default: SenseVoice).
@@ -302,12 +415,13 @@ fn main() -> Result<()> {
     };
     let s2 = Stage2CalibratorImpl::new(llm, Arc::clone(&hotwords), Arc::clone(&corrections));
 
-    // ── Pipeline on a dedicated std thread ── it bridges each TurnEvent to the event bus as
-    //    owned JSON. Events carry their own utterance seq (assigned by Stage1).
+    // ── Pipeline on a dedicated std thread ── mutates the shared utterance timeline + bumps
+    //    `version` on every change. No event bus: the SSE handler pings off `version`.
     {
-        let bus = bus.clone();
         let tool = tool.clone();
         let storage = Arc::clone(&storage);
+        let utterances = Arc::clone(&utterances);
+        let version = Arc::clone(&version);
         thread::Builder::new()
             .name("aura-pipeline".into())
             .spawn(move || {
@@ -316,7 +430,20 @@ fn main() -> Result<()> {
                     match ev {
                         TurnEvent::Interim { seq, partial, at_s } => {
                             info!(seq, at_s, partial = %partial, "流式");
-                            bus.send(json!({ "type":"interim", "seq":seq, "partial":partial, "at_s":at_s })).ok();
+                            upsert_live(&utterances, seq, |u| {
+                                u.partial = partial.to_string();
+                                u.live = true;
+                                u.at_s = at_s;
+                            });
+                        }
+                        TurnEvent::CalibratedInterim { seq, calibrated, route_ms } => {
+                            // Stage2 recalibrated an in-progress utterance (a fragment merged into
+                            // it). Live calibrated text — UI shows it in place of the raw partial.
+                            info!(seq, route_ms, calibrated = %calibrated, "纠偏(碎片)");
+                            upsert_live(&utterances, seq, |u| {
+                                u.calibrated = Some(calibrated);
+                                u.live = true;
+                            });
                         }
                         TurnEvent::Final { utterance: u, decision: d, route_ms } => {
                             // Log all three text layers — batch ASR (authoritative), streaming
@@ -336,8 +463,8 @@ fn main() -> Result<()> {
                             if stage3_on {
                                 stage3_rule_trigger(&tool, &d.calibrated_text);
                             }
-                            // One call records everywhere: PCM → audio archive,
-                            // transcript+decision → day log + recent ring (/results).
+                            // Record PCM → audio archive, transcript+decision → day log + recent
+                            // ring (backs /api/audio). Then freeze the timeline entry.
                             storage.record_final(FinalTurn {
                                 seq: u.seq,
                                 at_s: u.at_s,
@@ -350,29 +477,42 @@ fn main() -> Result<()> {
                                 route_ms,
                                 pcm: u.pcm.clone(),
                             });
-                            bus.send(json!({
-                                "type":"final",
-                                "seq": u.seq,
-                                "raw_text": &u.raw_text,
-                                "streaming_text": &u.streaming_text,
-                                "calibrated": &d.calibrated_text,
-                                "intent": &d.intent,
-                                "reply": &d.reply,
-                                "route_ms": route_ms,
-                            })).ok();
+                            upsert_live(&utterances, u.seq, |entry| {
+                                entry.live = false;
+                                entry.final_ = Some(FinalView {
+                                    raw: u.raw_text.clone(),
+                                    streaming: u.streaming_text.clone(),
+                                    calibrated: d.calibrated_text.clone(),
+                                    intent: d.intent.clone(),
+                                    reply: d.reply.clone(),
+                                    route_ms,
+                                });
+                            });
                         }
                     }
+                    // Any turn mutated the timeline (or, on Final, Stage3 may have added a
+                    // hotword) → bump so the SSE handler pings on its next tick.
+                    version.fetch_add(1, Ordering::Release);
                 });
             })?;
     }
 
     // ── Socket on the main thread's tokio runtime ──
-    let state = DaemonState { hotwords: Arc::clone(&hotwords), corrections: Arc::clone(&corrections), active: Arc::clone(&active), bus, storage };
+    let state = DaemonState {
+        hotwords: Arc::clone(&hotwords),
+        corrections: Arc::clone(&corrections),
+        active: Arc::clone(&active),
+        utterances: Arc::clone(&utterances),
+        version: Arc::clone(&version),
+        config,
+        stage3_on,
+        storage,
+    };
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("aura-socket")
         .build()?;
-    info!(port, "socket: http://127.0.0.1:{port}  (/health /api/status /api/stream /api/control/scout /context)");
+    info!(port, "socket: http://127.0.0.1:{port}  (/api/state /api/stream /api/control/scout /api/correct /api/audio)");
     info!(scout = %scout_addr, stage3 = stage3_on, "pipeline running on bg thread — Ctrl-C 结束");
     rt.block_on(serve_socket(state, port, web_dist));
     Ok(())
@@ -407,6 +547,35 @@ fn looks_like_concat(tok: &str) -> bool {
     })
 }
 
+/// Find the timeline entry with `seq` and mutate it; if absent, push a new live one. Evicts the
+/// oldest (lowest-seq) entries past [`MAX_UTTERANCES`]. Called only from the pipeline thread.
+fn upsert_live(
+    utterances: &Arc<RwLock<Vec<UtteranceView>>>,
+    seq: u64,
+    mutate: impl FnOnce(&mut UtteranceView),
+) {
+    let mut guard = utterances.write().unwrap();
+    if let Some(u) = guard.iter_mut().find(|u| u.seq == seq) {
+        mutate(u);
+    } else {
+        let mut u = UtteranceView {
+            seq,
+            partial: String::new(),
+            calibrated: None,
+            final_: None,
+            live: true,
+            corrected_by_user: false,
+            at_s: 0.0,
+        };
+        mutate(&mut u);
+        guard.push(u);
+    }
+    if guard.len() > MAX_UTTERANCES {
+        let excess = guard.len() - MAX_UTTERANCES;
+        guard.drain(0..excess);
+    }
+}
+
 async fn serve_socket(state: DaemonState, port: u16, web_dist: Option<String>) {
     // Production: the daemon also serves the built SPA (same origin — no proxy needed). Resolve
     // dist/ from the workspace root (BASE minus "/native") so it's independent of the daemon's
@@ -418,16 +587,15 @@ async fn serve_socket(state: DaemonState, port: u16, web_dist: Option<String>) {
     let static_spa = ServeDir::new(&dist_dir).fallback(ServeFile::new(format!("{dist_dir}/index.html")));
     let app = Router::new()
         .route("/health", get(health))
-        .route("/api/status", get(status_handler))
+        // ── the snapshot-sync contract ──
+        .route("/api/state", get(state_handler))           // full AuraStateView snapshot
+        .route("/api/stream", get(stream_asr))             // SSE: hello → state_changed* (throttled)
+        // ── actions (each mutates state → bumps version → next SSE tick pings) ──
         .route("/api/control/scout", post(control_scout))
-        .route("/api/stream", get(stream_asr))
+        .route("/api/correct", post(correction_handler))
+        // ── binary / queries ──
         .route("/api/audio/{seq}", get(audio_handler))
         .route("/api/recordings", get(recordings_handler))
-        .route("/context", get(context_handler))
-        // remaining stubs (speaker / results / annotate) — out of scope this round
-        .route("/control/speaker", post(control_stub))
-        .route("/results", get(results_handler))
-        .route("/api/correct", post(correction_handler))
         .fallback_service(static_spa)
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -446,9 +614,10 @@ async fn health(State(_s): State<DaemonState>) -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-/// Current scout-connection state (for the toggle's initial render).
-async fn status_handler(State(s): State<DaemonState>) -> Json<Value> {
-    Json(json!({ "connected": s.active.load(Ordering::Relaxed) }))
+/// `GET /api/state` — the complete [`AuraStateView`] snapshot. The frontend fetches this on mount
+/// and again whenever `/api/stream` pings `state_changed`. One source of truth for all display.
+async fn state_handler(State(s): State<DaemonState>) -> Json<AuraStateView> {
+    Json(s.snapshot())
 }
 
 /// Toggle aura's OWN connection to scout (does NOT kill scout). Body: `{"enabled": bool}`.
@@ -459,28 +628,50 @@ async fn control_scout(State(s): State<DaemonState>, body: Json<Value>) -> Json<
         None => !s.active.load(Ordering::Relaxed), // no arg → flip
     };
     s.active.store(next, Ordering::Relaxed);
-    s.emit(json!({ "type": "status", "connected": next }));
+    s.bump(); // connected changed → ping clients to re-fetch
     Json(json!({ "connected": next }))
 }
 
-/// SSE stream of Stage1 events: hello → (interim | final | status)*. Each event is one
-/// `data: <json>\n\n` frame. The bridge from the Pipeline thread is the broadcast channel.
+/// SSE subscription params: `?state_changed_frequency=<ms>` — the minimum interval between
+/// `state_changed` pings (floor 250 ms = max 4 Hz). The frontend renders at its own pace and may
+/// skip pings; this just caps wire traffic.
+#[derive(Debug, Deserialize)]
+struct StreamParams {
+    state_changed_frequency: Option<u64>,
+}
+
+/// `GET /api/stream?state_changed_frequency=400` — SSE: `hello`, then a `state_changed` ping each
+/// tick (at the client's rate, floor 250 ms) WHENEVER the global `version` advanced since the last
+/// tick the connection saw. No data is carried — the client re-GETs /api/state. Trailing-edge
+/// guaranteed: a change is always reported within one tick (a paused state syncs, never stuck).
 async fn stream_asr(
     State(s): State<DaemonState>,
+    Query(q): Query<StreamParams>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-    let rx = s.bus.subscribe();
+    let freq_ms = q.state_changed_frequency.unwrap_or(400).max(250);
+    let version = Arc::clone(&s.version);
+    let last_seen = Arc::new(AtomicU64::new(version.load(Ordering::Acquire)));
+
     let hello = tokio_stream::once(Ok::<_, Infallible>(
         Event::default().data(json!({ "type": "hello" }).to_string()),
     ));
-    let live = BroadcastStream::new(rx).map(|res| match res {
-        Ok(v) => Ok(Event::default().data(v.to_string())),
-        Err(_) => Ok(Event::default().comment("lagged")),
-    });
-    Sse::new(hello.chain(live)).keep_alive(KeepAlive::default())
-}
-
-async fn context_handler(State(s): State<DaemonState>) -> Json<Value> {
-    Json(json!({ "hotwords": s.hotwords.lock().unwrap().clone() }))
+    let pings = IntervalStream::new(tokio::time::interval(Duration::from_millis(freq_ms))).filter_map(
+        move |_| {
+            // Sync closure — AtomicU64 loads need no await. Emits one state_changed per tick iff
+            // the global version advanced since this connection last looked.
+            let cur = version.load(Ordering::Acquire);
+            let prev = last_seen.load(Ordering::Acquire);
+            if cur > prev {
+                last_seen.store(cur, Ordering::Release);
+                Some(Ok::<_, Infallible>(
+                    Event::default().data(json!({ "type": "state_changed" }).to_string()),
+                ))
+            } else {
+                None
+            }
+        },
+    );
+    Sse::new(hello.chain(pings)).keep_alive(KeepAlive::default())
 }
 
 /// `GET /api/audio/:seq` — serve utterance `seq` as a WAV for playback. The archive resolves
@@ -502,13 +693,9 @@ async fn recordings_handler(State(s): State<DaemonState>) -> Json<Value> {
     Json(json!({ "recordings": s.storage.recordings() }))
 }
 
-async fn control_stub() -> Json<Value> {
-    Json(json!({ "stub": true, "todo": "speaker control + runtime config" }))
-}
-/// `GET /results` — recent Stage1+Stage2 turn records (oldest → newest, bounded ring).
-async fn results_handler(State(s): State<DaemonState>) -> Json<Value> {
-    Json(json!({ "results": s.storage.recent() }))
-}
+/// `POST /api/correct {seq, raw, corrected}` — record a user correction: push to the Stage2
+/// correction store, flag the timeline entry `corrected_by_user`, and bump `version` so clients
+/// re-fetch and see the badge.
 async fn correction_handler(State(s): State<DaemonState>, body: Json<Value>) -> Json<Value> {
     let raw = body.get("raw").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let corrected = body.get("corrected").and_then(|v| v.as_str()).unwrap_or_default().to_string();
@@ -519,11 +706,16 @@ async fn correction_handler(State(s): State<DaemonState>, body: Json<Value>) -> 
     // Push to correction store (ring buffer, cap 20 — short-term memory for Stage2)
     {
         let mut c = s.corrections.lock().unwrap();
-        if c.len() >= 20 { c.remove(0); } // evict oldest
+        if c.len() >= 20 {
+            c.remove(0);
+        } // evict oldest
         c.push((raw.clone(), corrected.clone()));
     }
-    // Broadcast correction event to all SSE clients (Web UI marks item as corrected)
-    s.emit(json!({ "type": "correction", "seq": seq, "raw": raw, "corrected": corrected }));
+    // Flag the timeline entry (if present) so the UI shows "✓ 已纠正".
+    if let Some(u) = s.utterances.write().unwrap().iter_mut().find(|u| u.seq == seq) {
+        u.corrected_by_user = true;
+    }
+    s.bump();
     info!(seq, raw = %raw, corrected = %corrected, "user correction added → Stage2");
     Json(json!({ "ok": true }))
 }
@@ -546,13 +738,17 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_aura_json_parses() {
-        // Guard the dev runtime config against schema drift / typos.
-        let s = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/aura.json"))
-            .expect("apps/audio-aura/aura.json missing");
-        let conf: AuraConf = serde_json::from_str(&s).expect("aura.json must parse");
+    fn checked_in_aura_yaml_parses() {
+        // Guard the YAML config (the primary dev config) + the vad: section against drift.
+        // (aura.json is gone — yaml is the shipped config; json remains a loader fallback only.)
+        let s = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/aura.yaml"))
+            .expect("apps/audio-aura/aura.yaml missing");
+        let conf: AuraConf = serde_yaml::from_str(&s).expect("aura.yaml must parse");
         assert_eq!(conf.port, Some(9091));
-        assert!(conf.hotwords.as_deref().is_some_and(|h| !h.is_empty()));
+        let vad = conf.vad.expect("aura.yaml must have a vad: section");
+        assert_eq!(vad.merge_gap, Some(1.5), "merge_gap default documented in yaml");
+        assert_eq!(vad.threshold, Some(0.5));
+        assert_eq!(vad.min_silence, Some(1.0));
     }
 
     #[test]
@@ -586,5 +782,9 @@ mod tests {
         assert_eq!(d.scout_addr, "127.0.0.1:7878");
         assert_eq!(d.port, 9091);
         assert!(d.stage3_on);
+        // VAD defaults resolve to the built-ins (no vad: section ⇒ all-None ⇒ fallbacks).
+        assert_eq!(d.vad.merge_gap, 1.5);
+        assert_eq!(d.vad.threshold, 0.5);
+        assert_eq!(d.vad.min_silence, 1.0);
     }
 }

@@ -59,41 +59,58 @@ export interface TaskItem {
 }
 export type ConvItem = UserTurnItem | SecretaryItem | TaskItem;
 
-// ── daemon (Rust) SSE contract: live Stage1 recognition ───────────────────
-// Emitted by aura-daemon GET /api/stream. `interim` updates the current (in-progress)
-// utterance; `final` freezes it (with calibration) and the next interim starts a new one.
-export type AsrEvent =
-  | { type: 'hello' }
-  | { type: 'status'; connected: boolean }
-  | { type: 'interim'; seq: number; partial: string; at_s: number }
-  | {
-      type: 'final';
-      seq: number;
-      raw_text: string;
-      streaming_text: string;
-      calibrated: string;
-      intent: string;
-      reply: string;
-      route_ms: number;
-    }
-  | { type: 'correction'; seq: number; raw: string; corrected: string };
+// ── daemon (Rust) SSE + state contract ────────────────────────────────────
+// GET /api/stream?state_changed_frequency=<ms> emits `hello`, then `state_changed` pings
+// (throttled to ≥250ms). On a ping — and on mount — the frontend GETs /api/state for the full
+// `AuraStateView` snapshot and re-renders. One source of truth, one fetch (snapshot-sync).
+export type StreamPing = { type: 'hello' } | { type: 'state_changed' };
 
-/// One Stage1 utterance in the live list. `live` = currently being recognized (partial streams
-/// char-by-char, earlier chars get corrected as more audio arrives — forward correction).
-export interface UtteranceItem {
+export interface VadView {
+  threshold: number;
+  min_silence: number;
+  merge_gap: number;
+}
+export interface ConfigView {
+  asr_backend: string;
+  asr_kind: string; // local | remote
+  asr_provider: string; // cpu | cuda
+  llm_kind: string;
+  model: string;
+  vad: VadView;
+}
+export interface CorrectionView {
+  raw: string;
+  corrected: string;
+}
+export interface FinalView {
+  raw: string;
+  streaming: string;
+  calibrated: string;
+  intent: string;
+  reply: string;
+  route_ms: number;
+}
+/// One utterance in the timeline (live or finalized).
+export interface UtteranceView {
   seq: number;
-  /** Latest streaming partial (live) — the evolving best hypothesis. */
+  /** Latest streaming partial (raw, live). */
   partial: string;
-  /** Set when the utterance is finalized (VAD end-of-speech + Stage2 calibration done). */
-  final?: {
-    raw: string;
-    streaming: string;
-    calibrated: string;
-    intent: string;
-    reply: string;
-    route_ms: number;
-  };
+  /** Stage2's provisional calibration (per fragment) — shown in preference to `partial` when set. */
+  calibrated?: string;
+  /** Set when the utterance settled (VAD settle + Stage2 final calibration). */
+  final?: FinalView;
+  /** Still being recognized (absorbing fragments). */
   live: boolean;
-  /** Set when the user corrected this item via POST /api/correct. */
+  /** Set when the user corrected this utterance via POST /api/correct. */
   corrected_by_user?: boolean;
+  at_s: number;
+}
+/// The complete state snapshot served by GET /api/state.
+export interface AuraStateView {
+  connected: boolean;
+  stage3_on: boolean;
+  config: ConfigView;
+  hotwords: string[];
+  corrections: CorrectionView[];
+  utterances: UtteranceView[];
 }
