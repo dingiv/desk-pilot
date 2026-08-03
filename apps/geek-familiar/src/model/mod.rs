@@ -36,11 +36,24 @@ pub struct StyleConfig {
     /// → angle=135°, stop@0=(0.35,0.55,0.95,1.0), stop@1=(...)
     #[serde(default)]
     pub pill_accent_gradient: Option<Vec<f32>>,
+    /// Default body text colour [r, g, b, a].
+    #[serde(default = "def_text_color")]
+    pub text_color: [f32; 4],
+    /// Secondary / label text. Defaults to `text_color`.
+    #[serde(default = "def_text_color")]
+    pub text_dim: [f32; 4],
+    /// Placeholder / empty-state text. Defaults to `text_color`.
+    #[serde(default = "def_text_color")]
+    pub text_faint: [f32; 4],
+    /// Subtle text (eg. reply, finer print). Defaults to `text_color`.
+    #[serde(default = "def_text_color")]
+    pub text_subtle: [f32; 4],
 }
 fn def_card_bg() -> [f32; 4] { [0.12, 0.12, 0.18, 0.92] }
 fn def_shadow_color() -> [f32; 4] { [0.0, 0.0, 0.0, 0.35] }
 fn def_pill_accent() -> [f32; 4] { [0.35, 0.55, 0.95, 0.95] }
 fn def_pill_neutral() -> [f32; 4] { [0.20, 0.20, 0.26, 0.85] }
+fn def_text_color() -> [f32; 4] { [0.90, 0.90, 0.95, 1.0] }
 
 impl Default for StyleConfig {
     fn default() -> Self {
@@ -52,6 +65,10 @@ impl Default for StyleConfig {
             pill_accent: def_pill_accent(),
             pill_neutral: def_pill_neutral(),
             pill_accent_gradient: None,
+            text_color: def_text_color(),
+            text_dim: def_text_color(),
+            text_faint: def_text_color(),
+            text_subtle: def_text_color(),
         }
     }
 }
@@ -90,6 +107,8 @@ pub enum Message {
     // ── interaction ──
     DragStarted,
     TabPressed(Panel),
+    /// iced_aw TabBar selection (maps to TabPressed + toggle).
+    TabSelected(Panel),
     ImeInput(String),
     /// Right-click on an ASR entry → context menu (index into history).
     AsrContextMenu(u64),
@@ -107,6 +126,18 @@ pub enum Message {
     AudioPlayed(u64, bool),
     /// App-level status message (errors, hints, info).
     AppStatus(String),
+    /// Toggle a message in / out of the selection set.
+    ToggleSelectTurn(u64),
+    /// Copy all selected turns to clipboard.
+    CopySelectedTurns,
+    /// Toggle section collapse (0=ASR, 1=Clipboard, 2=Status).
+    ToggleSection(usize),
+    /// Start dragging the divider below section `idx`.
+    SectionDragStart(usize),
+    /// Mouse moved during section resize (carries Y in physical pixels).
+    SectionDragMove(f32),
+    /// End section divider drag.
+    SectionDragEnd,
     /// A file was dropped onto the pet window from a file manager.
     FileDropped(String),
     /// File drag hovered over the pet window (visual feedback).
@@ -137,7 +168,33 @@ pub use crate::service::asr::ConversationTurn;
 
 #[derive(Default)]
 pub struct AsrState {
-    pub connected: bool,
+    /// SSE stream connected to aura daemon (transport layer).
+    pub sse_connected: bool,
+    /// Scout is actively recording (business layer).
+    pub scout_active: bool,
     pub interim: String,
     pub history: Vec<ConversationTurn>,
+}
+
+impl AsrState {
+    /// Three-way status for the ASR dock button.
+    pub fn status(&self) -> AsrStatus {
+        if !self.sse_connected {
+            AsrStatus::Disconnected
+        } else if self.scout_active {
+            AsrStatus::Enabled
+        } else {
+            AsrStatus::Disabled
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsrStatus {
+    /// Not connected to aura daemon at all.
+    Disconnected,
+    /// Connected + scout active = recording live.
+    Enabled,
+    /// Connected but scout disabled (or failed to enable).
+    Disabled,
 }

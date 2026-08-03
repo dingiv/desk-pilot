@@ -12,7 +12,7 @@ use iced::widget::{column, container, image, mouse_area, row, stack, text, text_
 use iced::alignment::Vertical;
 use iced::widget::image::Handle;
 use iced::widget::svg::Handle as SvgHandle;
-use iced::{Background, Border, Color, ContentFit, Element, Length, Subscription, Task, alignment, window};
+use iced::{Background, Border, Color, ContentFit, Degrees, Element, Gradient, Length, Subscription, Task, alignment, window};
 
 pub(crate) use crate::model::{AsrState, ConversationTurn, DockingPreference, Message, Panel, StyleConfig};
 pub(crate) use crate::service::asr::AsrUpdate;
@@ -56,6 +56,18 @@ pub struct PetApp {
     pub(crate) corrections: Vec<(String, String)>,
     /// App-level status messages (errors, info, hints), newest first.
     pub(crate) status_messages: Vec<String>,
+    /// Collapsed state for sections: [ASR, Clipboard, Status].
+    pub(crate) section_collapsed: [bool; 3],
+    /// Current heights for sections (pixels), persisted across collapse.
+    pub(crate) section_heights: [f32; 3],
+    /// When Some, the divider BELOW section `idx` is being dragged.
+    pub(crate) dragging_divider: Option<usize>,
+    /// Mouse Y at drag-start, for computing delta.
+    drag_origin_y: f32,
+    /// Previous mouse Y for delta computation.
+    prev_mouse_y: f32,
+    /// Selected ASR turn indices (for multi-select copy).
+    pub(crate) selected_turns: Vec<u64>,
 }
 
 impl PetApp {
@@ -77,6 +89,12 @@ impl PetApp {
             correction_text: String::new(),
             corrections: Vec::new(),
             status_messages: vec![init_status],
+            section_collapsed: [false, false, false],
+            section_heights: [180.0, 120.0, 80.0],
+            dragging_divider: None,
+            drag_origin_y: 0.0,
+            prev_mouse_y: 0.0,
+            selected_turns: Vec::new(),
             resize_handle: SvgHandle::from_memory(RESIZOR_SVG),
         };
         let token_for_task = app.token.clone();
@@ -101,7 +119,8 @@ impl PetApp {
         match msg {
             Message::Asr(u) => match u {
                 AsrUpdate::Hello => {
-                    self.status_messages.insert(0, "🎙 aura SSE connected".into());
+                    self.asr.sse_connected = true;
+                    self.status_messages.insert(0, "🔌 aura SSE connected".into());
                     if self.status_messages.len() > 30 { self.status_messages.truncate(30); }
                 }
                 AsrUpdate::Interim(t) => self.asr.interim = t,
@@ -110,15 +129,18 @@ impl PetApp {
                     self.asr.history.push(ConversationTurn { seq, user_text: text, intent, reply });
                     if self.asr.history.len() > 20 { self.asr.history.remove(0); }
                 }
-                AsrUpdate::Status(connected) => {
-                    self.asr.connected = connected;
-                    let msg = if connected { "🎙 scout enabled" } else { "🎙 scout disabled" };
+                AsrUpdate::Status(active) => {
+                    self.asr.scout_active = active;
+                    let msg = if active { "🎙 scout enabled" } else { "🔇 scout disabled" };
                     self.status_messages.insert(0, msg.into());
                     if self.status_messages.len() > 30 { self.status_messages.truncate(30); }
                 }
-                AsrUpdate::Connected => {}
+                AsrUpdate::Connected => {
+                    self.asr.sse_connected = true;
+                }
                 AsrUpdate::Disconnected => {
-                    self.asr.connected = false;
+                    self.asr.sse_connected = false;
+                    self.asr.scout_active = false;
                     self.asr.interim.clear();
                     self.status_messages.insert(0, "⚠ aura SSE disconnected".into());
                     if self.status_messages.len() > 30 { self.status_messages.truncate(30); }
@@ -135,7 +157,7 @@ impl PetApp {
                     None => Task::none(),
                 });
             }
-            Message::TabPressed(p) => {
+            Message::TabPressed(p) | Message::TabSelected(p) => {
                 self.active_panel = if self.active_panel == Some(p) { None } else { Some(p) };
                 return screenshot_oldest();
             }
@@ -157,12 +179,17 @@ impl PetApp {
             Message::PassthroughApplied(n) => eprintln!("[passthrough] applied {n} rect(s)"),
             Message::RescanTick => return screenshot_oldest(),
             Message::ToggleRecording => {
-                let enable = !self.asr.connected;
-                let addr = self.aura_addr.clone();
-                return Task::perform(
-                    async move { let _ = crate::service::aura::control_scout(&addr, Some(enable)); },
-                    |_| Message::RecordingToggled,
-                );
+                // Three-way: only toggle when SSE is connected
+                if self.asr.sse_connected {
+                    let enable = !self.asr.scout_active;
+                    let addr = self.aura_addr.clone();
+                    return Task::perform(
+                        async move {
+                            let _ = crate::service::aura::control_scout(&addr, Some(enable));
+                        },
+                        |_| Message::RecordingToggled,
+                    );
+                }
             }
             Message::RecordingToggled => {
                 // Status updated by AsrUpdate::Status event from SSE.
@@ -280,6 +307,43 @@ impl PetApp {
                     if self.clipboard.len() > 50 { self.clipboard.truncate(50); }
                 }
             }
+            Message::ToggleSelectTurn(idx) => {
+                if let Some(pos) = self.selected_turns.iter().position(|&x| x == idx) {
+                    self.selected_turns.remove(pos);
+                } else {
+                    self.selected_turns.push(idx);
+                }
+            }
+            Message::CopySelectedTurns => {
+                if self.selected_turns.is_empty() { return Task::none(); }
+                self.selected_turns.sort();
+                let texts: Vec<String> = self.selected_turns.iter()
+                    .filter_map(|&idx| self.asr.history.get(idx as usize))
+                    .map(|t| t.user_text.clone())
+                    .collect();
+                let joined = texts.join("\n");
+                return iced::clipboard::write(joined);
+            }
+            Message::ToggleSection(idx) => {
+                let i = idx.min(2);
+                self.section_collapsed[i] = !self.section_collapsed[i];
+            }
+            Message::SectionDragStart(idx) => {
+                let i = idx.min(2);
+                self.dragging_divider = Some(i);
+                self.drag_origin_y = self.prev_mouse_y;
+            }
+            Message::SectionDragMove(y) => {
+                self.prev_mouse_y = y;
+                if let Some(i) = self.dragging_divider {
+                    let delta = y - self.drag_origin_y;
+                    self.drag_origin_y = y;
+                    self.section_heights[i] = (self.section_heights[i] + delta).max(30.0).min(600.0);
+                }
+            }
+            Message::SectionDragEnd => {
+                self.dragging_divider = None;
+            }
             Message::Quit => {
                 return window::oldest().then(|id| match id {
                     Some(id) => window::close::<Message>(id),
@@ -325,6 +389,8 @@ impl PetApp {
                 iced::Event::Window(iced::window::Event::FileDropped(path)) => Some(Message::FileDropped(path.to_string_lossy().to_string())),
                 iced::Event::Window(iced::window::Event::FileHovered(_)) => Some(Message::FileHovered),
                 iced::Event::Window(iced::window::Event::FilesHoveredLeft) => Some(Message::FileHoverLeft),
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => Some(Message::SectionDragMove(position.y)),
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => Some(Message::SectionDragEnd),
                 _ => None,
             }),
         ])
@@ -336,15 +402,77 @@ impl PetApp {
         let sprite = image(self.skin.clone()).width(self.sprite_size).height(self.sprite_size)
             .content_fit(ContentFit::Contain)
             .filter_method(if self.sprite_filter == "nearest" { iced::widget::image::FilterMethod::Nearest } else { iced::widget::image::FilterMethod::Linear });
-        let dock = row![
-            crate::view::drag_button(fs, style.clone()),
-            crate::view::dock_button("💬", Panel::Chat, self.active_panel == Some(Panel::Chat), fs, style.clone()),
-            crate::view::dock_button("⚙", Panel::Settings, self.active_panel == Some(Panel::Settings), fs, style.clone()),
-        ].spacing(4);
+        let mut tab_bar = iced_aw::TabBar::new(|tab_id| Message::TabSelected(tab_id))
+            .push(Panel::Chat, iced_aw::TabLabel::Text("💬".into()))
+            .push(Panel::Settings, iced_aw::TabLabel::Text("⚙".into()))
+            .tab_width(Length::Fixed(40.0))
+            .height(34.0)
+            .padding(0)
+            .width(Length::Shrink)
+            .style({
+                let s = style.clone();
+                let neutral = Color::from_rgba(s.pill_neutral[0], s.pill_neutral[1], s.pill_neutral[2], s.pill_neutral[3]);
+                // Build active gradient from config
+                let gradient_bg: Background = s.pill_accent_gradient.as_ref().map_or_else(
+                    || {
+                        let [r, g, b, a] = s.pill_accent;
+                        Background::Color(Color::from_rgba(r, g, b, a))
+                    },
+                    |g| {
+                        if g.len() >= 9 {
+                            Background::Gradient(Gradient::Linear(iced_core::gradient::Linear::new(Degrees(g[0]))
+                                .add_stop(0.0, Color::from_rgba(g[1], g[2], g[3], g[4]))
+                                .add_stop(1.0, Color::from_rgba(g[5], g[6], g[7], g[8]))))
+                        } else {
+                            let [r, g2, b, a] = s.pill_accent;
+                            Background::Color(Color::from_rgba(r, g2, b, a))
+                        }
+                    },
+                );
+                move |_theme, status| {
+                    use iced_aw::style::status::Status;
+                    let is_active = matches!(status, Status::Active);
+                    let is_hovered = matches!(status, Status::Hovered);
+                    iced_aw::style::tab_bar::Style {
+                        background: None,
+                        tab_label_background: if is_active || is_hovered {
+                            gradient_bg.clone()
+                        } else {
+                            Background::Color(neutral)
+                        },
+                        tab_label_border_color: if is_hovered && !is_active {
+                            Color::from_rgba(1.0, 1.0, 1.0, 0.35)
+                        } else {
+                            Color::TRANSPARENT
+                        },
+                        tab_label_border_width: if is_hovered && !is_active { 1.5 } else { 0.0 },
+                        tab_border_radius: 14.0.into(),
+                        text_color: Color::WHITE,
+                        icon_color: Color::WHITE,
+                        ..iced_aw::style::tab_bar::Style::default()
+                    }
+                }
+            });
+        if let Some(active) = self.active_panel {
+            tab_bar = tab_bar.set_active_tab(&active);
+        }
         let (h_align, grip_align) = match self.docking {
             DockingPreference::Left => (iced::alignment::Horizontal::Left, iced::alignment::Horizontal::Right),
             DockingPreference::Right => (iced::alignment::Horizontal::Right, iced::alignment::Horizontal::Left),
         };
+        let spacer_width = if self.docking == DockingPreference::Right { Length::Fill } else { Length::Fixed(0.0) };
+        let dock = row![
+            crate::view::drag_button(fs, style.clone()),
+            crate::view::asr_dock_button(self, style.clone()),
+            mouse_area(
+                container(text("📷").size(16.0))
+                    .width(32.0).height(28.0)
+                    .align_x(iced::alignment::Horizontal::Center).align_y(iced::alignment::Vertical::Center)
+                    .style({ let s = style.clone(); move |_theme| crate::view::pill_style(&s, false) }),
+            ).on_press(Message::TakeScreenshot).interaction(iced::mouse::Interaction::Pointer),
+            iced::widget::Space::new().width(spacer_width),
+            tab_bar,
+        ].spacing(4);
         let mut col = column![sprite, dock].align_x(h_align).spacing(6);
         if let Some(panel) = self.active_panel {
             let body: Element<Message> = match panel {

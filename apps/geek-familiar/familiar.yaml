@@ -27,7 +27,7 @@ docking_preference: "right"
 # Gradient pills: angle°, start_rgba, end_rgba (all 0..1).
 # Shadow: colour rgba + offset [x,y] + blur (pixels).  Omit shadow_blur for none.
 style:
-  card_bg:           [0.18, 0.18, 0.26, 0.66]     # frosted-glass card bg
+  card_bg:           [0.18, 0.18, 0.24, 0.66]     # frosted-glass card bg
   shadow_color:      [0.0, 0.0, 0.1, 0.20]         # soft dark shadow
   shadow_offset:     [1.0, 3.0]                     # shadow direction
   shadow_blur:       12.0                            # blur radius
@@ -35,6 +35,11 @@ style:
   pill_neutral:      [0.18, 0.18, 0.28, 0.85]      # idle pill
   # accent gradient — angle=135°, start→end blue-purple
   pill_accent_gradient: [135, 0.30, 0.50, 0.90, 1.0, 0.55, 0.35, 0.85, 1.0]
+  # Panel text colours [r, g, b, a]. Each defaults to text_color if omitted.
+  text_color:  [1.00, 1.00, 1.00, 1.0]   # body / primary text
+  text_dim:    [0.55, 0.55, 0.60, 1.0]   # secondary labels & headers
+  text_faint:  [0.33, 0.33, 0.36, 1.0]   # placeholders & empty states
+  text_subtle: [0.78, 0.78, 0.82, 1.0]   # reply text & finer print
 
 # Window background colour. Format: "r, g, b, a" (comma-separated 0..1).
 # Omit or delete for fully transparent (default). Dev: opaque white.

@@ -18,6 +18,7 @@ fs = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+iced_aw = { version = "0.13", features = ["tabs", "tab_bar", "card", "menu", "badge", "sidebar", "selection_list", "labeled_frame", "spinner"] }
 
 [build-dependencies]
 fs = { workspace = true }
