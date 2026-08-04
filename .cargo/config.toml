@@ -51,3 +51,5 @@ benchlive = "run -p audio-aura-core --features cuda,asr --example stage12_live -
 aura = "run -p aura-daemon --features asr,cuda --"
 
 scout = "run -p omni-scout --"
+
+swift = "run -p swift-ime --"

@@ -84,13 +84,20 @@ IME 是秘书系统里"产出最终文本"的那只手 —— 语音听进来、
 
 支持变量：`$DATE`（当前日期）、`$CLIPBOARD`（剪贴板内容）、`$CURSOR`（展开后光标位置）。
 
-### #asr — 语音缓冲插入
+### #asr — 语音录入锚点（实时候选 + 空格上屏）
 
 ```
-键入: #asr → 读取 aura SSE 语音缓冲 → 替换为识别文本
+键入 #asr → 进入 Voice 态（语音锚点）
+  候选区: [live]  ← 随 aura 流式（interim/calibrated_interim）实时变
+  Final 到达 → [final_N, ..., live]  ← final 插入成 1 号候选
+空格 → 提交 1 号候选（最近 final，或 live）→ 文本上屏 → 回 Idle
 ```
 
-IME 进程内维护一个持久 SSE 连接到 aura-daemon 的 `/api/stream`,累积 `AsrBuffer`（按 seq 组织的 streaming partial → final 文本）。`#asr` 触发时取最近 N 秒的 final calibrated 文本拼接。
+**数据通路**：IME 进程内（`apps/swift-ime/src/bridge.rs`）通过 `audio-aura-agent` SDK 在后台线程维持一条持久连接到 aura-daemon 的**数据面** `GET /api/asr_stream`（每事件直推、不节流）；按段类型写入 `AsrBuffer`：
+- `Interim{partial}` / `CalibratedInterim{calibrated}` → `set_live(..)`（流式候选）
+- `Final{calibrated}` → `push_final(..)`（成 1 号候选）
+
+`AsrBuffer`（`crates/ime-core/src/asr_buffer.rs`）是富状态 `{live, finals[], version}`，version 计数让前端无按键也能刷新。引擎 `#asr` 完成（matcher `Match::Complete` + expansion `__ASR_BUFFER__`）转 `ComposeState::Voice`（不再静态展开）；`StateMachine::refresh_voice()` 从 `voice_candidates()` 构造候选 `[finals..., live]`；`ImeEngine::voice_tick()` 在 Voice 态 + version 变化时重建视图。TUI `run_loop` 每轮（100ms）调 `voice_tick` → 候选区实时变。空格走 `handle_voice` 提交 1 号。控制面 `/api/stream`（settings 快照）不经此路——识别文字只走数据面。
 
 ### #exec — 关联动作触发
 
@@ -150,7 +157,7 @@ familiar 配置变更后通过专用 socket **立即推送完整规则集**到 I
 │                                                              │
 │  ┌──────────────────────────────────────────┐               │
 │  │  aura-daemon                             │               │
-│  │  GET /api/stream (SSE)                   │               │
+│  │  GET /api/asr_stream (data-plane SSE)    │               │
 │  │    interim {seq,partial,…}               │               │
 │  │    final   {seq,calibrated,…}            │               │
 │  └──────────────────────────────────────────┘               │
@@ -393,7 +400,7 @@ IME 侧启动一个 TCP server，familiar 作为 client 连接。协议：JSON l
 
 ### IME ↔ aura（HTTP/SSE，连 daemon :9091）
 
-IME 启动时建立持久 SSE 连接到 `GET /api/stream`，在进程内维护 `AsrBuffer`：
+IME 启动时（`bridge.rs::spawn_aura_client`）通过 `audio-aura-agent` SDK 建立持久连接到数据面 `GET /api/asr_stream`（在后台 std 线程的 current-thread tokio runtime 上驱动），每收到 `AsrSegment::Final` 就 `AsrBuffer::update(calibrated)`：
 
 ```rust
 struct AsrBuffer {

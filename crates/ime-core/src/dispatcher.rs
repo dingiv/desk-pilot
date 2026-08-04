@@ -153,6 +153,11 @@ impl Dispatcher {
         self.expander.set_asr_buffer(buf);
     }
 
+    /// Access the voice buffer (if attached). For the FSM's Voice state.
+    pub fn asr_buffer(&self) -> Option<std::sync::Arc<crate::asr_buffer::AsrBuffer>> {
+        self.expander.asr_buffer()
+    }
+
     pub fn reload_matcher(&mut self, entries: Vec<(String, String)>) {
         self.matcher = Matcher::new(entries);
     }
@@ -176,6 +181,9 @@ impl StepEnv for Dispatcher {
         if let Some(fam) = self.scorer.family("pinyin") {
             fam.learn_phrase(pinyin, hanzi);
         }
+    }
+    fn asr_buffer(&self) -> Option<std::sync::Arc<crate::asr_buffer::AsrBuffer>> {
+        self.expander.asr_buffer()
     }
 }
 

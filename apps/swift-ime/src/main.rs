@@ -34,7 +34,7 @@ struct Args {
     #[arg(long, default_value = "0")]
     async_wait: u64,
     #[arg(long, default_value = "false")]
-    connect_aura: bool,
+    aura: bool,
     #[arg(long)]
     aura_addr: Option<String>,
     #[arg(long)]
@@ -52,7 +52,7 @@ fn main() {
         top_n: args.top_n, verbose: args.verbose,
         config: args.config, asr_text: args.asr_text,
         commit: args.commit, async_wait: args.async_wait,
-        connect_aura: args.connect_aura, aura_addr: args.aura_addr,
+        connect_aura: args.aura, aura_addr: args.aura_addr,
         surrounding: args.surrounding,
         en_user_dict: args.en_user_dict, en_dicts: args.en_dicts,
     };

@@ -1,131 +1,182 @@
 //! Cross-subsystem communication.
 //!
-//! - **aura SSE client**: connects to aura-daemon (:9091). On startup fetches
-//!   `GET /api/state` to seed the voice buffer. Then subscribes to
-//!   `GET /api/stream?state_changed_frequency=<ms>` for `state_changed` pings,
-//!   re-fetching `/api/state` on each ping to update the buffer.
-//! - **familiar TCP server**: listens on :9601, accepts familiar connections for
-//!   snippet config push + status display (Phase 2 stub).
+//! - **aura data-plane client**: connects to aura-daemon (`GET /api/asr_stream`) via the
+//!   `audio-aura-agent` SDK. Runs on a dedicated tokio runtime in a background std thread; on
+//!   each settled utterance (`AsrSegment::Final`) it writes the calibrated text into the shared
+//!   [`AsrBuffer`], which the `#asr` magic command reads (non-blocking, microseconds) on the IME
+//!   key-event path. Resilient — the SDK reconnects on drop.
+//! - **familiar TCP server**: listens on :9601, accepts familiar connections for snippet config
+//!   push + status display (Phase 2 stub).
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use audio_aura_agent::client::AuraClient;
+use audio_aura_agent::AsrSegment;
+use futures::StreamExt;
 use ime_core::asr_buffer::AsrBuffer;
 
-const AURA_ADDR: &str = "127.0.0.1:9091";
-const STATE_CHANGED_FREQ: u64 = 500; // ms between pings (floor 250ms server-side)
+/// Default aura-daemon origin.
+const DEFAULT_AURA: &str = "http://127.0.0.1:9091";
+/// Connectivity probe interval (the segment stream alone can't tell "connected but silent"
+/// from "reconnecting" during pauses — a periodic /health ping can).
+const HEALTH_PROBE: Duration = Duration::from_secs(3);
+
+// ── Aura connectivity status ───────────────────────────────────────────
+
+/// Aura-daemon connectivity, read by the TUI for display. Stored as a `u8` in an
+/// [`AtomicU8`] so the background client (writer) and the render loop (reader) never contend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AuraConn {
+    /// No health reply yet / first connect in flight.
+    Connecting = 0,
+    /// Last `/health` ok OR a segment just arrived.
+    Connected = 1,
+    /// `/health` failed (daemon down / unreachable).
+    Disconnected = 2,
+}
+
+impl AuraConn {
+    fn from_ok(ok: bool) -> Self {
+        if ok { AuraConn::Connected } else { AuraConn::Disconnected }
+    }
+    fn from_u8(v: u8) -> Self {
+        match v { 1 => AuraConn::Connected, 2 => AuraConn::Disconnected, _ => AuraConn::Connecting }
+    }
+}
+
+/// Handle to the aura client's connectivity status. Cheap to clone; `.get()` is non-blocking.
+#[derive(Clone)]
+pub struct AuraConnHandle {
+    status: Arc<AtomicU8>,
+}
+
+impl AuraConnHandle {
+    /// Current connectivity (best-effort, last known).
+    pub fn get(&self) -> AuraConn {
+        AuraConn::from_u8(self.status.load(Ordering::Relaxed))
+    }
+}
 
 // ── Public API ─────────────────────────────────────────────────────────
 
-/// Spawn the aura SSE client on a background thread.
-pub fn spawn_aura_sse(buffer: Arc<AsrBuffer>, aura_addr: Option<&str>) {
-    let addr = aura_addr.unwrap_or(AURA_ADDR).to_string();
-    tracing::info!(addr = %addr, "aura SSE client starting (snapshot-sync)");
+/// Spawn the aura data-plane client on a background thread. Returns a connectivity handle the
+/// frontend can poll for display. Drives `subscribe_segments` on its own current-thread tokio
+/// runtime; on each `Final` it writes the calibrated text into `buffer`. The IME main thread
+/// never blocks — `AsrBuffer` is lock-guarded and only held microseconds per op.
+///
+/// `aura_addr` may be a bare `host:port` (http:// is prepended) or a full origin URL.
+pub fn spawn_aura_client(buffer: Arc<AsrBuffer>, aura_addr: Option<&str>) -> AuraConnHandle {
+    let base = normalize_origin(aura_addr.unwrap_or(DEFAULT_AURA));
+    let status = Arc::new(AtomicU8::new(AuraConn::Connecting as u8));
+    tracing::info!(addr = %base, "aura data-plane client starting");
 
+    let status_for_thread = Arc::clone(&status);
     thread::Builder::new()
-        .name("ime-aura-sse".into())
-        .spawn(move || {
-            loop {
-                match sync_with_aura(&addr, &buffer) {
-                    Ok(()) => tracing::info!("aura sync ended cleanly"),
-                    Err(e) => tracing::warn!(error = %e, "aura sync error — reconnecting in 2s"),
-                }
-                thread::sleep(Duration::from_secs(2));
-            }
-        })
-        .expect("spawn aura SSE thread");
+        .name("ime-aura-client".into())
+        .spawn(move || run_aura_client(&base, buffer, status_for_thread))
+        .expect("spawn aura client thread");
+
+    AuraConnHandle { status }
 }
 
-// ── Snapshot-sync protocol ─────────────────────────────────────────────
-
-fn sync_with_aura(addr: &str, buffer: &AsrBuffer) -> Result<(), Box<dyn std::error::Error>> {
-    // ── 1. Seed the buffer with the current state ──
-    if let Ok(text) = fetch_latest_calibrated(addr) {
-        if !text.is_empty() {
-            buffer.update(&text);
-            tracing::info!(text, "asr buffer seeded from /api/state");
+fn run_aura_client(base: &str, buffer: Arc<AsrBuffer>, status: Arc<AtomicU8>) {
+    // A single background thread drives the async SDK stream. current-thread runtime keeps the
+    // footprint minimal (no worker pool).
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build tokio runtime for aura client");
+            status.store(AuraConn::Disconnected as u8, Ordering::Relaxed);
+            return;
         }
-    }
+    };
+    rt.block_on(async move {
+        let client = match AuraClient::new(base) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "aura client init failed");
+                status.store(AuraConn::Disconnected as u8, Ordering::Relaxed);
+                return;
+            }
+        };
 
-    // ── 2. Subscribe to state_changed pings ──
-    let mut stream = TcpStream::connect(addr)?;
-    stream.set_read_timeout(Some(Duration::from_secs(300)))?;
+        // Periodic /health probe — sets Connected/Disconnected. Covers silent periods (segments
+        // alone can't distinguish "connected, no speech" from "reconnecting").
+        let hc_client = client.clone();
+        let hc_status = Arc::clone(&status);
+        tokio::spawn(async move {
+            loop {
+                let ok = hc_client.health().await.unwrap_or(false);
+                hc_status.store(AuraConn::from_ok(ok) as u8, Ordering::Relaxed);
+                tokio::time::sleep(HEALTH_PROBE).await;
+            }
+        });
 
-    let path = format!("/api/stream?state_changed_frequency={STATE_CHANGED_FREQ}");
-    write!(stream, "GET {path} HTTP/1.1\r\n")?;
-    write!(stream, "Host: {addr}\r\n")?;
-    write!(stream, "Accept: text/event-stream\r\n")?;
-    write!(stream, "Connection: keep-alive\r\n\r\n")?;
-    stream.flush()?;
-
-    let reader = BufReader::new(stream);
-    let mut data_buf = String::new();
-
-    for line in reader.lines() {
-        let line = line?;
-        let trimmed = line.trim();
-
-        if trimmed.is_empty() {
-            // End of SSE frame.
-            if data_buf.contains("state_changed") {
-                if let Ok(text) = fetch_latest_calibrated(addr) {
-                    if !text.is_empty() {
-                        buffer.update(&text);
-                        tracing::info!(text, "asr buffer updated via state_changed");
+        let segments = client.subscribe_segments();
+        tokio::pin!(segments); // subscribe_segments is !Unpin — pin before .next()
+        while let Some(seg) = segments.next().await {
+            // A segment arriving ⇒ the stream is live.
+            status.store(AuraConn::Connected as u8, Ordering::Relaxed);
+            // Feed the voice session: streaming → live, settled → final (becomes candidate #1).
+            match seg {
+                AsrSegment::Interim { partial, .. } => {
+                    if !partial.is_empty() {
+                        buffer.set_live(&partial);
+                        tracing::debug!(text = %partial, "asr live (interim)");
                     }
                 }
+                AsrSegment::CalibratedInterim { calibrated, .. } => {
+                    if !calibrated.is_empty() {
+                        buffer.set_live(&calibrated);
+                        tracing::debug!(text = %calibrated, "asr live (calibrated)");
+                    }
+                }
+                AsrSegment::Final { calibrated, .. } => {
+                    if !calibrated.is_empty() {
+                        buffer.push_final(&calibrated);
+                        tracing::info!(text = %calibrated, "asr final → candidate #1");
+                    }
+                }
+                AsrSegment::Correction { .. } => {} // not relevant to the voice buffer
             }
-            data_buf.clear();
-            continue;
         }
+        // subscribe_segments is infinite (it reconnects internally) — reaching here means the
+        // client was dropped / shut down.
+    });
+}
 
-        if let Some(data) = trimmed.strip_prefix("data:") {
-            data_buf.push_str(data.trim());
-        }
+/// Turn a bare `host:port` into an `http://host:port` origin (leave full URLs alone).
+fn normalize_origin(addr: &str) -> String {
+    let addr = addr.trim();
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
     }
-
-    Ok(())
-}
-
-/// `GET /api/state` → extract latest utterance's calibrated text.
-fn fetch_latest_calibrated(addr: &str) -> Result<String, String> {
-    let body = http_get(addr, "/api/state")?;
-    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("parse /api/state: {e}"))?;
-
-    let utterances = v.get("utterances").and_then(|u| u.as_array());
-    // Find the latest utterance with a settled final calibrated text.
-    let latest = utterances
-        .into_iter()
-        .flatten()
-        .filter_map(|u| {
-            let seq = u.get("seq")?.as_u64()?;
-            let final_view = u.get("final")?;
-            let calibrated = final_view.get("calibrated")?.as_str()?;
-            if calibrated.is_empty() { None }
-            else { Some((seq, calibrated.to_string())) }
-        })
-        .max_by_key(|(seq, _)| *seq);
-
-    Ok(latest.map(|(_, t)| t).unwrap_or_default())
-}
-
-/// Minimal HTTP GET, return stripped body.
-fn http_get(addr: &str, path: &str) -> Result<String, String> {
-    let mut stream = TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| format!("timeout: {e}"))?;
-    let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: application/json\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).map_err(|e| format!("write: {e}"))?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).map_err(|e| format!("read: {e}"))?;
-    let raw = String::from_utf8_lossy(&buf);
-    raw.split("\r\n\r\n").nth(1).map(|s| s.trim().to_string()).ok_or_else(|| "no body".to_string())
 }
 
 // ── Familiar TCP server (Phase 2 stub) ────────────────────────────────
 
 pub fn spawn_familiar_server() {
     tracing::info!("familiar TCP server :9601 — stub (Phase 2)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_origin;
+
+    #[test]
+    fn bare_hostport_gets_http_scheme() {
+        assert_eq!(normalize_origin("127.0.0.1:9091"), "http://127.0.0.1:9091");
+    }
+
+    #[test]
+    fn full_url_unchanged() {
+        assert_eq!(normalize_origin("http://1.2.3.4:9091"), "http://1.2.3.4:9091");
+        assert_eq!(normalize_origin("https://x.io"), "https://x.io");
+    }
 }

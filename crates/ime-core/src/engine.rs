@@ -83,6 +83,9 @@ pub struct ImeEngine {
     contexts: Mutex<HashMap<usize, PerContext>>,
     async_waits: Mutex<HashMap<usize, WaitState>>,
     store: Mutex<Option<std::sync::Arc<WeightStore>>>,
+    /// Voice buffer clone (same one the dispatcher/expander holds) — `voice_tick` reads its
+    /// `version()` to drive live candidate refreshes without a keypress.
+    asr: Mutex<Option<std::sync::Arc<crate::asr_buffer::AsrBuffer>>>,
 }
 
 impl ImeEngine {
@@ -122,6 +125,7 @@ impl ImeEngine {
             contexts: Mutex::new(HashMap::new()),
             async_waits: Mutex::new(HashMap::new()),
             store: Mutex::new(None),
+            asr: Mutex::new(None),
         };
         // Load embedded base dictionary (5KB, compiled into binary).
         let count = engine.dispatcher.scorer().family("pinyin")
@@ -394,10 +398,15 @@ impl ImeEngine {
     pub fn candidates_detailed(&self) -> Vec<crate::family::RankedCandidate> {
         let map = self.contexts.lock().unwrap();
         let Some(pc) = map.get(&DEFAULT_CTX) else { return Vec::new() };
-        // Snippet state: candidates come from the Matcher trie, not the scorer.
+        // Snippet/Voice state: candidates come from the Matcher trie / asr buffer, not the scorer.
         // Return them directly so #asr / #date expansions appear correctly.
-        if pc.sm.state == crate::state::ComposeState::Snippet && pc.sm.candidates_fresh {
-            let source = if pc.sm.buffer.starts_with('#') { "magic" } else { "snippet" };
+        let in_direct = pc.sm.state == crate::state::ComposeState::Snippet
+            || pc.sm.state == crate::state::ComposeState::Voice;
+        if in_direct && pc.sm.candidates_fresh {
+            let source = match pc.sm.state {
+                crate::state::ComposeState::Voice => "asr",
+                _ => if pc.sm.buffer.starts_with('#') { "magic" } else { "snippet" },
+            };
             return pc.sm.candidates.iter().map(|c| crate::family::RankedCandidate {
                 text: c.clone(),
                 score: 1.0,
@@ -483,9 +492,30 @@ impl ImeEngine {
 
     /// Attach the voice buffer so `#asr` resolves to live voice recognition
     /// text from the aura daemon SSE stream. Call once at startup after
-    /// the SSE client has been spawned.
+    /// the SSE client has been spawned. Stores a clone on the engine for `voice_tick`.
     pub fn set_asr_buffer(&self, buf: std::sync::Arc<crate::asr_buffer::AsrBuffer>) {
+        *self.asr.lock().unwrap() = Some(std::sync::Arc::clone(&buf));
         self.dispatcher.set_asr_buffer(buf);
+    }
+
+    /// Poll for voice-state changes while in Voice (`#asr`) mode. If the asr buffer advanced
+    /// since the last rebuild, refresh the live candidate view (streaming + finals). Returns the
+    /// new view, or None if not in Voice mode / nothing changed. Frontends call this from their
+    /// render loop to update the candidate area without a keypress.
+    pub fn voice_tick(&self) -> Option<ImeView> {
+        self.voice_tick_ctx(DEFAULT_CTX)
+    }
+
+    pub fn voice_tick_ctx(&self, ctx: usize) -> Option<ImeView> {
+        let buf = self.asr.lock().unwrap().clone()?;
+        let cur_version = buf.version();
+        self.with_ctx(ctx, |disp, pc| {
+            use crate::state::ComposeState;
+            if pc.sm.state != ComposeState::Voice || pc.sm.voice_version == cur_version {
+                return None;
+            }
+            Some(pc.sm.refresh_voice(disp))
+        })
     }
 
     /// Load an English user dictionary from a TSV file.
@@ -555,6 +585,83 @@ mod tests {
         assert_eq!(e.buffer(), "n");
         e.predict(InputEvent::backspace());
         assert!(e.buffer().is_empty());
+    }
+
+    #[test]
+    fn asr_voice_anchor_live_then_final_then_commit() {
+        use std::sync::Arc;
+        use crate::asr_buffer::AsrBuffer;
+        let mut e = eng();
+        let buf = Arc::new(AsrBuffer::new());
+        e.set_asr_buffer(Arc::clone(&buf));
+
+        // type #asr → Voice mode, preview candidate (no voice data yet)
+        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        let cands = e.candidates();
+        assert!(cands.iter().any(|c| c.contains("语音识别中")), "preview when empty: {cands:?}");
+
+        // voice streams → live candidate appears; voice_tick rebuilds it
+        buf.set_live("你好");
+        assert!(e.voice_tick().is_some(), "tick rebuilds after set_live");
+        let cands = e.candidates();
+        assert!(cands.iter().any(|c| c == "你好"), "live candidate shown: {cands:?}");
+
+        // Stage2 final → becomes #1
+        buf.push_final("你好世界");
+        assert!(e.voice_tick().is_some());
+        let cands = e.candidates();
+        assert_eq!(cands.first(), Some(&"你好世界".to_string()), "final is #1: {cands:?}");
+
+        // a second tick with no change → None
+        assert!(e.voice_tick().is_none(), "no rebuild when version unchanged");
+
+        // space commits #1 → 上屏; back to idle
+        let v = e.predict(InputEvent::space());
+        assert_eq!(ImeView::str_field(&v.commit_text), "你好世界");
+        assert!(e.candidates().is_empty(), "candidates cleared after commit");
+    }
+
+    #[test]
+    fn asr_voice_escape_cancels() {
+        use std::sync::Arc;
+        use crate::asr_buffer::AsrBuffer;
+        let mut e = eng();
+        let buf = Arc::new(AsrBuffer::new());
+        e.set_asr_buffer(Arc::clone(&buf));
+        buf.push_final("识别文本");
+        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        e.voice_tick();
+        // Escape → cancel (no commit), back to idle
+        let v = e.predict(InputEvent::escape());
+        assert!(ImeView::str_field(&v.commit_text).is_empty(), "escape commits nothing");
+        assert!(e.candidates().is_empty(), "cleared after escape");
+    }
+
+    #[test]
+    fn asr_voice_active_live_is_candidate_1() {
+        use std::sync::Arc;
+        use crate::asr_buffer::AsrBuffer;
+        let mut e = eng();
+        let buf = Arc::new(AsrBuffer::new());
+        e.set_asr_buffer(Arc::clone(&buf));
+        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        // two settled finals, then a 3rd utterance starts streaming (live)
+        buf.push_final("第一句");
+        buf.push_final("第二句");
+        buf.set_live("第三句流式中");
+        e.voice_tick();
+        let cands = e.candidates();
+        // live (the active one) is #1; then finals newest→oldest
+        assert_eq!(cands[0], "第三句流式中", "live is #1: {cands:?}");
+        assert_eq!(cands[1], "第二句", "newest final is #2");
+        assert_eq!(cands[2], "第一句", "older final is #3");
+
+        // when the live utterance settles, it graduates to #1 (still newest)
+        buf.push_final("第三句定稿");
+        e.voice_tick();
+        let cands = e.candidates();
+        assert_eq!(cands[0], "第三句定稿", "settled live becomes #1: {cands:?}");
+        assert_eq!(cands[1], "第二句");
     }
 
     #[test]

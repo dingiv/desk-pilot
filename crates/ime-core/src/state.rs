@@ -31,7 +31,7 @@ use crate::platform::{CANDIDATE_SLOTS, ImeView};
 use crate::PinyinEngine;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ComposeState { #[default] Idle, Snippet, Pinyin }
+pub enum ComposeState { #[default] Idle, Snippet, Pinyin, Voice }
 
 #[derive(Debug, Clone, Default)]
 pub struct StateMachine {
@@ -62,6 +62,9 @@ pub struct StateMachine {
     /// shown as a candidate rather than auto-committed. Space/digit to
     /// commit, Enter to force raw text.
     pending_expansion: Option<String>,
+    /// Last `AsrBuffer::version()` seen while in [`Voice`](ComposeState::Voice) state. The engine's
+    /// `voice_tick` compares it to detect "voice data changed → rebuild the candidate view".
+    pub voice_version: u64,
 }
 
 impl StateMachine {
@@ -72,6 +75,7 @@ impl StateMachine {
             ComposeState::Idle => self.handle_idle(ch, env),
             ComposeState::Snippet => self.handle_snippet(ch, env),
             ComposeState::Pinyin => self.handle_pinyin(ch, env),
+            ComposeState::Voice => self.handle_voice(ch, env),
         }
     }
 
@@ -267,11 +271,17 @@ impl StateMachine {
 
         match env.matcher().step(&self.buffer, ch) {
             Match::Complete { expansion, .. } => {
-                // Store the expansion as a pending candidate — don't auto-expand.
                 self.buffer.push(ch);
+                // `#asr` (expansion `__ASR_BUFFER__`) enters Voice mode — a live candidate that
+                // tracks the aura stream + accumulated finals. Other snippets expand statically.
+                if expansion == "__ASR_BUFFER__" {
+                    self.state = ComposeState::Voice;
+                    self.pending_expansion = None;
+                    return self.refresh_voice(env);
+                }
+                // Store the expansion as a pending candidate — don't auto-expand.
                 self.preedit = self.buffer.clone();
                 self.cursor = self.preedit.len();
-                // Show expansion as candidate.
                 let expanded = match env.expander().expand(&expansion) {
                     Ok(t) => t,
                     Err(e) => { tracing::warn!(error = %e, "expand failed"); expansion.clone() }
@@ -476,6 +486,65 @@ impl StateMachine {
         };
         Self::commit_view(&text)
     }
+
+    // ── Voice (#asr live mode) ────────────────────────────────────────
+
+    /// Rebuild Voice-mode candidates from the asr buffer: `[live (current streaming), finals (newest
+    /// →oldest)]`. The **active** utterance (live) is #1 — the one the user is currently producing
+    /// is most prominent; when it settles (Final) it graduates into `finals` (head = still #1, since
+    /// `push_final` clears live). So newest is always #1. Called on entering Voice and by the
+    /// engine's `voice_tick` whenever `asr_buffer.version()` advances.
+    pub fn refresh_voice(&mut self, env: &dyn StepEnv) -> ImeView {
+        let mut cands: Vec<String> = match env.asr_buffer() {
+            Some(buf) => {
+                let (finals, live) = buf.voice_candidates();
+                let mut v: Vec<String> = Vec::new();
+                if !live.is_empty() { v.push(live); }   // active streaming → #1
+                v.extend(finals);                        // then settled, newest→oldest
+                v
+            }
+            None => Vec::new(),
+        };
+        let empty = cands.is_empty();
+        if empty {
+            cands = vec!["语音识别中...".to_string()]; // preview placeholder until voice arrives
+        }
+        self.candidates = cands;
+        self.candidates_fresh = true;
+        self.candidate_highlight = 0;
+        self.candidate_page = 0;
+        self.full_comp_count = self.candidates.len();
+        self.partial_commit_indices = vec![false; self.candidates.len()];
+        self.preedit = if empty { "🎙 #asr …".to_string() } else { "🎙 #asr".to_string() };
+        self.cursor = self.preedit.len();
+        if let Some(buf) = env.asr_buffer() {
+            self.voice_version = buf.version();
+        }
+        self.make_view()
+    }
+
+    /// In Voice mode: Space commits candidate #1 (the latest final, or live); Escape / Enter /
+    /// Backspace cancel back to Idle; any other key passes through (Voice stays active so the
+    /// user can keep watching the live candidate).
+    fn handle_voice(&mut self, ch: char, _env: &dyn StepEnv) -> ImeView {
+        match ch {
+            ' ' => {
+                let text = self.candidates.first().cloned().unwrap_or_default();
+                self.reset();
+                // Preview ("...") or empty → commit nothing (voice hasn't produced a final yet).
+                if text.is_empty() || text.ends_with("...") {
+                    Self::commit_view("")
+                } else {
+                    Self::commit_view(&text)
+                }
+            }
+            '\x1b' | '\n' | '\r' | '\x08' => {
+                self.reset();
+                ImeView::empty()
+            }
+            _ => Self::passthrough_view(),
+        }
+    }
 }
 
 /// Borrowed engine components needed by the FSM to evaluate transitions.
@@ -495,4 +564,7 @@ pub trait StepEnv {
 
     /// Called after a multi-step composition completes.
     fn learn_phrase(&self, pinyin: &str, hanzi: &str);
+
+    /// The attached voice buffer, if any (for the Voice state's live candidates).
+    fn asr_buffer(&self) -> Option<std::sync::Arc<crate::asr_buffer::AsrBuffer>>;
 }

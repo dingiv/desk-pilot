@@ -80,6 +80,12 @@ impl Expander {
         *self.asr.lock().unwrap() = Some(buf);
     }
 
+    /// Access the attached voice buffer (if any). Used by the FSM's Voice state to build live
+    /// candidates from `voice_candidates()`.
+    pub fn asr_buffer(&self) -> Option<std::sync::Arc<AsrBuffer>> {
+        self.asr.lock().unwrap().clone()
+    }
+
     /// Expand a template string. Variables are `$NAME` or `${NAME}`.
     /// `$CURSOR` is replaced with an empty string (the caller is expected to
     /// record the cursor position from the pre-expansion string length).
@@ -261,7 +267,7 @@ mod tests {
         use crate::asr_buffer::AsrBuffer;
         let buf = std::sync::Arc::new(AsrBuffer::new());
         // Buffer exists but is empty → preview.
-        let mut exp = expander();
+        let exp = expander();
         exp.set_asr_buffer(buf);
         assert_eq!(exp.expand("__ASR_BUFFER__").unwrap(), "语音识别中...");
     }
@@ -271,7 +277,7 @@ mod tests {
         use crate::asr_buffer::AsrBuffer;
         let buf = std::sync::Arc::new(AsrBuffer::new());
         buf.update("今天天气不错");
-        let mut exp = expander();
+        let exp = expander();
         exp.set_asr_buffer(buf);
         assert_eq!(exp.expand("__ASR_BUFFER__").unwrap(), "今天天气不错");
     }
@@ -281,7 +287,7 @@ mod tests {
         use crate::asr_buffer::AsrBuffer;
         let buf = std::sync::Arc::new(AsrBuffer::new());
         buf.update("提交测试文本");
-        let mut exp = expander();
+        let exp = expander();
         exp.set_asr_buffer(buf);
         // __ASR_SUBMIT__ uses snapshot(), not take() — survives multiple calls.
         assert_eq!(exp.expand("__ASR_SUBMIT__").unwrap(), "提交测试文本");
@@ -297,7 +303,7 @@ mod tests {
     fn asr_submit_empty_buffer_returns_empty() {
         use crate::asr_buffer::AsrBuffer;
         let buf = std::sync::Arc::new(AsrBuffer::new());
-        let mut exp = expander();
+        let exp = expander();
         exp.set_asr_buffer(buf);
         // __ASR_SUBMIT__ with empty buffer → empty (not preview "...")
         assert_eq!(exp.expand("__ASR_SUBMIT__").unwrap(), "");

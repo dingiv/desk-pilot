@@ -52,7 +52,7 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
     // ── Voice input: spawn aura SSE client + attach buffer to engine ──
     let asr_buffer = Arc::new(AsrBuffer::new());
     engine.set_asr_buffer(Arc::clone(&asr_buffer));
-    crate::bridge::spawn_aura_sse(asr_buffer, None);
+    crate::bridge::spawn_aura_client(asr_buffer, None);
     // ──────────────────────────────────────────────────────────────────
 
     // ── English user dictionary ──

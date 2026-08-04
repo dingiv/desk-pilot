@@ -20,14 +20,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 
+use swift_ime::bridge::{AuraConn, AuraConnHandle};
 use swift_ime::frontends::mock::MockConfig;
 
-const POLL_MS: u64 = 200;
+const POLL_MS: u64 = 100; // voice live-refresh cadence (was 200)
 
 // ── Entry point ────────────────────────────────────────────────────────
 
 pub fn run(cfg: MockConfig) -> io::Result<()> {
-    let (mut engine, asr_buffer) = swift_ime::frontends::mock::build_engine(&cfg);
+    let (mut engine, asr_buffer, aura_status) = swift_ime::frontends::mock::build_engine(&cfg);
 
     let mut history: Vec<String> = Vec::new();
 
@@ -35,7 +36,7 @@ pub fn run(cfg: MockConfig) -> io::Result<()> {
     io::stdout().execute(crossterm::terminal::EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
-    let res = run_loop(&mut terminal, &mut engine, &asr_buffer, &mut history);
+    let res = run_loop(&mut terminal, &mut engine, &asr_buffer, &aura_status, &mut history);
 
     disable_raw_mode()?;
     io::stdout().execute(crossterm::terminal::LeaveAlternateScreen)?;
@@ -48,13 +49,14 @@ fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     engine: &mut ImeEngine,
     asr_buffer: &AsrBuffer,
+    aura_status: &Option<AuraConnHandle>,
     history: &mut Vec<String>,
 ) -> io::Result<()> {
     let mut last_view = ImeView::empty();
     let mut should_quit = false;
 
     while !should_quit {
-        terminal.draw(|f| render(f, &last_view, history, asr_buffer))?;
+        terminal.draw(|f| render(f, &last_view, history, asr_buffer, aura_status))?;
 
         if event::poll(Duration::from_millis(POLL_MS))? {
             if let Event::Key(key) = event::read()? {
@@ -107,6 +109,12 @@ fn run_loop(
             }
             last_view = view;
         }
+
+        // ── Voice live-refresh ── in `#asr` (Voice) mode, rebuild the candidate view when the
+        // aura stream advanced (new interim/calibrated/final), without a keypress.
+        if let Some(v) = engine.voice_tick() {
+            last_view = v;
+        }
     }
 
     Ok(())
@@ -114,7 +122,13 @@ fn run_loop(
 
 // ── Render ─────────────────────────────────────────────────────────────
 
-fn render(f: &mut Frame, view: &ImeView, history: &[String], asr_buffer: &AsrBuffer) {
+fn render(
+    f: &mut Frame,
+    view: &ImeView,
+    history: &[String],
+    asr_buffer: &AsrBuffer,
+    aura_status: &Option<AuraConnHandle>,
+) {
     let area = f.area();
 
     let rows = Layout::vertical([
@@ -128,7 +142,7 @@ fn render(f: &mut Frame, view: &ImeView, history: &[String], asr_buffer: &AsrBuf
     render_preedit(f, rows[0], view);
     render_candidates(f, rows[1], view);
     render_history(f, rows[2], history);
-    render_status(f, rows[3], view, asr_buffer);
+    render_status(f, rows[3], view, asr_buffer, aura_status);
 }
 
 fn render_preedit(f: &mut Frame, area: Rect, view: &ImeView) {
@@ -187,9 +201,23 @@ fn render_history(f: &mut Frame, area: Rect, history: &[String]) {
     f.render_widget(p, area);
 }
 
-fn render_status(f: &mut Frame, _area: Rect, view: &ImeView, asr_buffer: &AsrBuffer) {
+fn render_status(
+    f: &mut Frame,
+    _area: Rect,
+    view: &ImeView,
+    asr_buffer: &AsrBuffer,
+    aura_status: &Option<AuraConnHandle>,
+) {
     let voice = asr_buffer.snapshot();
     let vs = if voice.is_empty() { "ASR: idle".into() } else { format!("ASR: {}", &voice[..voice.len().min(30)]) };
+    let aura = match aura_status {
+        Some(h) => match h.get() {
+            AuraConn::Connected => Span::styled(" aura:✓ ", Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            AuraConn::Disconnected => Span::styled(" aura:✗ ", Style::new().fg(Color::Red)),
+            AuraConn::Connecting => Span::styled(" aura:… ", Style::new().fg(Color::Yellow)),
+        },
+        None => Span::styled(" aura:off ", Style::new().fg(Color::DarkGray)),
+    };
     let line = Line::from(vec![
         Span::styled(" ESC:quit ", Style::new().fg(Color::DarkGray)),
         Span::styled(" Space:commit ", Style::new().fg(Color::Green)),
@@ -197,6 +225,7 @@ fn render_status(f: &mut Frame, _area: Rect, view: &ImeView, asr_buffer: &AsrBuf
         Span::styled(" Tab:next ", Style::new().fg(Color::DarkGray)),
         Span::styled(" PgUp/Dn:page ", Style::new().fg(Color::DarkGray)),
         Span::styled(" 1-9:select ", Style::new().fg(Color::DarkGray)),
+        aura,
         Span::styled(format!(" | {vs}"), Style::new().fg(Color::Gray)),
     ]);
     let _ = view;

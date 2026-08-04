@@ -51,14 +51,14 @@ impl Default for MockConfig {
 /// Run batch evaluation against a test cases file.
 pub fn run_cases_mode(cfg: &MockConfig, cases_path: &str) {
     crate::logger::init_default();
-    let (mut engine, _) = build_engine(cfg);
+    let (mut engine, _, _) = build_engine(cfg);
     run_cases(&mut engine, cases_path, cfg.verbose);
 }
 
 /// Run single-input mode (show candidates or commit).
 pub fn run_input_mode(cfg: &MockConfig) {
     crate::logger::init_default();
-    let (mut engine, asr) = build_engine(cfg);
+    let (mut engine, asr, _) = build_engine(cfg);
     let input = cfg.input.as_deref().unwrap_or("");
     if cfg.async_wait > 0 { wait_for_voice(&asr, cfg.async_wait); }
     if cfg.commit {
@@ -68,8 +68,9 @@ pub fn run_input_mode(cfg: &MockConfig) {
     }
 }
 
-/// Build the IME engine with all config applied.
-pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<AsrBuffer>) {
+/// Build the IME engine with all config applied. Returns the engine, the shared voice buffer,
+/// and (if connecting to aura) a connectivity handle for the frontend to display.
+pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<AsrBuffer>, Option<crate::bridge::AuraConnHandle>) {
     let sw_cfg = if let Some(ref path) = cfg.config {
         match std::fs::read_to_string(path) {
             Ok(yaml) => match serde_yaml::from_str::<crate::config::SwiftImeConfig>(&yaml) {
@@ -107,15 +108,17 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<AsrBuffer>) {
     }
     engine.set_asr_buffer(Arc::clone(&asr_buffer));
 
-    if cfg.connect_aura || cfg.aura_addr.is_some() {
+    let aura_status = if cfg.connect_aura || cfg.aura_addr.is_some() {
         let addr = cfg.aura_addr.as_deref().unwrap_or("127.0.0.1:9091");
-        crate::ime_log!("connecting to aura SSE: {addr}");
-        crate::bridge::spawn_aura_sse(Arc::clone(&asr_buffer), Some(addr));
-    }
+        crate::ime_log!("connecting to aura: {addr}");
+        Some(crate::bridge::spawn_aura_client(Arc::clone(&asr_buffer), Some(addr)))
+    } else {
+        None
+    };
 
     let home = std::env::var("HOME").unwrap_or_default();
     engine.init_store(&format!("{home}/.desk-pilot/swift-ime.db"));
-    (engine, asr_buffer)
+    (engine, asr_buffer, aura_status)
 }
 
 // ── Async wait ─────────────────────────────────────────────────────────
