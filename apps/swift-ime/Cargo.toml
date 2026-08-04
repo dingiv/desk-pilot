@@ -14,7 +14,7 @@ name = "swift-ime"
 path = "src/main.rs"
 
 [dependencies]
-ime-core = { workspace = true }
+ime-core = { workspace = true, features = ["http"] }
 inputx-fsa = "1"
 shared = { path = "../../crates/shared", features = ["log"] }
 tracing = { workspace = true }

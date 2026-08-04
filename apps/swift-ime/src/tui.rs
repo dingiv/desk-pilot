@@ -110,9 +110,10 @@ fn run_loop(
             last_view = view;
         }
 
-        // ── Voice live-refresh ── in `#asr` (Voice) mode, rebuild the candidate view when the
-        // aura stream advanced (new interim/calibrated/final), without a keypress.
-        if let Some(v) = engine.voice_tick() {
+        // ── Magic live-refresh ── while a live magic command is active (`#asr`
+        // voice anchor, `#req` HTTP request, …), rebuild the candidate view when
+        // the member's async state advanced, without a keypress.
+        if let Some(v) = engine.magic_tick() {
             last_view = v;
         }
     }

@@ -11,7 +11,7 @@ use crate::family::english::EnglishFamily;
 use crate::family::magic::MagicFamily;
 use crate::family::pinyin::PinyinFamily;
 use crate::family::snippet::SnippetFamily;
-use crate::family::UnifiedScorer;
+use crate::family::{CandidateFamily, UnifiedScorer};
 use crate::matcher::Matcher;
 use crate::family::pinyin::engine::InputxPinyin;
 use crate::platform::ImeView;
@@ -24,6 +24,9 @@ pub struct Dispatcher {
     expander: Expander,
     pinyin: Box<dyn PinyinEngine>,
     scorer: UnifiedScorer,
+    /// The magic command registry — same `Arc` the engine holds, so late resource
+    /// attachment (voice buffer, req base) is visible to the FSM and the members.
+    magic: Arc<MagicFamily>,
 }
 
 impl Dispatcher {
@@ -36,20 +39,22 @@ impl Dispatcher {
         expander: Expander,
         weights: crate::family::pinyin::PinyinWeights,
     ) -> Self {
-        Self::with_config(matcher, expander, weights, 65, crate::family::english::EnglishWeights::default())
+        Self::with_config(matcher, expander, Arc::new(MagicFamily::new()), weights, 65, crate::family::english::EnglishWeights::default())
     }
 
-    /// Full constructor with configurable English family settings.
+    /// Full constructor with configurable English family settings. `magic` is the
+    /// shared registry — the engine keeps the same `Arc` for resource attachment.
     pub fn with_config(
         matcher: Matcher,
         expander: Expander,
+        magic: Arc<MagicFamily>,
         pinyin_weights: crate::family::pinyin::PinyinWeights,
         english_priority: u32,
         english_weights: crate::family::english::EnglishWeights,
     ) -> Self {
         let pinyin_family = PinyinFamily::with_weights(pinyin_weights);
         let snippet_family = SnippetFamily::new(matcher.clone(), expander.clone());
-        let magic_family = MagicFamily::new();
+        let magic_family: Box<dyn CandidateFamily> = Box::new((*magic).clone());
         let english_family = EnglishFamily::with_default_dict()
             .with_config(english_priority, english_weights);
         let emoji_family = EmojiFamily::new();
@@ -58,7 +63,7 @@ impl Dispatcher {
         // Build in priority order.
         let scorer = UnifiedScorer::new(vec![
             Box::new(pinyin_family),
-            Box::new(magic_family),
+            magic_family,
             Box::new(snippet_family),
             Box::new(english_family),
             Box::new(emoji_family),
@@ -70,6 +75,7 @@ impl Dispatcher {
             expander,
             pinyin: Box::new(InputxPinyin::new()),
             scorer,
+            magic,
         }
     }
 
@@ -83,7 +89,7 @@ impl Dispatcher {
         let pinyin_only = PinyinFamily::new();
         let scorer = UnifiedScorer::new(vec![Box::new(pinyin_only)]);
 
-        Dispatcher { matcher, expander, pinyin, scorer }
+        Dispatcher { matcher, expander, pinyin, scorer, magic: Arc::new(MagicFamily::new()) }
     }
 
     pub fn process_key(&self, ch: char, sm: &mut StateMachine) -> ImeView {
@@ -147,15 +153,17 @@ impl Dispatcher {
             .and_then(|f| f.load_dict(path))
     }
 
-    /// Attach the voice buffer so `#asr` → `__ASR_BUFFER__` resolves to live
-    /// voice recognition text from the aura daemon SSE stream.
+    /// Attach the voice buffer — routed to BOTH the magic registry's shared slot
+    /// (read by the voice-family member instances) and the expander (legacy
+    /// `__ASR_BUFFER__`/`__ASR_SUBMIT__` token fallback).
     pub fn set_asr_buffer(&self, buf: std::sync::Arc<crate::asr_buffer::AsrBuffer>) {
-        self.expander.set_asr_buffer(buf);
+        self.expander.set_asr_buffer(Arc::clone(&buf));
+        self.magic.set_asr_buffer(buf);
     }
 
-    /// Access the voice buffer (if attached). For the FSM's Voice state.
-    pub fn asr_buffer(&self) -> Option<std::sync::Arc<crate::asr_buffer::AsrBuffer>> {
-        self.expander.asr_buffer()
+    /// The magic command registry.
+    pub fn magic(&self) -> &MagicFamily {
+        &self.magic
     }
 
     pub fn reload_matcher(&mut self, entries: Vec<(String, String)>) {
@@ -182,8 +190,8 @@ impl StepEnv for Dispatcher {
             fam.learn_phrase(pinyin, hanzi);
         }
     }
-    fn asr_buffer(&self) -> Option<std::sync::Arc<crate::asr_buffer::AsrBuffer>> {
-        self.expander.asr_buffer()
+    fn magic(&self) -> &MagicFamily {
+        &self.magic
     }
 }
 

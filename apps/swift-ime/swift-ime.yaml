@@ -11,7 +11,11 @@ dicts:
 families:
   pinyin:   true      # full pinyin + jianpin (Viterbi + LargeDict + PhraseBook)
   english:  true      # English word prefix matching
-  magic:    true      # #date, #asr, #password commands
+  magic:    true      # #date, #asr, #req, #password commands
+
+# ── Magic commands ──────────────────────────────────────────────────────
+magic:
+  req_base: http://127.0.0.1:14555/api   # #req backend base URL (CLI --req-base overrides)
   snippet:  true      # /greet user-defined text expansion
   emoji:    false     # emoji shorthand (reserved)
   ai:       false     # LLM sentence prediction (reserved)

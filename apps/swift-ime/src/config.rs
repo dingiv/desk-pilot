@@ -16,6 +16,27 @@ pub struct SwiftImeConfig {
     pub input: InputConfig,
     #[serde(default)]
     pub weights: WeightsConfig,
+    #[serde(default)]
+    pub magic: MagicConfig,
+}
+
+/// `#req` magic-command backend configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MagicConfig {
+    /// Base URL the `#req` command appends its suffix to
+    /// (e.g. `#req/news?query=soccer` → `GET {req_base}/news?query=soccer`).
+    #[serde(default = "default_req_base")]
+    pub req_base: String,
+}
+
+fn default_req_base() -> String {
+    ime_core::family::magic::DEFAULT_REQ_BASE.to_string()
+}
+
+impl Default for MagicConfig {
+    fn default() -> Self {
+        MagicConfig { req_base: default_req_base() }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -188,6 +209,7 @@ impl Default for SwiftImeConfig {
             families: FamiliesConfig::default(),
             input: InputConfig { fuzzy: true, page_size: 7 },
             weights: WeightsConfig::default(),
+            magic: MagicConfig::default(),
         }
     }
 }

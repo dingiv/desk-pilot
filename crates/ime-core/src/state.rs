@@ -26,14 +26,15 @@
 //! the PhraseBook for future sessions.
 
 use crate::expander::Expander;
+use crate::family::magic::{MagicMember, MemberAction};
 use crate::matcher::{Match, Matcher};
 use crate::platform::{CANDIDATE_SLOTS, ImeView};
 use crate::PinyinEngine;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ComposeState { #[default] Idle, Snippet, Pinyin, Voice }
+pub enum ComposeState { #[default] Idle, Snippet, Pinyin, Magic }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub struct StateMachine {
     pub state: ComposeState,
     /// Raw pinyin buffer — remaining uncommitted pinyin syllables.
@@ -62,13 +63,27 @@ pub struct StateMachine {
     /// shown as a candidate rather than auto-committed. Space/digit to
     /// commit, Enter to force raw text.
     pending_expansion: Option<String>,
-    /// Last `AsrBuffer::version()` seen while in [`Voice`](ComposeState::Voice) state. The engine's
-    /// `voice_tick` compares it to detect "voice data changed → rebuild the candidate view".
-    pub voice_version: u64,
-    /// Full (un-truncated) texts of the Voice-mode candidates, parallel to [`Self::candidates`].
-    /// `candidates` holds the **preview** (short, for display); `voice_full` holds the **full**
-    /// text (committed by Space). Populated by [`Self::refresh_voice`], cleared by [`Self::reset`].
-    pub voice_full: Vec<String>,
+    /// The active live magic command (`#asr` voice anchor, `#req` HTTP request, …).
+    /// `Some` only while in [`Magic`](ComposeState::Magic) state. Each activation
+    /// spawns a fresh instance from the [`MagicFamily`] registry.
+    pub magic_member: Option<Box<dyn MagicMember>>,
+}
+
+impl std::fmt::Debug for StateMachine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateMachine")
+            .field("state", &self.state)
+            .field("buffer", &self.buffer)
+            .field("preedit", &self.preedit)
+            .field("cursor", &self.cursor)
+            .field("candidates", &self.candidates)
+            .field("candidate_highlight", &self.candidate_highlight)
+            .field(
+                "magic_member",
+                &self.magic_member.as_ref().map(|m| m.name()),
+            )
+            .finish()
+    }
 }
 
 impl StateMachine {
@@ -79,7 +94,33 @@ impl StateMachine {
             ComposeState::Idle => self.handle_idle(ch, env),
             ComposeState::Snippet => self.handle_snippet(ch, env),
             ComposeState::Pinyin => self.handle_pinyin(ch, env),
-            ComposeState::Voice => self.handle_voice(ch, env),
+            ComposeState::Magic => self.handle_magic(ch, env),
+        }
+    }
+
+    /// Magic (`#`-command live mode): route the key to the active member. The member
+    /// is temporarily taken out of the state machine so it can freely mutate the
+    /// state, then put back — or dropped on Commit/Exit (after `deactivate`).
+    fn handle_magic(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
+        let Some(mut member) = self.magic_member.take() else {
+            self.reset();
+            return ImeView::empty();
+        };
+        match member.on_key(self, ch, env) {
+            MemberAction::View(view) => {
+                self.magic_member = Some(member);
+                view
+            }
+            MemberAction::Commit(text) => {
+                member.deactivate();
+                self.reset();
+                Self::commit_view(&text)
+            }
+            MemberAction::Exit => {
+                member.deactivate();
+                self.reset();
+                ImeView::empty()
+            }
         }
     }
 
@@ -139,6 +180,11 @@ impl StateMachine {
     }
 
     pub fn reset(&mut self) {
+        // Drop the active magic member (after deactivate) — its per-session state
+        // goes with it; shared resources (voice slot, req fetcher) survive via Arc.
+        if let Some(mut m) = self.magic_member.take() {
+            m.deactivate();
+        }
         self.state = ComposeState::Idle;
         self.buffer.clear();
         self.preedit.clear();
@@ -152,7 +198,6 @@ impl StateMachine {
         self.full_comp_count = 0;
         self.partial_commit_indices.clear();
         self.pending_expansion = None;
-        self.voice_full.clear();
     }
 
     pub fn move_highlight(&mut self, delta: i32) {
@@ -190,19 +235,22 @@ impl StateMachine {
         ImeView::set_str(&mut view.aux_up, &self.preedit);
     }
 
-    fn make_view(&self) -> ImeView {
+    /// Build a view from the current state (no key processed). Used by the state
+    /// machine itself and by magic members rendering their candidates.
+    pub(crate) fn make_view(&self) -> ImeView {
         let mut v = ImeView::empty();
         self.fill_view(&mut v);
         v
     }
 
-    fn commit_view(text: &str) -> ImeView {
+    pub(crate) fn commit_view(text: &str) -> ImeView {
         let mut v = ImeView::empty();
         ImeView::set_str(&mut v.commit_text, text);
         v
     }
 
-    fn passthrough_view() -> ImeView {
+    /// View that passes the current key through to the application untouched.
+    pub(crate) fn passthrough_view() -> ImeView {
         let mut v = ImeView::empty();
         v.key_passthrough = 1;
         v
@@ -277,12 +325,16 @@ impl StateMachine {
         match env.matcher().step(&self.buffer, ch) {
             Match::Complete { expansion, .. } => {
                 self.buffer.push(ch);
-                // `#asr` (expansion `__ASR_BUFFER__`) enters Voice mode — a live candidate that
-                // tracks the aura stream + accumulated finals. Other snippets expand statically.
-                if expansion == "__ASR_BUFFER__" {
-                    self.state = ComposeState::Voice;
+                // Live magic commands (e.g. `#asr`, `#req`) enter Magic mode — the registry
+                // spawns a member instance that owns the interactive session (keys + async
+                // ticks are routed to it). Static expansions go the pending-candidate path.
+                if let Some(member) = env.magic().spawn(&expansion) {
+                    let mut member = member;
+                    self.state = ComposeState::Magic;
                     self.pending_expansion = None;
-                    return self.refresh_voice(env);
+                    let view = member.activate(self, env);
+                    self.magic_member = Some(member);
+                    return view;
                 }
                 // Store the expansion as a pending candidate — don't auto-expand.
                 self.preedit = self.buffer.clone();
@@ -492,92 +544,6 @@ impl StateMachine {
         Self::commit_view(&text)
     }
 
-    // ── Voice (#asr live mode) ────────────────────────────────────────
-
-    /// Maximum displayed bytes for a voice candidate **preview** (≈20 CJK chars). Longer texts get
-    /// `"first…"` — the full text is committed by Space from [`Self::voice_full`], so truncation
-    /// here is cosmetic.
-    const VOICE_PREVIEW_MAX: usize = 60;
-
-    /// Build a display-friendly preview: first [`VOICE_PREVIEW_MAX`] bytes (char-boundary-safe)
-    /// + `…` if truncated. The full text is in [`Self::voice_full`] for commit.
-    fn voice_preview(text: &str) -> String {
-        let bytes = text.as_bytes();
-        if bytes.len() <= Self::VOICE_PREVIEW_MAX {
-            return text.to_string();
-        }
-        let mut end = Self::VOICE_PREVIEW_MAX;
-        while end > 0 && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…", &text[..end])
-    }
-
-    /// Rebuild Voice-mode candidates from the asr buffer. `self.candidates` = **previews** (short,
-    /// for display); `self.voice_full` = **full texts** (committed by Space). Order: `[live, finals
-    /// (newest→oldest)]` — the active utterance is #1.
-    pub fn refresh_voice(&mut self, env: &dyn StepEnv) -> ImeView {
-        let full: Vec<String> = match env.asr_buffer() {
-            Some(buf) => {
-                let (finals, live) = buf.voice_candidates();
-                let mut v: Vec<String> = Vec::new();
-                if !live.is_empty() { v.push(live); }   // active streaming → #1
-                v.extend(finals);                        // then settled, newest→oldest
-                v
-            }
-            None => Vec::new(),
-        };
-        let empty = full.is_empty();
-        self.voice_full = full.clone();
-        let mut previews: Vec<String> = full.iter().map(|t| Self::voice_preview(t)).collect();
-        if empty {
-            previews = vec!["语音识别中...".to_string()]; // placeholder until voice arrives
-            self.voice_full.clear();
-        }
-        self.candidates = previews;
-        tracing::debug!(
-            previews = ?self.candidates,
-            full = ?self.voice_full,
-            "voice candidates rebuilt"
-        );
-        self.candidates_fresh = true;
-        self.candidate_highlight = 0;
-        self.candidate_page = 0;
-        self.full_comp_count = self.candidates.len();
-        self.partial_commit_indices = vec![false; self.candidates.len()];
-        self.preedit = if empty { "🎙 #asr …".to_string() } else { "🎙 #asr".to_string() };
-        self.cursor = self.preedit.len();
-        if let Some(buf) = env.asr_buffer() {
-            self.voice_version = buf.version();
-        }
-        self.make_view()
-    }
-
-    /// In Voice mode: Space commits candidate #1 (the latest final, or live); Escape / Enter /
-    /// Backspace cancel back to Idle; any other key passes through (Voice stays active so the
-    /// user can keep watching the live candidate).
-    fn handle_voice(&mut self, ch: char, _env: &dyn StepEnv) -> ImeView {
-        match ch {
-            ' ' => {
-                // Commit the FULL text (voice_full), not the display preview (candidates).
-                // candidates holds a truncated preview; voice_full holds the real sentence.
-                let text = self.voice_full.first().cloned()
-                    .unwrap_or_else(|| self.candidates.first().cloned().unwrap_or_default());
-                self.reset();
-                // Preview ("...") or empty → commit nothing (voice hasn't produced a final yet).
-                if text.is_empty() || text.ends_with("...") {
-                    Self::commit_view("")
-                } else {
-                    Self::commit_view(&text)
-                }
-            }
-            '\x1b' | '\n' | '\r' | '\x08' => {
-                self.reset();
-                ImeView::empty()
-            }
-            _ => Self::passthrough_view(),
-        }
-    }
 }
 
 /// Borrowed engine components needed by the FSM to evaluate transitions.
@@ -598,6 +564,7 @@ pub trait StepEnv {
     /// Called after a multi-step composition completes.
     fn learn_phrase(&self, pinyin: &str, hanzi: &str);
 
-    /// The attached voice buffer, if any (for the Voice state's live candidates).
-    fn asr_buffer(&self) -> Option<std::sync::Arc<crate::asr_buffer::AsrBuffer>>;
+    /// The magic command registry — spawns live member instances on trigger
+    /// completion, holds the shared resources (voice slot, req config).
+    fn magic(&self) -> &crate::family::magic::MagicFamily;
 }

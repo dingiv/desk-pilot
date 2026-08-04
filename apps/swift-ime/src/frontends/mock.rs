@@ -30,6 +30,8 @@ pub struct MockConfig {
     pub surrounding: Option<String>,
     pub en_user_dict: Option<String>,
     pub en_dicts: Vec<String>,
+    /// `#req` backend base URL — CLI override of `magic.req_base` config.
+    pub req_base: Option<String>,
 }
 
 impl Default for MockConfig {
@@ -37,6 +39,7 @@ impl Default for MockConfig {
         MockConfig {
             cases: None, input: None,
             top_n: 160, verbose: true,
+            req_base: None,
             config: None, asr_text: None,
             commit: false, async_wait: 0,
             connect_aura: false, aura_addr: None,
@@ -107,6 +110,11 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<AsrBuffer>, Option<crat
         crate::ime_log!("asr mock text: {text}");
     }
     engine.set_asr_buffer(Arc::clone(&asr_buffer));
+
+    // `#req` backend base URL — CLI `--req-base` overrides `magic.req_base` config.
+    let req_base = cfg.req_base.clone().unwrap_or_else(|| sw_cfg.magic.req_base.clone());
+    engine.set_req_base(&req_base);
+    crate::ime_log!("#req base: {req_base}");
 
     let aura_status = if cfg.connect_aura || cfg.aura_addr.is_some() {
         let addr = cfg.aura_addr.as_deref().unwrap_or("127.0.0.1:9091");

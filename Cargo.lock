@@ -3917,6 +3917,7 @@ version = "0.1.0"
 dependencies = [
  "inputx-fsa",
  "inputx-pinyin",
+ "reqwest 0.12.28",
  "rusqlite",
  "serde",
  "serde_json",

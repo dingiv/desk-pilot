@@ -24,11 +24,12 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::dispatcher::Dispatcher;
 use crate::family::InputContext;
+use crate::family::magic::{MagicFamily, ReqFetcher};
 use crate::platform::ImeView;
 use crate::special_key::{handle_special_key, SpecialKey};
 use crate::state::{StateMachine, StepEnv};
@@ -83,9 +84,10 @@ pub struct ImeEngine {
     contexts: Mutex<HashMap<usize, PerContext>>,
     async_waits: Mutex<HashMap<usize, WaitState>>,
     store: Mutex<Option<std::sync::Arc<WeightStore>>>,
-    /// Voice buffer clone (same one the dispatcher/expander holds) — `voice_tick` reads its
-    /// `version()` to drive live candidate refreshes without a keypress.
-    asr: Mutex<Option<std::sync::Arc<crate::asr_buffer::AsrBuffer>>>,
+    /// The magic command registry — same `Arc` the dispatcher holds. The engine
+    /// routes late resource attachment (voice buffer, `#req` base/fetcher) here;
+    /// the FSM spawns live member instances from it.
+    magic: Arc<MagicFamily>,
 }
 
 impl ImeEngine {
@@ -106,26 +108,26 @@ impl ImeEngine {
         english_priority: u32,
         english_weights: crate::family::english::EnglishWeights,
     ) -> Self {
-        let entries: Vec<(String, String)> = vec![
+        // Magic command entries are generated from the member registry (#asr, #flush,
+        // #submit, #req, #date, #password …) — adding a command = one member, nothing
+        // here. `/`-snippets and the `#wait` async demo stay plain matcher entries.
+        let magic = Arc::new(MagicFamily::new());
+        let mut entries = magic.matcher_entries();
+        entries.extend(vec![
             ("/greet".into(), "你好，我是 AI 秘书，请问有什么可以帮你的？".into()),
             ("/sig".into(), "Best regards,\nAlice".into()),
-            ("#date".into(), "2026-07-27".into()),
-            ("#asr".into(), "__ASR_BUFFER__".into()),
-            ("#flush".into(), "__ASR_BUFFER__".into()),
-            ("#submit".into(), "__ASR_SUBMIT__".into()),
-            ("#password".into(), "[password manager — not yet implemented]".into()),
             ("#wait".into(), "__WAIT_DEMO__".into()),
-        ];
+        ]);
         let matcher = crate::Matcher::new(entries);
         let expander = crate::Expander::new(Box::new(
             crate::expander::StaticProvider { date: String::from("2026-07-27"), clipboard: String::new() },
         ));
         let engine = ImeEngine {
-            dispatcher: Dispatcher::with_config(matcher, expander, pinyin_weights, english_priority, english_weights),
+            dispatcher: Dispatcher::with_config(matcher, expander, Arc::clone(&magic), pinyin_weights, english_priority, english_weights),
             contexts: Mutex::new(HashMap::new()),
             async_waits: Mutex::new(HashMap::new()),
             store: Mutex::new(None),
-            asr: Mutex::new(None),
+            magic,
         };
         // Load embedded base dictionary (5KB, compiled into binary).
         let count = engine.dispatcher.scorer().family("pinyin")
@@ -398,15 +400,20 @@ impl ImeEngine {
     pub fn candidates_detailed(&self) -> Vec<crate::family::RankedCandidate> {
         let map = self.contexts.lock().unwrap();
         let Some(pc) = map.get(&DEFAULT_CTX) else { return Vec::new() };
-        // Snippet/Voice state: candidates come from the Matcher trie / asr buffer, not the scorer.
-        // Return them directly so #asr / #date expansions appear correctly.
-        // For Voice, prefer the full texts (voice_full) over the display previews (candidates).
-        if pc.sm.state == crate::state::ComposeState::Voice && pc.sm.candidates_fresh {
-            let texts: &[String] = if pc.sm.voice_full.is_empty() { &pc.sm.candidates } else { &pc.sm.voice_full };
+        // Snippet/Magic state: candidates come from the Matcher trie / live member,
+        // not the scorer. Return them directly so #asr / #date expansions appear
+        // correctly. For Magic, prefer the member's full commit texts over the
+        // display previews (voice sentences / req bodies are truncated in the bar).
+        if pc.sm.state == crate::state::ComposeState::Magic && pc.sm.candidates_fresh {
+            let family: &'static str = pc.sm.magic_member.as_ref().map(|m| m.name()).unwrap_or("magic");
+            let texts: Vec<String> = match pc.sm.magic_member.as_ref() {
+                Some(m) => m.candidate_texts(&pc.sm),
+                None => pc.sm.candidates.clone(),
+            };
             return texts.iter().map(|c| crate::family::RankedCandidate {
                 text: c.clone(),
                 score: 1.0,
-                family: "asr",
+                family,
                 source: "exact",
             }).collect();
         }
@@ -496,54 +503,46 @@ impl ImeEngine {
     }
 
     /// Attach the voice buffer so `#asr` resolves to live voice recognition
-    /// text from the aura daemon SSE stream. Call once at startup after
-    /// the SSE client has been spawned. Stores a clone on the engine for `voice_tick`.
+    /// text from the aura daemon SSE stream. Call once at startup after the SSE
+    /// client has been spawned. Routed to the magic registry's shared slot —
+    /// every per-context `VoiceMember` instance reads it.
     pub fn set_asr_buffer(&self, buf: std::sync::Arc<crate::asr_buffer::AsrBuffer>) {
-        *self.asr.lock().unwrap() = Some(std::sync::Arc::clone(&buf));
         self.dispatcher.set_asr_buffer(buf);
     }
 
-    /// Poll for voice-state changes while in Voice (`#asr`) mode. If the asr buffer advanced
-    /// since the last rebuild, refresh the live candidate view (streaming + finals). Returns the
-    /// new view, or None if not in Voice mode / nothing changed. Frontends call this from their
-    /// render loop to update the candidate area without a keypress.
-    pub fn voice_tick(&self) -> Option<ImeView> {
-        self.voice_tick_ctx(DEFAULT_CTX)
+    /// `#req` backend base URL (default `http://127.0.0.1:14555/api`).
+    /// `#req/news?query=soccer` → `GET {base}/news?query=soccer`.
+    pub fn set_req_base(&self, base: &str) {
+        self.magic.set_req_base(base);
     }
 
-    pub fn voice_tick_ctx(&self, ctx: usize) -> Option<ImeView> {
-        let buf = match self.asr.lock().unwrap().clone() {
-            Some(b) => b,
-            None => {
-                tracing::warn!(ctx, "voice_tick: no asr buffer attached to engine");
-                return None;
-            }
-        };
-        let cur_version = buf.version();
+    /// Inject an HTTP fetcher for `#req` (tests use a fake; the production default
+    /// is a reqwest client behind ime-core's `http` feature).
+    pub fn set_req_fetcher(&self, fetcher: Arc<dyn ReqFetcher>) {
+        self.magic.set_req_fetcher(fetcher);
+    }
+
+    /// Poll for changes while a live magic command (`#asr` voice anchor, `#req`
+    /// HTTP request, …) is active. If the member's async state advanced, rebuild
+    /// the candidate view. Returns the new view, or None if no live command is
+    /// active / nothing changed. Frontends call this from their render loop to
+    /// update the candidate area without a keypress.
+    pub fn magic_tick(&self) -> Option<ImeView> {
+        self.magic_tick_ctx(DEFAULT_CTX)
+    }
+
+    pub fn magic_tick_ctx(&self, ctx: usize) -> Option<ImeView> {
         self.with_ctx(ctx, |disp, pc| {
             use crate::state::ComposeState;
-            if pc.sm.state != ComposeState::Voice {
-                return None; // not in voice mode for this ctx — common
+            if pc.sm.state != ComposeState::Magic {
+                return None; // not in a live command for this ctx — common
             }
-            if pc.sm.voice_version == cur_version {
-                // voice_tick IS polling this Voice ctx, but the buffer version hasn't advanced
-                // since the last rebuild (normal during silence). Trace-level to avoid spam now
-                // that the timer repeats; bump to debug/info if diagnosing a version stall.
-                tracing::trace!(
-                    ctx,
-                    voice_version = pc.sm.voice_version,
-                    cur_version,
-                    "voice_tick: Voice ctx, no version change"
-                );
-                return None;
-            }
-            tracing::debug!(
-                ctx,
-                voice_version = pc.sm.voice_version,
-                cur_version,
-                "voice_tick rebuild"
-            );
-            Some(pc.sm.refresh_voice(disp))
+            // The member is taken out so its tick can freely mutate the state
+            // machine, then put back (the member may have exited itself).
+            let mut member = pc.sm.magic_member.take()?;
+            let changed = member.tick(&mut pc.sm, disp);
+            pc.sm.magic_member = Some(member);
+            changed
         })
     }
 
@@ -631,18 +630,18 @@ mod tests {
 
         // voice streams → live candidate appears; voice_tick rebuilds it
         buf.set_live("你好");
-        assert!(e.voice_tick().is_some(), "tick rebuilds after set_live");
+        assert!(e.magic_tick().is_some(), "tick rebuilds after set_live");
         let cands = e.candidates();
         assert!(cands.iter().any(|c| c == "你好"), "live candidate shown: {cands:?}");
 
         // Stage2 final → becomes #1
         buf.push_final("你好世界");
-        assert!(e.voice_tick().is_some());
+        assert!(e.magic_tick().is_some());
         let cands = e.candidates();
         assert_eq!(cands.first(), Some(&"你好世界".to_string()), "final is #1: {cands:?}");
 
         // a second tick with no change → None
-        assert!(e.voice_tick().is_none(), "no rebuild when version unchanged");
+        assert!(e.magic_tick().is_none(), "no rebuild when version unchanged");
 
         // space commits #1 → 上屏; back to idle
         let v = e.predict(InputEvent::space());
@@ -659,7 +658,7 @@ mod tests {
         e.set_asr_buffer(Arc::clone(&buf));
         buf.push_final("识别文本");
         for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
-        e.voice_tick();
+        e.magic_tick();
         // Escape → cancel (no commit), back to idle
         let v = e.predict(InputEvent::escape());
         assert!(ImeView::str_field(&v.commit_text).is_empty(), "escape commits nothing");
@@ -678,7 +677,7 @@ mod tests {
         let mut e = eng();
         e.set_asr_buffer(Arc::clone(&buf));
         for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
-        e.voice_tick();
+        e.magic_tick();
         let cands = e.candidates();
         assert!(cands[0].ends_with('…'), "long preview has ellipsis: {}", cands[0]);
         assert!(cands[0].len() < long.len(), "preview is shorter than full ({})", cands[0].len());
@@ -699,7 +698,7 @@ mod tests {
         buf.push_final("第一句");
         buf.push_final("第二句");
         buf.set_live("第三句流式中");
-        e.voice_tick();
+        e.magic_tick();
         let cands = e.candidates();
         // live (the active one) is #1; then finals newest→oldest
         assert_eq!(cands[0], "第三句流式中", "live is #1: {cands:?}");
@@ -708,7 +707,7 @@ mod tests {
 
         // when the live utterance settles, it graduates to #1 (still newest)
         buf.push_final("第三句定稿");
-        e.voice_tick();
+        e.magic_tick();
         let cands = e.candidates();
         assert_eq!(cands[0], "第三句定稿", "settled live becomes #1: {cands:?}");
         assert_eq!(cands[1], "第二句");
@@ -736,5 +735,150 @@ mod tests {
         // A should still have "ni"
         let view = e.predict_ctx(1, ' ');
         assert!(ImeView::str_field(&view.commit_text).contains("你"));
+    }
+
+    // ── #req member ──────────────────────────────────────────────────────
+
+    /// Scripted fetcher — records the requested URL and returns a canned result.
+    #[derive(Clone)]
+    struct FakeFetcher {
+        result: Result<String, String>,
+        urls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ReqFetcher for FakeFetcher {
+        fn get(&self, url: &str) -> Result<String, String> {
+            self.urls.lock().unwrap().push(url.to_string());
+            self.result.clone()
+        }
+    }
+
+    /// Poll `magic_tick` until the worker thread's result lands (or fail).
+    fn wait_req_tick(e: &ImeEngine) {
+        for _ in 0..200 {
+            if e.magic_tick().is_some() { return; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("req result never landed");
+    }
+
+    fn req_eng() -> (ImeEngine, FakeFetcher) {
+        let e = eng();
+        let fake = FakeFetcher {
+            result: Ok("这是本地服务返回的正文内容".into()),
+            urls: Arc::new(Mutex::new(Vec::new())),
+        };
+        e.set_req_fetcher(Arc::new(fake.clone()));
+        (e, fake)
+    }
+
+    #[test]
+    fn req_anchor_hint_then_enter_fires_then_space_commits() {
+        let (mut e, fake) = req_eng();
+        for c in "#req".chars() { e.predict(InputEvent::char(c)); }
+        // Activation: hint candidate with the full URL
+        let cands = e.candidates();
+        assert!(cands.iter().any(|c| c.contains("http://127.0.0.1:14555/api")), "hint: {cands:?}");
+
+        // Enter fires the request → result lands on the worker thread
+        e.predict(InputEvent::enter());
+        wait_req_tick(&e);
+        let cands = e.candidates();
+        assert!(cands.iter().any(|c| c.contains("这是本地服务返回的正文内容")), "body shown: {cands:?}");
+        assert_eq!(fake.urls.lock().unwrap().as_slice(), ["http://127.0.0.1:14555/api"], "fired the base URL");
+
+        // Space commits the body; member exits, back to idle
+        let v = e.predict(InputEvent::space());
+        assert_eq!(ImeView::str_field(&v.commit_text), "这是本地服务返回的正文内容");
+        assert!(e.candidates().is_empty(), "cleared after commit");
+    }
+
+    #[test]
+    fn req_suffix_extends_url() {
+        let (mut e, fake) = req_eng();
+        for c in "#req/news?query=soccer".chars() { e.predict(InputEvent::char(c)); }
+        let cands = e.candidates();
+        assert!(cands.iter().any(|c| c.contains("http://127.0.0.1:14555/api/news?query=soccer")), "hint shows full URL: {cands:?}");
+
+        e.predict(InputEvent::enter());
+        wait_req_tick(&e);
+        assert_eq!(fake.urls.lock().unwrap().as_slice(), ["http://127.0.0.1:14555/api/news?query=soccer"], "fired with suffix");
+    }
+
+    #[test]
+    fn req_long_body_preview_truncates_commit_full() {
+        let body = "长正文".repeat(30); // 270 bytes, ≫ 60
+        let mut e = eng();
+        e.set_req_fetcher(Arc::new(FakeFetcher { result: Ok(body.clone()), urls: Arc::new(Mutex::new(Vec::new())) }));
+        for c in "#req".chars() { e.predict(InputEvent::char(c)); }
+        e.predict(InputEvent::enter());
+        wait_req_tick(&e);
+        let cands = e.candidates();
+        assert_eq!(cands.len(), 1, "whole body is ONE candidate: {cands:?}");
+        assert!(cands[0].ends_with('…'), "preview truncated with ellipsis: {}", cands[0]);
+        assert!(cands[0].chars().count() <= 60, "preview ≤ 60 chars: {}", cands[0]);
+        // Space commits the FULL body, not the preview
+        let v = e.predict(InputEvent::space());
+        assert_eq!(ImeView::str_field(&v.commit_text), body);
+    }
+
+    #[test]
+    fn req_failure_shows_error_and_never_commits_it() {
+        let mut e = eng();
+        e.set_req_fetcher(Arc::new(FakeFetcher { result: Err("HTTP 500".into()), urls: Arc::new(Mutex::new(Vec::new())) }));
+        for c in "#req".chars() { e.predict(InputEvent::char(c)); }
+        e.predict(InputEvent::enter());
+        wait_req_tick(&e);
+        let cands = e.candidates();
+        assert!(cands.iter().any(|c| c.contains("请求失败") && c.contains("HTTP 500")), "error shown: {cands:?}");
+
+        // Space on a failed state re-fires (no garbage commit)
+        let v = e.predict(InputEvent::space());
+        assert!(ImeView::str_field(&v.commit_text).is_empty(), "error text never committed");
+        wait_req_tick(&e);
+        // Escape cancels the session
+        let v = e.predict(InputEvent::escape());
+        assert!(ImeView::str_field(&v.commit_text).is_empty());
+        assert!(e.candidates().is_empty(), "cleared after escape");
+    }
+
+    #[test]
+    fn req_backspace_edits_suffix_then_exits() {
+        let (mut e, _fake) = req_eng();
+        for c in "#req/news".chars() { e.predict(InputEvent::char(c)); }
+        // Backspace pops one suffix char
+        e.predict(InputEvent::backspace());
+        let cands = e.candidates();
+        assert!(cands.iter().any(|c| c.contains("/new") && !c.contains("/news")), "suffix edited: {cands:?}");
+        // Delete the rest — when the suffix is empty, Backspace exits the member
+        for _ in 0..5 { e.predict(InputEvent::backspace()); }
+        assert!(e.candidates().is_empty(), "member exited when suffix emptied: {:?}", e.candidates());
+    }
+
+    #[test]
+    fn req_digit_extends_url_without_result_commits_with_result() {
+        let (mut e, fake) = req_eng();
+        for c in "#req/news".chars() { e.predict(InputEvent::char(c)); }
+        // No result yet → digit is a URL character
+        e.predict(InputEvent::char('2'));
+        e.predict(InputEvent::char('0'));
+        let cands = e.candidates();
+        assert!(cands.iter().any(|c| c.contains("/news20")), "digit appended to suffix: {cands:?}");
+
+        // Fire → result lands → digit 1 commits the body
+        e.predict(InputEvent::enter());
+        wait_req_tick(&e);
+        let v = e.predict(InputEvent::char('1'));
+        assert_eq!(ImeView::str_field(&v.commit_text), "这是本地服务返回的正文内容");
+        assert!(fake.urls.lock().unwrap().iter().any(|u| u.ends_with("/news20")), "fired with digits in URL");
+    }
+
+    #[test]
+    fn req_escape_cancels() {
+        let mut e = eng();
+        for c in "#req".chars() { e.predict(InputEvent::char(c)); }
+        let v = e.predict(InputEvent::escape());
+        assert!(ImeView::str_field(&v.commit_text).is_empty(), "escape commits nothing");
+        assert!(e.candidates().is_empty(), "cleared after escape");
     }
 }

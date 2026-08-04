@@ -43,6 +43,9 @@ struct Args {
     en_user_dict: Option<String>,
     #[arg(long)]
     en_dicts: Vec<String>,
+    /// `#req` backend base URL (default http://127.0.0.1:14555/api).
+    #[arg(long)]
+    req_base: Option<String>,
 }
 
 fn main() {
@@ -55,6 +58,7 @@ fn main() {
         connect_aura: args.aura, aura_addr: args.aura_addr,
         surrounding: args.surrounding,
         en_user_dict: args.en_user_dict, en_dicts: args.en_dicts,
+        req_base: args.req_base,
     };
 
     if let Some(ref cases_path) = cfg.cases {

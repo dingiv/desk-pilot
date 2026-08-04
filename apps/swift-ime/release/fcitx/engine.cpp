@@ -138,7 +138,7 @@ void SwiftImeEngine::startAsyncPoll() {
     if (pollTimer_) return;
     // fcitx5 recurring-timer idiom: first fire = now + period, interval = dummy, re-arm manually
     // via setTime + setOneShot in the callback (interval arg alone doesn't repeat). See
-    // startVoicePoll + fcitx5-chinese-addons/pinyincandidate.cpp.
+    // startMagicPoll + fcitx5-chinese-addons/pinyincandidate.cpp.
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t now = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
@@ -165,17 +165,19 @@ void SwiftImeEngine::startAsyncPoll() {
         });
 }
 
-// ── Voice (#asr) async-refresh timer ────────────────────────────────────
+// ── Magic live-command async-refresh timer ──────────────────────────────
 //
 // A dedicated 100 ms TimeEvent (decoupled from the #wait pollTimer_) that, for every active
-// input context, calls swift_ime_voice_tick and applies the view if the voice buffer advanced.
-// This is what makes the `#asr` candidate area update live WITHOUT a keypress — the Rust engine
-// reads the AsrBuffer (written by the background aura SSE thread) and rebuilds candidates; we
-// just push them into fcitx5's inputPanel + repaint. Runs on fcitx5's main loop → thread-safe.
+// input context, calls swift_ime_magic_tick and applies the view if the active live magic
+// member's async state advanced (voice buffer for `#asr`, HTTP result for `#req`). This is
+// what makes the candidate area update live WITHOUT a keypress — the Rust engine reads the
+// AsrBuffer (written by the background aura SSE thread) / the HTTP worker result and rebuilds
+// candidates; we just push them into fcitx5's inputPanel + repaint. Runs on fcitx5's main loop
+// → thread-safe.
 
-void SwiftImeEngine::startVoicePoll() {
-    if (voiceTimer_) return;
-    FCITX_INFO() << "voice poll timer started (100ms)";
+void SwiftImeEngine::startMagicPoll() {
+    if (magicTimer_) return;
+    FCITX_INFO() << "magic poll timer started (100ms)";
     // fcitx5's addTimeEvent does NOT auto-repeat by the interval arg. The recurring idiom (per
     // fcitx5-chinese-addons/pinyincandidate.cpp) is: first fire = now + period, interval = dummy,
     // then in the callback manually setTime(next) + setOneShot() to re-arm. Returning true alone
@@ -183,12 +185,12 @@ void SwiftImeEngine::startVoicePoll() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t now = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
-    voiceTimer_ = instance_->eventLoop().addTimeEvent(
+    magicTimer_ = instance_->eventLoop().addTimeEvent(
         CLOCK_MONOTONIC, now + 100000, 1,
         [this](fcitx::EventSourceTime *event, uint64_t time) {
             for (auto *ic : activeContexts_) {
                 ImeView view;
-                if (swift_ime_voice_tick(handle_, (void *)ic, &view)) {
+                if (swift_ime_magic_tick(handle_, (void *)ic, &view)) {
                     apply_view(ic, view);
                 }
             }
@@ -225,7 +227,7 @@ void SwiftImeEngine::activate(const fcitx::InputMethodEntry &entry,
     // Safety: ensure no stale lastView carries over from a previous session.
     lastViews_.erase(ic);
     activeContexts_.insert(ic);
-    if (!voiceTimer_) startVoicePoll();
+    if (!magicTimer_) startMagicPoll();
     swift_ime_activate(handle_, (void *)ic);
 }
 
@@ -302,12 +304,12 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
     if (!pollTimer_) {
         startAsyncPoll();
     }
-    // Track the key-receiving ic + ensure the voice-refresh timer is running. Starting here (not
+    // Track the key-receiving ic + ensure the magic-refresh timer is running. Starting here (not
     // only in activate) is the robust pattern — activate's ic isn't always the keyEvent ic, and
     // activate may not fire before the first key in every fcitx5 flow.
     activeContexts_.insert(ic);
-    if (!voiceTimer_) {
-        startVoicePoll();
+    if (!magicTimer_) {
+        startMagicPoll();
     }
 
     apply_view(ic, view);

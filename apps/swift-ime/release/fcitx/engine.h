@@ -57,10 +57,13 @@ extern "C" {
                                   ImeView *out_view);
     int  swift_ime_poll_async(ImeHandle *handle, void *ctx,
                               ImeView *out_view);
-    /// Voice (`#asr`) async refresh: returns 1 + fills out_view when the voice buffer advanced
-    /// and the ctx is in Voice mode. Polled by the C++ TimeEvent so candidates update live.
-    int  swift_ime_voice_tick(ImeHandle *handle, void *ctx,
+    /// Magic live-command async refresh (`#asr` voice anchor, `#req` HTTP request, …):
+    /// returns 1 + fills out_view when the active member's async state advanced and the ctx
+    /// is in Magic mode. Polled by the C++ TimeEvent so candidates update live.
+    int  swift_ime_magic_tick(ImeHandle *handle, void *ctx,
                               ImeView *out_view);
+    /// Reconfigure the `#req` backend base URL at runtime (default http://127.0.0.1:14555/api).
+    int  swift_ime_set_req_base(ImeHandle *handle, const char *base);
     void swift_ime_reset(ImeHandle *handle, void *ctx);
     void swift_ime_activate(ImeHandle *handle, void *ctx);
     void swift_ime_deactivate(ImeHandle *handle, void *ctx);
@@ -118,11 +121,11 @@ private:
     std::unique_ptr<fcitx::EventSourceTime> pollTimer_;
     void startAsyncPoll();
 
-    /// Active input contexts (added on activate, removed on deactivate/reset). The voice poll
-    /// timer iterates these to refresh `#asr` candidates async.
+    /// Active input contexts (added on activate, removed on deactivate/reset). The magic poll
+    /// timer iterates these to refresh live-command candidates (`#asr`/`#req`) async.
     std::unordered_set<fcitx::InputContext *> activeContexts_;
-    std::unique_ptr<fcitx::EventSourceTime> voiceTimer_;
-    void startVoicePoll();
+    std::unique_ptr<fcitx::EventSourceTime> magicTimer_;
+    void startMagicPoll();
 };
 
 // ── Candidate word ──────────────────────────────────────────────────────────

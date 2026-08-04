@@ -32,6 +32,10 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
         eng_weights,
     );
 
+    // `#req` backend base URL (config `magic.req_base`, default
+    // http://127.0.0.1:14555/api).
+    engine.set_req_base(&cfg.magic.req_base);
+
     // Load rime-ice FST if enabled in config.
     if cfg.dicts.rime_ice {
         let loader = shared::loader!("assets");
@@ -166,22 +170,37 @@ pub extern "C" fn swift_ime_poll_async(
     code
 }
 
-/// Poll for voice-state changes in `#asr` (Voice) mode — the async candidate refresh entry point.
-/// Returns 1 + fills `out_view` if the voice buffer advanced (new interim/calibrated/final) and the
-/// ctx is in Voice mode; 0 otherwise. Called by the C++ glue's periodic TimeEvent (main loop) so
-/// the candidate area updates live WITHOUT a keypress — same `voice_tick` the TUI uses.
+/// Poll for changes while a live magic command (`#asr` voice anchor, `#req`
+/// HTTP request, …) is active — the async candidate refresh entry point.
+/// Returns 1 + fills `out_view` if the active member's async state advanced
+/// and the ctx is in Magic mode; 0 otherwise. Called by the C++ glue's
+/// periodic TimeEvent (main loop) so the candidate area updates live WITHOUT
+/// a keypress — same `magic_tick` the TUI uses.
 #[no_mangle]
-pub extern "C" fn swift_ime_voice_tick(
+pub extern "C" fn swift_ime_magic_tick(
     engine: *mut ImeEngine,
     ctx: *const std::ffi::c_void,
     out_view: *mut ImeView,
 ) -> i32 {
     if engine.is_null() || out_view.is_null() { return 0; }
-    match unsafe { &*engine }.voice_tick_ctx(ctx as usize) {
+    match unsafe { &*engine }.magic_tick_ctx(ctx as usize) {
         Some(view) => {
             unsafe { *out_view = view; }
             1
         }
         None => 0,
     }
+}
+
+/// Reconfigure the `#req` backend base URL at runtime (default
+/// http://127.0.0.1:14555/api). Safe to call any time — shared config.
+#[no_mangle]
+pub extern "C" fn swift_ime_set_req_base(
+    engine: *mut ImeEngine,
+    base: *const c_char,
+) -> i32 {
+    if engine.is_null() || base.is_null() { return 0; }
+    let s = unsafe { std::ffi::CStr::from_ptr(base) }.to_string_lossy();
+    unsafe { &*engine }.set_req_base(&s);
+    1
 }

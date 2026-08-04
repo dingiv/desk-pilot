@@ -26,7 +26,7 @@
 //! the normal prediction pipeline.
 
 use crate::platform::ImeView;
-use crate::state::StepEnv;
+use crate::state::{ComposeState, StepEnv};
 
 /// Special keys recognized by the engine.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -135,6 +135,12 @@ pub fn handle_special_key(
             Some(view)
         }
         SpecialKey::Digit(n) => {
+            // Live magic commands own digit semantics (candidate selection for
+            // voice, URL characters for `#req`) — route through the member, not
+            // the generic pinyin select.
+            if sm.state == ComposeState::Magic {
+                return Some(sm.step(char::from(b'0' + n), env));
+            }
             let idx = (n - 1) as usize;
             if idx < sm.candidates.len() {
                 let view = sm.select(idx, env);

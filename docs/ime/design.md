@@ -84,20 +84,42 @@ IME 是秘书系统里"产出最终文本"的那只手 —— 语音听进来、
 
 支持变量：`$DATE`（当前日期）、`$CLIPBOARD`（剪贴板内容）、`$CURSOR`（展开后光标位置）。
 
+### Magic 成员框架 — 所有 `#` 命令统一为 Member
+
+语音识别（`#asr`）、HTTP 请求（`#req`）、静态展开（`#date`/`#password`）……每一个 `#` 命令都是一个 **MagicMember**（`crates/ime-core/src/family/magic/`）：
+
+- **静态成员**：激活即内联展开成固定文本（`#date` → 今天日期）。
+- **动态成员**：拥有一个交互会话 — 触发完成后 FSM 进入 `ComposeState::Magic`，按键路由给该成员的 `on_key`，异步状态（语音 buffer、HTTP 结果）由 `tick` 刷新。
+- **注册表驱动**：matcher 条目、预测提示、token→激活分发全部从 `MagicFamily` 成员列表生成 — 加一个命令 = 一个 struct + 一行注册，**不再动引擎/FSM**。
+- `MemberAction::View/Commit/Exit` 解决成员与 StateMachine 的借用冲突（take-out-then-put-back）。
+
 ### #asr — 语音录入锚点（实时候选 + 空格上屏）
 
 ```
-键入 #asr → 进入 Voice 态（语音锚点）
+键入 #asr → 进入 Magic 态（VoiceMember 会话）
   候选区: [live]  ← 随 aura 流式（interim/calibrated_interim）实时变
   Final 到达 → [final_N, ..., live]  ← final 插入成 1 号候选
 空格 → 提交 1 号候选（最近 final，或 live）→ 文本上屏 → 回 Idle
 ```
 
-**数据通路**：IME 进程内（`apps/swift-ime/src/bridge.rs`）通过 `audio-aura-agent` SDK 在后台线程维持一条持久连接到 aura-daemon 的**数据面** `GET /api/asr_stream`（每事件直推、不节流）；按段类型写入 `AsrBuffer`：
+**数据通路**：IME 进程内（`apps/swift-ime/src/bridge.rs`）通过 `audio-aura-agent` SDK 在后台线程维持一条持久连接到 aura-daemon 的**数据面** `GET /api/asr_stream`（每事件直推、不节流）；按段类型写入 `AsrBuffer`（挂在 `MagicFamily` 的共享 `VoiceSlot` 上，成员实例延迟 attach）：
 - `Interim{partial}` / `CalibratedInterim{calibrated}` → `set_live(..)`（流式候选）
 - `Final{calibrated}` → `push_final(..)`（成 1 号候选）
 
-`AsrBuffer`（`crates/ime-core/src/asr_buffer.rs`）是富状态 `{live, finals[], version}`，version 计数让前端无按键也能刷新。引擎 `#asr` 完成（matcher `Match::Complete` + expansion `__ASR_BUFFER__`）转 `ComposeState::Voice`（不再静态展开）；`StateMachine::refresh_voice()` 从 `voice_candidates()` 构造候选 `[finals..., live]`；`ImeEngine::voice_tick()` 在 Voice 态 + version 变化时重建视图。TUI `run_loop` 每轮（100ms）调 `voice_tick` → 候选区实时变。空格走 `handle_voice` 提交 1 号。控制面 `/api/stream`（settings 快照）不经此路——识别文字只走数据面。
+`AsrBuffer`（`crates/ime-core/src/asr_buffer.rs`）是富状态 `{live, finals[], version}`，version 计数让前端无按键也能刷新。引擎 `#asr` 完成（matcher `Match::Complete` + expansion `__ASR_BUFFER__`）→ `MagicFamily::spawn("__ASR_BUFFER__")` 出新 `VoiceMember` 实例；`ImeEngine::magic_tick()` 在 Magic 态 + version 变化时重建视图（TUI `run_loop` 每 100ms 调一次；fcitx5 由 C++ `startMagicPoll` 的 100ms TimeEvent 轮询 `swift_ime_magic_tick`）。空格走成员 `on_key` 提交 1 号。控制面 `/api/stream`（settings 快照）不经此路——识别文字只走数据面。
+
+### #req — 本地 HTTP 后端请求
+
+```
+键入 #req            → 请求默认后端 http://127.0.0.1:14555/api
+键入 #req/news?query=soccer → GET http://127.0.0.1:14555/api/news?query=soccer
+回车 → 触发请求（worker 线程，引擎不阻塞）
+结果到达 → 整个响应体是一条候选（后端保证普通文本），超长截断为预览（60 字符 + …）
+空格/数字 1 → 提交完整正文；继续键入 → 追加 URL 后缀并作废旧结果
+退格 → 删后缀字符；后缀空时退格/Esc 取消会话
+```
+
+**架构**：`ReqMember` 通过注入的 `ReqFetcher`（`crates/ime-core` 的 `http` feature 下为 reqwest 阻塞客户端，测试注入 fake）在 `std::thread` 上异步 GET；结果按 version 计数由 `tick` 拾取 — 与语音成员同一条无按键刷新路径。后端 base 可配置：config `magic.req_base`、CLI `--req-base`、或运行时 C ABI `swift_ime_set_req_base`。失败显示「请求失败: …」且**不可提交**（空格重试）。
 
 ### #exec — 关联动作触发
 
