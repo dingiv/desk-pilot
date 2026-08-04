@@ -59,10 +59,12 @@ export interface TaskItem {
 }
 export type ConvItem = UserTurnItem | SecretaryItem | TaskItem;
 
-// ── daemon (Rust) SSE + state contract ────────────────────────────────────
-// GET /api/stream?state_changed_frequency=<ms> emits `hello`, then `state_changed` pings
-// (throttled to ≥250ms). On a ping — and on mount — the frontend GETs /api/state for the full
-// `AuraStateView` snapshot and re-renders. One source of truth, one fetch (snapshot-sync).
+// ── daemon (Rust) contract: two planes ────────────────────────────────────
+// CONTROL plane (settings, low-freq): GET /api/state → AuraStateView; GET /api/stream emits
+//   `hello` + `state_changed` pings (throttled ≥250ms) → re-GET /api/state. No utterances here.
+// DATA plane (recognition, low-latency): GET /api/asr_stream emits `hello` + AsrSegment per event
+//   (interim / calibrated_interim / final / correction). The client builds its utterance list
+//   from these.
 export type StreamPing = { type: 'hello' } | { type: 'state_changed' };
 
 export interface VadView {
@@ -82,35 +84,49 @@ export interface CorrectionView {
   raw: string;
   corrected: string;
 }
-export interface FinalView {
-  raw: string;
-  streaming: string;
-  calibrated: string;
-  intent: string;
-  reply: string;
-  route_ms: number;
-}
-/// One utterance in the timeline (live or finalized).
-export interface UtteranceView {
-  seq: number;
-  /** Latest streaming partial (raw, live). */
-  partial: string;
-  /** Stage2's provisional calibration (per fragment) — shown in preference to `partial` when set. */
-  calibrated?: string;
-  /** Set when the utterance settled (VAD settle + Stage2 final calibration). */
-  final?: FinalView;
-  /** Still being recognized (absorbing fragments). */
-  live: boolean;
-  /** Set when the user corrected this utterance via POST /api/correct. */
-  corrected_by_user?: boolean;
-  at_s: number;
-}
-/// The complete state snapshot served by GET /api/state.
+/// The CONTROL-plane snapshot — settings only (recognition text is on the data plane).
 export interface AuraStateView {
   connected: boolean;
   stage3_on: boolean;
   config: ConfigView;
   hotwords: string[];
   corrections: CorrectionView[];
-  utterances: UtteranceView[];
+}
+
+/// One recognition segment pushed by the data-plane stream (GET /api/asr_stream).
+export type AsrSegment =
+  | { type: 'interim'; seq: number; partial: string; at_s: number }
+  | { type: 'calibrated_interim'; seq: number; calibrated: string }
+  | {
+      type: 'final';
+      seq: number;
+      raw_text: string;
+      streaming_text: string;
+      calibrated: string;
+      intent: string;
+      reply: string;
+      route_ms: number;
+    }
+  | { type: 'correction'; seq: number; raw: string; corrected: string };
+
+/// Client-local utterance model (built from AsrSegment, NOT served by the daemon).
+export interface UtteranceItem {
+  seq: number;
+  /** Latest streaming partial (raw, live). */
+  partial: string;
+  /** Stage2's provisional calibration (per fragment) — shown in preference to `partial` when set. */
+  calibrated?: string;
+  /** Set when the utterance settled (VAD settle + Stage2 final calibration). */
+  final?: {
+    raw: string;
+    streaming: string;
+    calibrated: string;
+    intent: string;
+    reply: string;
+    route_ms: number;
+  };
+  /** Still being recognized (absorbing fragments). */
+  live: boolean;
+  /** Set when the user corrected this utterance (via a `correction` segment). */
+  corrected_by_user?: boolean;
 }

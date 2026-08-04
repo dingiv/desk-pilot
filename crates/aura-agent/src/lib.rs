@@ -31,4 +31,4 @@ pub use tool::{AddHotwordTool, Tool};
 // Light on purpose (no mistralrs/asr): upper layers (desktop-pet, visual-rover, …) depend on
 // THIS crate to talk to the aura-daemon without pulling the GPU inference stack.
 pub use client::AuraClient;
-pub use view::{AuraStateView, ConfigView, CorrectionView, FinalView, UtteranceView, VadView};
+pub use view::{AsrSegment, AuraStateView, ConfigView, CorrectionView, VadView};

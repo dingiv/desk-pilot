@@ -1,12 +1,15 @@
-//! view.rs — the `AuraStateView` snapshot: the authoritative wire contract between the
-//! aura-daemon and any client (the web UI, this crate's [`crate::client::AuraClient`] SDK, or the
-//! desktop-pet). Defined here in the consumer-facing crate (audio-aura-agent) so both the server
-//! (daemon, which imports it) and Rust clients share one type — no drift — without pulling the
-//! heavy mistralrs/asr machinery of aura-core.
+//! view.rs — the wire contract between the aura-daemon and any client (web UI, this crate's
+//! [`crate::client::AuraClient`] SDK, or the desktop-pet). Defined in the consumer-facing crate
+//! (audio-aura-agent) so server + Rust clients share one type — no drift — without pulling
+//! aura-core's mistralrs/asr machinery.
 //!
-//! Snapshot-sync contract: the daemon serves the full `AuraStateView` at `GET /api/state`; on any
-//! state change it bumps a `version` counter and pings subscribers via `GET /api/stream`
-//! (`{type:"state_changed"}`, throttled ≥250ms). Clients re-GET `/api/state` on a ping.
+//! Two planes:
+//! - **Control plane** — [`AuraStateView`] (settings snapshot) served at `GET /api/state`;
+//!   `GET /api/stream` pings `state_changed` (throttled ≥250ms) so clients re-GET. Low-frequency
+//!   state: connection, config, hotwords, corrections.
+//! - **Data plane** — [`AsrSegment`] pushed at `GET /api/asr_stream` (every event, low-latency):
+//!   the live recognition text + per-utterance events. The client builds its utterance list from
+//!   these; the snapshot carries NO utterances.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,45 +31,15 @@ pub struct VadView {
     pub merge_gap: f64,
 }
 
-/// One user correction (raw → corrected), echoed back for a corrections panel.
+/// One user correction (raw → corrected), echoed back for a corrections panel + fed to Stage2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorrectionView {
     pub raw: String,
     pub corrected: String,
 }
 
-/// A finalized utterance's authoritative fields.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FinalView {
-    pub raw: String,
-    pub streaming: String,
-    pub calibrated: String,
-    pub intent: String,
-    pub reply: String,
-    pub route_ms: f64,
-}
-
-/// One utterance in the timeline (live or finalized).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UtteranceView {
-    pub seq: u64,
-    /// Latest streaming partial (raw, live).
-    pub partial: String,
-    /// Stage2's provisional calibration (per fragment) — shown in preference to `partial` when set.
-    pub calibrated: Option<String>,
-    /// Set when the utterance settled (VAD settle + Stage2 final calibration). (`final` is a Rust
-    /// keyword, so the field is `final_` renamed to `final` on the wire — matches the JS/JSON name.)
-    #[serde(rename = "final")]
-    pub final_: Option<FinalView>,
-    /// Still being recognized (absorbing fragments).
-    pub live: bool,
-    /// Set when the user corrected this utterance via POST /api/correct.
-    pub corrected_by_user: bool,
-    pub at_s: f64,
-}
-
-/// The complete state snapshot. Served by the daemon's `GET /api/state`; clients re-fetch on
-/// `state_changed`. `utterances` is bounded to the most recent N by the daemon.
+/// The **control-plane** snapshot — settings only (no utterances; recognition text lives on the
+/// data plane). Served by `GET /api/state`; clients re-fetch on `state_changed`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuraStateView {
     pub connected: bool,
@@ -74,5 +47,30 @@ pub struct AuraStateView {
     pub config: ConfigView,
     pub hotwords: Vec<String>,
     pub corrections: Vec<CorrectionView>,
-    pub utterances: Vec<UtteranceView>,
+}
+
+/// One **data-plane** segment pushed by `GET /api/asr_stream` /
+/// [`crate::client::AuraClient::subscribe_segments`]. Serialized as `{type: "...", ...}` via the
+/// internally-tagged `type` field (snake_case variant names). The client builds + maintains its
+/// utterance list from this stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AsrSegment {
+    /// Live streaming partial (raw, evolving — forward correction as more audio arrives).
+    Interim { seq: u64, partial: String, at_s: f64 },
+    /// Stage2 provisional calibration of an in-progress utterance (per merged fragment).
+    CalibratedInterim { seq: u64, calibrated: String },
+    /// Settled utterance — authoritative batch ASR + Stage2 final calibration.
+    Final {
+        seq: u64,
+        raw_text: String,
+        streaming_text: String,
+        calibrated: String,
+        intent: String,
+        reply: String,
+        route_ms: f64,
+    },
+    /// A user correction was submitted for utterance `seq` (POST /api/correct) — mark it corrected.
+    /// (The raw→corrected pair also enters the snapshot's `corrections` list as Stage2 feedback.)
+    Correction { seq: u64, raw: String, corrected: String },
 }

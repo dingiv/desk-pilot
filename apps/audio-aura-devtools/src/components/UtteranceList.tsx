@@ -1,17 +1,17 @@
 import { useState } from 'react';
-import type { UtteranceView } from '../types';
+import type { UtteranceItem } from '../types';
 import { API_BASE } from '../apiBase';
 
 interface Props {
-  utterances: UtteranceView[];
+  utterances: UtteranceItem[];
 }
 
 /**
- * Live list of Stage1 utterances (rendered from the AuraStateView snapshot). The last item is the
- * sentence currently being recognized — its `partial` streams char-by-char and earlier chars get
- * rewritten as more audio arrives; `calibrated` (Stage2 provisional) is shown in preference when
- * set. Finalized items show the raw transcript + the Stage2-calibrated text + an intent badge, and
- * have a "✏️ 纠正" button for inline editing → POST /api/correct.
+ * Live list of utterances, built client-side from the data-plane AsrSegment stream. The last item
+ * is the sentence currently being recognized — its `partial` streams char-by-char and earlier
+ * chars get rewritten as more audio arrives; `calibrated` (Stage2 provisional) is shown in
+ * preference when set. Finalized items show the raw transcript + the Stage2-calibrated text + an
+ * intent badge, and have a "✏️ 纠正" button for inline editing → POST /api/correct.
  */
 export function UtteranceList({ utterances }: Props) {
   const [editingSeq, setEditingSeq] = useState<number | null>(null);

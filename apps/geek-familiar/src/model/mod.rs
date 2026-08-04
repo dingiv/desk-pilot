@@ -88,7 +88,8 @@ pub enum Panel {
 #[derive(Debug, Clone)]
 pub enum Message {
     // ── audio-aura ──
-    Asr(crate::service::asr::AsrUpdate),
+    #[allow(unused)]
+    AuraState(audio_aura_agent::view::AuraStateView),
     ToggleRecording,
     HandshakeDone(bool),
     /// Trigger an aura health check (button press).
@@ -103,6 +104,8 @@ pub enum Message {
     ClipboardPoll,
     /// User editing the scratchpad buffer (multi-line text_editor).
     ScratchpadEdit(iced::widget::text_editor::Action),
+    /// Transcript buffer actions (read-only feel — we just let it bubble).
+    TranscriptAction(iced::widget::text_editor::Action),
 
     // ── interaction ──
     DragStarted,
@@ -164,7 +167,14 @@ pub enum Message {
 
 // ── ASR state ────────────────────────────────────────────────────────────────
 
-pub use crate::service::asr::ConversationTurn;
+/// One conversation turn (synced from aura's FinalView).
+#[derive(Debug, Clone)]
+pub struct ConversationTurn {
+    pub seq: u64,
+    pub user_text: String,
+    pub intent: String,
+    pub reply: String,
+}
 
 #[derive(Default)]
 pub struct AsrState {

@@ -1,3 +1,2 @@
-pub mod asr;
-pub mod aura;
+pub mod aura_client;
 pub mod gnome_ext;

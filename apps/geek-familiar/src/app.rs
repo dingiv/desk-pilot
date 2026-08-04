@@ -14,8 +14,9 @@ use iced::widget::image::Handle;
 use iced::widget::svg::Handle as SvgHandle;
 use iced::{Background, Border, Color, ContentFit, Degrees, Element, Gradient, Length, Subscription, Task, alignment, window};
 
-pub(crate) use crate::model::{AsrState, ConversationTurn, DockingPreference, Message, Panel, StyleConfig};
-pub(crate) use crate::service::asr::AsrUpdate;
+pub(crate) use crate::model::{AsrState, DockingPreference, Message, Panel, StyleConfig};
+pub(crate) use audio_aura_agent::view::AuraStateView;
+pub(crate) use crate::service::aura_client::{aura_stream, AuraHandle};
 
 /// Bundled fallback skin (used when FileLoader can't resolve the configured skin).
 const IDLE_PNG: &[u8] = include_bytes!("../assets/skins/default/idle.png");
@@ -68,6 +69,10 @@ pub struct PetApp {
     prev_mouse_y: f32,
     /// Selected ASR turn indices (for multi-select copy).
     pub(crate) selected_turns: Vec<u64>,
+    /// Accumulating transcript — all utterances in one text_editor.
+    pub(crate) transcript: text_editor::Content,
+    /// aura daemon command handle (scout toggle, correct, audio, health).
+    aura_handle: AuraHandle,
 }
 
 impl PetApp {
@@ -77,6 +82,8 @@ impl PetApp {
         sprite_size: f32, sprite_filter: String,
     ) -> (Self, Task<Message>) {
         let init_status = format!("started — aura: {aura_addr}");
+        let aura_handle = AuraHandle::new(&aura_addr)
+            .unwrap_or_else(|e| { eprintln!("[geek-familiar] AuraHandle failed: {e}"); std::process::exit(1) });
         let app = PetApp {
             aura_addr, skin, token, font_size, sprite_size, sprite_filter, style, window_bg, docking,
             asr: AsrState::default(),
@@ -95,6 +102,8 @@ impl PetApp {
             drag_origin_y: 0.0,
             prev_mouse_y: 0.0,
             selected_turns: Vec::new(),
+            transcript: text_editor::Content::new(),
+            aura_handle,
             resize_handle: SvgHandle::from_memory(RESIZOR_SVG),
         };
         let token_for_task = app.token.clone();
@@ -117,39 +126,54 @@ impl PetApp {
 
     pub fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
-            Message::Asr(u) => match u {
-                AsrUpdate::Hello => {
-                    self.asr.sse_connected = true;
-                    self.status_messages.insert(0, "🔌 aura SSE connected".into());
-                    if self.status_messages.len() > 30 { self.status_messages.truncate(30); }
+            Message::AuraState(view) => {
+                self.asr.sse_connected = true; // SDK is receiving snapshots
+                self.asr.scout_active = view.connected;
+                // Process utterances
+                let mut transcript_text = String::new();
+                for u in &view.utterances {
+                    if let Some(f) = &u.final_ {
+                        // Update or insert into history
+                        let existing = self.asr.history.iter_mut().find(|t| t.seq == u.seq);
+                        let turn = crate::model::ConversationTurn {
+                            seq: u.seq,
+                            user_text: f.calibrated.clone(),
+                            intent: f.intent.clone(),
+                            reply: f.reply.clone(),
+                        };
+                        if let Some(t) = existing { *t = turn; } else { self.asr.history.push(turn); }
+                        // Build transcript
+                        if !transcript_text.is_empty() { transcript_text.push('\n'); }
+                        transcript_text.push_str(&f.calibrated);
+                        if !f.reply.is_empty() {
+                            transcript_text.push_str(&format!("\n   ◀ {}", f.reply));
+                        }
+                    }
+                    // Live utterance → update interim
+                    if u.live {
+                        self.asr.interim = u.calibrated.clone().unwrap_or_else(|| u.partial.clone());
+                    }
                 }
-                AsrUpdate::Interim(t) => self.asr.interim = t,
-                AsrUpdate::Final { text, intent, reply, seq } => {
-                    self.asr.interim.clear();
-                    self.asr.history.push(ConversationTurn { seq, user_text: text, intent, reply });
-                    if self.asr.history.len() > 20 { self.asr.history.remove(0); }
+                // Cap history
+                if self.asr.history.len() > 20 {
+                    self.asr.history.drain(0..self.asr.history.len() - 20);
                 }
-                AsrUpdate::Status(active) => {
-                    self.asr.scout_active = active;
-                    let msg = if active { "🎙 scout enabled" } else { "🔇 scout disabled" };
-                    self.status_messages.insert(0, msg.into());
-                    if self.status_messages.len() > 30 { self.status_messages.truncate(30); }
+                // Update transcript
+                if !transcript_text.is_empty() {
+                    self.transcript = text_editor::Content::with_text(&transcript_text);
                 }
-                AsrUpdate::Connected => {
-                    self.asr.sse_connected = true;
-                }
-                AsrUpdate::Disconnected => {
-                    self.asr.sse_connected = false;
-                    self.asr.scout_active = false;
-                    self.asr.interim.clear();
-                    self.status_messages.insert(0, "⚠ aura SSE disconnected".into());
-                    if self.status_messages.len() > 30 { self.status_messages.truncate(30); }
-                }
-            },
+                // Sync corrections from server
+                self.corrections = view.corrections.iter().map(|c| (c.raw.clone(), c.corrected.clone())).collect();
+                // Update hotwords (for future display)
+                self.status_messages.retain(|m| !m.starts_with("🔤"));
+                self.status_messages.insert(0, format!("🔤 hotwords: {}", view.hotwords.join(", ")));
+                if self.status_messages.len() > 30 { self.status_messages.truncate(30); }
+            }
+            // Placeholder for SSE connection status from the stream itself
+            // (the old AsrUpdate variants aren't needed — snapshots are the source of truth)
             Message::HandshakeDone(ok) => {
                 eprintln!("[geek-familiar] gnome-layer-ext handshake ok={ok}");
-                let addr = self.aura_addr.clone();
-                return Task::perform(async move { crate::service::aura::health(&addr) }, Message::HealthCheck);
+                self.aura_handle.health_check();
             }
             Message::DragStarted => {
                 return window::oldest().then(|id| match id {
@@ -179,22 +203,16 @@ impl PetApp {
             Message::PassthroughApplied(n) => eprintln!("[passthrough] applied {n} rect(s)"),
             Message::RescanTick => return screenshot_oldest(),
             Message::ToggleRecording => {
-                // Three-way: only toggle when SSE is connected
                 if self.asr.sse_connected {
                     let enable = !self.asr.scout_active;
-                    let addr = self.aura_addr.clone();
-                    return Task::perform(
-                        async move {
-                            let _ = crate::service::aura::control_scout(&addr, Some(enable));
-                        },
-                        |_| Message::RecordingToggled,
-                    );
+                    self.aura_handle.toggle_scout(enable);
                 }
             }
             Message::RecordingToggled => {
                 // Status updated by AsrUpdate::Status event from SSE.
             }
             Message::ScratchpadEdit(action) => self.scratchpad.perform(action),
+            Message::TranscriptAction(action) => self.transcript.perform(action),
             Message::FileDropped(path) => {
                 eprintln!("[geek-familiar] file dropped: {path}");
                 self.drop_highlight = false;
@@ -248,28 +266,7 @@ impl PetApp {
             }
             Message::PlayAudio(idx) => {
                 eprintln!("[geek-familiar] play audio seq={idx}");
-                let addr = self.aura_addr.clone();
-                return Task::perform(
-                    async move {
-                        let result = crate::service::aura::fetch_audio(&addr, idx);
-                        match result {
-                            Ok(bytes) if !bytes.is_empty() => {
-                                let path = format!("/tmp/geek-familiar-audio-{idx}.wav");
-                                if let Err(e) = std::fs::write(&path, &bytes) {
-                                    eprintln!("[geek-familiar] write audio: {e}");
-                                    return (idx, false);
-                                }
-                                let status = std::process::Command::new("pw-play")
-                                    .arg(&path).status();
-                                eprintln!("[geek-familiar] pw-play exit: {status:?}");
-                                (idx, status.map_or(false, |s| s.success()))
-                            }
-                            Ok(_) => { eprintln!("[geek-familiar] audio empty"); (idx, false) }
-                            Err(e) => { eprintln!("[geek-familiar] fetch audio: {e}"); (idx, false) }
-                        }
-                    },
-                    |(seq, ok)| Message::AudioPlayed(seq, ok),
-                );
+                self.aura_handle.play_audio(idx);
             }
             Message::AudioPlayed(seq, ok) => {
                 let msg = if ok { format!("🔊 audio seq={seq} played") } else { format!("⚠ audio seq={seq} failed") };
@@ -282,18 +279,11 @@ impl PetApp {
                     let seq = turn.seq;
                     let raw = turn.user_text.clone();
                     let corrected = self.correction_text.clone();
-                    // Record locally
                     self.corrections.insert(0, (raw.clone(), corrected.clone()));
                     if self.corrections.len() > 50 { self.corrections.truncate(50); }
-                    let addr = self.aura_addr.clone();
+                    self.aura_handle.correct(seq, &raw, &corrected);
                     self.editing_turn = None;
                     self.correction_text.clear();
-                    return Task::perform(
-                        async move {
-                            let _ = crate::service::aura::correct(&addr, seq, &raw, &corrected);
-                        },
-                        |_| Message::RecordingToggled, // reuse as no-op ack
-                    );
                 }
             }
             Message::CancelEdit => {
@@ -351,8 +341,7 @@ impl PetApp {
                 });
             }
             Message::CheckHealth => {
-                let addr = self.aura_addr.clone();
-                return Task::perform(async move { crate::service::aura::health(&addr) }, Message::HealthCheck);
+                self.aura_handle.health_check();
             }
             Message::AppStatus(s) => {
                 eprintln!("[geek-familiar] status: {s}");
@@ -381,7 +370,7 @@ impl PetApp {
 
     pub fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
-            Subscription::run_with(self.aura_addr.clone(), asr_stream),
+            Subscription::run_with(self.aura_addr.clone(), aura_stream).map(Message::AuraState),
             Subscription::run_with("rescan".to_string(), rescan_stream),
             Subscription::run_with(self.token.clone(), clipboard_stream),
             Subscription::run_with("clip_poll".to_string(), clipboard_poll_stream),
@@ -521,13 +510,6 @@ fn apply_to_window(w: &dyn iced::Window, rects: &[crate::input_region::Rect]) {
     let (raw_window_handle::RawWindowHandle::Wayland(sh), raw_window_handle::RawDisplayHandle::Wayland(dh)) =
         (wh.as_raw(), dh.as_raw()) else { return; };
     unsafe { crate::input_region::apply(sh.surface.as_ptr() as _, dh.display.as_ptr() as _, rects); }
-}
-
-fn asr_stream(addr: &String) -> std::pin::Pin<Box<dyn iced::futures::Stream<Item = Message> + Send>> {
-    let addr = addr.clone();
-    Box::pin(iced::stream::channel::<Message>(100, move |mut sender: iced::futures::channel::mpsc::Sender<Message>| async move {
-        crate::service::asr::spawn(addr, move |upd| { let _ = sender.try_send(Message::Asr(upd)); });
-    }))
 }
 
 fn rescan_stream(_id: &String) -> std::pin::Pin<Box<dyn iced::futures::Stream<Item = Message> + Send>> {

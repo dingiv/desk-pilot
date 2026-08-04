@@ -9,10 +9,10 @@
 //! Threading: the Pipeline runs Stage1 on a dedicated **std thread** (it blocks forever) and
 //! Stage2 on its own internal `aura-stage2` worker (so partials never freeze behind a 1-2s LLM
 //! route); the axum socket runs on a multi-thread tokio runtime on the main thread. The
-//! Pipeline's `on_turn` callback mutates the shared utterance timeline (`Arc<RwLock<...>>`) and
-//! bumps a global `version: AtomicU64` — no event bus. Each mutation site (pipeline / scout
-//! toggle / correction / Stage3 hotword) bumps `version`; the SSE handler ticks at the client's
-//! rate and pings only when `version` advanced since its last tick.
+//! Pipeline's `on_turn` callback pushes recognition [`AsrSegment`]s onto a broadcast channel
+//! (the **data plane**, `/api/asr_stream`); settings changes (scout toggle / correction / Stage3
+//! hotword) bump a global `version: AtomicU64` (the **control plane** — `/api/stream` pings
+//! `state_changed`, clients re-GET `/api/state`). Recognition events do NOT bump `version`.
 //!
 //! Run: cargo run -p aura-daemon --features asr,cuda -- 127.0.0.1:7879
 //! Config precedence: CLI (high-frequency knobs, see `Cli`) > `aura.yaml` (full surface, dev:
@@ -20,7 +20,7 @@
 
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -34,7 +34,8 @@ use clap::Parser;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{error, info, instrument, warn};
-use tokio_stream::wrappers::IntervalStream;
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
@@ -259,12 +260,7 @@ fn resolve(cli: Cli, conf: AuraConf) -> Settings {
 // UtteranceView) live in `audio_aura_agent::view` — the consumer-facing crate — shared with the
 // `audio_aura_agent::client` SDK so server and Rust clients can't drift. The daemon constructs
 // them; this module just imports.
-use audio_aura_agent::{
-    AuraStateView, ConfigView, CorrectionView, FinalView, UtteranceView, VadView,
-};
-
-/// Cap on the in-memory utterance timeline (oldest evicted). Bounds the /api/state payload.
-const MAX_UTTERANCES: usize = 200;
+use audio_aura_agent::{AsrSegment, AuraStateView, ConfigView, CorrectionView, VadView};
 
 /// Shared daemon state surfaced over the socket.
 #[derive(Clone)]
@@ -273,11 +269,13 @@ struct DaemonState {
     corrections: Arc<Mutex<Vec<(String, String)>>>,
     /// Scout-connection toggle (shared with Stage1Executor's ingest + run loop).
     active: Arc<AtomicBool>,
-    /// The utterance timeline — the pipeline thread writes, GET /api/state reads.
-    utterances: Arc<RwLock<Vec<UtteranceView>>>,
-    /// Bumped on ANY state change (utterance / connected / hotword / correction). The SSE
-    /// handler ticks at the client's rate and pings only when this advances.
+    /// Bumped on ANY SETTINGS change (connected / hotword / correction). Recognition events do
+    /// NOT bump — they're pushed via `asr_events` (the data plane). The SSE handler ticks at the
+    /// client's rate and pings only when this advances.
     version: Arc<AtomicU64>,
+    /// Data-plane broadcast: recognition segments pushed directly to `GET /api/asr_stream`
+    /// subscribers (low-latency, every event — unlike the throttled control-plane ping).
+    asr_events: broadcast::Sender<AsrSegment>,
     config: ConfigView,
     stage3_on: bool,
     /// The Storage supervisor: audio archive (hot replay + date-named WAV flush) +
@@ -289,7 +287,6 @@ impl DaemonState {
     /// Assemble the full [`AuraStateView`] snapshot — lock each source, clone, release. Called by
     /// GET /api/state (every change). No lock is held across an await (clones are synchronous).
     fn snapshot(&self) -> AuraStateView {
-        let utterances = self.utterances.read().unwrap().clone();
         let hotwords = self.hotwords.lock().unwrap().clone();
         let corrections = self
             .corrections
@@ -304,7 +301,6 @@ impl DaemonState {
             config: self.config.clone(),
             hotwords,
             corrections,
-            utterances,
         }
     }
 
@@ -324,8 +320,9 @@ fn main() -> Result<()> {
     // Connection toggle + shared snapshot state, shared across the Pipeline thread + socket
     // handlers. (No event bus — SSE pings off the `version` counter; data lives in the snapshot.)
     let active = Arc::new(AtomicBool::new(true));
-    let utterances: Arc<RwLock<Vec<UtteranceView>>> = Arc::new(RwLock::new(Vec::new()));
     let version = Arc::new(AtomicU64::new(0));
+    // Data-plane channel: recognition segments pushed to /api/asr_stream subscribers.
+    let (asr_events, _) = broadcast::channel::<AsrSegment>(1024);
     let config = ConfigView {
         asr_backend: asr_backend.clone(),
         asr_kind: asr_kind.clone(),
@@ -420,36 +417,29 @@ fn main() -> Result<()> {
     {
         let tool = tool.clone();
         let storage = Arc::clone(&storage);
-        let utterances = Arc::clone(&utterances);
         let version = Arc::clone(&version);
+        let asr_events = asr_events.clone();
         thread::Builder::new()
             .name("aura-pipeline".into())
             .spawn(move || {
                 // TODO: 这里是核心的模型推理触发点；
                 Pipeline::new(s1, Box::new(s2)).run(move |ev| {
-                    match ev {
+                    // Recognition events → DATA plane only (broadcast the segment). The control
+                    // plane (version/snapshot) is NOT bumped here — only settings changes bump it.
+                    let segment = match ev {
                         TurnEvent::Interim { seq, partial, at_s } => {
                             info!(seq, at_s, partial = %partial, "流式");
-                            upsert_live(&utterances, seq, |u| {
-                                u.partial = partial.to_string();
-                                u.live = true;
-                                u.at_s = at_s;
-                            });
+                            Some(AsrSegment::Interim { seq, partial: partial.to_string(), at_s })
                         }
                         TurnEvent::CalibratedInterim { seq, calibrated, route_ms } => {
-                            // Stage2 recalibrated an in-progress utterance (a fragment merged into
-                            // it). Live calibrated text — UI shows it in place of the raw partial.
+                            // Stage2 recalibrated an in-progress utterance (a fragment merged into it).
                             info!(seq, route_ms, calibrated = %calibrated, "纠偏(碎片)");
-                            upsert_live(&utterances, seq, |u| {
-                                u.calibrated = Some(calibrated);
-                                u.live = true;
-                            });
+                            Some(AsrSegment::CalibratedInterim { seq, calibrated })
                         }
                         TurnEvent::Final { utterance: u, decision: d, route_ms } => {
                             // Log all three text layers — batch ASR (authoritative), streaming
                             // ASR (hotword-biased), and the Stage2 rewrite — so ASR-level loss is
                             // distinguishable from LLM rewriting when diagnosing "missing" words.
-                            // (No pcm field: never log audio buffers.)
                             info!(
                                 seq = u.seq,
                                 at_s = u.at_s,
@@ -460,11 +450,8 @@ fn main() -> Result<()> {
                                 calibrated = %d.calibrated_text,
                                 "final"
                             );
-                            if stage3_on {
-                                stage3_rule_trigger(&tool, &d.calibrated_text);
-                            }
                             // Record PCM → audio archive, transcript+decision → day log + recent
-                            // ring (backs /api/audio). Then freeze the timeline entry.
+                            // ring (backs /api/audio + /api/recordings).
                             storage.record_final(FinalTurn {
                                 seq: u.seq,
                                 at_s: u.at_s,
@@ -477,22 +464,26 @@ fn main() -> Result<()> {
                                 route_ms,
                                 pcm: u.pcm.clone(),
                             });
-                            upsert_live(&utterances, u.seq, |entry| {
-                                entry.live = false;
-                                entry.final_ = Some(FinalView {
-                                    raw: u.raw_text.clone(),
-                                    streaming: u.streaming_text.clone(),
-                                    calibrated: d.calibrated_text.clone(),
-                                    intent: d.intent.clone(),
-                                    reply: d.reply.clone(),
-                                    route_ms,
-                                });
-                            });
+                            // Stage3 may add hotwords — that's a SETTINGS change → control plane.
+                            if stage3_on && stage3_rule_trigger(&tool, &d.calibrated_text) {
+                                version.fetch_add(1, Ordering::Release);
+                            }
+                            Some(AsrSegment::Final {
+                                seq: u.seq,
+                                raw_text: u.raw_text.clone(),
+                                streaming_text: u.streaming_text.clone(),
+                                calibrated: d.calibrated_text.clone(),
+                                intent: d.intent.clone(),
+                                reply: d.reply.clone(),
+                                route_ms,
+                            })
                         }
+                    };
+                    // Data plane: push the recognition segment directly to /api/asr_stream
+                    // subscribers (low-latency). Err only when there are no receivers (fine).
+                    if let Some(seg) = segment {
+                        let _ = asr_events.send(seg);
                     }
-                    // Any turn mutated the timeline (or, on Final, Stage3 may have added a
-                    // hotword) → bump so the SSE handler pings on its next tick.
-                    version.fetch_add(1, Ordering::Release);
                 });
             })?;
     }
@@ -502,8 +493,8 @@ fn main() -> Result<()> {
         hotwords: Arc::clone(&hotwords),
         corrections: Arc::clone(&corrections),
         active: Arc::clone(&active),
-        utterances: Arc::clone(&utterances),
         version: Arc::clone(&version),
+        asr_events: asr_events.clone(),
         config,
         stage3_on,
         storage,
@@ -523,7 +514,8 @@ fn main() -> Result<()> {
 /// corrections so future turns are reinforced. Concatenation artifacts ("APIdocker" — batch ASR
 /// gluing adjacent terms) are rejected so they can't pollute the store.
 #[instrument(skip(tool))]
-fn stage3_rule_trigger(tool: &AddHotwordTool, text: &str) {
+fn stage3_rule_trigger(tool: &AddHotwordTool, text: &str) -> bool {
+    let mut added_any = false;
     for tok in text.split(|c: char| !c.is_ascii_alphanumeric()) {
         if tok.len() < 2 || !tok.chars().any(|c| c.is_ascii_uppercase()) || looks_like_concat(tok)
         {
@@ -532,9 +524,11 @@ fn stage3_rule_trigger(tool: &AddHotwordTool, text: &str) {
         if let Ok(out) = tool.invoke(&json!({ "word": tok })) {
             if out["added"].as_bool() == Some(true) {
                 info!(word = %tok, "stage3 规则触发器加词");
+                added_any = true;
             }
         }
     }
+    added_any
 }
 
 /// A concatenation artifact like "APIdocker": an UPPER-UPPER-lower trigram marks the glue seam
@@ -545,35 +539,6 @@ fn looks_like_concat(tok: &str) -> bool {
     c.windows(3).any(|w| {
         w[0].is_ascii_uppercase() && w[1].is_ascii_uppercase() && w[2].is_ascii_lowercase()
     })
-}
-
-/// Find the timeline entry with `seq` and mutate it; if absent, push a new live one. Evicts the
-/// oldest (lowest-seq) entries past [`MAX_UTTERANCES`]. Called only from the pipeline thread.
-fn upsert_live(
-    utterances: &Arc<RwLock<Vec<UtteranceView>>>,
-    seq: u64,
-    mutate: impl FnOnce(&mut UtteranceView),
-) {
-    let mut guard = utterances.write().unwrap();
-    if let Some(u) = guard.iter_mut().find(|u| u.seq == seq) {
-        mutate(u);
-    } else {
-        let mut u = UtteranceView {
-            seq,
-            partial: String::new(),
-            calibrated: None,
-            final_: None,
-            live: true,
-            corrected_by_user: false,
-            at_s: 0.0,
-        };
-        mutate(&mut u);
-        guard.push(u);
-    }
-    if guard.len() > MAX_UTTERANCES {
-        let excess = guard.len() - MAX_UTTERANCES;
-        guard.drain(0..excess);
-    }
 }
 
 async fn serve_socket(state: DaemonState, port: u16, web_dist: Option<String>) {
@@ -589,7 +554,8 @@ async fn serve_socket(state: DaemonState, port: u16, web_dist: Option<String>) {
         .route("/health", get(health))
         // ── the snapshot-sync contract ──
         .route("/api/state", get(state_handler))           // full AuraStateView snapshot
-        .route("/api/stream", get(stream_asr))             // SSE: hello → state_changed* (throttled)
+        .route("/api/stream", get(stream_asr))             // control plane: hello → state_changed* (throttled)
+        .route("/api/asr_stream", get(asr_stream))         // data plane: hello → recognition segments* (pushed)
         // ── actions (each mutates state → bumps version → next SSE tick pings) ──
         .route("/api/control/scout", post(control_scout))
         .route("/api/correct", post(correction_handler))
@@ -674,6 +640,24 @@ async fn stream_asr(
     Sse::new(hello.chain(pings)).keep_alive(KeepAlive::default())
 }
 
+/// `GET /api/asr_stream` — the DATA plane: pushes each recognition segment directly to the
+/// subscriber (low-latency, every event — not throttled, unlike the control-plane `/api/stream`).
+/// One `data: <AsrSegment json>\n\n` frame per Interim / CalibratedInterim / Final. Late/lagged
+/// subscribers get a `lagged` comment (broadcast backlog overflowed) and keep going.
+async fn asr_stream(State(s): State<DaemonState>) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let rx = s.asr_events.subscribe();
+    let hello = tokio_stream::once(Ok::<_, Infallible>(
+        Event::default().data(json!({ "type": "hello" }).to_string()),
+    ));
+    let live = BroadcastStream::new(rx).map(|res| match res {
+        Ok(seg) => Ok(Event::default().data(
+            serde_json::to_string(&seg).unwrap_or_else(|_| "{}".into()),
+        )),
+        Err(_) => Ok(Event::default().comment("lagged")),
+    });
+    Sse::new(hello.chain(live)).keep_alive(KeepAlive::default())
+}
+
 /// `GET /api/audio/:seq` — serve utterance `seq` as a WAV for playback. The archive resolves
 /// transparently: hot tier first, then the flushed file on disk.
 async fn audio_handler(
@@ -711,12 +695,11 @@ async fn correction_handler(State(s): State<DaemonState>, body: Json<Value>) -> 
         } // evict oldest
         c.push((raw.clone(), corrected.clone()));
     }
-    // Flag the timeline entry (if present) so the UI shows "✓ 已纠正".
-    if let Some(u) = s.utterances.write().unwrap().iter_mut().find(|u| u.seq == seq) {
-        u.corrected_by_user = true;
-    }
+    // Data plane: tell subscribers to mark utterance `seq` corrected (the live list is client-side).
+    let _ = s.asr_events.send(AsrSegment::Correction { seq, raw, corrected });
+    // Control plane: the corrections list changed → re-fetch snapshot.
     s.bump();
-    info!(seq, raw = %raw, corrected = %corrected, "user correction added → Stage2");
+    info!("user correction added → Stage2");
     Json(json!({ "ok": true }))
 }
 

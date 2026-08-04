@@ -1,23 +1,24 @@
-//! client.rs — `AuraClient`: an async Rust SDK for the aura-daemon's snapshot-sync API.
+//! client.rs — `AuraClient`: an async Rust SDK for the aura-daemon, with TWO streaming planes:
 //!
-//! The daemon is the single source of truth; this client fetches the full [`AuraStateView`]
-//! snapshot and re-fetches on change. For the live-updating case, [`AuraClient::subscribe`]
-//! opens the SSE ping stream and yields a fresh snapshot on each `state_changed` ping (it
-//! reconnects with backoff, so the stream is resilient — the consumer just renders snapshots).
+//! - **Control plane** ([`subscribe`]): snapshot-sync. The daemon is the source of truth; this
+//!   fetches the full [`AuraStateView`] and re-fetches on each throttled `state_changed` ping.
+//!   Right for low-frequency state (connection, config, hotwords, corrections).
+//! - **Data plane** ([`subscribe_segments`]): live recognition segments pushed directly
+//!   (low-latency, every event). Each [`AsrSegment`] is one Interim / CalibratedInterim / Final —
+//!   render the live streaming text off this, without the ping→fetch round-trip.
 //!
-//! This crate (audio-aura-agent) is dependency-light on purpose — no mistralrs/asr — so an upper
-//! layer (the desktop-pet secretary, visual-rover, …) can talk to aura without pulling the GPU
-//! inference stack.
+//! Both streams are resilient + infinite (they reconnect on drop). This crate is dependency-light
+//! on purpose (no mistralrs/asr) so an upper layer talks to aura without the GPU stack.
 //!
 //! ```ignore
 //! use audio_aura_agent::client::AuraClient;
 //! use futures::StreamExt;
 //! # #[tokio::main] async fn main() -> anyhow::Result<()> {
 //! let client = AuraClient::new("http://127.0.0.1:9091")?;
-//! let states = client.subscribe(400); // ping ≥400ms
-//! tokio::pin!(states);
-//! while let Some(snap) = states.next().await {
-//!     println!("{} utterances, connected={}", snap.utterances.len(), snap.connected);
+//! let segs = client.subscribe_segments();
+//! tokio::pin!(segs);
+//! while let Some(seg) = segs.next().await {
+//!     println!("{seg:?}");
 //! }
 //! # Ok(()) }
 //! ```
@@ -27,9 +28,9 @@ use std::time::Duration;
 use anyhow::Result;
 use futures::{Stream, StreamExt};
 
-use crate::view::AuraStateView;
+use crate::view::{AsrSegment, AuraStateView};
 
-/// Reconnect backoff when the SSE stream drops or the daemon is unreachable.
+/// Reconnect backoff when an SSE stream drops or the daemon is unreachable.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Async client for the aura-daemon HTTP socket. Cheap to clone (shares the reqwest pool).
@@ -53,7 +54,7 @@ impl AuraClient {
         Ok(r.status().is_success())
     }
 
-    /// `GET /api/state` — the complete snapshot (the one source of truth).
+    /// `GET /api/state` — the complete snapshot (the control-plane source of truth).
     pub async fn state(&self) -> Result<AuraStateView> {
         Ok(self
             .http
@@ -120,15 +121,9 @@ impl AuraClient {
             .unwrap_or_default())
     }
 
-    /// Subscribe to state changes: opens `GET /api/stream?state_changed_frequency=<ms>` and, on
-    /// each `state_changed` ping, fetches `/api/state` and yields the snapshot. The stream is
-    /// **resilient + infinite** — on any drop (daemon restart, network blip) it reconnects after
-    /// [`RECONNECT_BACKOFF`]. `freq_ms` is the min interval between pings (floored to 250ms by the
-    /// server). Backpressure is cooperative: when the consumer stops pulling, no pings are
-    /// processed (it just renders at its own pace).
-    pub fn subscribe(&self, freq_ms: u64) -> impl Stream<Item = AuraStateView> + '_ {
-        let freq = freq_ms.max(250);
-        let url = format!("{}/api/stream?state_changed_frequency={}", self.base, freq);
+    /// Raw `data:` payloads from an SSE endpoint, with reconnect. Shared by [`subscribe`] and
+    /// [`subscribe_segments`]. Yields one owned String per `data:` line (a frame may carry ≥1).
+    fn sse_data(&self, url: String) -> impl Stream<Item = String> + '_ {
         async_stream::stream! {
             loop {
                 match self.http.get(&url).send().await {
@@ -139,16 +134,13 @@ impl AuraClient {
                         loop {
                             match bytes.next().await {
                                 Some(Ok(chunk)) => {
-                                    // SSE frames are ASCII (`{"type":"state_changed"}` / keep-alive
-                                    // comments) — lossy utf8 is safe and never splits a multi-byte
-                                    // char mid-frame.
+                                    // SSE frames are ASCII (JSON pings / keep-alive comments) —
+                                    // lossy utf8 is safe and never splits a multi-byte char mid-frame.
                                     buf.push_str(&String::from_utf8_lossy(&chunk));
                                     while let Some(idx) = buf.find("\n\n") {
                                         let frame: String = buf.drain(..idx + 2).collect();
-                                        if frame_is_state_changed(&frame) {
-                                            if let Ok(snap) = self.state().await {
-                                                yield snap;
-                                            }
+                                        for payload in data_payloads(&frame) {
+                                            yield payload.to_string();
                                         }
                                     }
                                 }
@@ -156,43 +148,76 @@ impl AuraClient {
                             }
                         }
                     }
-                    Ok(resp) => tracing::warn!(status = %resp.status(), "aura /api/stream bad status; reconnecting"),
-                    Err(e) => tracing::warn!(error = %e, "aura /api/stream connect failed; retrying"),
+                    Ok(resp) => tracing::warn!(status = %resp.status(), "aura SSE bad status; reconnecting"),
+                    Err(e) => tracing::warn!(error = %e, "aura SSE connect failed; retrying"),
                 }
                 tokio::time::sleep(RECONNECT_BACKOFF).await;
             }
         }
     }
+
+    /// **Control plane** — snapshot-sync. Opens `GET /api/stream?state_changed_frequency=<ms>` and,
+    /// on each `state_changed` ping, fetches `/api/state` and yields the snapshot. Resilient +
+    /// infinite (reconnects on drop). `freq_ms` is the min interval between pings (floored to 250ms
+    /// by the server). Backpressure is cooperative: the consumer renders at its own pace.
+    pub fn subscribe(&self, freq_ms: u64) -> impl Stream<Item = AuraStateView> + '_ {
+        let url = format!("{}/api/stream?state_changed_frequency={}", self.base, freq_ms.max(250));
+        async_stream::stream! {
+            let data = self.sse_data(url);
+            tokio::pin!(data); // sse_data's stream is !Unpin — pin before .next()
+            while let Some(payload) = data.next().await {
+                if payload.contains("\"state_changed\"") {
+                    if let Ok(snap) = self.state().await {
+                        yield snap;
+                    }
+                }
+            }
+        }
+    }
+
+    /// **Data plane** — live recognition segments pushed directly. Opens `GET /api/asr_stream` and
+    /// yields each [`AsrSegment`] (Interim / CalibratedInterim / Final) as it happens —
+    /// low-latency, every event, no ping→fetch round-trip. Resilient + infinite (reconnects on
+    /// drop). Render the live streaming text off this.
+    pub fn subscribe_segments(&self) -> impl Stream<Item = AsrSegment> + '_ {
+        let url = format!("{}/api/asr_stream", self.base);
+        async_stream::stream! {
+            let data = self.sse_data(url);
+            tokio::pin!(data);
+            while let Some(payload) = data.next().await {
+                if let Ok(seg) = serde_json::from_str::<AsrSegment>(&payload) {
+                    yield seg;
+                }
+            }
+        }
+    }
 }
 
-/// Does an SSE frame (the text between two blank lines) carry a `state_changed` data payload?
-fn frame_is_state_changed(frame: &str) -> bool {
-    frame.lines().any(|line| {
-        let data = line.strip_prefix("data:").unwrap_or("").trim();
-        if data.is_empty() {
-            return false;
-        }
-        serde_json::from_str::<serde_json::Value>(data)
-            .ok()
-            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|s| s == "state_changed"))
-            .unwrap_or(false)
-    })
+/// The `data:` payloads of one SSE frame (the text between two blank lines). Each `data:` line's
+/// content, trimmed (SSE allows an optional space after the colon).
+fn data_payloads(frame: &str) -> impl Iterator<Item = &str> {
+    frame
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim))
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::frame_is_state_changed;
+    use super::data_payloads;
 
     #[test]
-    fn parses_state_changed_frame() {
-        assert!(frame_is_state_changed("data: {\"type\":\"state_changed\"}\n"));
-        assert!(frame_is_state_changed("data:{\"type\":\"state_changed\"}"));
+    fn extracts_data_payloads() {
+        let frame = "data: {\"type\":\"state_changed\"}\n";
+        assert_eq!(data_payloads(frame).collect::<Vec<_>>(), vec!["{\"type\":\"state_changed\"}"]);
+        // optional space after colon
+        assert_eq!(data_payloads("data:  hi").collect::<Vec<_>>(), vec!["hi"]);
     }
 
     #[test]
-    fn ignores_other_frames() {
-        assert!(!frame_is_state_changed("data: {\"type\":\"hello\"}\n"));
-        assert!(!frame_is_state_changed(": keep-alive comment\n")); // axum KeepAlive
-        assert!(!frame_is_state_changed(""));
+    fn ignores_non_data_lines() {
+        // keep-alive comments (axum KeepAlive) and event/id lines carry no data.
+        assert_eq!(data_payloads(": keep-alive\n").collect::<Vec<_>>(), Vec::<&str>::new());
+        assert_eq!(data_payloads("event: ping\ndata:\n").collect::<Vec<_>>(), Vec::<&str>::new());
     }
 }

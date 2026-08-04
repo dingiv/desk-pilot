@@ -13,6 +13,7 @@
 - **[adaptive-learning.md](adaptive-learning.md)** — 自适应学习闭环设计（存疑→纠错→热词/微调）。
 - **[real-world-speech-design.md](real-world-speech-design.md)** — 真实场景 8 类语音问题 + 处理方案。`🟢 2026-08 新`
 - **[realtime-voice-models.md](realtime-voice-models.md)** — 实时语音模型调研（Moshi/GLM-4-Voice/Mini-Omni2）。`🟢 2026-08 新`
+- **[client-state-sync.md](client-state-sync.md)** — 客户端状态同步：按"频率×数据量"分控制面/数据面/按需；状态盘点表。`🟢 2026-08 新`
 - **[moshi-spike.md](moshi-spike.md)** — Moshi spike 记录（16GB VRAM 限制搁置）。
 
 ## 📚 技术参考

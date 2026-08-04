@@ -27,7 +27,7 @@ docking_preference: "right"
 # Gradient pills: angle°, start_rgba, end_rgba (all 0..1).
 # Shadow: colour rgba + offset [x,y] + blur (pixels).  Omit shadow_blur for none.
 style:
-  card_bg:           [0.18, 0.18, 0.24, 0.66]     # frosted-glass card bg
+  card_bg:           [0.18, 0.18, 0.24, 0.8]     # frosted-glass card bg
   shadow_color:      [0.0, 0.0, 0.1, 0.20]         # soft dark shadow
   shadow_offset:     [1.0, 3.0]                     # shadow direction
   shadow_blur:       12.0                            # blur radius
