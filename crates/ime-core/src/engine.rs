@@ -400,13 +400,18 @@ impl ImeEngine {
         let Some(pc) = map.get(&DEFAULT_CTX) else { return Vec::new() };
         // Snippet/Voice state: candidates come from the Matcher trie / asr buffer, not the scorer.
         // Return them directly so #asr / #date expansions appear correctly.
-        let in_direct = pc.sm.state == crate::state::ComposeState::Snippet
-            || pc.sm.state == crate::state::ComposeState::Voice;
-        if in_direct && pc.sm.candidates_fresh {
-            let source = match pc.sm.state {
-                crate::state::ComposeState::Voice => "asr",
-                _ => if pc.sm.buffer.starts_with('#') { "magic" } else { "snippet" },
-            };
+        // For Voice, prefer the full texts (voice_full) over the display previews (candidates).
+        if pc.sm.state == crate::state::ComposeState::Voice && pc.sm.candidates_fresh {
+            let texts: &[String] = if pc.sm.voice_full.is_empty() { &pc.sm.candidates } else { &pc.sm.voice_full };
+            return texts.iter().map(|c| crate::family::RankedCandidate {
+                text: c.clone(),
+                score: 1.0,
+                family: "asr",
+                source: "exact",
+            }).collect();
+        }
+        if pc.sm.state == crate::state::ComposeState::Snippet && pc.sm.candidates_fresh {
+            let source = if pc.sm.buffer.starts_with('#') { "magic" } else { "snippet" };
             return pc.sm.candidates.iter().map(|c| crate::family::RankedCandidate {
                 text: c.clone(),
                 score: 1.0,
@@ -532,7 +537,7 @@ impl ImeEngine {
                 );
                 return None;
             }
-            tracing::info!(
+            tracing::debug!(
                 ctx,
                 voice_version = pc.sm.voice_version,
                 cur_version,
@@ -659,6 +664,27 @@ mod tests {
         let v = e.predict(InputEvent::escape());
         assert!(ImeView::str_field(&v.commit_text).is_empty(), "escape commits nothing");
         assert!(e.candidates().is_empty(), "cleared after escape");
+    }
+
+    #[test]
+    fn asr_voice_long_sentence_preview_with_ellipsis_commit_full() {
+        use std::sync::Arc;
+        use crate::asr_buffer::AsrBuffer;
+        // A sentence > VOICE_PREVIEW_MAX (60) bytes — each char = 3 bytes, 10 chars = 30.
+        // 3× repeat → ~90 bytes, well above the preview cap.
+        let long = "这是一句相当长的话，超出六十字节限制。".repeat(2); // ~72 bytes
+        let buf = Arc::new(AsrBuffer::new());
+        buf.push_final(&long);
+        let mut e = eng();
+        e.set_asr_buffer(Arc::clone(&buf));
+        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        e.voice_tick();
+        let cands = e.candidates();
+        assert!(cands[0].ends_with('…'), "long preview has ellipsis: {}", cands[0]);
+        assert!(cands[0].len() < long.len(), "preview is shorter than full ({})", cands[0].len());
+        // Space commits the FULL text (from voice_full), not the display preview.
+        let v = e.predict(InputEvent::space());
+        assert_eq!(ImeView::str_field(&v.commit_text), long);
     }
 
     #[test]

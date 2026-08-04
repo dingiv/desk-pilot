@@ -119,13 +119,13 @@ void SwiftImeEngine::apply_view(fcitx::InputContext *ic, const ImeView &v) {
     ic->updatePreedit();
     ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
 
-    // After refresh: log the candidate area when in voice (#asr) mode, so the live-refresh path
-    // is observable in fcitx5's log.
+    // After refresh: log the candidate area when in voice (#asr) mode. Debug-level (gated by
+    // FCITX_DEBUG) so it doesn't spam by default — enable when diagnosing the live-refresh path.
     if (std::strstr(v.preedit_text, "asr") != nullptr) {
-        FCITX_INFO() << "[voice] apply_view ic=" << ic << " count=" << v.candidate_count
-                     << " preedit='" << v.preedit_text << "'";
+        FCITX_DEBUG() << "[voice] apply_view ic=" << ic << " count=" << v.candidate_count
+                      << " preedit='" << v.preedit_text << "'";
         for (unsigned int i = 0; i < v.candidate_count && i < CANDIDATE_SLOTS; i++) {
-            FCITX_INFO() << "[voice]   [" << i << "] " << v.candidates[i].text;
+            FCITX_DEBUG() << "[voice]   [" << i << "] " << v.candidates[i].text;
         }
     }
 

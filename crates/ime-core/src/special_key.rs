@@ -140,7 +140,11 @@ pub fn handle_special_key(
                 let view = sm.select(idx, env);
                 Some(view)
             } else {
-                None // out of range → pass to character
+                // No candidates (e.g. Idle state typing a bare digit) — pass the key through
+                // so the application gets the digit character instead of it being silently eaten.
+                let mut v = ImeView::empty();
+                v.key_passthrough = 1;
+                Some(v)
             }
         }
     }

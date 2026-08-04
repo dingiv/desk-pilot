@@ -26,7 +26,7 @@ struct ImeHandle; // defined in libswift_ime.so, created/destroyed via C ABI
 static const unsigned int CANDIDATE_SLOTS = 16;
 
 struct CandidateSlot {
-    char text[64];
+    char text[128];
     char label[8];
 };
 

@@ -23,24 +23,24 @@ pub trait PinyinEngine: Send + Sync {
 
 pub const CANDIDATE_SLOTS: usize = 16;
 
-/// One candidate in the ImeView. Fixed-size for C ABI compatibility.
+/// One candidate in the ImeView. Fixed-size for C ABI compatibility. `text` is 128 bytes so a
+/// full voice sentence (~40+ CJK chars) fits; longer candidates truncate cleanly at a char
+/// boundary (see [`ImeView::set_str`]).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CandidateSlot {
-    pub text: [u8; 64],
+    pub text: [u8; 128],
     pub label: [u8; 8],
 }
 
 impl Default for CandidateSlot {
-    fn default() -> Self { CandidateSlot { text: [0u8; 64], label: [0u8; 8] } }
+    fn default() -> Self { CandidateSlot { text: [0u8; 128], label: [0u8; 8] } }
 }
 
 impl CandidateSlot {
     pub fn from_str(text: &str) -> Self {
         let mut s = CandidateSlot::default();
-        let bytes = text.as_bytes();
-        let n = bytes.len().min(s.text.len() - 1);
-        s.text[..n].copy_from_slice(&bytes[..n]);
+        ImeView::set_str(&mut s.text, text);
         s
     }
 }
@@ -80,12 +80,24 @@ impl ImeView {
         }
     }
 
-    /// Fill a string field in the view (NUL-terminated).
+    /// Fill a string field in the view (NUL-terminated). Truncates at the last **char boundary**
+    /// ≤ `buf.len()-1` — never splits a multi-byte character, so the result is always valid UTF-8
+    /// (byte-truncation would produce garbage that crashes fcitx5's UI with "Invalid utf8 string").
     pub fn set_str(buf: &mut [u8], s: &str) {
         buf.fill(0);
         let bytes = s.as_bytes();
-        let n = bytes.len().min(buf.len() - 1);
-        buf[..n].copy_from_slice(&bytes[..n]);
+        let max = buf.len().saturating_sub(1); // leave room for the NUL
+        if bytes.len() <= max {
+            buf[..bytes.len()].copy_from_slice(bytes);
+            return;
+        }
+        // Walk back from `max` to the nearest char boundary — ensures the truncated string is
+        // valid UTF-8 even when `max` falls in the middle of a multi-byte sequence.
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        buf[..end].copy_from_slice(&bytes[..end]);
     }
 
     pub fn str_field(buf: &[u8]) -> &str {
@@ -102,10 +114,38 @@ impl Default for ImeView {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn ime_state_defaults() {
         let sm = crate::state::StateMachine::new();
         assert!(sm.buffer.is_empty());
         assert_eq!(sm.state, crate::state::ComposeState::Idle);
+    }
+
+    #[test]
+    fn set_str_truncates_at_char_boundary() {
+        let mut buf = [0u8; 10]; // room for 9 chars + NUL
+        // 9 ASCII bytes fits exactly (no truncation).
+        ImeView::set_str(&mut buf, "123456789");
+        assert_eq!(ImeView::str_field(&buf), "123456789");
+
+        // 10-byte ASCII: truncated, but ASCII is 1-byte → any byte is a char boundary.
+        let mut buf = [0u8; 10];
+        ImeView::set_str(&mut buf, "1234567890"); // 10 bytes, max=9 → truncate
+        assert_eq!(ImeView::str_field(&buf), "123456789"); // 9 chars
+
+        // CJK: "你好世界" = 12 bytes. buf len=10 → max=9. Bytes 0-8 hold "你好世" (all 3 chars fit
+        // on char boundaries). Byte 9 starts "界" → doesn't fit → truncates to 3 chars.
+        let mut buf = [0u8; 10];
+        ImeView::set_str(&mut buf, "你好世界"); // 你(0-2) 好(3-5) 世(6-8) 界(9-11)
+        let result = ImeView::str_field(&buf);
+        assert_eq!(result, "你好世", "3 full CJK chars (9 bytes) fit in 9-byte buf");
+        assert!(!result.is_empty());
+
+        // buf too small: "你好" = 6 bytes, buf len=5 → max=4 → walks back to 3 ("你") → "你".
+        let mut buf = [0u8; 5];
+        ImeView::set_str(&mut buf, "你好");
+        assert_eq!(ImeView::str_field(&buf), "你");
     }
 }

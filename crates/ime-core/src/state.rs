@@ -65,10 +65,14 @@ pub struct StateMachine {
     /// Last `AsrBuffer::version()` seen while in [`Voice`](ComposeState::Voice) state. The engine's
     /// `voice_tick` compares it to detect "voice data changed → rebuild the candidate view".
     pub voice_version: u64,
+    /// Full (un-truncated) texts of the Voice-mode candidates, parallel to [`Self::candidates`].
+    /// `candidates` holds the **preview** (short, for display); `voice_full` holds the **full**
+    /// text (committed by Space). Populated by [`Self::refresh_voice`], cleared by [`Self::reset`].
+    pub voice_full: Vec<String>,
 }
 
 impl StateMachine {
-    pub fn new() -> Self { StateMachine { candidate_page_size: 7, ..StateMachine::default() } }
+    pub fn new() -> Self { StateMachine { candidate_page_size: 7 /* FIXME: 使用配置指定 */, ..StateMachine::default() } }
 
     pub fn step(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
         match self.state {
@@ -148,6 +152,7 @@ impl StateMachine {
         self.full_comp_count = 0;
         self.partial_commit_indices.clear();
         self.pending_expansion = None;
+        self.voice_full.clear();
     }
 
     pub fn move_highlight(&mut self, delta: i32) {
@@ -489,13 +494,30 @@ impl StateMachine {
 
     // ── Voice (#asr live mode) ────────────────────────────────────────
 
-    /// Rebuild Voice-mode candidates from the asr buffer: `[live (current streaming), finals (newest
-    /// →oldest)]`. The **active** utterance (live) is #1 — the one the user is currently producing
-    /// is most prominent; when it settles (Final) it graduates into `finals` (head = still #1, since
-    /// `push_final` clears live). So newest is always #1. Called on entering Voice and by the
-    /// engine's `voice_tick` whenever `asr_buffer.version()` advances.
+    /// Maximum displayed bytes for a voice candidate **preview** (≈20 CJK chars). Longer texts get
+    /// `"first…"` — the full text is committed by Space from [`Self::voice_full`], so truncation
+    /// here is cosmetic.
+    const VOICE_PREVIEW_MAX: usize = 60;
+
+    /// Build a display-friendly preview: first [`VOICE_PREVIEW_MAX`] bytes (char-boundary-safe)
+    /// + `…` if truncated. The full text is in [`Self::voice_full`] for commit.
+    fn voice_preview(text: &str) -> String {
+        let bytes = text.as_bytes();
+        if bytes.len() <= Self::VOICE_PREVIEW_MAX {
+            return text.to_string();
+        }
+        let mut end = Self::VOICE_PREVIEW_MAX;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &text[..end])
+    }
+
+    /// Rebuild Voice-mode candidates from the asr buffer. `self.candidates` = **previews** (short,
+    /// for display); `self.voice_full` = **full texts** (committed by Space). Order: `[live, finals
+    /// (newest→oldest)]` — the active utterance is #1.
     pub fn refresh_voice(&mut self, env: &dyn StepEnv) -> ImeView {
-        let mut cands: Vec<String> = match env.asr_buffer() {
+        let full: Vec<String> = match env.asr_buffer() {
             Some(buf) => {
                 let (finals, live) = buf.voice_candidates();
                 let mut v: Vec<String> = Vec::new();
@@ -505,12 +527,19 @@ impl StateMachine {
             }
             None => Vec::new(),
         };
-        let empty = cands.is_empty();
+        let empty = full.is_empty();
+        self.voice_full = full.clone();
+        let mut previews: Vec<String> = full.iter().map(|t| Self::voice_preview(t)).collect();
         if empty {
-            cands = vec!["语音识别中...".to_string()]; // preview placeholder until voice arrives
+            previews = vec!["语音识别中...".to_string()]; // placeholder until voice arrives
+            self.voice_full.clear();
         }
-        self.candidates = cands;
-        tracing::info!(candidates = ?self.candidates, "voice candidates rebuilt");
+        self.candidates = previews;
+        tracing::debug!(
+            previews = ?self.candidates,
+            full = ?self.voice_full,
+            "voice candidates rebuilt"
+        );
         self.candidates_fresh = true;
         self.candidate_highlight = 0;
         self.candidate_page = 0;
@@ -530,7 +559,10 @@ impl StateMachine {
     fn handle_voice(&mut self, ch: char, _env: &dyn StepEnv) -> ImeView {
         match ch {
             ' ' => {
-                let text = self.candidates.first().cloned().unwrap_or_default();
+                // Commit the FULL text (voice_full), not the display preview (candidates).
+                // candidates holds a truncated preview; voice_full holds the real sentence.
+                let text = self.voice_full.first().cloned()
+                    .unwrap_or_else(|| self.candidates.first().cloned().unwrap_or_default());
                 self.reset();
                 // Preview ("...") or empty → commit nothing (voice hasn't produced a final yet).
                 if text.is_empty() || text.ends_with("...") {

@@ -33,6 +33,10 @@ use dp_models::{http::HttpAsr, AsrProvider, ProviderKind};
 const DEFAULT_RING_CAP: usize = 16_000 * 600;
 /// Streaming-partial decode cadence: every N windows (~0.5s @ 32ms Silero windows).
 const PARTIAL_EVERY_FRAMES: u32 = 15;
+/// Diligent Stage2: calibrate the streaming partial this often during active speech. The partial
+/// is already text (no batch ASR needed) — just a Stage2 LLM call — so this is cheap and keeps
+/// the live candidate calibrated-fresh instead of idling between rare VAD fragments.
+const STREAM_CALIBRATE_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// Config for [`OnnxStage1Executor`] — paths + params for the VAD, batch ASR, and streaming ASR,
 /// plus the omni-scout address, ring capacity, and the connection `active` flag.
@@ -428,6 +432,7 @@ impl Stage1Executor for OnnxStage1Executor {
         let sasr = self.mgr.streaming_asr();
         let mut stream_sess = sasr.map(|s| s.create_session());
         let mut last_partial = String::new();
+        let mut last_stream_calibrate: Option<Instant> = None;
         let mut frames_since_partial = 0u32;
         let mut ring_empty_since: Option<Instant> = None;
         // Segment merger — absorbs VAD fragments split by short pauses (< merge_gap_s) into one
@@ -512,6 +517,23 @@ impl Stage1Executor for OnnxStage1Executor {
                             partial: partial.clone(),
                             at_s: start.elapsed().as_secs_f64(),
                         });
+                        // Diligent Stage2: periodically calibrate the streaming partial text
+                        // (the partial is already text → no batch ASR, just Stage2). Keeps the
+                        // live candidate calibrated-fresh during continuous speech, instead of
+                        // waiting for a rare VAD fragment. seq = idx+1 (same as Interim/Final).
+                        if last_stream_calibrate
+                            .map_or(true, |t| t.elapsed() >= STREAM_CALIBRATE_INTERVAL)
+                        {
+                            last_stream_calibrate = Some(Instant::now());
+                            on_event(Stage1Event::Revise(Utterance {
+                                seq: idx + 1,
+                                raw_text: partial.clone(),
+                                streaming_text: String::new(),
+                                duration_ms: 0.0,
+                                at_s: start.elapsed().as_secs_f64(),
+                                pcm: Vec::new(),
+                            }));
+                        }
                         last_partial = partial;
                     }
                     frames_since_partial = 0;
