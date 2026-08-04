@@ -8,7 +8,8 @@
 //! let exec = OnnxStage1Executor::new(Stage1Config { scout_addr, vad, asr, streaming, ring_cap_samples })?;
 //! exec.run(&mut |ev| match ev {
 //!     Stage1Event::Interim { partial, .. } => println!("…{partial}"),
-//!     Stage1Event::Final(u) => stage2.calibrate(&u),
+//!     Stage1Event::Action(Stage1Action::MergeBatch(u)) => stage2.calibrate(&u),
+//!     Stage1Event::Action(Stage1Action::Batch(u)) => stage2.calibrate_provisional(&u),
 //! });
 //! ```
 
@@ -26,7 +27,7 @@ use crate::onnx::{
     VadConfig, WINDOW,
 };
 use crate::scout::ScoutAudioSource;
-use crate::{Stage1Event, Utterance, VadEventKind};
+use crate::{Stage1Action, Stage1Event, Utterance, VadEventKind};
 use dp_models::{http::HttpAsr, AsrProvider, ProviderKind};
 
 /// Default ring capacity: 10 min @ 16 kHz mono (~19 MB).
@@ -50,11 +51,15 @@ pub struct Stage1Config {
     /// Batch ASR backend: `Local` (lib sherpa OnnxAsr) or `Remote` (HTTP, OpenAI-compatible).
     /// Streaming ASR + VAD stay local sherpa regardless (real-time partials need low latency).
     pub asr_kind: ProviderKind,
-    /// ★Segment-merge gap (seconds). VAD fires EOS on every pause ≥ `min_silence`; the
-    /// [`SegmentMerger`] then absorbs a following segment into the pending utterance when the
-    /// inter-speech silence is < this, and only emits a Final when the utterance settles (a gap
-    /// ≥ this, or no new speech for this long). Decouples "VAD sensitivity" from "what's one
-    /// utterance" — VAD stays reactive, merging repairs the fragmentation. 0 → no merging.
+    /// ★Segment-merge gap (seconds) — the UPPER bound of the medium-interval multi-sentence
+    /// merge window. VAD fires EOS on every pause ≥ `min_silence` (kept low, ~1.0s, so batch
+    /// recognition kicks in fast); the [`SegmentMerger`] then absorbs a following segment into
+    /// the pending utterance when the inter-speech silence < this. The lower bound is implicit:
+    /// `min_silence` is what splits segments in the first place, so the effective window is
+    /// (min_silence, merge_gap) ≈ 1–5s — fragments forcibly split by a medium pause stitch back
+    /// into one paragraph, and batch ASR re-runs on the merged PCM to UPDATE the sentence. Only
+    /// a gap ≥ this (or no new speech for this long) settles → Final. Decouples "VAD sensitivity"
+    /// from "what's one utterance" — VAD stays reactive, merging repairs the fragmentation. 0 → no merging.
     pub merge_gap_s: f64,
     /// Shared connection toggle (see [`ScoutAudioSource::with_active`]). Flip to false to stop
     /// ingesting from scout (does NOT kill scout). Defaults to true.
@@ -97,7 +102,7 @@ impl Stage1Config {
             },
             ring_cap_samples: DEFAULT_RING_CAP,
             asr_kind: ProviderKind::Local,
-            merge_gap_s: 1.5,
+            merge_gap_s: 5.0,
             active: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -246,11 +251,11 @@ fn spawn_ingest(
 // R2 from docs/aura/real-world-speech-design.md §1 (停顿碎片化). VAD fires EOS on every pause
 // ≥ min_silence; the merger absorbs a following segment into the pending utterance when the
 // inter-speech silence is < `merge_gap_s`. Each absorbed fragment re-runs batch ASR on the
-// accumulated PCM and emits a `Revise` (provisional, same seq — Stage2 recalibrates
-// incrementally, the UI updates in place); the utterance only `Final`s when it settles (a gap
-// ≥ merge_gap_s, or no new speech for merge_gap_s). So the UI sees one growing utterance instead
-// of N fragments — "fragment anxiety" (R3) solved for free — and Stage2's calibrated text appears
-// live (per fragment), not delayed until settle.
+// accumulated PCM and emits a `Batch` action (provisional, same seq — Stage2 recalibrates
+// incrementally, the UI updates in place); the utterance only settles (a gap ≥ merge_gap_s, or
+// no new speech for merge_gap_s) into a `MergeBatch` action (authoritative). So the UI sees one
+// growing utterance instead of N fragments — "fragment anxiety" (R3) solved for free — and
+// Stage2's calibrated text appears live (per fragment), not delayed until settle.
 
 /// Accumulated audio + timing for an utterance that may still absorb more segments.
 struct MergeAccum {
@@ -264,23 +269,25 @@ struct MergeAccum {
 }
 
 /// A reference to a (possibly merged) audio buffer + its utterance start — what the caller
-/// transcribes (batch ASR) to produce a Revise or Final.
+/// transcribes (batch ASR) to produce a Batch or MergeBatch action.
 struct MergeRef {
     pcm: Vec<i16>,
     start_at: f64,
 }
 
 /// What [`SegmentMerger::on_eos`] produced: optionally a *settled* previous utterance (emit
-/// Final), plus always the *current* in-progress utterance's accumulated audio (emit Revise).
+/// Final), plus always the *current* in-progress utterance's accumulated audio (emit Batch).
 struct EosOutcome {
     /// The previous utterance settled (gap ≥ merge_gap_s) — transcribe + emit Final. `None` when
     /// this segment was absorbed into the current utterance (or it's the first ever segment).
     settled: Option<MergeRef>,
-    /// The current utterance's accumulated audio so far — transcribe + emit Revise (provisional).
+    /// The current utterance's accumulated audio so far — transcribe + emit a `Batch` action
+    /// (provisional).
     provisional: MergeRef,
 }
 
-/// Turns a VAD SOS/EOS stream into provisional Revise events + settled Finals, merging fragments
+/// Turns a VAD SOS/EOS stream into provisional Batch actions + settled MergeBatch actions,
+/// merging fragments
 /// whose inter-speech silence is shorter than `merge_gap_s`. Pure + unit-testable (no I/O). The
 /// executor drives it: `on_sos`/`on_eos` per VAD event, `check_settle` every tick.
 struct SegmentMerger {
@@ -451,7 +458,7 @@ impl Stage1Executor for OnnxStage1Executor {
             // progress inside the merger.) Runs every active tick; this is how the *trailing*
             // utterance finalizes (every other utterance settles when the next segment's gap ≥
             // merge_gap). The wait is unavoidable — you must observe the gap to know it ended —
-            // but the streaming partial + provisional Revise results have been showing live text
+            // but the streaming partial + provisional Batch results have been showing live text
             // throughout, so it doesn't lag.
             let now_s = start.elapsed().as_secs_f64();
             if let Some(settled) = merger.check_settle(now_s) {
@@ -465,7 +472,7 @@ impl Stage1Executor for OnnxStage1Executor {
                 ) {
                     idx += 1;
                     u.seq = idx;
-                    on_event(Stage1Event::Final(u));
+                    on_event(Stage1Event::Action(Stage1Action::MergeBatch(u)));
                     last_partial.clear();
                 }
             }
@@ -525,14 +532,14 @@ impl Stage1Executor for OnnxStage1Executor {
                             .map_or(true, |t| t.elapsed() >= STREAM_CALIBRATE_INTERVAL)
                         {
                             last_stream_calibrate = Some(Instant::now());
-                            on_event(Stage1Event::Revise(Utterance {
+                            on_event(Stage1Event::Action(Stage1Action::Batch(Utterance {
                                 seq: idx + 1,
                                 raw_text: partial.clone(),
                                 streaming_text: String::new(),
                                 duration_ms: 0.0,
                                 at_s: start.elapsed().as_secs_f64(),
                                 pcm: Vec::new(),
-                            }));
+                            })));
                         }
                         last_partial = partial;
                     }
@@ -540,13 +547,14 @@ impl Stage1Executor for OnnxStage1Executor {
                 }
             }
 
-            // (2) VAD segment boundaries → SegmentMerger → batch provisional (Revise) + settle Final.
-            //     Each absorbed fragment re-runs batch ASR on the accumulated PCM → Revise (provisional,
-            //     same seq, Stage2 recalibrates incrementally). When the gap ≥ merge_gap the previous
-            //     utterance settles → Final (authoritative). Streaming partials + Revise keep the same
-            //     seq across the whole merge, so the UI sees one growing utterance, not N fragments.
-            //     The streaming session spans the whole merged utterance (NOT reset per EOS); it's
-            //     finalized only at settle (inside `transcribe_final`).
+            // (2) VAD segment boundaries → SegmentMerger → Batch action (provisional) + settle →
+            //     MergeBatch action (authoritative). Each absorbed fragment re-runs batch ASR on
+            //     the accumulated PCM → `Stage1Action::Batch` (provisional, same seq, Stage2
+            //     recalibrates incrementally). When the gap ≥ merge_gap the previous utterance
+            //     settles → `Stage1Action::MergeBatch` (authoritative). Streaming partials + Batch
+            //     keep the same seq across the whole merge, so the UI sees one growing utterance,
+            //     not N fragments. The streaming session spans the whole merged utterance (NOT
+            //     reset per EOS); it's finalized only at settle (inside `transcribe_final`).
             for ev in self.mgr.vad().unwrap().push_frame(&frame) {
                 match ev.kind {
                     VadEventKind::StartOfSpeech => {
@@ -567,11 +575,11 @@ impl Stage1Executor for OnnxStage1Executor {
                             ) {
                                 idx += 1;
                                 u.seq = idx;
-                                on_event(Stage1Event::Final(u));
+                                on_event(Stage1Event::Action(Stage1Action::MergeBatch(u)));
                                 last_partial.clear();
                             }
                         }
-                        // (b) current utterance's accumulated audio → provisional Revise (seq = idx+1,
+                        // (b) current utterance's accumulated audio → provisional Batch action (seq = idx+1,
                         //     the in-progress utterance's prospective seq, matching the Interim partials).
                         if let Some(mut u) = transcribe_provisional(
                             &outcome.provisional.pcm,
@@ -580,7 +588,7 @@ impl Stage1Executor for OnnxStage1Executor {
                             sr,
                         ) {
                             u.seq = idx + 1;
-                            on_event(Stage1Event::Revise(u));
+                            on_event(Stage1Event::Action(Stage1Action::Batch(u)));
                         }
                     }
                 }

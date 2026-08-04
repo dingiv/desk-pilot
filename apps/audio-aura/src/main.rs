@@ -77,11 +77,20 @@ struct VadConf {
     min_speech: Option<f32>,
     /// Force-split backstop for very long utterances, seconds (default 28.0).
     max_speech: Option<f32>,
-    /// ★Segment-merge gap, seconds (default 1.5). VAD fragments whose inter-speech silence <
-    /// this absorb into one utterance (batch ASR re-runs on the concatenated PCM, same seq);
-    /// ≥ this settles the previous utterance. Decoupled from `min_silence` — VAD stays
-    /// sensitive, merging repairs the fragmentation. 0 disables merging.
+    /// ★Segment-merge gap, seconds (default 5.0) — the UPPER bound of the medium-interval
+    /// merge window. VAD fragments whose inter-speech silence < this absorb into one utterance
+    /// (batch ASR re-runs on the concatenated PCM, same seq — the result UPDATES the sentence
+    /// in place); ≥ this settles the previous utterance. Lower bound is implicit: `min_silence`
+    /// is what splits fragments in the first place, so the effective window is
+    /// (min_silence, merge_gap) ≈ 1–5s. Decoupled from `min_silence` — VAD stays sensitive,
+    /// merging repairs the fragmentation. 0 disables merging.
     merge_gap: Option<f64>,
+    /// ★Segment edge-extension, seconds (default 0.3; 0 = off). Silero cuts the soft onset
+    /// (before its probability crosses `threshold`) and the fading coda (after it drops
+    /// below) from every segment — the extension re-pads both edges from the recall buffer,
+    /// so the batch ASR hears the real speech. Fixes "missing first/last character" on
+    /// merged utterances.
+    edge_margin: Option<f32>,
 }
 
 /// Runtime config (`CONF::aura.json` via the shared FileLoader — dev: this crate's dir;
@@ -192,6 +201,7 @@ struct VadResolved {
     min_speech: f32,
     max_speech: f32,
     merge_gap: f64,
+    edge_margin: f32,
 }
 
 /// Fully-resolved runtime settings (what `main` actually runs on).
@@ -228,7 +238,8 @@ fn resolve(cli: Cli, conf: AuraConf) -> Settings {
         min_silence: v.min_silence.unwrap_or(1.0),
         min_speech: v.min_speech.unwrap_or(0.3),
         max_speech: v.max_speech.unwrap_or(28.0),
-        merge_gap: v.merge_gap.unwrap_or(1.5),
+        merge_gap: v.merge_gap.unwrap_or(5.0),
+        edge_margin: v.edge_margin.unwrap_or(0.3),
     };
     Settings {
         scout_addr: cli
@@ -363,12 +374,14 @@ fn main() -> Result<()> {
     cfg.vad.min_silence_duration = vad.min_silence;
     cfg.vad.min_speech_duration = vad.min_speech;
     cfg.vad.max_speech_duration = vad.max_speech;
+    cfg.vad.edge_margin_s = vad.edge_margin;
     cfg.merge_gap_s = vad.merge_gap;
     info!(
         threshold = vad.threshold,
         min_silence_s = vad.min_silence,
         merge_gap_s = vad.merge_gap,
-        "VAD: min_silence 切段 + merge_gap 合并碎片 (解耦)"
+        edge_margin_s = vad.edge_margin,
+        "VAD: min_silence 切段 + merge_gap 合并碎片 + edge_margin 补边界 (解耦)"
     );
     // Bake the seed hotwords into the streaming recognizer (beam-search biasing).
     cfg.streaming.hotwords = seed_hotwords;
@@ -729,7 +742,7 @@ mod tests {
         let conf: AuraConf = serde_yaml::from_str(&s).expect("aura.yaml must parse");
         assert_eq!(conf.port, Some(9091));
         let vad = conf.vad.expect("aura.yaml must have a vad: section");
-        assert_eq!(vad.merge_gap, Some(1.5), "merge_gap default documented in yaml");
+        assert_eq!(vad.merge_gap, Some(2.5), "merge_gap documented in yaml");
         assert_eq!(vad.threshold, Some(0.5));
         assert_eq!(vad.min_silence, Some(1.0));
     }
@@ -766,7 +779,7 @@ mod tests {
         assert_eq!(d.port, 9091);
         assert!(d.stage3_on);
         // VAD defaults resolve to the built-ins (no vad: section ⇒ all-None ⇒ fallbacks).
-        assert_eq!(d.vad.merge_gap, 1.5);
+        assert_eq!(d.vad.merge_gap, 5.0);
         assert_eq!(d.vad.threshold, 0.5);
         assert_eq!(d.vad.min_silence, 1.0);
     }

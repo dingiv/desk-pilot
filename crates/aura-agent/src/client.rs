@@ -48,6 +48,11 @@ impl AuraClient {
         Ok(Self { base, http })
     }
 
+    /// The daemon origin (normalized, no trailing slash) — the client's identity.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
     /// `GET /health` — true if the daemon is reachable.
     pub async fn health(&self) -> Result<bool> {
         let r = self.http.get(format!("{}/health", self.base)).send().await?;

@@ -87,9 +87,9 @@ pub enum Panel {
 /// Every event the pet can respond to.
 #[derive(Debug, Clone)]
 pub enum Message {
-    // ── audio-aura ──
+    // ── audio-aura (AuraAgent events — control plane + data plane in one stream) ──
     #[allow(unused)]
-    AuraState(audio_aura_agent::view::AuraStateView),
+    AuraEvent(audio_aura_agent::agent::AgentEvent),
     ToggleRecording,
     HandshakeDone(bool),
     /// Trigger an aura health check (button press).

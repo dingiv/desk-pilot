@@ -15,8 +15,8 @@ use iced::widget::svg::Handle as SvgHandle;
 use iced::{Background, Border, Color, ContentFit, Degrees, Element, Gradient, Length, Subscription, Task, alignment, window};
 
 pub(crate) use crate::model::{AsrState, DockingPreference, Message, Panel, StyleConfig};
-pub(crate) use audio_aura_agent::view::AuraStateView;
-pub(crate) use crate::service::aura_client::{aura_stream, AuraHandle};
+pub(crate) use audio_aura_agent::agent::AuraAgent;
+pub(crate) use crate::service::aura_client::{aura_stream, connect as connect_aura, play_audio};
 
 /// Bundled fallback skin (used when FileLoader can't resolve the configured skin).
 const IDLE_PNG: &[u8] = include_bytes!("../assets/skins/default/idle.png");
@@ -71,8 +71,9 @@ pub struct PetApp {
     pub(crate) selected_turns: Vec<u64>,
     /// Accumulating transcript — all utterances in one text_editor.
     pub(crate) transcript: text_editor::Content,
-    /// aura daemon command handle (scout toggle, correct, audio, health).
-    aura_handle: AuraHandle,
+    /// Shared AuraAgent — owns the connection + state (background driver). Commands go through
+    /// it; the iced subscription forwards its events.
+    pub(crate) agent: std::sync::Arc<AuraAgent>,
 }
 
 impl PetApp {
@@ -82,8 +83,8 @@ impl PetApp {
         sprite_size: f32, sprite_filter: String,
     ) -> (Self, Task<Message>) {
         let init_status = format!("started — aura: {aura_addr}");
-        let aura_handle = AuraHandle::new(&aura_addr)
-            .unwrap_or_else(|e| { eprintln!("[geek-familiar] AuraHandle failed: {e}"); std::process::exit(1) });
+        let agent = connect_aura(&aura_addr)
+            .unwrap_or_else(|e| { eprintln!("[geek-familiar] AuraAgent connect failed: {e}"); std::process::exit(1) });
         let app = PetApp {
             aura_addr, skin, token, font_size, sprite_size, sprite_filter, style, window_bg, docking,
             asr: AsrState::default(),
@@ -103,7 +104,7 @@ impl PetApp {
             prev_mouse_y: 0.0,
             selected_turns: Vec::new(),
             transcript: text_editor::Content::new(),
-            aura_handle,
+            agent,
             resize_handle: SvgHandle::from_memory(RESIZOR_SVG),
         };
         let token_for_task = app.token.clone();
@@ -126,54 +127,56 @@ impl PetApp {
 
     pub fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
-            Message::AuraState(view) => {
-                self.asr.sse_connected = true; // SDK is receiving snapshots
-                self.asr.scout_active = view.connected;
-                // Process utterances
-                let mut transcript_text = String::new();
-                for u in &view.utterances {
-                    if let Some(f) = &u.final_ {
-                        // Update or insert into history
-                        let existing = self.asr.history.iter_mut().find(|t| t.seq == u.seq);
+            Message::AuraEvent(ev) => {
+                use audio_aura_agent::agent::AgentEvent::*;
+                match ev {
+                    // Control plane: snapshot refreshed → scout + corrections + hotwords.
+                    StateChanged(view) => {
+                        self.asr.sse_connected = true;
+                        self.asr.scout_active = view.connected;
+                        self.corrections = view.corrections.iter().map(|c| (c.raw.clone(), c.corrected.clone())).collect();
+                        self.status_messages.retain(|m| !m.starts_with("🔤"));
+                        self.status_messages.insert(0, format!("🔤 hotwords: {}", view.hotwords.join(", ")));
+                        if self.status_messages.len() > 30 { self.status_messages.truncate(30); }
+                    }
+                    // Data plane: settled utterance → history + transcript.
+                    TurnFinal(u) => {
                         let turn = crate::model::ConversationTurn {
                             seq: u.seq,
-                            user_text: f.calibrated.clone(),
-                            intent: f.intent.clone(),
-                            reply: f.reply.clone(),
+                            user_text: u.calibrated.clone(),
+                            intent: u.intent.clone(),
+                            reply: u.reply.clone(),
                         };
+                        let existing = self.asr.history.iter_mut().find(|t| t.seq == u.seq);
                         if let Some(t) = existing { *t = turn; } else { self.asr.history.push(turn); }
-                        // Build transcript
-                        if !transcript_text.is_empty() { transcript_text.push('\n'); }
-                        transcript_text.push_str(&f.calibrated);
-                        if !f.reply.is_empty() {
-                            transcript_text.push_str(&format!("\n   ◀ {}", f.reply));
+                        if self.asr.history.len() > 20 {
+                            self.asr.history.drain(0..self.asr.history.len() - 20);
                         }
+                        let mut line = u.calibrated.clone();
+                        if !u.reply.is_empty() {
+                            line.push_str(&format!("\n   ◀ {}", u.reply));
+                        }
+                        let mut content = self.transcript.clone();
+                        if !content.text().is_empty() { content = text_editor::Content::with_text(&format!("{}\n{}", content.text(), line)); }
+                        else { content = text_editor::Content::with_text(&line); }
+                        self.transcript = content;
                     }
-                    // Live utterance → update interim
-                    if u.live {
-                        self.asr.interim = u.calibrated.clone().unwrap_or_else(|| u.partial.clone());
-                    }
+                    // ① new Stage1 streaming fragment — raw partial (fast UI follow).
+                    Interim { partial, .. } => self.asr.interim = partial,
+                    // ② Stage2 corrected a batch — calibrated text wins over the raw partial.
+                    CalibratedInterim { calibrated, .. } => self.asr.interim = calibrated,
+                    // Connectivity changed (the agent probes /health itself).
+                    ConnChanged(c) => self.asr.sse_connected = c == audio_aura_agent::AuraConn::Connected,
+                    TurnCorrected(_) => {} // the pair already entered Stage2; UI shows via corrections
                 }
-                // Cap history
-                if self.asr.history.len() > 20 {
-                    self.asr.history.drain(0..self.asr.history.len() - 20);
-                }
-                // Update transcript
-                if !transcript_text.is_empty() {
-                    self.transcript = text_editor::Content::with_text(&transcript_text);
-                }
-                // Sync corrections from server
-                self.corrections = view.corrections.iter().map(|c| (c.raw.clone(), c.corrected.clone())).collect();
-                // Update hotwords (for future display)
-                self.status_messages.retain(|m| !m.starts_with("🔤"));
-                self.status_messages.insert(0, format!("🔤 hotwords: {}", view.hotwords.join(", ")));
-                if self.status_messages.len() > 30 { self.status_messages.truncate(30); }
             }
             // Placeholder for SSE connection status from the stream itself
             // (the old AsrUpdate variants aren't needed — snapshots are the source of truth)
             Message::HandshakeDone(ok) => {
                 eprintln!("[geek-familiar] gnome-layer-ext handshake ok={ok}");
-                self.aura_handle.health_check();
+                if self.agent.conn() != audio_aura_agent::AuraConn::Connected {
+                    eprintln!("[geek-familiar] aura daemon not reachable");
+                }
             }
             Message::DragStarted => {
                 return window::oldest().then(|id| match id {
@@ -205,7 +208,7 @@ impl PetApp {
             Message::ToggleRecording => {
                 if self.asr.sse_connected {
                     let enable = !self.asr.scout_active;
-                    self.aura_handle.toggle_scout(enable);
+                    self.agent.set_connected(enable);
                 }
             }
             Message::RecordingToggled => {
@@ -266,7 +269,7 @@ impl PetApp {
             }
             Message::PlayAudio(idx) => {
                 eprintln!("[geek-familiar] play audio seq={idx}");
-                self.aura_handle.play_audio(idx);
+                play_audio(self.agent.clone(), idx);
             }
             Message::AudioPlayed(seq, ok) => {
                 let msg = if ok { format!("🔊 audio seq={seq} played") } else { format!("⚠ audio seq={seq} failed") };
@@ -281,7 +284,7 @@ impl PetApp {
                     let corrected = self.correction_text.clone();
                     self.corrections.insert(0, (raw.clone(), corrected.clone()));
                     if self.corrections.len() > 50 { self.corrections.truncate(50); }
-                    self.aura_handle.correct(seq, &raw, &corrected);
+                    self.agent.correct(seq, &raw, &corrected);
                     self.editing_turn = None;
                     self.correction_text.clear();
                 }
@@ -341,7 +344,7 @@ impl PetApp {
                 });
             }
             Message::CheckHealth => {
-                self.aura_handle.health_check();
+                eprintln!("[geek-familiar] aura daemon {}", if self.agent.conn() == audio_aura_agent::AuraConn::Connected { "reachable" } else { "NOT reachable" });
             }
             Message::AppStatus(s) => {
                 eprintln!("[geek-familiar] status: {s}");
@@ -370,7 +373,9 @@ impl PetApp {
 
     pub fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
-            Subscription::run_with(self.aura_addr.clone(), aura_stream).map(Message::AuraState),
+            // AuraAgent: Hash = the daemon origin → id dedups by address; the fn pointer
+            // reconstructs the stream per re-run.
+            Subscription::run_with(self.agent.clone(), aura_stream).map(Message::AuraEvent),
             Subscription::run_with("rescan".to_string(), rescan_stream),
             Subscription::run_with(self.token.clone(), clipboard_stream),
             Subscription::run_with("clip_poll".to_string(), clipboard_poll_stream),

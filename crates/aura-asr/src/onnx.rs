@@ -25,11 +25,17 @@ use sherpa_onnx::{
     OnlineModelConfig, OnlineRecognizer, OnlineRecognizerConfig, OnlineTransducerModelConfig,
     SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
 };
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
 /// Silero window = 512 samples = 32 ms @ 16 kHz (fixed by the model).
 pub const WINDOW: usize = 512;
+/// Audio sample rate the whole Stage1 pipeline runs at.
+pub const SAMPLE_RATE: u32 = 16000;
+/// Recall window for segment edge-extension: must span the longest segment (max_speech 28 s)
+/// plus the trailing-silence observation (~1 s) plus the margin — 60 s covers all of it.
+const RECALL_S: usize = 60;
 
 // ── Streaming ASR: Zipformer transducer (real-time, partial results with correction) ──
 
@@ -304,6 +310,16 @@ pub struct VadConfig {
     pub max_speech_duration: f32,  // seconds (force-split very long utterances)
     pub window_size: i32,          // samples (512 = 32ms @ 16kHz, fixed by Silero)
     pub buffer_seconds: f32,       // internal segment accumulator
+    /// ★Segment edge-extension (seconds) at VAD boundaries, default 0.3 (0 = off).
+    /// Silero cuts the soft onset (samples BEFORE its probability first crosses `threshold`)
+    /// and the fading coda (samples AFTER it drops below) off every segment — the batch ASR
+    /// hears the detection window, not the real speech, so a sentence can lose its first or
+    /// last character. The extension re-pads both edges from the executor's recall buffer
+    /// (see [`OnnxVad`]): head up to `edge_margin_s` before the onset, tail up to
+    /// `edge_margin_s` after the end — the fade-out has already streamed through by the time
+    /// EOS fires (`min_silence` of observation), so both recoveries are free. This is the
+    /// fix for "missing first/last word" on merged utterances.
+    pub edge_margin_s: f32,
 }
 
 impl Default for VadConfig {
@@ -327,6 +343,7 @@ impl Default for VadConfig {
             max_speech_duration: 28.0,
             window_size: 512,
             buffer_seconds: 60.0,
+            edge_margin_s: 0.3,
         }
     }
 }
@@ -343,6 +360,19 @@ struct Vad {
     /// accumulated utterance (i16) for the current segment — sherpa returns f32 segments, we
     /// convert + keep so the consumer gets i16 like the rest of the pipeline.
     speaking: bool,
+    /// Sliding recall of every sample fed to the VAD (last `RECALL_S` seconds). At EOS the true
+    /// speech extends past Silero's threshold-crossing boundaries (soft onsets and fading codas
+    /// live BELOW `threshold` and get cut from the segment) — the edge extension pulls those
+    /// samples back out of recall, so the batch ASR hears the real speech, not the detection
+    /// window. This is what fixes "first/last character dropped" at merge boundaries.
+    recall: VecDeque<i16>,
+    /// Total samples fed to the VAD so far — aligns `SpeechSegment::start` (absolute sample
+    /// offset in the fed stream) with `recall`'s window.
+    total_fed: u64,
+    /// Absolute end sample of the last emitted segment (INCLUDING its tail extension) — the
+    /// next segment's head extension stops here so adjacent segments never overlap (no
+    /// duplicated audio in the merger's concatenated PCM).
+    prev_seg_end: Option<i64>,
 }
 
 impl OnnxVad {
@@ -356,19 +386,35 @@ impl OnnxVad {
                 max_speech_duration: cfg.max_speech_duration,
                 window_size: cfg.window_size,
             },
-            sample_rate: 16000,
+            sample_rate: SAMPLE_RATE as i32,
             ..Default::default()
         };
         let det = VoiceActivityDetector::create(&mc, cfg.buffer_seconds)
             .ok_or_else(|| anyhow::anyhow!("sherpa-onnx VoiceActivityDetector::create failed"))?;
-        Ok(OnnxVad { inner: Mutex::new(Vad { det, speaking: false }), cfg })
+        Ok(OnnxVad {
+            inner: Mutex::new(Vad {
+                det,
+                speaking: false,
+                recall: VecDeque::with_capacity(RECALL_S * SAMPLE_RATE as usize),
+                total_fed: 0,
+                prev_seg_end: None,
+            }),
+            cfg,
+        })
     }
 
-    /// Feed exactly `window_size` i16 samples. Returns any SOS/EOS events.
+    /// Feed exactly `window_size` i16 samples. Returns any SOS/EOS events — the EOS segment's
+    /// PCM is edge-extended (see [`VadConfig::edge_margin_s`]) with the real audio around
+    /// Silero's threshold-crossing boundaries, pulled from this VAD's recall buffer.
     pub fn push_frame(&self, frame: &[i16]) -> Vec<VadEvent> {
         assert_eq!(frame.len(), self.cfg.window_size as usize, "OnnxVad expects window_size frames");
         let samples: Vec<f32> = frame.iter().map(|&s| s as f32 / 32768.0).collect();
         let mut inner = self.inner.lock().unwrap();
+        inner.total_fed += frame.len() as u64;
+        inner.recall.extend(frame.iter().copied());
+        while inner.recall.len() > RECALL_S * SAMPLE_RATE as usize {
+            inner.recall.pop_front();
+        }
         inner.det.accept_waveform(&samples);
 
         let mut events = Vec::new();
@@ -380,7 +426,42 @@ impl OnnxVad {
                 }
                 let pcm: Vec<i16> =
                     seg.samples().iter().map(|&f| (f * 32768.0).clamp(-32768.0, 32767.0) as i16).collect();
-                events.push(VadEvent { kind: VadEventKind::EndOfSpeech, pcm });
+                // Edge extension: the segment covers only [onset, fade-start] (Silero's
+                // threshold crossings); the real speech extends past both. Recall holds every
+                // fed sample, so both edges are recoverable — head before the onset, tail after
+                // the segment end (EOS fired `min_silence` AFTER the fade, so it's in recall).
+                let ext = segment_extension(
+                    seg.start() as i64,
+                    pcm.len() as i64,
+                    inner.total_fed,
+                    inner.recall.len(),
+                    self.cfg.edge_margin_s,
+                    inner.prev_seg_end,
+                );
+                let mut extended =
+                    Vec::with_capacity(ext.head_len() + pcm.len() + ext.tail_len());
+                let recall_lo = inner.total_fed as i64 - inner.recall.len() as i64;
+                if ext.head_len() > 0 {
+                    copy_recall(
+                        &mut extended,
+                        inner.recall.as_slices(),
+                        (ext.head_lo - recall_lo) as usize,
+                        (ext.head_hi - recall_lo) as usize,
+                    );
+                }
+                extended.extend_from_slice(&pcm);
+                if ext.tail_len() > 0 {
+                    copy_recall(
+                        &mut extended,
+                        inner.recall.as_slices(),
+                        (ext.tail_lo - recall_lo) as usize,
+                        (ext.tail_hi - recall_lo) as usize,
+                    );
+                }
+                // Track the EXTENDED end — the next segment's head extension must not reach
+                // back into this segment's tail (they would overlap in the merged PCM).
+                inner.prev_seg_end = Some(seg.start() as i64 + extended.len() as i64);
+                events.push(VadEvent { kind: VadEventKind::EndOfSpeech, pcm: extended });
                 inner.speaking = false;
             }
             inner.det.pop();
@@ -399,6 +480,130 @@ impl OnnxVad {
     /// Whether the VAD currently thinks someone is speaking (for diagnostics).
     pub fn is_speaking(&self) -> bool {
         self.inner.lock().unwrap().speaking
+    }
+}
+
+// ── Segment edge-extension (pure helpers) ──────────────────────────────────
+
+/// Extension window for a VAD segment spanning absolute samples `[start, start+len)`: the
+/// samples Silero's threshold cut off — soft onset before the first above-threshold frame,
+/// fading coda after the last one. `[head_lo, head_hi)` is prepended, `[tail_lo, tail_hi)`
+/// appended. All indices are absolute (sample position in the fed audio stream).
+struct SegmentExtent {
+    head_lo: i64,
+    head_hi: i64,
+    tail_lo: i64,
+    tail_hi: i64,
+}
+
+impl SegmentExtent {
+    fn head_len(&self) -> usize {
+        (self.head_hi - self.head_lo).max(0) as usize
+    }
+    fn tail_len(&self) -> usize {
+        (self.tail_hi - self.tail_lo).max(0) as usize
+    }
+}
+
+/// Compute the edge-extension window — see [`VadConfig::edge_margin_s`]. `total_fed` /
+/// `recall_len` bound the recall buffer's reach (samples before `total_fed - recall_len` are
+/// gone); `prev_seg_end` (the previous segment's EXTENDED end) stops the head extension from
+/// reaching back into it — at a merge boundary the previous tail is already in the
+/// accumulator, and duplicating it would make the batch ASR repeat text.
+fn segment_extension(
+    start: i64,
+    len: i64,
+    total_fed: u64,
+    recall_len: usize,
+    margin_s: f32,
+    prev_seg_end: Option<i64>,
+) -> SegmentExtent {
+    let margin = (margin_s * SAMPLE_RATE as f32) as i64;
+    let total = total_fed as i64;
+    let recall_lo = total - recall_len as i64;
+    let end = start + len;
+    SegmentExtent {
+        head_lo: (start - margin).max(recall_lo).max(prev_seg_end.unwrap_or(i64::MIN)),
+        head_hi: start.min(total),
+        tail_lo: end.min(total),
+        tail_hi: (end + margin).min(total),
+    }
+}
+
+/// Copy samples `[s, e)` of the recall buffer (absolute indices) into `out`, given the two
+/// `VecDeque::as_slices` halves.
+fn copy_recall(out: &mut Vec<i16>, (a, b): (&[i16], &[i16]), s: usize, e: usize) {
+    let n = e - s;
+    if s + n <= a.len() {
+        out.extend_from_slice(&a[s..s + n]);
+    } else if s < a.len() {
+        out.extend_from_slice(&a[s..]);
+        out.extend_from_slice(&b[..n - (a.len() - s)]);
+    } else {
+        out.extend_from_slice(&b[s - a.len()..s - a.len() + n]);
+    }
+}
+
+#[cfg(test)]
+mod vad_edge_tests {
+    use super::*;
+
+    #[test]
+    fn recovers_onset_and_coda() {
+        // margin 0.3 s = 4800 samples @ 16 kHz. Segment [10000, 18000); recall covers it all.
+        let e = segment_extension(10000, 8000, 30000, 30000, 0.3, None);
+        assert_eq!(e.head_lo, 5200, "head reaches back one margin");
+        assert_eq!(e.head_hi, 10000);
+        assert_eq!(e.head_len(), 4800);
+        assert_eq!(e.tail_lo, 18000);
+        assert_eq!(e.tail_hi, 22800, "tail reaches forward one margin");
+        assert_eq!(e.tail_len(), 4800);
+    }
+
+    #[test]
+    fn zero_margin_is_noop() {
+        let e = segment_extension(10000, 8000, 30000, 30000, 0.0, None);
+        assert_eq!(e.head_len(), 0);
+        assert_eq!(e.tail_len(), 0);
+    }
+
+    #[test]
+    fn head_stops_at_previous_segment() {
+        // Previous segment's extended end = 19000; this one starts at 21000. A full head margin
+        // (→16200) would duplicate the gap audio in the merger — clamp to 19000.
+        let e = segment_extension(21000, 8000, 40000, 40000, 0.3, Some(19000));
+        assert_eq!(e.head_lo, 19000);
+        assert_eq!(e.head_len(), 2000);
+    }
+
+    #[test]
+    fn clamps_to_recall_coverage() {
+        // recall covers [20000, 30000). start 21000 is inside → head gets only the covered
+        // 1000 samples (the rest of the margin is gone); tail extends up to the fed total.
+        let e = segment_extension(21000, 8000, 30000, 10000, 0.3, None);
+        assert_eq!(e.head_lo, 20000);
+        assert_eq!(e.head_len(), 1000);
+        assert_eq!(e.tail_lo, 29000);
+        assert_eq!(e.tail_hi, 30000);
+        assert_eq!(e.tail_len(), 1000);
+
+        // segment entirely before recall coverage (long segment, start already evicted) → no
+        // head extension at all; tail (recent, always covered) still extends to the fed total.
+        let e = segment_extension(19000, 8000, 30000, 10000, 0.3, None);
+        assert_eq!(e.head_len(), 0);
+        assert_eq!(e.tail_lo, 27000);
+        assert_eq!(e.tail_hi, 30000);
+        assert_eq!(e.tail_len(), 3000);
+    }
+
+    #[test]
+    fn copy_spans_both_recall_slices() {
+        let mut out = Vec::new();
+        copy_recall(&mut out, (&[1, 2, 3][..], &[4, 5, 6][..]), 2, 5);
+        assert_eq!(out, vec![3, 4, 5], "crosses the slice boundary");
+        let mut out = Vec::new();
+        copy_recall(&mut out, (&[1, 2, 3][..], &[4, 5, 6][..]), 0, 6);
+        assert_eq!(out, vec![1, 2, 3, 4, 5, 6]);
     }
 }
 

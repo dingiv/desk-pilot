@@ -13,30 +13,50 @@
 **现象**：用户说"帮我把…（停顿 1.5s）…会议文件…（停顿 1.2s）…改成 markdown"，
 VAD 在每个停顿切 EOS，产生 3 个碎片段。
 
-**根因**：`min_silence_duration = 1.0s` 太短。正常中文说话的自然停顿 0.8-2.0s。
+**根因**：VAD 切段灵敏度与"什么算一句话"混为一谈。为了响应快（停顿一过立即出 batch
+结果），`min_silence` 必须保持小（1.0s）——代价是长句在思考间隙被强切成碎片。
 
 **处理层**：Stage1（VAD + 段合并）
 
-**方案**：
-- **自适应静音**：短句（<3s）用 1.0s（命令式），中长句（3-10s）用 1.8s（容忍思考间隙），超长（>10s）用 1.5s（防内存爆炸）
-- **段合并（Segment Stitching）**：EOS 后进入 pending 状态 0.8s。如果 0.8s 内新段 SOS 且流式 partial 与上段语义连续 → 合并 PCM + 文本。超时则确认 final。
-- **数据结构**：
-  ```rust
-  // executor.rs 新增
-  struct SegmentBuffer {
-      pending: Option<Utterance>,
-      pending_since: Instant,
-  }
-  fn on_eos(utt) -> Action {
-      if let Some(prev) = &mut pending {
-          if gap < 1.5s && semantic_continuous(prev, &utt) { prev.merge(utt); return Hold }
-      }
-      pending = Some(utt); Hold
-  }
-  fn on_timeout() -> Option<Utterance> { pending.take() }
-  ```
+**方案（2026-08-04 设计明确）**——`min_silence` 与 `merge_gap` 解耦，共同构成
+**"中等间隔多句 merge"窗口**：
+- **流式保响应**：scout 音频碎片不断追加进流式模型（Zipformer），每 15 帧出 streaming
+  partial（`Interim`）。
+- **低阈值触发 batch**：VAD 静音 ≥ `min_silence`（1.0s）即 EOS → 立即对累积 PCM 跑一次
+  batch 识别（`Stage1Action::Batch`，普通 Batch 动作）→ Stage2 增量校准 →
+  `CalibratedInterim` 同一 seq **就地更新**已有句子（不产生新句）。阈值低 → 停顿一过
+  文字立刻出现。
+- **补救 = 中等间隔合并**：`SegmentMerger` 按**时间戳**（`sos - last_seg_end_at`，精确测量
+  真实句间静音——SOS/EOS 同时发出的自消除性质）判断相邻碎片间隔。间隔 < `merge_gap`
+  → 吸收进同一 utterance，PCM 拼接后重跑 batch，结果更新已有句子；间隔 ≥ `merge_gap`
+  → 上一句定稿（`Stage1Action::MergeBatch`，大 MergeBatch 动作）。窗口下界由
+  `min_silence` 天然保证（不到 1s 的停顿根本不会切段），上界即 `merge_gap`。合并后重跑
+  batch = 对整段做权威转写，校准结果替换句子的旧内容。0 = 关闭合并。
+- **两种动作 = Stage2 的监听输入**（`Stage1Action`，与 `Utterance` 载荷一起定义在
+  aura-asr 的数据契约区）：Batch（provisional，不写 ContextWindow）与 MergeBatch
+  （authoritative，写 ContextWindow）都会触发 Stage2 纠偏——composer 的 Stage2 worker
+  只消费这一个枚举。
 
-**验证**：说"帮我把会议文件…（停 1.5s）…改成 markdown" → 1 段 final 而非 3 段。
+**验证**：说"帮我把会议文件…（停 3s）…改成 markdown" → 1 段 final 而非 2 段；
+停顿 6s → 2 段。
+
+#### 1a. 段边界损失（拼接后"开头/结尾掉字"）🔴 已修复 2026-08-04
+
+**现象**：拼接开启后，一个合并 utterance 的**开头或结尾偶尔掉 1-2 个字**（每段边界都
+贡献一对损失，拼接把分散的损失集中到句内）。
+
+**根因**（sherpa-onnx 1.13.4 `voice-activity-detector.cc` + `silero-vad-model.cc`）：
+Silero VAD 的段边界 = **概率跨 threshold 的窗口**，不是真实语音边界——
+- **段头**：`start_` 只回溯到 `temp_start_`（prob 首次 > threshold 的窗口）。轻声/弱辅音
+  起音概率低于 threshold → 检测延迟 → 首字丢失。
+- **段尾**：段截止于 `temp_end_`（prob 首次跌破 threshold 的窗口）。句尾弱化、韵尾渐弱
+  → 尾字丢失。（`min_silence` 观察期内的音频只是被"算作静音"，不在段内。）
+
+**方案**：`VadConfig.edge_margin_s`（默认 0.3s，0 = 关闭）——`OnnxVad` 维护全量样本的
+recall 缓冲（60s），EOS 时用 `SpeechSegment::start()`（绝对样本偏移）把段头/段尾各扩展
+`edge_margin_s` 的真实音频（头：onset 前的软起音；尾：fade 后的弱尾音——EOS 判定晚
+`min_silence`，这段音频必然已流过）。上一段的**扩展后** end 作为下一段头扩展的下限，
+拼接处永不重叠（不会产生重复文本）。纯函数 `segment_extension` 有单测。
 
 ---
 
@@ -177,7 +197,7 @@ ASR 转出两段："帮我用 rost 写个游戏" + "不对 Rust 写个游戏"。
 
 | # | 问题 | 处理层 | 优先级 | 工作量 | 状态 |
 |---|---|---|---|---|---|
-| 1 | **停顿碎片化** | Stage1 VAD + 合并 | 🔴 P0 | 中 | 设计完 |
+| 1 | **停顿碎片化** | Stage1 VAD + 合并 | 🔴 P0 | 中 | ✅ 已实现 |
 | 2 | **语气词** | Stage2 prompt | 🟡 P1 | 小 | ✅ 已解决 |
 | 3 | **同音歧义** | Stage2 + 热词 + 纠偏 | 🟡 P1 | 小 | ✅ 已有机制 |
 | 4 | **口误自纠** | Stage2 预处理 | 🟢 P2 | 小 | 设计完 |
@@ -196,9 +216,13 @@ ASR 转出两段："帮我用 rost 写个游戏" + "不对 Rust 写个游戏"。
 - ✅ Ring 空超时不触发 batch（已加静音帧喂 VAD）
 - ✅ Qwen3-ASR 标记泄漏（strip_qwen3_markers）
 
-## 下一步做（P0）
+## 已解决：停顿碎片化 ✅
 
-1. **自适应 VAD**：min_silence 根据说话时长动态调整
-2. **段合并**：EOS 后 pending 0.8s，连续语音拼接
-
-这两个做完，停顿碎片化问题基本解决——从"说 1 句话出 3 段碎片"变成"出 1 段完整句"。
+- **段合并**（SegmentMerger，2026-08-04 设计明确）：`min_silence`（1.0s，低阈值保响应）
+  与 `merge_gap`（内置默认 5.0s，aura.yaml 可配，中等间隔窗口上界）解耦；时间戳判断句间
+  静音，间隔 < merge_gap
+  吸收拼接 + 重跑 batch + 同一 seq 就地更新；≥ 则定稿。
+- **段边界损失**（edge_margin_s 0.3s，见 §1a）：VAD 段边界 = threshold 交叉而非语音边界，
+  扩展修复软起音/弱尾音丢失。
+- 停顿碎片化从"说 1 句话出 3 段碎片"变成"出 1 段完整句"。
+- 未来可调：merge_gap 调小（命令式场景，更快定稿）/ 调大（长句场景，更少切碎）。

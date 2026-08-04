@@ -58,6 +58,25 @@ impl Utterance {
     }
 }
 
+/// The two trigger actions Stage1 emits for Stage2 to listen for and correct (纠偏).
+///
+/// The payload is a [`Utterance`], which carries at least the three essentials of a batch
+/// action: the audio data (`pcm`), the audio's production timestamp (`at_s`, wall-clock s
+/// since executor start), and the Stage1 recognition result (`raw_text`, with `streaming_text`
+/// as fallback when the batch pass is empty).
+#[derive(Debug, Clone)]
+pub enum Stage1Action {
+    /// Normal Batch — fired when VAD silence ≥ `min_silence` (~1s): a quick batch pass over the
+    /// current accumulated PCM. Provisional — Stage2 recalibrates and updates the sentence in
+    /// place (same `seq`, `CalibratedInterim`), never committing to the ContextWindow.
+    Batch(Utterance),
+    /// Big MergeBatch — fired when silence ≥ `merge_gap` (~5s): a re-run of the batch model over
+    /// the merged paragraph (the SegmentMerger stitched medium-gap fragments back together).
+    /// Authoritative — Stage2 calibrates and commits to the ContextWindow (`TurnEvent::Final`),
+    /// feeding Stage3.
+    MergeBatch(Utterance),
+}
+
 /// Events emitted by [`executor::Stage1Executor`]. Defined here (ungated) so downstream crates
 /// can match on them without the `onnx` feature.
 #[derive(Debug, Clone)]
@@ -65,15 +84,12 @@ pub enum Stage1Event {
     /// A live streaming partial (the "phone input method" evolving text). `seq` is the
     /// prospective sequence number of the in-progress utterance (= last Final's seq + 1), so
     /// consumers can group partials with their utterance even when events from different
-    /// pipeline threads interleave.
+    /// pipeline threads interleave. Passes straight through to the UI — NOT a Stage2 input.
     Interim { seq: u64, partial: String, at_s: f64 },
-    /// A provisional (in-progress) batch result for an utterance still absorbing fragments —
-    /// the SegmentMerger re-runs batch ASR on the accumulated PCM at each absorbed fragment and
-    /// emits this so Stage2 can recalibrate incrementally. Same `seq` as the Interim/Final of
-    /// this utterance (it updates in place, never starts a new one). `seq` = last Final's seq + 1.
-    Revise(Utterance),
-    /// A finalized utterance ready for Stage2 calibration.
-    Final(Utterance),
+    /// A Stage1 action for Stage2 — the only events Stage2 listens for. Both [`Stage1Action`]
+    /// variants trigger its correction pass: `Batch` → provisional calibration, `MergeBatch`
+    /// → authoritative calibration.
+    Action(Stage1Action),
 }
 
 /// One audio buffer: 16 kHz mono S16LE by default (matches omni-scout `/audio`).

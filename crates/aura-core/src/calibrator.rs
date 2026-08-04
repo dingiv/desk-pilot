@@ -16,14 +16,20 @@ use crate::prompt::PromptBuilder;
 use crate::Decision;
 
 /// Turns a finalized utterance into a calibrated Decision. Implementations own their context.
+///
+/// Stage2's correction pass (纠偏) is driven by the two [`audio_aura_asr::Stage1Action`]s
+/// Stage1 emits — both land here: the `Batch` action (普通 batch, pause ≈ 1s) via
+/// [`calibrate_provisional`](Self::calibrate_provisional), the `MergeBatch` action (大合并,
+/// pause ≈ 5s, settled paragraph) via [`calibrate`](Self::calibrate).
 pub trait Stage2Calibrator: Send {
-    /// Authoritative calibration of a SETTLED utterance — commits the (raw→calibrated) pair to
-    /// the ContextWindow so subsequent utterances can reference it.
+    /// Authoritative calibration of a SETTLED utterance (a `MergeBatch` action) — commits the
+    /// (raw→calibrated) pair to the ContextWindow so subsequent utterances can reference it.
     fn calibrate(&mut self, utterance: &Utterance) -> Decision;
-    /// Provisional calibration of an IN-PROGRESS utterance (a `Revise` from an absorbed fragment)
-    /// — same calibration logic, but does NOT commit to the ContextWindow. A growing utterance's
-    /// intermediate states must not pollute the window; only its settle `Final` enters context.
-    /// Default delegates to [`calibrate`](Self::calibrate) for impls that don't track context.
+    /// Provisional calibration of an IN-PROGRESS utterance (a `Batch` action from an absorbed
+    /// fragment) — same calibration logic, but does NOT commit to the ContextWindow. A growing
+    /// utterance's intermediate states must not pollute the window; only its settle `MergeBatch`
+    /// enters context. Default delegates to [`calibrate`](Self::calibrate) for impls that don't
+    /// track context.
     fn calibrate_provisional(&mut self, utterance: &Utterance) -> Decision {
         self.calibrate(utterance)
     }

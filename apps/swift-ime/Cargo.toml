@@ -25,10 +25,9 @@ serde_yaml = "0.9"
 anyhow = "1"
 ratatui = "0.28"
 crossterm = "0.28.1"
-# ── aura voice integration ── data-plane SSE client (audio-aura-agent SDK) driven on a tokio
-# runtime in a background thread; feeds AsrSegment::Final → AsrBuffer for `#asr`.
+# ── aura voice integration ── the audio-aura-agent SDK owns the whole connection (its own
+# background driver + tokio runtime); the bridge only drains poll_events → AsrBuffer for `#asr`.
 audio-aura-agent = { path = "../../crates/aura-agent" }
-tokio = { version = "1", features = ["rt", "macros", "time"] }
 futures = "0.3"
 
 [build-dependencies]

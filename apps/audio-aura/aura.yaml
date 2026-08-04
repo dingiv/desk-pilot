@@ -24,16 +24,18 @@ asr_endpoint: "http://127.0.0.1:8000"  # asr_kind=remote 时
 hotwords: ["Rust", "Bevy", "贪吃蛇"]
 
 # ── VAD / 分段 (Silero; 全部可选, 不写用内置默认) ──
-#   min_silence 和 merge_gap 解耦:
-#     · min_silence = VAD 多久静音判 EOS (切段灵敏度) —— 保持小, 反应快
-#     · merge_gap   = 段间静音 <此值 → 拼成一句 (批处理重跑合并 PCM, 同一 seq 就地更新)
-#                    ≥此值 → 上一句定稿。这是"什么算一句话"的旋钮, 与 VAD 灵敏度无关。
+#   min_silence 和 merge_gap 解耦, 共同构成"中等间隔多句 merge"窗口:
+#     · min_silence = VAD 多久静音判 EOS (切段灵敏度) —— 保持小 (1s), 停顿一过立即
+#                     batch 识别, 响应快; 代价是长句被强切成碎片
+#     · merge_gap   = 补偿: 碎片间隔静音 (1s~此值) 拼回一个长段落 (批处理重跑合并 PCM,
+#                    结果同一 seq 就地更新已有句子); ≥此值才定稿。窗口下界由
+#                    min_silence 天然保证, 上界即此值。"什么算一句话"的旋钮。
 vad:
   threshold: 0.5        # Silero 灵敏度 (高=迟钝少误触; 低=灵敏可能切轻声头)
   min_silence: 1.0      # 静音达此秒数 → EOS 切段
   min_speech: 0.3       # 短于此秒数的段直接丢弃
   max_speech: 28.0      # 超长强制切 (backstop, 秒)
-  merge_gap: 1.5        # ★碎片合并阈值 (秒): 段间静音 <此值拼一句; 0=关闭合并
+  merge_gap: 2.5        # ★碎片合并窗口上界 (秒): 段间静音 1~5s 拼一句; 0=关闭合并
 
 # ── 未来: dp-models ModelSpec 结构化配置 (当前 AuraConf 不认, 待整改 docs/dp-models.md) ──
 # stage_asr:
