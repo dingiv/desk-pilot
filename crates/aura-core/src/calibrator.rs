@@ -104,7 +104,7 @@ impl Stage2CalibratorImpl {
             pb = pb.corrections(&corrections);
         }
         let (system, user) = pb.build();
-        tracing::debug!(target: "stage2::prompt", commit, system = %system, user = %user, "calibrate prompt");
+        tracing::info!(target: "stage2::prompt", commit, system = %system, user = %user, "calibrate prompt");
 
         // LLM returns plain text — no JSON parsing needed.
         let calibrated = self.llm.complete(&system, &user).unwrap_or_else(|_| route.to_string());

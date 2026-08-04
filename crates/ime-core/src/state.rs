@@ -510,6 +510,7 @@ impl StateMachine {
             cands = vec!["语音识别中...".to_string()]; // preview placeholder until voice arrives
         }
         self.candidates = cands;
+        tracing::info!(candidates = ?self.candidates, "voice candidates rebuilt");
         self.candidates_fresh = true;
         self.candidate_highlight = 0;
         self.candidate_page = 0;

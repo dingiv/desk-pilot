@@ -165,3 +165,23 @@ pub extern "C" fn swift_ime_poll_async(
     if code != 0 { unsafe { *out_view = view; } }
     code
 }
+
+/// Poll for voice-state changes in `#asr` (Voice) mode — the async candidate refresh entry point.
+/// Returns 1 + fills `out_view` if the voice buffer advanced (new interim/calibrated/final) and the
+/// ctx is in Voice mode; 0 otherwise. Called by the C++ glue's periodic TimeEvent (main loop) so
+/// the candidate area updates live WITHOUT a keypress — same `voice_tick` the TUI uses.
+#[no_mangle]
+pub extern "C" fn swift_ime_voice_tick(
+    engine: *mut ImeEngine,
+    ctx: *const std::ffi::c_void,
+    out_view: *mut ImeView,
+) -> i32 {
+    if engine.is_null() || out_view.is_null() { return 0; }
+    match unsafe { &*engine }.voice_tick_ctx(ctx as usize) {
+        Some(view) => {
+            unsafe { *out_view = view; }
+            1
+        }
+        None => 0,
+    }
+}

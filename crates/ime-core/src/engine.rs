@@ -507,13 +507,37 @@ impl ImeEngine {
     }
 
     pub fn voice_tick_ctx(&self, ctx: usize) -> Option<ImeView> {
-        let buf = self.asr.lock().unwrap().clone()?;
+        let buf = match self.asr.lock().unwrap().clone() {
+            Some(b) => b,
+            None => {
+                tracing::warn!(ctx, "voice_tick: no asr buffer attached to engine");
+                return None;
+            }
+        };
         let cur_version = buf.version();
         self.with_ctx(ctx, |disp, pc| {
             use crate::state::ComposeState;
-            if pc.sm.state != ComposeState::Voice || pc.sm.voice_version == cur_version {
+            if pc.sm.state != ComposeState::Voice {
+                return None; // not in voice mode for this ctx — common
+            }
+            if pc.sm.voice_version == cur_version {
+                // voice_tick IS polling this Voice ctx, but the buffer version hasn't advanced
+                // since the last rebuild (normal during silence). Trace-level to avoid spam now
+                // that the timer repeats; bump to debug/info if diagnosing a version stall.
+                tracing::trace!(
+                    ctx,
+                    voice_version = pc.sm.voice_version,
+                    cur_version,
+                    "voice_tick: Voice ctx, no version change"
+                );
                 return None;
             }
+            tracing::info!(
+                ctx,
+                voice_version = pc.sm.voice_version,
+                cur_version,
+                "voice_tick rebuild"
+            );
             Some(pc.sm.refresh_voice(disp))
         })
     }

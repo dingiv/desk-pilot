@@ -15,6 +15,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 // ── Opaque Rust handle ──────────────────────────────────────────────────────
 
@@ -55,6 +56,10 @@ extern "C" {
     int  swift_ime_commit_pending(ImeHandle *handle, void *ctx,
                                   ImeView *out_view);
     int  swift_ime_poll_async(ImeHandle *handle, void *ctx,
+                              ImeView *out_view);
+    /// Voice (`#asr`) async refresh: returns 1 + fills out_view when the voice buffer advanced
+    /// and the ctx is in Voice mode. Polled by the C++ TimeEvent so candidates update live.
+    int  swift_ime_voice_tick(ImeHandle *handle, void *ctx,
                               ImeView *out_view);
     void swift_ime_reset(ImeHandle *handle, void *ctx);
     void swift_ime_activate(ImeHandle *handle, void *ctx);
@@ -112,6 +117,12 @@ private:
 
     std::unique_ptr<fcitx::EventSourceTime> pollTimer_;
     void startAsyncPoll();
+
+    /// Active input contexts (added on activate, removed on deactivate/reset). The voice poll
+    /// timer iterates these to refresh `#asr` candidates async.
+    std::unordered_set<fcitx::InputContext *> activeContexts_;
+    std::unique_ptr<fcitx::EventSourceTime> voiceTimer_;
+    void startVoicePoll();
 };
 
 // ── Candidate word ──────────────────────────────────────────────────────────
