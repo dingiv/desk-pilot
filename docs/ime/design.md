@@ -307,7 +307,7 @@ IME 跨平台的核心架构决策：**后端(ime-core)拥有全部 UI 状态数
 - 每个平台 adapter 只需要实现 ~300 行代码:按键→`process_key`、读 `StateMachine` 渲染候选窗、`select` 上屏
 - 前端完全控制 UI 外观(候选窗大小/颜色/字体),后端只提供数据
 
-当前实现:fcitx5 adapter (`release/fcitx/engine.cpp` + `ffi.rs`) 约 200 行 C++ + 150 行 Rust C ABI,对应关系:
+当前实现:fcitx5 adapter (`release/fcitx/swift-ime.cpp` + `ffi.rs`) 约 200 行 C++ + 150 行 Rust C ABI,对应关系:
 
 | 后端 | fcitx5 前端 |
 |---|---|

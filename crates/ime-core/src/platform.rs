@@ -52,14 +52,17 @@ impl CandidateSlot {
 #[derive(Debug, Clone, Copy)]
 pub struct ImeView {
     pub commit_text: [u8; 512],
-    pub preedit_text: [u8; 256],
+    /// Preedit slot: 512 bytes so a magic anchor can expand into the recognized
+    /// text (e.g. `🎙 #asr 今天天气真不错…`) — long voice sentences fit whole.
+    pub preedit_text: [u8; 512],
     pub preedit_cursor: u32,
     pub candidates: [CandidateSlot; CANDIDATE_SLOTS],
     pub candidate_count: u32,
     pub candidate_highlight: u32,
     pub candidate_page: u32,
     pub candidate_page_size: u32,
-    pub aux_up: [u8; 256],
+    /// Aux-up mirrors the preedit; same size so an expanded preedit is never cut here.
+    pub aux_up: [u8; 512],
     pub key_passthrough: u8,
 }
 
@@ -68,14 +71,14 @@ impl ImeView {
     pub fn empty() -> Self {
         ImeView {
             commit_text: [0u8; 512],
-            preedit_text: [0u8; 256],
+            preedit_text: [0u8; 512],
             preedit_cursor: 0,
             candidates: [CandidateSlot::default(); CANDIDATE_SLOTS],
             candidate_count: 0,
             candidate_highlight: 0,
             candidate_page: 0,
             candidate_page_size: 7,
-            aux_up: [0u8; 256],
+            aux_up: [0u8; 512],
             key_passthrough: 0,
         }
     }

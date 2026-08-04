@@ -19,7 +19,7 @@
 
 // ── Opaque Rust handle ──────────────────────────────────────────────────────
 
-struct ImeHandle; // defined in libswift_ime.so, created/destroyed via C ABI
+struct ImeHandle; // defined in libswift-ime-core.so, created/destroyed via C ABI
 
 // ── ImeView: cross-platform UI state snapshot (must match Rust #[repr(C)]) ─
 
@@ -32,14 +32,14 @@ struct CandidateSlot {
 
 struct ImeView {
     char           commit_text[512];
-    char           preedit_text[256];
+    char           preedit_text[512];  // expanded magic anchor (e.g. "🎙 #asr <voice>")
     uint32_t       preedit_cursor;
     CandidateSlot  candidates[CANDIDATE_SLOTS];
     uint32_t       candidate_count;
     uint32_t       candidate_highlight;
     uint32_t       candidate_page;
     uint32_t       candidate_page_size;
-    char           aux_up[256];
+    char           aux_up[512];
     uint8_t        key_passthrough;
 };
 

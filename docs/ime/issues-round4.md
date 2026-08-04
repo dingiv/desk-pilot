@@ -71,7 +71,7 @@ void surroundingTextCallback(
 
 **接入方案**：
 
-1. C++ glue engine.cpp 实现 `surroundingTextCallback`
+1. C++ glue swift-ime.cpp 实现 `surroundingTextCallback`
 2. 通过 C ABI `swift_ime_set_surrounding(ctx, text)` 传给 Rust
 3. ImeEngine 在 predict 前检查 surrounding text，有则更新 `InputContext`
 

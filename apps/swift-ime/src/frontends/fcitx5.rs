@@ -4,13 +4,38 @@
 //! creates one ImeEngine per SwiftImeEngine instance and passes the
 //! opaque pointer on every call. Per-context state is managed
 //! internally by the engine.
+//!
+//! Candidate rows are truncated **here, at the frontend**: the engine passes
+//! full texts (voice sentences are long), and each frontend renders rows to
+//! its own space — the fcitx5 panel is short, so rows get a compact preview;
+//! the TUI shows everything. Commit always uses the engine's full text, so
+//! truncation never loses data.
 
 use std::os::raw::c_char;
 use std::sync::Arc;
 
 use ime_core::asr_buffer::AsrBuffer;
 use ime_core::engine::ImeEngine;
+use ime_core::family::magic::preview_text;
 use ime_core::platform::ImeView;
+
+/// Max displayed bytes for one candidate row in the fcitx5 panel (≈8 CJK
+/// chars). The panel adapts its width to the longest row — truncating here
+/// keeps the box compact while the full text stays committable.
+const FCITX_CANDIDATE_TEXT_MAX: usize = 8 * 3;
+
+/// Truncate candidate row texts in place, at the frontend boundary. Pure
+/// display — the engine's internal candidates (and thus what Space commits)
+/// are untouched.
+fn truncate_candidate_rows(view: &mut ImeView) {
+    for i in 0..view.candidate_count as usize {
+        let text = ImeView::str_field(&view.candidates[i].text);
+        let preview = preview_text(&text, FCITX_CANDIDATE_TEXT_MAX);
+        if preview != text {
+            ImeView::set_str(&mut view.candidates[i].text, &preview);
+        }
+    }
+}
 
 // ── C ABI — all functions take the engine pointer ──────────────────────
 
@@ -86,7 +111,8 @@ pub extern "C" fn swift_ime_process_key(
 ) -> i32 {
     let c = char::from_u32(ch).unwrap_or('\0');
     if c == '\0' || engine.is_null() || out_view.is_null() { return 0; }
-    let view = unsafe { &*engine }.predict_ctx(ctx as usize, c);
+    let mut view = unsafe { &*engine }.predict_ctx(ctx as usize, c);
+    truncate_candidate_rows(&mut view);
     unsafe { *out_view = view; }
     1
 }
@@ -99,7 +125,8 @@ pub extern "C" fn swift_ime_select_candidate(
     out_view: *mut ImeView,
 ) -> i32 {
     if engine.is_null() || out_view.is_null() { return 0; }
-    let view = unsafe { &*engine }.select_ctx(ctx as usize, index as usize);
+    let mut view = unsafe { &*engine }.select_ctx(ctx as usize, index as usize);
+    truncate_candidate_rows(&mut view);
     unsafe { *out_view = view; }
     1
 }
@@ -118,7 +145,8 @@ pub extern "C" fn swift_ime_special_key(
     out_view: *mut ImeView,
 ) -> i32 {
     if engine.is_null() || out_view.is_null() { return 0; }
-    let view = unsafe { &*engine }.special_key_code_ctx(ctx as usize, code);
+    let mut view = unsafe { &*engine }.special_key_code_ctx(ctx as usize, code);
+    truncate_candidate_rows(&mut view);
     unsafe { *out_view = view; }
     1
 }
@@ -141,7 +169,8 @@ pub extern "C" fn swift_ime_commit_pending(
     out_view: *mut ImeView,
 ) -> i32 {
     if engine.is_null() || out_view.is_null() { return 0; }
-    let view = unsafe { &*engine }.commit_pending_ctx(ctx as usize);
+    let mut view = unsafe { &*engine }.commit_pending_ctx(ctx as usize);
+    truncate_candidate_rows(&mut view);
     unsafe { *out_view = view; }
     1
 }
@@ -165,8 +194,11 @@ pub extern "C" fn swift_ime_poll_async(
     out_view: *mut ImeView,
 ) -> i32 {
     if engine.is_null() || out_view.is_null() { return 0; }
-    let (code, view) = unsafe { &*engine }.poll_async_ctx(ctx as usize);
-    if code != 0 { unsafe { *out_view = view; } }
+    let (code, mut view) = unsafe { &*engine }.poll_async_ctx(ctx as usize);
+    if code != 0 {
+        truncate_candidate_rows(&mut view);
+        unsafe { *out_view = view; }
+    }
     code
 }
 
@@ -184,7 +216,8 @@ pub extern "C" fn swift_ime_magic_tick(
 ) -> i32 {
     if engine.is_null() || out_view.is_null() { return 0; }
     match unsafe { &*engine }.magic_tick_ctx(ctx as usize) {
-        Some(view) => {
+        Some(mut view) => {
+            truncate_candidate_rows(&mut view);
             unsafe { *out_view = view; }
             1
         }
@@ -203,4 +236,33 @@ pub extern "C" fn swift_ime_set_req_base(
     let s = unsafe { std::ffi::CStr::from_ptr(base) }.to_string_lossy();
     unsafe { &*engine }.set_req_base(&s);
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_rows_truncated_at_frontend_with_ellipsis() {
+        // 24 CJK chars = 72 bytes, well above the 24-byte panel cap.
+        let long = "今天天气真不错我们一起去公园散步顺便买个冰淇淋吃";
+        let mut view = ImeView::empty();
+        ImeView::set_str(&mut view.candidates[0].text, long);
+        view.candidate_count = 1;
+        truncate_candidate_rows(&mut view);
+        let shown = ImeView::str_field(&view.candidates[0].text);
+        assert!(shown.ends_with('…'), "row truncated with ellipsis: {shown}");
+        assert_eq!(shown.len(), FCITX_CANDIDATE_TEXT_MAX + 3, "FCITX_CANDIDATE_TEXT_MAX bytes + 3-byte …: {shown}");
+        assert!(shown.starts_with("今天天气真"), "head kept: {shown}");
+    }
+
+    #[test]
+    fn short_rows_untouched() {
+        let short = "你好";
+        let mut view = ImeView::empty();
+        ImeView::set_str(&mut view.candidates[0].text, short);
+        view.candidate_count = 1;
+        truncate_candidate_rows(&mut view);
+        assert_eq!(ImeView::str_field(&view.candidates[0].text), short);
+    }
 }

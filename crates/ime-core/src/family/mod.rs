@@ -9,11 +9,10 @@
 //! returns a globally ranked list.
 //!
 //! ```text
-//! Input → PinyinFamily (priority=100) → [候选A:0.95, 候选B:0.80, ...]
-//!       → JianpinFamily (priority=85)  → [候选C:0.72, ...]
-//!       → EnglishFamily (priority=60)  → [black:0.88, ...]
-//!       → MagicFamily  (priority=95)   → [#date:1.0, ...]
+//! Input → PinyinFamily (priority=100) → [候选A:0.95, 候选B:0.80, ...]  (含 jianpin 组合)
+//!       → MagicFamily   (priority=95)  → [#date:1.0, #asr:1.0, ...]
 //!       → SnippetFamily (priority=75)  → [/greet:1.0, ...]
+//!       → EnglishFamily (priority=70)  → [black:0.88, ...]
 //!                    ↓
 //!       UnifiedScorer::rank()
 //!         → final_score = raw_score × (priority / 100)
@@ -187,20 +186,6 @@ impl UnifiedScorer {
         UnifiedScorer { families }
     }
 
-    /// Build with the standard five families.
-    #[cfg(test)]
-    pub fn with_defaults(
-        pinyin: Box<dyn CandidateFamily>,
-        snippet: Box<dyn CandidateFamily>,
-        magic: Box<dyn CandidateFamily>,
-        english: Box<dyn CandidateFamily>,
-        jianpin: Box<dyn CandidateFamily>,
-    ) -> Self {
-        UnifiedScorer {
-            families: vec![pinyin, jianpin, magic, snippet, english],
-        }
-    }
-
     /// Rank all candidates (context-free). Returns deduplicated texts.
     pub fn rank(&self, input: &str) -> Vec<String> {
         self.rank_with_context(input, &InputContext::new())
@@ -346,8 +331,6 @@ mod tests {
 
 // ── Submodule declarations ──────────────────────────────────────────────
 
-pub mod ai;
-pub mod emoji;
 pub mod english;
 pub mod magic;
 pub mod pinyin;

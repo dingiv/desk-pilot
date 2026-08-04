@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use super::member::{preview_text, CANDIDATE_PREVIEW_MAX, MagicMember, MemberAction};
+use super::member::{MagicMember, MemberAction};
 use super::MagicResources;
 use crate::platform::ImeView;
 use crate::state::{StateMachine, StepEnv};
@@ -20,8 +20,8 @@ pub struct VoiceMember {
     resources: Arc<MagicResources>,
     /// Last `AsrBuffer::version()` seen — `tick` compares to detect changes.
     last_version: u64,
-    /// Full (un-truncated) texts of the current candidates, parallel to the
-    /// display previews in `sm.candidates`. Space commits `full[0]`.
+    /// Candidate texts (same as `sm.candidates` — full, un-truncated; each
+    /// frontend truncates rows for its own display). Space commits `full[0]`.
     full: Vec<String>,
 }
 
@@ -50,17 +50,28 @@ impl VoiceMember {
             sm.candidates = vec!["语音识别中...".to_string()];
             self.full.clear();
         } else {
-            sm.candidates = self.full.iter().map(|t| preview_text(t, CANDIDATE_PREVIEW_MAX)).collect();
+            // Full texts, un-truncated: each frontend renders rows to its own space
+            // (the TUI has room and shows everything; the fcitx5 panel truncates at
+            // its export). Commit uses `self.full`, so display never loses data.
+            sm.candidates = self.full.clone();
         }
         sm.candidates_fresh = true;
         sm.candidate_highlight = 0;
         sm.candidate_page = 0;
-        sm.preedit = if empty { "🎙 #asr …".into() } else { "🎙 #asr".into() };
+        if empty {
+            sm.preedit = "🎙 #asr …".into();
+        } else {
+            // Expand the anchor into the recognized text: the preedit slot is
+            // large (512 B) and frontends show more of it than the 6-char rows,
+            // so the user reads the sentence while it streams in.
+            let head = self.full.first().cloned().unwrap_or_default();
+            sm.preedit = format!("🎙 #asr {head}");
+        }
         sm.cursor = sm.preedit.len();
         if let Some(b) = buf.as_ref() {
             self.last_version = b.version();
         }
-        tracing::debug!(previews = ?sm.candidates, full = ?self.full, "voice candidates rebuilt");
+        tracing::debug!(candidates = ?sm.candidates, "voice candidates rebuilt");
         sm.make_view()
     }
 }

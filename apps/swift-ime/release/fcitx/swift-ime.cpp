@@ -4,7 +4,7 @@
 // the Dispatcher and per-context state machines. The C++ side keeps a
 // per-context lastView_ for diffing. No global state anywhere.
 
-#include "engine.h"
+#include "swift-ime.h"
 
 #include <fcitx/inputcontext.h>
 #include <fcitx/inputpanel.h>

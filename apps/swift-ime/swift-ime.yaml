@@ -7,18 +7,9 @@ dicts:
   base: true          # embedded base dictionary (compiled into binary)
   rime_ice: true      # rime-ice large dictionary (loaded from disk at startup)
 
-# ── Prediction families ─────────────────────────────────────────────────
-families:
-  pinyin:   true      # full pinyin + jianpin (Viterbi + LargeDict + PhraseBook)
-  english:  true      # English word prefix matching
-  magic:    true      # #date, #asr, #req, #password commands
-
 # ── Magic commands ──────────────────────────────────────────────────────
 magic:
   req_base: http://127.0.0.1:14555/api   # #req backend base URL (CLI --req-base overrides)
-  snippet:  true      # /greet user-defined text expansion
-  emoji:    false     # emoji shorthand (reserved)
-  ai:       false     # LLM sentence prediction (reserved)
 
 # ── Input ───────────────────────────────────────────────────────────────
 input:
@@ -30,14 +21,10 @@ input:
 # All values are intentionally conservative — top candidates land in
 # 0.70–0.85 range, leaving headroom for recency/context boosts.
 weights:
-  # Family priorities (0-100, higher = more weight in global ranking)
+  # English priority in the global ranking (0-100). The other families'
+  # priorities (pinyin/magic/snippet) are fixed in the engine's scorer.
   family_priority:
-    pinyin: 90
-    magic: 90
-    snippet: 70
     english: 70
-    emoji: 50
-    ai: 40
 
   # Pinyin family internal scores (0.0-1.0)
   pinyin:
@@ -45,9 +32,6 @@ weights:
     large_dict: 0.85        # rime-ice exact match
     viterbi_base: 0.25      # Viterbi min score
     viterbi_scale: 0.55     # Viterbi score range (max = base + scale = 0.80)
-    session: 0.5            # inputx session lookup
-    prefix: 0.3             # prefix fallback (incomplete syllable)
-    phrase_book_prefix: 0.80 # PhraseBook prefix match
     jianpin: 0.50           # initials-only match discount (nh→你好)
     single_syl_decay: 0.5   # score decay per position in single-syllable lookup
     context_boost: 0.12     # bonus for bigram match with previous word
@@ -57,24 +41,8 @@ weights:
     large_dict_take: 96     # max LargeDict candidates per query
     viterbi_take: 48        # max Viterbi compositions per query
     jianpin_take: 8         # max jianpin candidates per query
-    prefix_take: 256        # max prefix fallback candidates
-
-  # Snippet family internal scores
-  snippet:
-    exact: 0.92             # exact trigger match
-    partial: 0.4            # partial trigger (still typing)
-
-  # Magic family internal scores
-  magic:
-    exact: 0.92             # exact command match
-    prefix: 0.82            # prefix command match
 
   # English family internal scores
   english:
     exact: 0.88             # exact word match
     prefix_ratio: 0.6       # max score for prefix match (scaled by match ratio)
-
-  # Candidate display
-  display:
-    max_full_comps: 8       # scorer entries on first page
-    max_char_cands: 8       # single-char options on first page

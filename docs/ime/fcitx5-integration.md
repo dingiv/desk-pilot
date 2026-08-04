@@ -119,7 +119,7 @@ void SwiftImeEngine::keyEvent(...) {
 
 ```
 fcitx5 启动
-  └─ dlopen("swift-ime.so")
+  └─ dlopen("libswift-ime.so")
        └─ FCITX_ADDON_FACTORY → SwiftImeFactory::create()
             └─ swift_ime_init(nullptr)          ← ★ 全局初始化(仅一次)
 
@@ -171,11 +171,11 @@ fcitx5 启动
 | 步骤 | fcitx5-pinyin (C++) | swift-ime (Rust C ABI) |
 |---|---|---|
 | 1. 取每窗口状态 | `auto *state = ic->propertyFor(&factory_)` | `with_ctx(ctx, \|disp, sm\| { ... })` |
-| 2. 按键→字符 | `Key::keySymToUnicode(sym)` | 同,在 C++ engine.cpp 完成 |
-| 3. 按键消费 | `event.filterAndAccept()` | 同,在 C++ engine.cpp |
+| 2. 按键→字符 | `Key::keySymToUnicode(sym)` | 同,在 C++ swift-ime.cpp 完成 |
+| 3. 按键消费 | `event.filterAndAccept()` | 同,在 C++ swift-ime.cpp |
 | 4. 业务逻辑 | `state->context_.type(ch)` → `PinyinContext` 处理 | `sm.step(ch, env)` → `StateMachine` FSM |
 | 5. 取候选 | `context.candidatesToCursor()` | `state.sm.candidates.clone()`(缓存) |
-| 6. 填候选窗 | `CommonCandidateList + setPageSize + append` | 同模式,在 C++ engine.cpp |
+| 6. 填候选窗 | `CommonCandidateList + setPageSize + append` | 同模式,在 C++ swift-ime.cpp |
 | 7. 显示 preedit | `ic->inputPanel().setClientPreedit(text)` | 同,out_text 带拼音 buffer |
 | 8. 提交文本 | `ic->commitString(sentence)` | 同,action==Commit 分支 |
 | 9. 候选选词 | `CandidateWord::select(ic)` → `commitString` | `SwiftCandidateWord::select` → `commitString`（同模式） |

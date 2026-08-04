@@ -5,8 +5,6 @@
 //! and ranks candidates from all enabled prediction families.
 
 use crate::expander::Expander;
-use crate::family::ai::AiFamily;
-use crate::family::emoji::EmojiFamily;
 use crate::family::english::EnglishFamily;
 use crate::family::magic::MagicFamily;
 use crate::family::pinyin::PinyinFamily;
@@ -30,18 +28,6 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
-    pub fn new(matcher: Matcher, expander: Expander) -> Self {
-        Self::with_pinyin_weights(matcher, expander, crate::family::pinyin::PinyinWeights::default())
-    }
-
-    pub fn with_pinyin_weights(
-        matcher: Matcher,
-        expander: Expander,
-        weights: crate::family::pinyin::PinyinWeights,
-    ) -> Self {
-        Self::with_config(matcher, expander, Arc::new(MagicFamily::new()), weights, 65, crate::family::english::EnglishWeights::default())
-    }
-
     /// Full constructor with configurable English family settings. `magic` is the
     /// shared registry — the engine keeps the same `Arc` for resource attachment.
     pub fn with_config(
@@ -57,8 +43,6 @@ impl Dispatcher {
         let magic_family: Box<dyn CandidateFamily> = Box::new((*magic).clone());
         let english_family = EnglishFamily::with_default_dict()
             .with_config(english_priority, english_weights);
-        let emoji_family = EmojiFamily::new();
-        let ai_family = AiFamily::new();
 
         // Build in priority order.
         let scorer = UnifiedScorer::new(vec![
@@ -66,8 +50,6 @@ impl Dispatcher {
             magic_family,
             Box::new(snippet_family),
             Box::new(english_family),
-            Box::new(emoji_family),
-            Box::new(ai_family),
         ]);
 
         Dispatcher {
@@ -153,11 +135,9 @@ impl Dispatcher {
             .and_then(|f| f.load_dict(path))
     }
 
-    /// Attach the voice buffer — routed to BOTH the magic registry's shared slot
-    /// (read by the voice-family member instances) and the expander (legacy
-    /// `__ASR_BUFFER__`/`__ASR_SUBMIT__` token fallback).
+    /// Attach the voice buffer to the magic registry's shared slot — read by the
+    /// `#asr`/`#submit` member instances.
     pub fn set_asr_buffer(&self, buf: std::sync::Arc<crate::asr_buffer::AsrBuffer>) {
-        self.expander.set_asr_buffer(Arc::clone(&buf));
         self.magic.set_asr_buffer(buf);
     }
 

@@ -63,7 +63,14 @@ echo ""
 # ── Step 1: Build the Rust cdylib ──────────────────────────────────────
 echo "── [1/4] Building Rust cdylib …"
 cargo build -p swift-ime --lib $CARGO_FLAGS
-echo "   → $RUST_BUILD_DIR/libswift_ime.so"
+# cargo rejects hyphens in lib target names, so the cdylib is emitted as
+# libswift_ime.so — and cargo re-hardlinks that name into place on EVERY
+# build (the real artifact lives in target/release/deps/). Copy (not mv)
+# to the packaging name the CMake glue links against, so it survives
+# cargo's next hard-link restore.
+rm -f "$RUST_BUILD_DIR/libswift-ime-core.so"
+cp -f "$RUST_BUILD_DIR/libswift_ime.so" "$RUST_BUILD_DIR/libswift-ime-core.so"
+echo "   → $RUST_BUILD_DIR/libswift-ime-core.so"
 echo ""
 
 # ── Step 2: CMake configure ───────────────────────────────────────────────
@@ -79,9 +86,9 @@ cmake -S "$PROJECT_DIR" -B "$BUILD_DIR" \
 echo ""
 
 # ── Step 3: Build the C++ addon ───────────────────────────────────────────
-echo "── [3/4] Building fcitx5 addon (swift-ime.so) …"
+echo "── [3/4] Building fcitx5 addon (libswift-ime.so) …"
 cmake --build "$BUILD_DIR" -j"$(nproc)"
-echo "   → $BUILD_DIR/release/fcitx/swift-ime.so"
+echo "   → $BUILD_DIR/release/fcitx/libswift-ime.so"
 echo ""
 
 # ── Step 4 (optional): Install ────────────────────────────────────────────
@@ -98,7 +105,7 @@ if [ "$DO_DEB" = true ]; then
 
     if ! command -v dpkg-buildpackage &>/dev/null; then
         echo "   ⚠  dpkg-buildpackage not found (apt install dpkg-dev)"
-        echo "   The .so is ready: $BUILD_DIR/release/fcitx/swift-ime.so"
+        echo "   The .so is ready: $BUILD_DIR/release/fcitx/libswift-ime.so"
         exit 0
     fi
 
@@ -131,8 +138,8 @@ echo "════════════════════════�
 echo " Build complete."
 echo ""
 echo " Artifacts:"
-echo "   $RUST_BUILD_DIR/libswift_ime.so"
-echo "   $BUILD_DIR/release/fcitx/swift-ime.so"
+echo "   $RUST_BUILD_DIR/libswift-ime-core.so"
+echo "   $BUILD_DIR/release/fcitx/libswift-ime.so"
 if [ "${DEB_FILE:-}" != "" ] && [ -f "$DEB_FILE" ]; then
     echo "   $DEB_FILE"
 fi

@@ -296,65 +296,6 @@ impl ImeEngine {
         self.select_ctx(DEFAULT_CTX, index)
     }
 
-    /// Move the candidate highlight by `delta` (±1) in the default context.
-    pub fn move_highlight(&self, delta: i32) {
-        self.move_highlight_ctx(DEFAULT_CTX, delta)
-    }
-
-    /// Move the candidate highlight by `delta` for a specific context.
-    pub fn move_highlight_ctx(&self, ctx: usize, delta: i32) {
-        self.contexts.lock().unwrap()
-            .get_mut(&ctx)
-            .map(|pc| pc.sm.move_highlight(delta));
-    }
-
-    /// Change candidate page by `delta` (-1=prev, +1=next) in the default context.
-    pub fn page(&self, delta: i32) {
-        self.page_ctx(DEFAULT_CTX, delta)
-    }
-
-    /// Change candidate page by `delta` for a specific context.
-    pub fn page_ctx(&self, ctx: usize, delta: i32) {
-        self.contexts.lock().unwrap()
-            .get_mut(&ctx)
-            .map(|pc| {
-                let n = pc.sm.candidates.len();
-                if n == 0 || pc.sm.candidate_page_size == 0 { return; }
-                let total_pages = (n + pc.sm.candidate_page_size - 1) / pc.sm.candidate_page_size;
-                let new_page = (pc.sm.candidate_page as i32 + delta).clamp(0, total_pages as i32 - 1) as usize;
-                if new_page != pc.sm.candidate_page {
-                    pc.sm.candidate_page = new_page;
-                    pc.sm.candidate_highlight = new_page * pc.sm.candidate_page_size;
-                }
-            });
-    }
-
-    /// Go to the previous candidate page in the default context.
-    pub fn page_up(&self) { self.page(-1); }
-
-    /// Go to the next candidate page in the default context.
-    pub fn page_down(&self) { self.page(1); }
-
-    /// Get the full ImeView for a specific context without processing a key.
-    pub fn view_ctx(&self, ctx: usize) -> ImeView {
-        self.contexts.lock().unwrap()
-            .get(&ctx)
-            .map(|pc| {
-                let mut v = ImeView::empty();
-                v.candidate_count = pc.sm.candidates.len().min(16) as u32;
-                v.candidate_highlight = pc.sm.candidate_highlight as u32;
-                v.candidate_page = pc.sm.candidate_page as u32;
-                v.candidate_page_size = pc.sm.candidate_page_size as u32;
-                for (i, c) in pc.sm.candidates.iter().take(16).enumerate() {
-                    ImeView::set_str(&mut v.candidates[i].text, c);
-                }
-                ImeView::set_str(&mut v.preedit_text, &pc.sm.preedit);
-                v.preedit_cursor = pc.sm.cursor as u32;
-                v
-            })
-            .unwrap_or_else(ImeView::empty)
-    }
-
     /// Poll async state for the default context.
     pub fn poll_async(&self) -> (i32, ImeView) {
         self.poll_async_ctx(DEFAULT_CTX)
@@ -402,8 +343,8 @@ impl ImeEngine {
         let Some(pc) = map.get(&DEFAULT_CTX) else { return Vec::new() };
         // Snippet/Magic state: candidates come from the Matcher trie / live member,
         // not the scorer. Return them directly so #asr / #date expansions appear
-        // correctly. For Magic, prefer the member's full commit texts over the
-        // display previews (voice sentences / req bodies are truncated in the bar).
+        // correctly. For Magic, the member's full commit texts (voice sentences /
+        // req bodies stay whole — each frontend truncates rows for its own display).
         if pc.sm.state == crate::state::ComposeState::Magic && pc.sm.candidates_fresh {
             let family: &'static str = pc.sm.magic_member.as_ref().map(|m| m.name()).unwrap_or("magic");
             let texts: Vec<String> = match pc.sm.magic_member.as_ref() {
@@ -431,14 +372,6 @@ impl ImeEngine {
         drop(map);
         use crate::state::StepEnv;
         self.dispatcher.scorer().rank_detailed(&buffer, &ctx)
-    }
-
-    /// Short-term text context for the default context.
-    pub fn context_text(&self) -> String {
-        self.contexts.lock().unwrap()
-            .get(&DEFAULT_CTX)
-            .map(|pc| pc.text_context.recent_text.clone())
-            .unwrap_or_default()
     }
 
     /// Manually set the text context (simulates pre-filled text).
@@ -487,19 +420,6 @@ impl ImeEngine {
         if prev.is_empty() || next.is_empty() { return; }
         if let Some(ref s) = *self.store.lock().unwrap() { s.record_bigram(prev, next); }
         self.dispatcher.record_bigram(prev, next);
-    }
-
-    /// Commit pending text in the default context.
-    pub fn commit_pending(&mut self) -> Option<String> {
-        let view = self.commit_pending_ctx(DEFAULT_CTX);
-        let text = ImeView::str_field(&view.commit_text);
-        if text.is_empty() { None } else {
-            self.with_ctx(DEFAULT_CTX, |disp, pc| {
-                pc.text_context.update(text);
-                disp.reset(&mut pc.sm);
-            });
-            Some(text.to_string())
-        }
     }
 
     /// Attach the voice buffer so `#asr` resolves to live voice recognition
@@ -628,7 +548,7 @@ mod tests {
         let cands = e.candidates();
         assert!(cands.iter().any(|c| c.contains("语音识别中")), "preview when empty: {cands:?}");
 
-        // voice streams → live candidate appears; voice_tick rebuilds it
+        // voice streams → live candidate appears; magic_tick rebuilds it
         buf.set_live("你好");
         assert!(e.magic_tick().is_some(), "tick rebuilds after set_live");
         let cands = e.candidates();
@@ -666,12 +586,13 @@ mod tests {
     }
 
     #[test]
-    fn asr_voice_long_sentence_preview_with_ellipsis_commit_full() {
+    fn asr_voice_long_sentence_keeps_full_text_for_frontends() {
         use std::sync::Arc;
         use crate::asr_buffer::AsrBuffer;
-        // A sentence > VOICE_PREVIEW_MAX (60) bytes — each char = 3 bytes, 10 chars = 30.
-        // 3× repeat → ~90 bytes, well above the preview cap.
-        let long = "这是一句相当长的话，超出六十字节限制。".repeat(2); // ~72 bytes
+        // A long sentence (~72 bytes, well under the 128-byte C ABI candidate slot).
+        // The engine passes full texts — each frontend truncates rows for its own
+        // display (fcitx5 panel), while the TUI shows everything.
+        let long = "这是一句相当长的话，超出显示上限。".repeat(2); // ~72 bytes
         let buf = Arc::new(AsrBuffer::new());
         buf.push_final(&long);
         let mut e = eng();
@@ -679,9 +600,12 @@ mod tests {
         for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
         e.magic_tick();
         let cands = e.candidates();
-        assert!(cands[0].ends_with('…'), "long preview has ellipsis: {}", cands[0]);
-        assert!(cands[0].len() < long.len(), "preview is shorter than full ({})", cands[0].len());
-        // Space commits the FULL text (from voice_full), not the display preview.
+        assert_eq!(cands[0], long, "engine candidate is the full text: {cands:?}");
+        // The preedit expands the anchor into the recognized text.
+        let v0 = e.view();
+        let preedit = ImeView::str_field(&v0.preedit_text);
+        assert_eq!(preedit, format!("🎙 #asr {long}"), "preedit shows the voice text");
+        // Space commits the FULL text (from voice_full), not any display preview.
         let v = e.predict(InputEvent::space());
         assert_eq!(ImeView::str_field(&v.commit_text), long);
     }
