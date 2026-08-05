@@ -702,6 +702,27 @@ mod tests {
     }
 
     #[test]
+    fn unknown_snippet_space_commits_raw() {
+        // `/unknown` (no trie match) → the raw text is a fallback candidate;
+        // Space commits it — the trie never swallows unknown `/` input.
+        let mut e = eng();
+        for c in "/unknown".chars() { e.predict(InputEvent::char(c)); }
+        let cands = e.candidates();
+        assert_eq!(cands, vec!["/unknown".to_string()], "raw fallback: {cands:?}");
+
+        let v = e.predict(InputEvent::space());
+        assert_eq!(ImeView::str_field(&v.commit_text), "/unknown", "space commits raw");
+        assert!(e.candidates().is_empty(), "cleared after commit");
+
+        // Escape cancels instead of committing.
+        let mut e2 = eng();
+        for c in "/unknown".chars() { e2.predict(InputEvent::char(c)); }
+        let v = e2.predict(InputEvent::escape());
+        assert!(ImeView::str_field(&v.commit_text).is_empty(), "escape cancels");
+        assert!(e2.candidates().is_empty(), "cleared after escape");
+    }
+
+    #[test]
     fn unknown_magic_space_commits_raw() {
         // `#x` (no magic match) → raw kept as candidate; Space commits it.
         let mut e = eng();
@@ -848,8 +869,10 @@ mod tests {
     }
 
     /// Poll `magic_tick` until the worker thread's result lands (or fail).
+    /// Budget 2s — under full parallel test load the spawned worker thread can
+    /// be starved past the old 1s budget (flaky "never landed" under load).
     fn wait_req_tick(e: &ImeEngine) {
-        for _ in 0..200 {
+        for _ in 0..400 {
             if e.magic_tick().is_some() { return; }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }

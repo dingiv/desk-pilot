@@ -475,7 +475,7 @@ impl StateMachine {
         }
 
         match env.matcher().step(&self.buffer, ch) {
-            Match::Complete { expansion, .. } => {
+            Match::Complete { trigger, expansion } => {
                 self.buffer.push(ch);
                 // The trigger is fully matched — stale prefix hints from earlier Partial steps
                 // must not linger (a later Space would misroute to the hint branch).
@@ -492,14 +492,24 @@ impl StateMachine {
                     self.assemble_magic_tail(env);
                     return view;
                 }
+                // Magic static commands carry a sentinel (expansion == trigger)
+                // instead of a frozen value — resolve FRESH so a #date typed
+                // days after engine start commits TODAY, not the startup date.
+                // User snippets (expansion ≠ trigger) keep their own text.
+                let static_expanded = if expansion == trigger {
+                    env.magic().static_expansion(&trigger)
+                        .unwrap_or_else(|| expansion.clone())
+                } else {
+                    expansion.clone()
+                };
                 // Store the expansion as a pending candidate — don't auto-expand.
                 self.preedit = self.buffer.clone();
                 self.cursor = self.preedit.len();
-                let expanded = match env.expander().expand(&expansion) {
+                let expanded = match env.expander().expand(&static_expanded) {
                     Ok(t) => t,
-                    Err(e) => { tracing::warn!(error = %e, "expand failed"); expansion.clone() }
+                    Err(e) => { tracing::warn!(error = %e, "expand failed"); static_expanded.clone() }
                 };
-                self.pending_expansion = Some(expansion);
+                self.pending_expansion = Some(static_expanded);
                 self.candidates = vec![expanded];
                 self.candidates_fresh = true;
                 self.candidate_highlight = 0;
@@ -535,10 +545,11 @@ impl StateMachine {
                 self.preedit = self.buffer.clone();
                 self.cursor = self.preedit.len();
                 self.magic_hints.clear();
-                if self.buffer.starts_with('#') {
-                    // Unknown magic: DON'T vanish — keep the raw text as a candidate and let
-                    // Space commit it. (Non-# dead ends keep the old immediate-commit behavior
-                    // so `/tmp/…`-style input flows through without a leftover preedit.)
+                if self.buffer.starts_with('#') || self.buffer.starts_with('/') {
+                    // Unknown trigger: DON'T vanish — keep the raw text as a
+                    // fallback candidate (`/unknown` → candidate `/unknown`),
+                    // Space commits it, Esc/Backspace cancel. The same trie
+                    // fallback serves `#` and `/` uniformly.
                     self.candidates = vec![self.buffer.clone()];
                     self.candidates_fresh = true;
                     self.candidate_highlight = 0;

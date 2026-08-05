@@ -147,12 +147,20 @@ impl MagicFamily {
         self.enabled = enabled;
     }
 
-    /// All matcher entries: static triggers → their expansion; live triggers →
-    /// the activation token (plus aliases, e.g. `#flush` → voice token).
+    /// All matcher entries: static triggers → their trigger itself as a SENTINEL;
+    /// live triggers → the activation token (plus aliases, e.g. `#flush` → voice
+    /// token).
+    ///
+    /// Statics are NOT frozen into the matcher: `expansion()` is time-varying
+    /// (`#date`), and calling it here would commit the ENGINE-STARTUP date when
+    /// the trigger completes days later. The FSM detects the sentinel
+    /// (expansion == trigger) and resolves the static FRESH from the registry.
+    /// A user snippet shadowing the same trigger has expansion ≠ trigger, so
+    /// the override is untouched.
     pub fn matcher_entries(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for s in &self.statics {
-            out.push((s.trigger.to_string(), s.expansion()));
+            out.push((s.trigger.to_string(), s.trigger.to_string()));
         }
         for m in &self.members {
             let token = m.activation_token().expect("live member needs an activation token");
@@ -320,9 +328,12 @@ mod tests {
     fn matcher_entries_cover_all_commands() {
         let fam = MagicFamily::new();
         let entries: Vec<(String, String)> = fam.matcher_entries();
-        assert!(entries.contains(&("#date".into(), today_str())), "{entries:?}");
+        // Statics carry a sentinel (trigger == expansion) — resolved FRESH at
+        // completion so a long-running engine doesn't commit the startup date.
+        assert!(entries.contains(&("#date".into(), "#date".into())), "{entries:?}");
+        assert!(entries.contains(&("#password".into(), "#password".into())), "{entries:?}");
         assert!(entries.contains(&("#asr".into(), "__ASR_BUFFER__".into())));
-        assert!(entries.contains(&("#flush".into(), "__ASR_BUFFER__".into())), "alias");
+        assert!(!entries.iter().any(|(t, _)| t == "#flush"), "#flush alias removed");
         assert!(entries.contains(&("#submit".into(), "__ASR_SUBMIT__".into())));
         assert!(entries.contains(&("#req".into(), "__REQ__".into())));
     }

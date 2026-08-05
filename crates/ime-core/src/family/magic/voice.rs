@@ -1,10 +1,11 @@
-//! VoiceMember — `#asr` (alias `#flush`): live voice-input anchor.
+//! VoiceMember — `#asr`: live voice-input anchor.
 //!
 //! Activation token `__ASR_BUFFER__`. The candidate list tracks the aura stream:
 //! the live interim as #1 while streaming, then settled finals (newest first).
 //! Space commits the **full** #1 text; Esc / Enter / Backspace cancel; other keys
 //! pass through so typing while listening still works. `tick` rebuilds the view
-//! when the shared [`AsrBuffer`] version advances.
+//! when the shared [`AsrBuffer`] version advances — the async-refresh timer makes
+//! the old `#flush` alias (manual refresh) unnecessary.
 
 use std::sync::Arc;
 
@@ -121,7 +122,7 @@ impl MagicMember for VoiceMember {
     }
 
     fn aliases(&self) -> &[&'static str] {
-        &["flush"]
+        &[] // #flush removed — async magic tick refreshes the view automatically
     }
 
     fn spawn(&self) -> Box<dyn MagicMember> {

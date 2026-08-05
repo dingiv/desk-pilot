@@ -1,7 +1,7 @@
 //! Mock frontend — standalone evaluation tool for testing the IME engine.
 //!
 //! Provides batch evaluation, interactive mode, single-input testing, and
-//! debug commands (`#asr`, `#flush`, `#submit`, etc.).
+//! debug commands (`#asr`, `#submit`, `#req`, etc.).
 //!
 //! The caller (main.rs) parses CLI args and passes them as a [`MockConfig`].
 

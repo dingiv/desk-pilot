@@ -40,12 +40,6 @@ pub trait MagicMember: Send + Sync {
         None
     }
 
-    /// Static expansion text (e.g. `#date` → "2026-07-27"). `None` = live command.
-    /// Static members are expanded inline by the snippet path, never activated.
-    fn static_expansion(&self) -> Option<String> {
-        None
-    }
-
     /// Extra triggers that resolve to this same member (e.g. "#flush" → voice).
     fn aliases(&self) -> &[&'static str] {
         &[]

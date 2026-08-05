@@ -245,8 +245,10 @@ impl MagicMember for ReqMember {
                     MemberAction::View(self.rebuild(sm))
                 }
             }
-            // URL-ish characters extend the suffix (path + query).
-            c if c.is_ascii_alphanumeric() || "/?&=:.%+-_~".contains(c) => {
+            // URL-ish characters extend the suffix (path + query). Alphanumerics
+            // plus the RFC 3986 unreserved / sub-delim / reserved set — `;`/`@`
+            // etc. must stay in the URL, not pass through to the application.
+            c if c.is_ascii_alphanumeric() || "/?&=:.%+-_~!$'()*,;@[]".contains(c) => {
                 self.arg.push(c);
                 self.invalidate_result();
                 MemberAction::View(self.rebuild(sm))

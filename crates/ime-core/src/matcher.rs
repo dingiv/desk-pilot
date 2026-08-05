@@ -94,16 +94,6 @@ impl Matcher {
         }
     }
 
-    /// Try to match the complete accumulated buffer at once. Used for triggers that
-    /// are typed then committed immediately (special commands like `#asr`).
-    pub fn match_exact(&self, buffer: &str) -> Option<String> {
-        let mut node = &self.root;
-        for ch in buffer.chars() {
-            node = node.children.get(&ch)?;
-        }
-        node.expansion.clone()
-    }
-
     /// Number of triggers in the trie (for diagnostics).
     pub fn len(&self) -> usize {
         self.count_leaves(&self.root)
@@ -174,15 +164,6 @@ mod tests {
         let m = test_matcher();
         assert_eq!(m.step("", 'x'), Match::None);
         assert_eq!(m.step("/g", 'x'), Match::None);
-    }
-
-    #[test]
-    fn exact_match_for_special_triggers() {
-        let m = test_matcher();
-        assert_eq!(m.match_exact("#asr"), Some("__ASR_BUFFER__".into()));
-        assert_eq!(m.match_exact("#exec_resize"), Some("__EXEC_resize__".into()));
-        assert_eq!(m.match_exact("/greet"), Some("你好,我是 AI 秘书".into()));
-        assert_eq!(m.match_exact("#unknown"), None);
     }
 
     #[test]
