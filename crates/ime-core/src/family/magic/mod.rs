@@ -183,6 +183,42 @@ impl MagicFamily {
         Some(self.members[idx].spawn())
     }
 
+    /// All magic commands whose trigger is a strict extension of `prefix` — the prediction
+    /// hints shown while typing `#…`. Live members carry their activation token (Space on the
+    /// hint completes INTO the command's Magic mode); static commands carry `None` (Space
+    /// resolves their expansion instead). The raw buffer stays a rollback candidate.
+    pub fn hints(&self, prefix: &str) -> Vec<(String, Option<&'static str>)> {
+        if prefix.is_empty() || !prefix.starts_with('#') {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for s in &self.statics {
+            if s.trigger.starts_with(prefix) && s.trigger != prefix {
+                out.push((s.trigger.to_string(), None));
+            }
+        }
+        for m in &self.members {
+            if let Some(token) = m.activation_token() {
+                let t = format!("#{}", m.name());
+                if t.starts_with(prefix) && t != prefix {
+                    out.push((t.clone(), Some(token)));
+                }
+                for alias in m.aliases() {
+                    let ta = format!("#{alias}");
+                    if ta.starts_with(prefix) && ta != prefix {
+                        out.push((ta.clone(), Some(token)));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Static expansion text for a full trigger (e.g. `#date` → today's date).
+    pub fn static_expansion(&self, trigger: &str) -> Option<String> {
+        self.statics.iter().find(|s| s.trigger == trigger).map(|s| s.expansion())
+    }
+
     /// Attach the voice buffer — routed to the shared slot all voice members read.
     pub fn set_asr_buffer(&self, buf: Arc<crate::asr_buffer::AsrBuffer>) {
         self.resources.voice.set(buf);

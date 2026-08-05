@@ -124,26 +124,46 @@ pub struct LatticeDecoder {
     /// Initials index: "gysj" → [(pinyin, word, freq), ...].
     /// Stores full pinyin code for pattern verification.
     initials_index: HashMap<String, Vec<(String, String, u64)>>,
-    /// Path to the .fst file, used to derive the .idx cache path.
+    /// Path to the .fst file — for the cache filename + staleness check.
     fst_path: String,
+    /// Size of the .fst on disk at load time; the cache header records it so a newer .fst
+    /// (e.g. after a deb upgrade) invalidates the stale cache.
+    fst_len: u64,
 }
 
 impl LatticeDecoder {
-    /// Build from an already-loaded FST. `fst_path` is the original .fst
-    /// file path, used to derive the `.idx` cache location.
+    /// Build from an already-loaded FST. `fst_path` is the original .fst file path; the `.idx`
+    /// cache lives in the USER data dir (`~/.desk-pilot/`), not next to the .fst — the .fst may
+    /// sit in a read-only system dir (deb: `/usr/share/swift-ime/dict`).
     pub fn new(fst: inputx_fsa::Dict<Vec<u8>>, fst_path: &str) -> Self {
+        let fst_len = std::fs::metadata(fst_path).map(|m| m.len()).unwrap_or(0);
         let mut decoder = LatticeDecoder {
             fst,
             initials_index: HashMap::new(),
             fst_path: fst_path.to_string(),
+            fst_len,
         };
         decoder.build_initials_index();
         decoder
     }
 
-    /// Cache path: `{fst_path}.idx`.
-    fn cache_path(&self) -> std::path::PathBuf {
-        std::path::PathBuf::from(format!("{}.idx", self.fst_path))
+    /// Candidate cache locations for a given .fst path, in preference order:
+    /// 1. **next to the .fst** (`assets/dict/rime-ice.fst.idx`) — dev machines ship one in the
+    ///    repo, so startup loads instantly instead of rebuilding the 29万-entry index (~46s).
+    /// 2. **`~/.desk-pilot/`** — the deb's `/usr/share/swift-ime/dict` is read-only, so a first
+    ///    run there can't write beside the .fst and must fall back to the user dir.
+    /// Loading takes the first that exists; saving takes the first that's writable.
+    fn cache_paths(fst_path: &str) -> Vec<std::path::PathBuf> {
+        let mut v = Vec::with_capacity(2);
+        v.push(std::path::PathBuf::from(format!("{fst_path}.idx")));
+        let name = std::path::Path::new(fst_path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| fst_path.to_string());
+        v.push(std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+            .join(".desk-pilot")
+            .join(format!("{name}.idx")));
+        v
     }
 
     /// Build the initials index from the FST, storing (pinyin, word, freq).
@@ -186,9 +206,44 @@ impl LatticeDecoder {
         self.save_cache();
     }
 
+    /// Cache format: `# swift-ime idx v1 <fst_len>\n` header line, then the binary blob.
+    const CACHE_MAGIC: &str = "# swift-ime idx v1";
+
     fn try_load_cache(&mut self) -> bool {
-        let cp = self.cache_path();
-        let Ok(data) = std::fs::read(&cp) else { return false };
+        for cp in Self::cache_paths(&self.fst_path) {
+            let Ok(data) = std::fs::read(&cp) else { continue };
+            // New format: `# swift-ime idx v1 <fst_len>\n` header. A different fst_len ⇒ the
+            // .fst changed (deb upgrade) ⇒ stale.
+            if data.starts_with(Self::CACHE_MAGIC.as_bytes()) {
+                let header_end = match data.iter().position(|&b| b == b'\n') {
+                    Some(i) => i,
+                    None => continue,
+                };
+                let header = String::from_utf8_lossy(&data[..header_end]);
+                let expected = format!("{} {}", Self::CACHE_MAGIC, self.fst_len);
+                if header != expected {
+                    continue; // stale — try the next candidate location
+                }
+                if self.parse_cache(&data[header_end + 1..]) {
+                    return true;
+                }
+            } else {
+                // Legacy format (pre-2026-08-04, no header): shipped beside the .fst in the
+                // repo. Freshness can't be verified, but it's committed together with the
+                // .fst — trusted. Only accepted from the next-to-fst candidate, never the
+                // user dir (a re-downloaded stale copy there must not win).
+                let first = Self::cache_paths(&self.fst_path).into_iter().next()
+                    .is_some_and(|p| p == cp);
+                if first && self.parse_cache(&data) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Parse the binary blob after the header into `initials_index`.
+    fn parse_cache(&mut self, data: &[u8]) -> bool {
         let mut pos = 0;
         let mut count = 0;
         while pos < data.len() {
@@ -227,8 +282,10 @@ impl LatticeDecoder {
     }
 
     fn save_cache(&self) {
-        let cp = self.cache_path();
-        let mut buf = Vec::new();
+        // Build the blob once, then write to the first writable candidate (beside the .fst in
+        // dev; the user dir when the system dir is read-only). Failing all is fine — next start
+        // rebuilds.
+        let mut buf = format!("{} {}\n", Self::CACHE_MAGIC, self.fst_len).into_bytes();
         for (key, entries) in &self.initials_index {
             buf.push(key.len() as u8);
             buf.extend_from_slice(key.as_bytes());
@@ -241,7 +298,18 @@ impl LatticeDecoder {
                 buf.extend_from_slice(&freq.to_le_bytes());
             }
         }
-        let _ = std::fs::write(&cp, &buf);
+        for cp in Self::cache_paths(&self.fst_path) {
+            if let Some(parent) = cp.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::write(&cp, &buf) {
+                Ok(_) => {
+                    eprintln!("[lattice] saved initials cache to {}", cp.display());
+                    return;
+                }
+                Err(e) => eprintln!("[lattice] cache write to {} failed: {e}", cp.display()),
+            }
+        }
     }
 
     /// Score from rime-ice weight — log₂ normalization.
@@ -333,5 +401,14 @@ mod tests {
         let segs = greedy_parse("gysj");
         assert_eq!(segs.len(), 4);
         assert!(matches!(segs[0], Segment::Initial('g')));
+    }
+
+    #[test]
+    fn cache_paths_prefer_next_to_fst_then_user_dir() {
+        // Priority: beside the .fst (dev ships it in the repo → instant startup), then the
+        // user dir (deb system dir is read-only → first run falls back there).
+        let paths = LatticeDecoder::cache_paths("/usr/share/swift-ime/dict/rime-ice.fst");
+        assert_eq!(paths[0], std::path::PathBuf::from("/usr/share/swift-ime/dict/rime-ice.fst.idx"));
+        assert_eq!(paths[1], std::path::PathBuf::from(format!("{}/.desk-pilot/rime-ice.fst.idx", std::env::var("HOME").unwrap())));
     }
 }

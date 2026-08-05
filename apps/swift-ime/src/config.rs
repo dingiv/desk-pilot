@@ -4,6 +4,8 @@
 //!   dev:  <crate>/swift-ime.yaml
 //!   prod: ~/.desk-pilot/swift-ime.yaml
 
+use std::path::Path;
+
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -163,12 +165,41 @@ impl Default for SwiftImeConfig {
     }
 }
 
+/// System config template, installed by the .deb to `/usr/share/swift-ime/`. On first run (no
+/// user config yet) it is copied to the user's CONF dir, then loaded — the user can edit their
+/// copy; a template update never overwrites it.
+const TEMPLATE_PATH: &str = "/usr/share/swift-ime/swift-ime.yaml";
+
 impl SwiftImeConfig {
     /// Load from the CONF namespace via FileLoader, falling back to defaults.
+    ///
+    /// First run: if the user config doesn't exist yet, copy the system template
+    /// (`/usr/share/swift-ime/swift-ime.yaml`, installed by the .deb) into place — so a fresh
+    /// install boots with real config, not defaults. The user's copy is never overwritten.
+    ///
+    /// Note: `FileLoader::resolve_ns` returns the CONF path even when the file doesn't exist
+    /// (it serves write scenarios like the .log / user-dict files). So the existence check is
+    /// here, not in the loader — "no config" must not be reported as a read error.
     pub fn load() -> Self {
         let loader = shared::loader!(".");
         match loader.resolve("CONF::swift-ime.yaml") {
             Some(path) => {
+                // First run: seed the user config from the system template.
+                if !path.exists() {
+                    match seed_from_template(&path, Path::new(TEMPLATE_PATH)) {
+                        SeedOutcome::Copied => {
+                            eprintln!("[swift-ime] seeded user config from template → {}", path.display());
+                        }
+                        SeedOutcome::TemplateMissing => {
+                            eprintln!("[swift-ime] no user config, template missing ({TEMPLATE_PATH}), using defaults");
+                            return SwiftImeConfig::default();
+                        }
+                        SeedOutcome::CopyFailed(e) => {
+                            eprintln!("[swift-ime] template copy failed: {e}, using defaults");
+                            return SwiftImeConfig::default();
+                        }
+                    }
+                }
                 match std::fs::read_to_string(&path) {
                     Ok(yaml) => {
                         match serde_yaml::from_str(&yaml) {
@@ -185,5 +216,75 @@ impl SwiftImeConfig {
             None => eprintln!("[swift-ime] no config found, using defaults"),
         }
         SwiftImeConfig::default()
+    }
+}
+
+/// Outcome of seeding the user config from the system template.
+#[derive(Debug)]
+enum SeedOutcome {
+    Copied,
+    TemplateMissing,
+    CopyFailed(std::io::Error),
+}
+
+impl PartialEq for SeedOutcome {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (SeedOutcome::Copied, SeedOutcome::Copied) => true,
+            (SeedOutcome::TemplateMissing, SeedOutcome::TemplateMissing) => true,
+            (SeedOutcome::CopyFailed(a), SeedOutcome::CopyFailed(b)) => a.kind() == b.kind(),
+            _ => false,
+        }
+    }
+}
+
+/// Copy the template to `user_path` if the template exists (its parent dir is created first).
+/// Never overwrites an existing user config — callers only invoke this when `user_path` is
+/// absent. Pure + unit-testable.
+fn seed_from_template(user_path: &Path, template: &Path) -> SeedOutcome {
+    if !template.exists() {
+        return SeedOutcome::TemplateMissing;
+    }
+    if let Some(parent) = user_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return SeedOutcome::CopyFailed(e);
+        }
+    }
+    match std::fs::copy(template, user_path) {
+        Ok(_) => SeedOutcome::Copied,
+        Err(e) => SeedOutcome::CopyFailed(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_copies_template_when_user_config_absent() {
+        let dir = std::env::temp_dir().join(format!("swift-ime-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tpl = dir.join("tpl.yaml");
+        std::fs::write(&tpl, "input: { fuzzy: false }\n").unwrap();
+        let user = dir.join("nested/dir/swift-ime.yaml"); // parent doesn't exist yet
+
+        assert_eq!(seed_from_template(&user, &tpl), SeedOutcome::Copied);
+        assert!(user.exists(), "user config seeded");
+        assert_eq!(std::fs::read_to_string(&user).unwrap(), "input: { fuzzy: false }\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_reports_missing_template() {
+        let dir = std::env::temp_dir().join(format!("swift-ime-noseed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("no-tpl.yaml");
+        let user = dir.join("swift-ime.yaml");
+        assert_eq!(seed_from_template(&user, &missing), SeedOutcome::TemplateMissing);
+        assert!(!user.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -122,7 +122,10 @@ impl MagicMember for VoiceMember {
                     None => MemberAction::View(StateMachine::passthrough_view()),
                 }
             }
-            '\x1b' | '\n' | '\r' | '\x08' => MemberAction::Exit,
+            // Enter: force-commit the trigger text (`#asr`) and exit the session —
+            // "回车强制 '#asr' 上屏". Esc/Backspace still cancel.
+            '\n' | '\r' => MemberAction::Commit(format!("#{}", self.name())),
+            '\x1b' | '\x08' => MemberAction::Exit,
             _ => MemberAction::View(StateMachine::passthrough_view()),
         }
     }
@@ -200,7 +203,9 @@ impl MagicMember for SubmitMember {
                     MemberAction::Commit(text)
                 }
             }
-            '\x1b' | '\n' | '\r' | '\x08' => MemberAction::Exit,
+            // Enter: force-commit the trigger text (`#submit`) and exit. Esc/Backspace cancel.
+            '\n' | '\r' => MemberAction::Commit(format!("#{}", self.name())),
+            '\x1b' | '\x08' => MemberAction::Exit,
             _ => MemberAction::View(StateMachine::passthrough_view()),
         }
     }

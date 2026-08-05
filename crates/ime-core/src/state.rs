@@ -63,6 +63,21 @@ pub struct StateMachine {
     /// shown as a candidate rather than auto-committed. Space/digit to
     /// commit, Enter to force raw text.
     pending_expansion: Option<String>,
+    /// Magic command prediction hints while typing `#…`: all commands whose trigger extends
+    /// the buffer, as `(trigger, activation_token?)` — live members carry their token (Space
+    /// on the hint COMPLETES into that command's Magic mode), static commands carry `None`
+    /// (Space resolves their expansion). The raw buffer is the LAST rollback candidate.
+    /// Only set in Snippet state; cleared on any other transition.
+    magic_hints: Vec<(String, Option<String>)>,
+    /// Preview-state candidate tail. In Magic (preview) mode the candidate panel is assembled
+    /// in three segments: [member candidates…] [`magic_tail`]…] + the final rollback (the raw
+    /// trigger, e.g. `#asr`). `magic_member_cand_count` is where the member segment ends;
+    /// `magic_tail` holds the family-prediction continuations (`#asr` → `#asrplus`) with their
+    /// activation tokens (None = static expansion). Space routes by highlight: member segment
+    /// → the member; a tail continuation → switch into that command's preview; the rollback
+    /// → commit the raw trigger text. Only set in Magic state.
+    magic_member_cand_count: usize,
+    magic_tail: Vec<(String, Option<String>)>,
     /// The active live magic command (`#asr` voice anchor, `#req` HTTP request, …).
     /// `Some` only while in [`Magic`](ComposeState::Magic) state. Each activation
     /// spawns a fresh instance from the [`MagicFamily`] registry.
@@ -98,17 +113,51 @@ impl StateMachine {
         }
     }
 
-    /// Magic (`#`-command live mode): route the key to the active member. The member
-    /// is temporarily taken out of the state machine so it can freely mutate the
-    /// state, then put back — or dropped on Commit/Exit (after `deactivate`).
+    /// Magic (`#`-command live mode / preview): the candidate panel is the member's own
+    /// candidates followed by the family-prediction tail + rollback (see [`magic_tail`]).
+    /// Space routes by highlight: the member segment → the member; a tail continuation
+    /// (`#asrplus`) → switch into that command's preview; the rollback → commit the raw
+    /// trigger text. Other keys route to the member.
     fn handle_magic(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
+        // Space on the tail segment (continuation / rollback) is handled here, NOT by the
+        // member — the member only owns its own candidates.
+        if ch == ' ' {
+            let hl = self.candidate_highlight;
+            if hl >= self.magic_member_cand_count {
+                let tail_idx = hl - self.magic_member_cand_count;
+                if tail_idx < self.magic_tail.len() {
+                    let (trigger, token) = self.magic_tail[tail_idx].clone();
+                    // Continuation (`#asrplus`): switch into that command's preview.
+                    if let Some(tok) = token {
+                        if let Some(new_member) = env.magic().spawn(&tok) {
+                            let mut new_member = new_member;
+                            self.magic_member.take(); // drop old member (deactivate)
+                            self.buffer = trigger.clone();
+                            self.pending_expansion = None;
+                            self.state = ComposeState::Magic;
+                            let view = new_member.activate(self, env);
+                            self.magic_member = Some(new_member);
+                            self.assemble_magic_tail(env);
+                            return view;
+                        }
+                    }
+                    // Static continuation or rollback fallback: commit the trigger text.
+                    // (Rollback is the LAST tail entry — commit the raw trigger.)
+                    return self.commit_magic_rollback(&trigger);
+                }
+                // tail_idx == magic_tail.len() → the rollback (raw buffer).
+                let raw = self.buffer.clone();
+                return self.commit_magic_rollback(&raw);
+            }
+        }
         let Some(mut member) = self.magic_member.take() else {
             self.reset();
             return ImeView::empty();
         };
-        match member.on_key(self, ch, env) {
+        let out = match member.on_key(self, ch, env) {
             MemberAction::View(view) => {
                 self.magic_member = Some(member);
+                self.assemble_magic_tail(env);
                 view
             }
             MemberAction::Commit(text) => {
@@ -121,7 +170,43 @@ impl StateMachine {
                 self.reset();
                 ImeView::empty()
             }
+        };
+        out
+    }
+
+    /// Commit the raw trigger text (`#asr`) as a rollback: deactivate the member, leave
+    /// Magic mode, 上屏. (The buffer holds the trigger during preview.)
+    fn commit_magic_rollback(&mut self, trigger: &str) -> ImeView {
+        if let Some(mut m) = self.magic_member.take() {
+            m.deactivate();
         }
+        let text = trigger.to_string();
+        self.reset();
+        Self::commit_view(&text)
+    }
+
+    /// Assemble the preview candidate panel: member candidates + family-prediction tail
+    /// (continuations like `#asrplus`) + final rollback (the raw trigger). Called after the
+    /// member rebuilds its candidates (activate / refresh / tick).
+    pub(crate) fn assemble_magic_tail(&mut self, env: &dyn StepEnv) {
+        if self.state != ComposeState::Magic {
+            return;
+        }
+        self.magic_member_cand_count = self.candidates.len();
+        // Continuations: all commands whose trigger strictly extends the current one.
+        self.magic_tail = env.magic()
+            .hints(&self.buffer)
+            .into_iter()
+            .map(|(t, tok)| (t, tok.map(|s| s.to_string())))
+            .collect();
+        // Panel = [member…] + [tail…] + [rollback].
+        let mut cands = self.candidates.clone();
+        for (t, _) in &self.magic_tail {
+            cands.push(t.clone());
+        }
+        cands.push(self.buffer.clone()); // rollback
+        self.candidates = cands;
+        self.candidates_fresh = true;
     }
 
     /// Select candidate at `index`.
@@ -198,6 +283,15 @@ impl StateMachine {
         self.full_comp_count = 0;
         self.partial_commit_indices.clear();
         self.pending_expansion = None;
+        self.magic_hints.clear();
+        self.magic_member_cand_count = 0;
+        self.magic_tail.clear();
+    }
+
+    /// Is the candidate panel OPEN (non-empty candidate list)? Navigation/paging special keys
+    /// only act while it's open; when closed they pass through to the application.
+    pub fn candidate_panel_open(&self) -> bool {
+        !self.candidates.is_empty()
     }
 
     pub fn move_highlight(&mut self, delta: i32) {
@@ -284,6 +378,7 @@ impl StateMachine {
         if ch == '\x08' {
             self.buffer.pop();
             self.pending_expansion = None;
+            self.magic_hints.clear();
             if self.buffer.is_empty() {
                 self.reset();
                 return ImeView::empty();
@@ -300,11 +395,41 @@ impl StateMachine {
             return Self::commit_view(&raw);
         }
 
-        // Space: commit the pending expansion if one exists, otherwise
-        // commit the raw trigger text. Preview placeholders (tokens that
-        // resolved to text ending with "...") commit an empty string —
-        // the real voice data hasn't arrived yet.
+        // Space: the highlighted candidate decides. A magic hint (not the last rollback)
+        // COMPLETES into that command — live → enter its Magic mode (`#as` + Space behaves
+        // like typing `#asr`); static → resolve its expansion. The rollback (last candidate,
+        // the raw `#xxx`) and any pending expansion commit text. Preview placeholders (tokens
+        // resolving to text ending with "...") commit empty.
         if ch == ' ' {
+            let hl = self.candidate_highlight;
+            if hl < self.magic_hints.len() {
+                let (trigger, token) = self.magic_hints[hl].clone();
+                self.magic_hints.clear();
+                if let Some(tok) = token {
+                    self.buffer = trigger.clone();
+                    self.pending_expansion = None;
+                    if let Some(member) = env.magic().spawn(&tok) {
+                        let mut member = member;
+                        self.state = ComposeState::Magic;
+                        let view = member.activate(self, env);
+                        self.magic_member = Some(member);
+                        self.assemble_magic_tail(env);
+                        return view;
+                    }
+                    // Token vanished (registry changed?) — fall through to commit raw.
+                    self.buffer = trigger;
+                } else {
+                    // Static command hint (`#date`) — resolve its expansion inline.
+                    let expanded = env.magic().static_expansion(&trigger)
+                        .unwrap_or_else(|| trigger.clone());
+                    self.reset();
+                    if expanded.ends_with("...") {
+                        return Self::commit_view("");
+                    }
+                    return Self::commit_view(&expanded);
+                }
+            }
+            self.magic_hints.clear();
             if let Some(expansion) = self.pending_expansion.take() {
                 let expanded = match env.expander().expand(&expansion) {
                     Ok(t) => t,
@@ -325,6 +450,9 @@ impl StateMachine {
         match env.matcher().step(&self.buffer, ch) {
             Match::Complete { expansion, .. } => {
                 self.buffer.push(ch);
+                // The trigger is fully matched — stale prefix hints from earlier Partial steps
+                // must not linger (a later Space would misroute to the hint branch).
+                self.magic_hints.clear();
                 // Live magic commands (e.g. `#asr`, `#req`) enter Magic mode — the registry
                 // spawns a member instance that owns the interactive session (keys + async
                 // ticks are routed to it). Static expansions go the pending-candidate path.
@@ -334,6 +462,7 @@ impl StateMachine {
                     self.pending_expansion = None;
                     let view = member.activate(self, env);
                     self.magic_member = Some(member);
+                    self.assemble_magic_tail(env);
                     return view;
                 }
                 // Store the expansion as a pending candidate — don't auto-expand.
@@ -356,11 +485,41 @@ impl StateMachine {
                 self.preedit = self.buffer.clone();
                 self.cursor = self.preedit.len();
                 self.pending_expansion = None;
+                // Magic prediction: ALL commands extending the buffer become hints (the user
+                // may not know the commands exist), with the raw buffer as the LAST rollback.
+                // Space on a hint completes into that command; Space on the rollback commits
+                // the raw `#xxx`.
+                self.magic_hints = env.magic()
+                    .hints(&self.buffer)
+                    .into_iter()
+                    .map(|(t, tok)| (t, tok.map(|s| s.to_string())))
+                    .collect();
+                let mut cands: Vec<String> = self.magic_hints.iter().map(|(t, _)| t.clone()).collect();
+                cands.push(self.buffer.clone()); // rollback — last default option
+                self.candidates = cands;
+                self.candidates_fresh = true;
+                self.candidate_highlight = 0;
+                self.full_comp_count = self.candidates.len();
+                self.partial_commit_indices = vec![false; self.candidates.len()];
                 self.make_view()
             }
             Match::None => {
-                let mut text = self.buffer.clone();
-                text.push(ch);
+                self.buffer.push(ch);
+                self.preedit = self.buffer.clone();
+                self.cursor = self.preedit.len();
+                self.magic_hints.clear();
+                if self.buffer.starts_with('#') {
+                    // Unknown magic: DON'T vanish — keep the raw text as a candidate and let
+                    // Space commit it. (Non-# dead ends keep the old immediate-commit behavior
+                    // so `/tmp/…`-style input flows through without a leftover preedit.)
+                    self.candidates = vec![self.buffer.clone()];
+                    self.candidates_fresh = true;
+                    self.candidate_highlight = 0;
+                    self.full_comp_count = 1;
+                    self.partial_commit_indices = vec![false];
+                    return self.make_view();
+                }
+                let text = std::mem::take(&mut self.buffer);
                 self.reset();
                 Self::commit_view(&text)
             }

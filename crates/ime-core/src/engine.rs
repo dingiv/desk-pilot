@@ -462,6 +462,8 @@ impl ImeEngine {
             let mut member = pc.sm.magic_member.take()?;
             let changed = member.tick(&mut pc.sm, disp);
             pc.sm.magic_member = Some(member);
+            // The member rebuilt its candidates — re-assemble the preview tail.
+            pc.sm.assemble_magic_tail(disp);
             changed
         })
     }
@@ -583,6 +585,91 @@ mod tests {
         let v = e.predict(InputEvent::escape());
         assert!(ImeView::str_field(&v.commit_text).is_empty(), "escape commits nothing");
         assert!(e.candidates().is_empty(), "cleared after escape");
+    }
+
+    #[test]
+    fn magic_prefix_space_completes_into_command_not_raw() {
+        // `#as` + Space → behaves like typing `#asr` (enters Magic mode), NOT committing "#as".
+        use std::sync::Arc;
+        use crate::asr_buffer::AsrBuffer;
+        let mut e = eng();
+        let buf = Arc::new(AsrBuffer::new());
+        e.set_asr_buffer(Arc::clone(&buf));
+
+        for c in "#as".chars() { e.predict(InputEvent::char(c)); }
+        // Hint: completion candidate (#asr) + raw (#as).
+        let cands = e.candidates();
+        assert!(cands.contains(&"#asr".to_string()), "completion hint shown: {cands:?}");
+        assert!(cands.contains(&"#as".to_string()), "raw kept as fallback: {cands:?}");
+
+        // Space → enters Voice mode (like #asr), does NOT commit "#as".
+        let v = e.predict(InputEvent::space());
+        assert_eq!(ImeView::str_field(&v.commit_text), "", "space must not commit raw #as");
+        assert!(e.candidates().iter().any(|c| c.contains("语音识别中")), "now in asr mode: {:?}", e.candidates());
+    }
+
+    #[test]
+    fn magic_preview_panel_has_member_tail_and_rollback() {
+        // Preview state (Magic) candidate panel = [member candidates…] + [tail…] + [rollback].
+        use std::sync::Arc;
+        use crate::asr_buffer::AsrBuffer;
+        let mut e = eng();
+        let buf = Arc::new(AsrBuffer::new());
+        e.set_asr_buffer(Arc::clone(&buf));
+        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        // Member placeholder is #1; rollback (#asr) is the LAST candidate.
+        let cands = e.candidates();
+        assert!(cands.first().map(|c| c.contains("语音识别中")).unwrap_or(false), "member candidate first: {cands:?}");
+        assert_eq!(cands.last(), Some(&"#asr".to_string()), "rollback is last: {cands:?}");
+    }
+
+    #[test]
+    fn magic_rollback_space_commits_trigger_text() {
+        // In preview, Space on the LAST (rollback) candidate commits the raw trigger.
+        use std::sync::Arc;
+        use crate::asr_buffer::AsrBuffer;
+        let mut e = eng();
+        let buf = Arc::new(AsrBuffer::new());
+        e.set_asr_buffer(Arc::clone(&buf));
+        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        // Move highlight to the rollback (last candidate), then Space.
+        let n = e.candidates().len();
+        for _ in 0..(n - 1) {
+            e.special_key_ctx(0, SpecialKey::Down);
+        }
+        let v = e.predict(InputEvent::space());
+        assert_eq!(ImeView::str_field(&v.commit_text), "#asr", "rollback commits #asr");
+        assert!(e.candidates().is_empty(), "exited preview");
+    }
+
+    #[test]
+    fn unknown_magic_space_commits_raw() {
+        // `#x` (no magic match) → raw kept as candidate; Space commits it.
+        let mut e = eng();
+        for c in "#x".chars() { e.predict(InputEvent::char(c)); }
+        let cands = e.candidates();
+        assert_eq!(cands, vec!["#x".to_string()], "raw only: {cands:?}");
+
+        let v = e.predict(InputEvent::space());
+        assert_eq!(ImeView::str_field(&v.commit_text), "#x", "space commits raw #x");
+        assert!(e.candidates().is_empty(), "cleared after commit");
+    }
+
+    #[test]
+    fn magic_enter_commits_trigger_text() {
+        // `#asr` complete match → Magic mode; Enter force-commits "#asr" (回车强制上屏).
+        use std::sync::Arc;
+        use crate::asr_buffer::AsrBuffer;
+        let mut e = eng();
+        let buf = Arc::new(AsrBuffer::new());
+        e.set_asr_buffer(Arc::clone(&buf));
+
+        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        assert!(e.candidates().iter().any(|c| c.contains("语音识别中")), "in asr mode: {:?}", e.candidates());
+
+        let v = e.predict(InputEvent::enter());
+        assert_eq!(ImeView::str_field(&v.commit_text), "#asr", "Enter force-commits the trigger");
+        assert!(e.candidates().is_empty(), "exited magic mode");
     }
 
     #[test]
@@ -738,10 +825,12 @@ mod tests {
         e.predict(InputEvent::enter());
         wait_req_tick(&e);
         let cands = e.candidates();
-        assert_eq!(cands.len(), 1, "whole body is ONE candidate: {cands:?}");
+        // Preview panel: [member body] + [rollback #req]. The body is #1.
+        assert!(cands.len() >= 2, "body + rollback tail: {cands:?}");
         assert!(cands[0].ends_with('…'), "preview truncated with ellipsis: {}", cands[0]);
         assert!(cands[0].chars().count() <= 60, "preview ≤ 60 chars: {}", cands[0]);
-        // Space commits the FULL body, not the preview
+        assert_eq!(cands.last(), Some(&"#req".to_string()), "rollback is the last candidate");
+        // Space on the member candidate commits the FULL body, not the preview
         let v = e.predict(InputEvent::space());
         assert_eq!(ImeView::str_field(&v.commit_text), body);
     }
@@ -804,5 +893,39 @@ mod tests {
         let v = e.predict(InputEvent::escape());
         assert!(ImeView::str_field(&v.commit_text).is_empty(), "escape commits nothing");
         assert!(e.candidates().is_empty(), "cleared after escape");
+    }
+
+    #[test]
+    fn special_keys_pass_through_when_no_candidate_panel() {
+        let mut e = eng();
+        // No input yet → panel closed. Navigation/paging keys pass through to the app
+        // (typing "-" must reach the application, not vanish into the IME).
+        for key in [
+            SpecialKey::Up, SpecialKey::Down, SpecialKey::Left, SpecialKey::Right,
+            SpecialKey::Tab, SpecialKey::PageUp, SpecialKey::PageDown,
+            SpecialKey::BracketLeft, SpecialKey::BracketRight,
+            SpecialKey::Plus, SpecialKey::Minus,
+        ] {
+            let v = e.special_key_ctx(0, key);
+            assert_eq!(v.key_passthrough, 1, "{key:?} must pass through with no panel");
+        }
+        // Commit/edit keys keep IME semantics even with the panel closed.
+        let v = e.special_key_ctx(0, SpecialKey::Escape);
+        assert_eq!(v.key_passthrough, 0, "Escape resets, not passthrough");
+    }
+
+    #[test]
+    fn special_keys_act_when_candidate_panel_open() {
+        let mut e = eng();
+        for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
+        assert!(!e.candidates().is_empty(), "panel open after typing pinyin");
+        // Panel open → Minus pages (no passthrough), Left moves highlight (no passthrough).
+        let v = e.special_key_ctx(0, SpecialKey::Minus);
+        assert_eq!(v.key_passthrough, 0, "Minus pages when panel open");
+        let v = e.special_key_ctx(0, SpecialKey::Left);
+        assert_eq!(v.key_passthrough, 0, "Left moves highlight when panel open");
+        // And the page actually moved (panel had >1 page? 20 candidates, page size 7).
+        let v2 = e.special_key_ctx(0, SpecialKey::Right);
+        assert_eq!(v2.key_passthrough, 0);
     }
 }

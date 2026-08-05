@@ -17,7 +17,8 @@
 //! | Escape | reset |
 //! | 1-9 | select candidate by index |
 //! | Backspace | pop last character |
-//! | + - | reserved |
+//! | + = | next page (fcitx convention) |
+//! | - | previous page |
 //!
 //! ## Return value
 //!
@@ -44,6 +45,8 @@ pub enum SpecialKey {
     Backspace,
     BracketLeft,
     BracketRight,
+    Plus,
+    Minus,
     Digit(u8), // 1-9
 }
 
@@ -64,6 +67,8 @@ impl SpecialKey {
             13 => Some(SpecialKey::Backspace),
             20 => Some(SpecialKey::BracketLeft),
             21 => Some(SpecialKey::BracketRight),
+            22 => Some(SpecialKey::Plus),
+            23 => Some(SpecialKey::Minus),
             d @ 101..=109 => Some(SpecialKey::Digit((d - 100) as u8)),
             _ => None,
         }
@@ -73,11 +78,28 @@ impl SpecialKey {
 /// Process a special key for the given state machine and context.
 /// Returns `Some(view)` if handled, `None` if the key should be passed
 /// to normal character prediction.
+///
+/// Navigation/paging keys (arrows, page, +-, []) only carry their special meaning while the
+/// candidate panel is OPEN. When it's closed (no candidates), they pass through to the
+/// application — typing `-` with no panel up must reach the app, not vanish into the IME.
+/// Selection/commit keys (Space/Enter/Backspace/Escape/Digit) keep their semantics regardless.
 pub fn handle_special_key(
     sm: &mut crate::state::StateMachine,
     key: SpecialKey,
     env: &dyn StepEnv,
 ) -> Option<ImeView> {
+    if !sm.candidate_panel_open() {
+        match key {
+            SpecialKey::Up | SpecialKey::Down | SpecialKey::Left | SpecialKey::Right
+            | SpecialKey::Tab | SpecialKey::PageUp | SpecialKey::PageDown
+            | SpecialKey::BracketLeft | SpecialKey::BracketRight
+            | SpecialKey::Plus | SpecialKey::Minus => {
+                // Panel closed → these keys are the APPLICATION's (scroll, move caret, type -).
+                return Some(crate::state::StateMachine::passthrough_view());
+            }
+            _ => {} // Space/Enter/Backspace/Escape/Digit keep IME semantics.
+        }
+    }
     match key {
         SpecialKey::Up => {
             sm.move_highlight(-1);
@@ -114,6 +136,14 @@ pub fn handle_special_key(
             if sm.cursor < max {
                 sm.cursor += 1;
             }
+            Some(sm.view(env))
+        }
+        SpecialKey::Plus => {
+            sm.change_page(1);
+            Some(sm.view(env))
+        }
+        SpecialKey::Minus => {
+            sm.change_page(-1);
             Some(sm.view(env))
         }
         SpecialKey::Space => {
@@ -199,4 +229,44 @@ impl crate::state::StateMachine {
             self.candidate_highlight = new_page * self.candidate_page_size;
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::StateMachine;
+
+    #[test]
+    fn from_code_maps_navigation_and_paging() {
+        assert_eq!(SpecialKey::from_code(1), Some(SpecialKey::Up));
+        assert_eq!(SpecialKey::from_code(4), Some(SpecialKey::Right));
+        assert_eq!(SpecialKey::from_code(6), Some(SpecialKey::PageUp));
+        assert_eq!(SpecialKey::from_code(20), Some(SpecialKey::BracketLeft));
+        // fcitx C++ special_key_code(): plus/equal → 22, minus → 23.
+        assert_eq!(SpecialKey::from_code(22), Some(SpecialKey::Plus));
+        assert_eq!(SpecialKey::from_code(23), Some(SpecialKey::Minus));
+        assert_eq!(SpecialKey::from_code(0), None);
+        assert_eq!(SpecialKey::from_code(99), None);
+    }
+
+    #[test]
+    fn plus_minus_page_through_candidates() {
+        let mut sm = StateMachine::new();
+        sm.candidates = (0..20).map(|i| format!("cand{i}")).collect();
+        sm.candidate_page_size = 7;
+
+        sm.change_page(1);
+        assert_eq!(sm.candidate_page, 1, "+ paged to page 2");
+        sm.change_page(1);
+        assert_eq!(sm.candidate_page, 2, "+ paged to page 3 (clamped at 3 pages)");
+        sm.change_page(1);
+        assert_eq!(sm.candidate_page, 2, "+ clamps at last page");
+        sm.change_page(-1);
+        assert_eq!(sm.candidate_page, 1, "- paged back");
+        sm.change_page(-1);
+        assert_eq!(sm.candidate_page, 0, "- back to first page");
+        sm.change_page(-1);
+        assert_eq!(sm.candidate_page, 0, "- clamps at first page");
+    }
+
 }

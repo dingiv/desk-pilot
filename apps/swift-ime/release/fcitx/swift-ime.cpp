@@ -69,9 +69,13 @@ void SwiftImeEngine::apply_view(fcitx::InputContext *ic, const ImeView &v) {
         }
     }
 
-    // Candidates
+    // Candidates. Compare highlight + page too — arrows move the highlight without touching the
+    // candidate texts, and a missed diff here would leave the panel stuck on the first candidate
+    // (the highlight-apply loop below only runs when the list is rebuilt).
     bool cands_changed =
         v.candidate_count != prev.candidate_count
+        || v.candidate_highlight != prev.candidate_highlight
+        || v.candidate_page != prev.candidate_page
         || std::memcmp(v.candidates, prev.candidates,
                        sizeof(v.candidates)) != 0;
     if (cands_changed) {
@@ -269,6 +273,28 @@ void SwiftImeEngine::reset(const fcitx::InputMethodEntry &entry,
 
 // ── Key event ───────────────────────────────────────────────────────────
 
+// Special keys are handled by the engine via swift_ime_special_key (navigation, paging, cursor
+// movement, +- paging); everything else falls through to the character path. These must be
+// intercepted HERE — keySymToUnicode returns 0 for arrows/PgUp/PgDn (they'd be silently eaten)
+// and '+','-','=','[',']' have unicode (they'd commit the preedit and insert a symbol).
+static int special_key_code(fcitx::KeySym sym) {
+    switch (sym) {
+        case FcitxKey_Up:        return 1;   // SpecialKey::Up
+        case FcitxKey_Down:      return 2;   // SpecialKey::Down
+        case FcitxKey_Left:      return 3;   // SpecialKey::Left
+        case FcitxKey_Right:     return 4;   // SpecialKey::Right
+        case FcitxKey_Tab:       return 5;   // SpecialKey::Tab
+        case FcitxKey_Page_Up:   return 6;   // SpecialKey::PageUp
+        case FcitxKey_Page_Down: return 7;   // SpecialKey::PageDown
+        case FcitxKey_bracketleft:  return 20; // SpecialKey::BracketLeft (cursor left)
+        case FcitxKey_bracketright: return 21; // SpecialKey::BracketRight (cursor right)
+        case FcitxKey_plus:
+        case FcitxKey_equal:     return 22;  // SpecialKey::Plus (next page)
+        case FcitxKey_minus:     return 23;  // SpecialKey::Minus (prev page)
+        default:                 return 0;
+    }
+}
+
 void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
                                fcitx::KeyEvent &keyEvent) {
     FCITX_UNUSED(entry);
@@ -276,11 +302,6 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
 
     auto *ic = keyEvent.inputContext();
     if (!ic) return;
-
-    // ── Process key through Rust engine ──
-    auto sym = keyEvent.key().sym();
-    uint32_t ch = fcitx::Key::keySymToUnicode(sym);
-    if (ch == 0) return;
 
     // Feed surrounding text to the engine for context-aware prediction.
     if (ic->capabilityFlags().test(fcitx::CapabilityFlag::SurroundingText)) {
@@ -292,7 +313,16 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
     }
 
     ImeView view;
-    swift_ime_process_key(handle_, (void *)ic, ch, &view);
+    auto sym = keyEvent.key().sym();
+    int sp = special_key_code(sym);
+    if (sp != 0) {
+        // Navigation / paging / cursor / +- — never a character.
+        swift_ime_special_key(handle_, (void *)ic, sp, &view);
+    } else {
+        uint32_t ch = fcitx::Key::keySymToUnicode(sym);
+        if (ch == 0) return;  // unmapped non-character (F1, …) — let fcitx handle it
+        swift_ime_process_key(handle_, (void *)ic, ch, &view);
+    }
 
     if (view.key_passthrough) {
         apply_view(ic, view);

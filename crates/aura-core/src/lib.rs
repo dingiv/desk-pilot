@@ -4,9 +4,14 @@
 //! aura-store (hub/archive/wav).
 //!
 //! External dep graph: this crate → audio-aura-asr; daemon/native → this crate.
+//!
+//! `composer` (the [`Pipeline`]) composes the ONNX-side `Stage1Executor` → Stage2, so it is
+//! gated behind the `asr` feature (= `audio-aura-asr/onnx`) — the default build stays light
+//! (calibrator/context/storage only, no sherpa-onnx). Enable it with `features = ["asr"]`.
 
 pub mod archive;
 pub mod calibrator;
+#[cfg(feature = "asr")]
 pub mod composer;
 pub mod context;
 pub mod hub;
@@ -14,6 +19,7 @@ pub mod prompt;
 pub mod wav;
 
 pub use calibrator::{Stage2Calibrator, Stage2CalibratorImpl};
+#[cfg(feature = "asr")]
 pub use composer::{Pipeline, TurnEvent};
 pub use context::ContextWindow;
 pub use prompt::PromptBuilder;

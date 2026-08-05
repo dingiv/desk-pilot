@@ -41,12 +41,13 @@ install(FILES "${RUST_BUILD_DIR}/libswift-ime-core.so"
         DESTINATION "${CMAKE_INSTALL_LIBDIR}")
 
 # ── Install dictionaries ─────────────────────────────────────────────────────
+# rime-ice.fst.idx is NOT packaged: it's a per-user cache generated at runtime from the .fst
+# into ~/.desk-pilot (the system /usr/share/swift-ime/dict is read-only, so shipping it would
+# never be written anyway). See LatticeDecoder::cache_path.
 set(SWIFT_IME_DICT_DIR "${CMAKE_INSTALL_DATADIR}/swift-ime/dict")
 install(FILES assets/dict/base.tsv
         DESTINATION "${SWIFT_IME_DICT_DIR}")
 install(FILES assets/dict/rime-ice.fst
-        DESTINATION "${SWIFT_IME_DICT_DIR}")
-install(FILES assets/dict/rime-ice.fst.idx
         DESTINATION "${SWIFT_IME_DICT_DIR}")
 
 # ── Install default config ────────────────────────────────────────────────────
