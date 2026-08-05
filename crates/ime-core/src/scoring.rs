@@ -7,18 +7,19 @@
 
 /// 家族优先级(最终分 = raw_score × priority/100)。
 ///
-/// 只有拼音与英文参与统一打分(中英混输竞争):`#`/`/` 强制前缀分流后,
-/// 魔法命令与 snippet 的候选由 FSM 直接填充,不再经过 scorer —— 它们不
-/// 参与这里的排序。
+/// 拼音、英文、emoji 参与统一打分(中英混输 + emoji 竞争):`#`/`/` 强制前缀
+/// 分流后,魔法命令与 snippet 的候选由 FSM 直接填充,不再经过 scorer ——
+/// 它们不参与这里的排序。
 #[derive(Debug, Clone, Copy)]
 pub struct FamilyPriorities {
     pub pinyin: u32,
     pub english: u32,
+    pub emoji: u32,
 }
 
 impl Default for FamilyPriorities {
     fn default() -> Self {
-        FamilyPriorities { pinyin: 100, english: 70 }
+        FamilyPriorities { pinyin: 100, english: 70, emoji: 60 }
     }
 }
 
@@ -29,6 +30,7 @@ impl FamilyPriorities {
         match family {
             "pinyin" => Some(self.pinyin),
             "english" => Some(self.english),
+            "emoji" => Some(self.emoji),
             _ => None,
         }
     }
@@ -121,6 +123,7 @@ mod tests {
         let s = ScoringConfig::default();
         assert_eq!(s.priorities.pinyin, 100);
         assert_eq!(s.priorities.english, 70);
+        assert_eq!(s.priorities.emoji, 60);
         assert_eq!(s.recency.pos0, 0.20);
         assert_eq!(s.recency.far, 0.02);
         assert_eq!(s.bigram.max_boost, 0.25);

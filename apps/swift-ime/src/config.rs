@@ -75,16 +75,17 @@ pub struct WeightsConfig {
 }
 
 /// 各家族的全局优先级(最终分 = raw_score × priority/100)。
-/// 只有拼音与英文参与统一打分(`#`/`/` 前缀分流后,魔法与 snippet 不走 scorer)。
+/// 拼音/英文/emoji 参与统一打分(`#`/`/` 前缀分流后,魔法与 snippet 不走 scorer)。
 #[derive(Debug, Clone, Deserialize)]
 pub struct FamilyPriorityConfig {
     #[serde(default = "default_100")] pub pinyin: u32,
     #[serde(default = "default_70")] pub english: u32,
+    #[serde(default = "default_60")] pub emoji: u32,
 }
 
 impl Default for FamilyPriorityConfig {
     fn default() -> Self {
-        FamilyPriorityConfig { pinyin: 100, english: 70 }
+        FamilyPriorityConfig { pinyin: 100, english: 70, emoji: 60 }
     }
 }
 
@@ -159,6 +160,7 @@ impl WeightsConfig {
             priorities: ime_core::scoring::FamilyPriorities {
                 pinyin: self.family_priority.pinyin,
                 english: self.family_priority.english,
+                emoji: self.family_priority.emoji,
             },
             recency: ime_core::scoring::RecencyBoosts {
                 pos0: self.recency.pos0,
@@ -209,6 +211,7 @@ fn default_1_0() -> f64 { 1.0 }
 
 fn default_100() -> u32 { 100 }
 fn default_70() -> u32 { 70 }
+fn default_60() -> u32 { 60 }
 fn default_0_88() -> f64 { 0.88 }
 fn default_0_85() -> f64 { 0.85 }
 fn default_0_55() -> f64 { 0.55 }
@@ -404,9 +407,8 @@ snippets:
 weights:
   family_priority:
     pinyin: 90
-    magic: 80
-    snippet: 60
     english: 50
+    emoji: 40
   recency:
     pos0: 0.30
     pos1: 0.20
@@ -421,6 +423,7 @@ weights:
         let s = cfg.weights.to_scoring();
         assert_eq!(s.priorities.pinyin, 90);
         assert_eq!(s.priorities.english, 50);
+        assert_eq!(s.priorities.emoji, 40);
         assert_eq!(s.recency.pos0, 0.30);
         assert_eq!(s.recency.pos1, 0.20);
         assert_eq!(s.recency.far, 0.02, "未指定的档回退默认");
@@ -438,6 +441,7 @@ weights:
         let s = cfg.weights.to_scoring();
         assert_eq!(s.priorities.pinyin, 100);
         assert_eq!(s.priorities.english, 70);
+        assert_eq!(s.priorities.emoji, 60);
         assert_eq!(s.recency.pos0, 0.20);
         assert_eq!(s.bigram.max_boost, 0.25);
         assert_eq!(s.freq_scale.max_weight, 0.0, "auto by default");

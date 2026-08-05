@@ -35,11 +35,12 @@ input:
 # 0.70–0.85 range, leaving headroom for recency/context boosts.
 weights:
   # 全局排序中的优先级 (0-100): final_score = raw_score × priority/100。
-  # 只有拼音与英文参与统一打分(中英混输竞争)——魔法命令(#)与 snippet(/)
-  # 强制前缀分流,候选由引擎直接填充,不走这里的排序。
+  # 拼音 / 英文 / emoji 参与统一打分(中英混输 + emoji 竞争)——魔法命令(#)
+  # 与 snippet(/) 强制前缀分流,候选由引擎直接填充,不走这里的排序。
   family_priority:
     pinyin: 100
     english: 70
+    emoji: 60
 
   # Pinyin family internal scores (0.0-1.0)
   pinyin:

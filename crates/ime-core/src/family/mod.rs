@@ -347,6 +347,7 @@ mod tests {
 
 // ── Submodule declarations ──────────────────────────────────────────────
 
+pub mod emoji;
 pub mod english;
 pub mod magic;
 pub mod pinyin;

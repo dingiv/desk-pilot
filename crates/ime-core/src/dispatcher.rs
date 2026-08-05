@@ -40,16 +40,18 @@ impl Dispatcher {
         english_weights: crate::family::english::EnglishWeights,
         scoring: crate::scoring::ScoringConfig,
     ) -> Self {
-        // Only pinyin + english compete in the unified scorer (中英混输).
-        // Magic (#) and snippet (/) are routed by the FSM via the matcher —
-        // their candidates never pass through the scorer.
+        // pinyin + english + emoji compete in the unified scorer (中英混输 +
+        // emoji). Magic (#) and snippet (/) are routed by the FSM via the
+        // matcher — their candidates never pass through the scorer.
         let pinyin_family = PinyinFamily::with_scoring(pinyin_weights, scoring);
         let english_family = EnglishFamily::with_default_dict()
             .with_config(scoring.priorities.english, english_weights);
+        let emoji_family = crate::family::emoji::EmojiFamily::new();
 
         let scorer = UnifiedScorer::new(vec![
             Box::new(pinyin_family),
             Box::new(english_family),
+            Box::new(emoji_family),
         ], scoring.priorities);
 
         Dispatcher {

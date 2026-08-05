@@ -1108,6 +1108,21 @@ mod tests {
     }
 
     #[test]
+    fn emoji_family_competes_in_unified_ranking() {
+        // Emoji 是并列于中英文的第三家族:"smile" 输入时 😊 经统一打分
+        // 出现在候选区(emoji priority 60 → exact 1.0 × 0.6 = 0.6)。
+        let mut e = eng();
+        for c in "smile".chars() { e.predict(InputEvent::char(c)); }
+        let cands = e.candidates();
+        assert!(cands.contains(&"😊".to_string()), "smile surfaces 😊: {cands:?}");
+
+        // 拼音关键词同样生效:"weixiao" → 😊。
+        let mut e2 = eng();
+        for c in "weixiao".chars() { e2.predict(InputEvent::char(c)); }
+        assert!(e2.candidates().contains(&"😊".to_string()), "weixiao surfaces 😊: {:?}", e2.candidates());
+    }
+
+    #[test]
     fn scoring_config_priorities_affect_ranking() {
         // family_priority 来自 swift-ime.yaml:英文优先级配成 0 → black 的
         // 最终分 = 0(被全局排序压到底),默认 70 时 > 0。
