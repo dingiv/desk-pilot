@@ -49,7 +49,7 @@ const EMOJI_TABLE: &[EmojiEntry] = &[
     EmojiEntry { emoji: "😉", keys: &["wink", "zhayan", "眨眼"] },
     EmojiEntry { emoji: "😘", keys: &["kiss", "qinqin", "亲亲"] },
     EmojiEntry { emoji: "😴", keys: &["sleep", "shuijiao", "睡觉", "困"] },
-    EmojiEntry { emoji: "😅", keys: &["sweat", "gan ga", "尴尬", "汗"] },
+    EmojiEntry { emoji: "😅", keys: &["sweat", "ganga", "尴尬", "汗"] },
     EmojiEntry { emoji: "🙏", keys: &["pray", "qidao", "祈祷", "拜托"] },
     EmojiEntry { emoji: "👋", keys: &["wave", "zaijian", "再见", "挥手"] },
     EmojiEntry { emoji: "🎉", keys: &["party", "celebrate", "qingzhu", "庆祝", "派对"] },
@@ -289,5 +289,42 @@ mod tests {
     fn empty_input_returns_empty() {
         let fam = EmojiFamily::new();
         assert!(fam.predict("").is_empty());
+    }
+
+    /// Unique per-test temp dict — tests run in parallel threads (same lesson
+    /// as english.rs: a shared temp path made writers race).
+    fn temp_emoji_tsv(tag: &str, content: &str) -> String {
+        let path = std::env::temp_dir().join(format!("emoji_test_{}_{tag}.tsv", std::process::id()));
+        std::fs::write(&path, content).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn tsv_load_adds_pinyin_keywords() {
+        // The generated emoji.tsv carries PINYIN keywords (Chinese CLDR words
+        // are converted by fetch_emoji.sh — hanzi can never be typed into the
+        // pinyin buffer). Loading such a table must make them triggerable.
+        let fam = EmojiFamily::new();
+        let path = temp_emoji_tsv("ganlan", "ganlan\t🥦\nweixiao\t☺\n");
+        assert_eq!(fam.load_tsv(&path).unwrap(), 2);
+        assert!(fam.predict("ganlan").iter().any(|c| c.text == "🥦"), "ganlan triggers 🥦");
+        assert!(fam.predict("weixiao").iter().any(|c| c.text == "☺"), "weixiao triggers ☺");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn later_load_overrides_keyword_keeping_position() {
+        // External dict then user dict: the user's emoji wins for the same
+        // keyword, and the entry stays single (position kept, no duplicates).
+        let fam = EmojiFamily::new();
+        let ext = temp_emoji_tsv("ext", "ganlan\t🥦\n");
+        let usr = temp_emoji_tsv("usr", "ganlan\t🥬\n");
+        fam.load_tsv(&ext).unwrap();
+        fam.load_tsv(&usr).unwrap();
+        let cands = fam.predict("ganlan");
+        assert_eq!(cands[0].text, "🥬", "user dict wins: {cands:?}");
+        assert_eq!(cands.len(), 1, "no duplicate entries: {cands:?}");
+        let _ = std::fs::remove_file(&ext);
+        let _ = std::fs::remove_file(&usr);
     }
 }

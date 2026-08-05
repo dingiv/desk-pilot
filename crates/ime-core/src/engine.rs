@@ -1124,6 +1124,21 @@ mod tests {
     }
 
     #[test]
+    fn emoji_tsv_load_enables_pinyin_keywords() {
+        // 外部词表(CLDR 生成的拼音关键词)经 load_emoji_dict 加载后,
+        // 拼音输入触发对应 emoji —— 汉字关键词无法在拼音 buffer 触发,
+        // 词表必须携带拼音形式。
+        let path = format!("/tmp/swift-ime-emoji-load-{}.tsv", std::process::id());
+        std::fs::write(&path, "ganlan\t🥦\n").unwrap();
+        let mut e = eng();
+        e.load_emoji_dict(&path).unwrap();
+        for c in "ganlan".chars() { e.predict(InputEvent::char(c)); }
+        assert!(e.candidates().contains(&"🥦".to_string()),
+            "ganlan surfaces 🥦: {:?}", e.candidates());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn emoji_family_competes_in_unified_ranking() {
         // Emoji 是并列于中英文的第三家族:"smile" 输入时 😊 经统一打分
         // 出现在候选区(emoji priority 60 → exact 1.0 × 0.6 = 0.6)。
