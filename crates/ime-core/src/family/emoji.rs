@@ -1,13 +1,25 @@
 //! EmojiFamily — emoji prediction as a first-class family in the unified scorer.
 //!
 //! Ranks alongside pinyin + english (中英混输 competition): every emoji has
-//! THREE keyword groups — English name, pinyin, and hanzi — so `smile`,
-//! `weixiao`, or `微` all surface 😊 as a candidate. Prefix match shows the
-//! emoji while the user is still typing; exact match scores 1.0.
+//! keyword groups — English name, pinyin, and hanzi — so `smile`, `weixiao`,
+//! or `微` all surface 😊 as a candidate. Prefix match shows the emoji while
+//! the user is still typing; exact match scores 1.0.
 //!
 //! No special trigger prefix: the family participates in the normal candidate
 //! competition, and its priority (default 60, below english 70) keeps emoji
 //! from drowning out text candidates.
+//!
+//! ## Dictionary layers (like EnglishFamily)
+//! 1. **base** — the curated table below, compiled into the binary (backstop);
+//! 2. **external** — a large keyword table generated from Unicode CLDR
+//!    annotations (`assets/dict/emoji.tsv`, via `scripts/fetch_emoji.sh`),
+//!    loaded at startup: `keyword<TAB>emoji` per line, `#` comments allowed;
+//! 3. **user** — the user's own mapping (`emoji_user.tsv`).
+//!
+//! Later loads override earlier ones per keyword (user wins over external,
+//! external over base); the entry POSITION is kept so ranking stays stable.
+
+use std::sync::Mutex;
 
 use super::{CandidateFamily, ScoredCandidate};
 
@@ -53,15 +65,53 @@ const EMOJI_TABLE: &[EmojiEntry] = &[
 
 pub struct EmojiFamily {
     enabled: bool,
+    /// (keyword, emoji) in insertion order — base table first, then loaded
+    /// dicts. Merging keeps the original position of an existing keyword
+    /// (stable ranking) while replacing its emoji (later load wins).
+    entries: Mutex<Vec<(String, String)>>,
 }
 
 impl EmojiFamily {
     pub fn new() -> Self {
-        EmojiFamily { enabled: true }
+        let mut entries = Vec::new();
+        for e in EMOJI_TABLE {
+            for k in e.keys {
+                entries.push((k.to_string(), e.emoji.to_string()));
+            }
+        }
+        EmojiFamily { enabled: true, entries: Mutex::new(entries) }
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+    }
+
+    /// Merge loaded rows into the table. A keyword already present keeps its
+    /// position but gets the new emoji (later loads override earlier ones).
+    fn merge(&self, rows: Vec<(String, String)>) -> usize {
+        let mut entries = self.entries.lock().unwrap();
+        let mut count = 0;
+        for (k, e) in rows {
+            match entries.iter_mut().find(|(ek, _)| *ek == k) {
+                Some(slot) => slot.1 = e,
+                None => entries.push((k, e)),
+            }
+            count += 1;
+        }
+        count
+    }
+
+    /// Load a keyword table from TSV: `keyword<TAB>emoji` per line, `#`
+    /// comment lines and blank lines skipped. Shared by the external dict and
+    /// the user dict — call order decides precedence (later wins).
+    pub fn load_tsv(&self, path: &str) -> std::io::Result<usize> {
+        let data = std::fs::read_to_string(path)?;
+        let rows = parse_emoji_tsv(&data);
+        let n = self.merge(rows);
+        if n > 0 {
+            tracing::info!(count = n, path, "emoji: loaded keyword table");
+        }
+        Ok(n)
     }
 }
 
@@ -69,6 +119,24 @@ impl Default for EmojiFamily {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Parse `keyword<TAB>emoji` lines; `#`-prefixed and blank lines skipped.
+/// Malformed lines (missing a column) are dropped.
+fn parse_emoji_tsv(data: &str) -> Vec<(String, String)> {
+    data.lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .filter_map(|l| {
+            let mut it = l.split('\t');
+            let kw = it.next()?.trim();
+            let emoji = it.next()?.trim();
+            if kw.is_empty() || emoji.is_empty() {
+                None
+            } else {
+                Some((kw.to_string(), emoji.to_string()))
+            }
+        })
+        .collect()
 }
 
 impl CandidateFamily for EmojiFamily {
@@ -89,30 +157,36 @@ impl CandidateFamily for EmojiFamily {
     }
 
     fn predict(&self, input: &str) -> Vec<ScoredCandidate> {
-        if input.is_empty() {
+        // Single-char input is skipped: with a large CLDR table, "a"/"h" would
+        // match hundreds of generic keywords and flood the candidate list.
+        if input.chars().count() < 2 {
             return Vec::new();
         }
+        let entries = self.entries.lock().unwrap();
         let mut out = Vec::new();
-        for e in EMOJI_TABLE {
-            let mut hit = false;
-            for k in e.keys {
-                if k.starts_with(input) {
-                    // Exact keyword → 1.0; prefix → 0.8 (below english exact).
-                    let score = if *k == input { 1.0 } else { 0.8 };
-                    out.push(ScoredCandidate {
-                        text: e.emoji.to_string(),
-                        family: "emoji",
-                        source: if *k == input { "exact" } else { "prefix" },
-                        raw_score: score,
-                    });
-                    hit = true;
-                    break; // one candidate per emoji
-                }
+        for (kw, emoji) in entries.iter() {
+            if kw.starts_with(input) {
+                // Exact keyword → 1.0; prefix → 0.8 (below english exact).
+                let exact = kw == input;
+                out.push(ScoredCandidate {
+                    text: emoji.clone(),
+                    family: "emoji",
+                    source: if exact { "exact" } else { "prefix" },
+                    raw_score: if exact { 1.0 } else { 0.8 },
+                });
             }
-            let _ = hit;
         }
+        drop(entries);
         out.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap_or(std::cmp::Ordering::Equal));
         out
+    }
+
+    fn load_dict(&self, path: &str) -> std::io::Result<usize> {
+        self.load_tsv(path)
+    }
+
+    fn load_user_dict(&self, path: &str) -> std::io::Result<usize> {
+        self.load_tsv(path)
     }
 }
 
@@ -137,10 +211,60 @@ mod tests {
     }
 
     #[test]
+    fn single_char_input_skipped() {
+        // With the large CLDR table a 1-char input would match hundreds of
+        // generic keywords — the family stays silent until ≥2 chars.
+        let fam = EmojiFamily::new();
+        assert!(fam.predict("a").is_empty());
+        assert!(fam.predict("h").is_empty());
+        assert!(fam.predict("微").is_empty(), "even hanzi needs 2 chars");
+    }
+
+    #[test]
+    fn load_external_table_extends_base() {
+        let dir = std::env::temp_dir().join(format!("emoji-ext-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("emoji.tsv");
+        std::fs::write(&path, "# comment\nrocket_emoji\t🚀\n外星人\t👽\n").unwrap();
+        let fam = EmojiFamily::new();
+        assert!(fam.predict("外星人").is_empty(), "not in base");
+        let n = fam.load_tsv(path.to_str().unwrap()).unwrap();
+        assert_eq!(n, 2);
+        assert!(fam.predict("外星人").iter().any(|c| c.text == "👽"), "external keyword works");
+        assert!(fam.predict("rocket_e").iter().any(|c| c.text == "🚀"), "english keyword works");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn later_load_overrides_earlier_per_keyword() {
+        // user 词典覆盖 external 覆盖 base:同关键词后加载的生效(位置保持)。
+        let dir = std::env::temp_dir().join(format!("emoji-ovr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ext = dir.join("ext.tsv");
+        std::fs::write(&ext, "smile\t😀\n").unwrap(); // override base smile → 😊
+        let user = dir.join("user.tsv");
+        std::fs::write(&user, "smile\t🥰\n").unwrap(); // override ext → 🥰
+        let fam = EmojiFamily::new();
+        fam.load_tsv(ext.to_str().unwrap()).unwrap();
+        assert!(fam.predict("smile").iter().any(|c| c.text == "😀"), "external overrides base");
+        fam.load_tsv(user.to_str().unwrap()).unwrap();
+        let cands = fam.predict("smile");
+        assert!(cands.iter().any(|c| c.text == "🥰"), "user overrides external: {cands:?}");
+        assert!(!cands.iter().any(|c| c.text == "😊"), "base replaced: {cands:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_lines_skipped() {
+        let rows = parse_emoji_tsv("a\t😀\n\n# comment\nbadtwo\nc\t\t\nd\t🙂\n");
+        assert_eq!(rows, vec![("a".to_string(), "😀".to_string()), ("d".to_string(), "🙂".to_string())]);
+    }
+
+    #[test]
     fn pinyin_and_hanzi_keywords() {
         let fam = EmojiFamily::new();
         assert!(fam.predict("weixiao").iter().any(|c| c.text == "😊"), "pinyin key");
-        assert!(fam.predict("微").iter().any(|c| c.text == "😊"), "hanzi key");
+        assert!(fam.predict("微笑").iter().any(|c| c.text == "😊"), "hanzi key");
     }
 
     #[test]

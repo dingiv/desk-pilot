@@ -257,10 +257,13 @@ pub struct DictsConfig {
     pub base: bool,
     #[serde(default = "default_true")]
     pub rime_ice: bool,
+    /// CLDR 生成的 emoji 关键词词表(emoji.tsv)。关掉后只剩内置精选 28 个。
+    #[serde(default = "default_true")]
+    pub emoji: bool,
 }
 
 impl Default for DictsConfig {
-    fn default() -> Self { DictsConfig { base: true, rime_ice: true } }
+    fn default() -> Self { DictsConfig { base: true, rime_ice: true, emoji: true } }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

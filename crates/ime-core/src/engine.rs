@@ -528,6 +528,22 @@ impl ImeEngine {
         self.dispatcher.load_en_user_dict(path)
     }
 
+    /// Load the emoji keyword table (CLDR-generated `emoji.tsv`):
+    /// `keyword<TAB>emoji`, overriding the embedded base for the same keyword.
+    pub fn load_emoji_dict(&self, path: &str) -> std::io::Result<usize> {
+        self.dispatcher.scorer().load_dict_to("emoji", path)
+            .unwrap_or_else(|| Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound, "emoji family not found")))
+    }
+
+    /// Load the user emoji mapping (`emoji_user.tsv`) — overrides everything
+    /// loaded before for the same keyword.
+    pub fn load_emoji_user_dict(&self, path: &str) -> std::io::Result<usize> {
+        self.dispatcher.scorer().load_user_dict_to("emoji", path)
+            .unwrap_or_else(|| Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound, "emoji family not found")))
+    }
+
     /// Load an external English dictionary (auto-detect type, normalize, cache).
     pub fn load_en_dict(&self, path: &str) -> std::io::Result<usize> {
         self.dispatcher.load_en_dict(path)

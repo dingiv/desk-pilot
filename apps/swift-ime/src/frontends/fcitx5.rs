@@ -108,6 +108,26 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
         }
     }
 
+    // ── Emoji keyword table (CLDR-generated) + user mapping ──
+    if cfg.dicts.emoji {
+        let loader = shared::loader!("assets");
+        if let Some(p) = loader.resolve("DICT::emoji.tsv") {
+            match engine.load_emoji_dict(&p.to_string_lossy()) {
+                Ok(n) => crate::ime_log!("loaded emoji: {n} keyword rows from {}", p.display()),
+                Err(e) => crate::ime_log!("emoji dict load error: {e}"),
+            }
+        }
+    }
+    let loader = shared::loader!(".");
+    if let Some(p) = loader.resolve("CONF::emoji_user.tsv") {
+        if p.exists() {
+            match engine.load_emoji_user_dict(&p.to_string_lossy()) {
+                Ok(n) => crate::ime_log!("loaded {n} emoji user rows from {}", p.display()),
+                Err(e) => crate::ime_log!("emoji user dict load error: {e}"),
+            }
+        }
+    }
+
     // Initialize SQLite weight store.
     let home = std::env::var("HOME").unwrap_or_default();
     engine.init_store(&format!("{home}/.desk-pilot/swift-ime.db"));

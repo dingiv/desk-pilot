@@ -116,6 +116,26 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<AsrBuffer>, Option<crat
         }
     }
 
+    // Emoji keyword table (CLDR-generated) + user mapping.
+    if sw_cfg.dicts.emoji {
+        let loader = shared::loader!("assets");
+        if let Some(p) = loader.resolve("DICT::emoji.tsv") {
+            match engine.load_emoji_dict(&p.to_string_lossy()) {
+                Ok(n) => crate::ime_log!("loaded emoji: {n} keyword rows from {}", p.display()),
+                Err(e) => crate::ime_log!("emoji dict load error: {e}"),
+            }
+        }
+    }
+    let loader = shared::loader!(".");
+    if let Some(p) = loader.resolve("CONF::emoji_user.tsv") {
+        if p.exists() {
+            match engine.load_emoji_user_dict(&p.to_string_lossy()) {
+                Ok(n) => crate::ime_log!("loaded {n} emoji user rows from {}", p.display()),
+                Err(e) => crate::ime_log!("emoji user dict load error: {e}"),
+            }
+        }
+    }
+
     let asr_buffer = Arc::new(AsrBuffer::new());
     if let Some(ref text) = cfg.asr_text {
         asr_buffer.update(text);

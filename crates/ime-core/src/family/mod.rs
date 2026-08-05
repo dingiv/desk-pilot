@@ -263,6 +263,12 @@ impl UnifiedScorer {
     pub fn load_dict_to(&self, family_name: &str, path: &str) -> Option<std::io::Result<usize>> {
         self.family(family_name).map(|f| f.load_dict(path))
     }
+
+    /// Load a user dictionary into the named family (all entries override
+    /// earlier loads for the same keyword).
+    pub fn load_user_dict_to(&self, family_name: &str, path: &str) -> Option<std::io::Result<usize>> {
+        self.family(family_name).map(|f| f.load_user_dict(path))
+    }
 }
 
 #[cfg(test)]

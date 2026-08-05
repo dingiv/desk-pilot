@@ -6,6 +6,7 @@
 dicts:
   base: true          # embedded base dictionary (compiled into binary)
   rime_ice: true      # rime-ice large dictionary (loaded from disk at startup)
+  emoji: true         # CLDR emoji keyword table (emoji.tsv, ~1600 emoji; off = built-in 28)
 
 # ── Magic commands ──────────────────────────────────────────────────────
 magic:

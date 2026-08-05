@@ -49,6 +49,8 @@ install(FILES assets/dict/base.tsv
         DESTINATION "${SWIFT_IME_DICT_DIR}")
 install(FILES assets/dict/rime-ice.fst
         DESTINATION "${SWIFT_IME_DICT_DIR}")
+install(FILES assets/dict/emoji.tsv
+        DESTINATION "${SWIFT_IME_DICT_DIR}")
 
 # ── Install default config ────────────────────────────────────────────────────
 install(FILES swift-ime.yaml
