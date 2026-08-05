@@ -1,19 +1,24 @@
 //! Batch-transcribe several WAVs through SenseVoice (loads the model once). Reads each file's real
-//! sample rate via `audio_aura_store::wav`.
-//! Run: SHERPA_LIB_PATH=<dir> cargo run -p audio-aura-asr --features sherpa --example batch_transcribe -- <wav>...
+//! sample rate via `audio_aura_core::wav`. Model paths resolve via the `MODELS` namespace.
+//! Run: cargo run -p audio-aura-asr --features onnx --example batch_transcribe -- <wav>...
 
 use std::path::Path;
 use std::time::Instant;
 
-use audio_aura_asr::onnx::{AsrConfig, OnnxAsr};
+use audio_aura_asr::onnx::{AsrBackend, AsrConfig, OnnxAsr};
 use audio_aura_asr::Asr;
-use audio_aura_store::wav;
+use audio_aura_core::wav;
 
 fn main() -> anyhow::Result<()> {
-    let base = "/workspaces/gui_agent/audio-aura/native/models/sensevoice";
+    let fs = shared::loader!();
+    let p = |rel: &str| fs.resolve(rel).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+
     let asr = OnnxAsr::new(AsrConfig {
-        model: format!("{base}/model.int8.onnx"),
-        tokens: format!("{base}/tokens.txt"),
+        backend: AsrBackend::SenseVoice {
+            model: p("MODELS::sensevoice/model.int8.onnx"),
+            language: "auto".into(),
+        },
+        tokens: p("MODELS::sensevoice/tokens.txt"),
         ..Default::default()
     })?;
     println!("{:<24} {:>7} {:>6} {:>7}  transcript", "file", "rate", "dur", "asr");

@@ -4,11 +4,14 @@
 use ime_core::engine::{ImeEngine, InputEvent};
 use std::path::Path;
 
-/// Find rime-ice.tsv — tries dev paths relative to workspace root.
+/// Find rime-ice.fst (the compiled dictionary — the repo no longer ships rime-ice.tsv).
+/// Cargo runs tests with CWD = package dir, but resolve via CARGO_MANIFEST_DIR so it works
+/// from any invocation directory.
 fn rime_ice_path() -> Option<String> {
+    let pkg = env!("CARGO_MANIFEST_DIR");
     for candidate in &[
-        "apps/swift-ime/assets/dict/rime-ice.tsv",
-        "assets/dict/rime-ice.tsv",
+        format!("{pkg}/assets/dict/rime-ice.fst"),
+        "apps/swift-ime/assets/dict/rime-ice.fst".to_string(),
     ] {
         if Path::new(candidate).exists() {
             return Some(candidate.to_string());
@@ -19,9 +22,8 @@ fn rime_ice_path() -> Option<String> {
 
 fn engine_with_rime() -> ImeEngine {
     let engine = ImeEngine::new();
-    let path = rime_ice_path().expect("rime-ice.tsv not found — run from workspace root");
-    let n = engine.load_dict(&path).expect("failed to load rime-ice");
-    assert!(n > 500_000, "expected 500k+ entries, got {n}");
+    let path = rime_ice_path().expect("rime-ice.fst not found — run from workspace root");
+    engine.load_dict(&path).expect("failed to load rime-ice");
     engine
 }
 
@@ -36,11 +38,16 @@ fn candidates_for(engine: &mut ImeEngine, input: &str) -> Vec<String> {
 
 #[test]
 fn rime_ice_loads_successfully() {
-    let path = rime_ice_path().expect("rime-ice.tsv not found");
+    let path = rime_ice_path().expect("rime-ice.fst not found");
     let engine = ImeEngine::new();
-    let n = engine.load_dict(&path).expect("load_dict failed");
-    assert!(n > 500_000, "expected 500k+ entries, got {n}");
-    eprintln!("rime-ice: {n} entries loaded");
+    engine.load_dict(&path).expect("load_dict failed");
+    // The .fst format doesn't report entry counts (load_dict returns Ok(0)); effectiveness is
+    // verified by the word tests below (谦抑原则 is a distinctive rime-ice entry — if the FST
+    // or its .idx cache is broken, this yields no candidates).
+    let mut e = engine;
+    let cands = candidates_for(&mut e, "qianyiyuanze");
+    assert!(!cands.is_empty(), "lattice should produce candidates after FST load");
+    eprintln!("rime-ice.fst loaded OK, qianyiyuanze candidates: {:?}", &cands[..5.min(cands.len())]);
 }
 
 // ── Common words from rime-ice ─────────────────────────────────────────

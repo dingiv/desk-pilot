@@ -11,9 +11,11 @@ use audio_aura_asr::{EnergyVad, VadConfig, VadEventKind};
 const FRAME: usize = 320;
 
 fn load_test_wav() -> (Vec<i16>, u32) {
-    audio_aura_store::wav::read_wav_i16(std::path::Path::new(
-        "/workspaces/gui_agent/audio-aura/native/models/sensevoice/test_wavs/zh.wav",
-    ))
+    // Repo-relative: assets/models/sensevoice/test_wavs/zh.wav (crates/aura-asr → ../../assets).
+    audio_aura_core::wav::read_wav_i16(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../assets/models/sensevoice/test_wavs/zh.wav"
+    )))
     .unwrap()
 }
 

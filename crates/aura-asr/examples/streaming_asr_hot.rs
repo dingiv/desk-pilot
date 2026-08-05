@@ -7,13 +7,13 @@ use std::path::Path;
 use std::time::Instant;
 
 use audio_aura_asr::onnx::{OnlineAsr, StreamingAsrConfig};
-use audio_aura_store::wav;
+use audio_aura_core::wav;
 
 fn main() -> anyhow::Result<()> {
-    let base = "/workspaces/gui_agent/audio-aura/native/models/zipformer-streaming-zh-en";
-    let wav_path = std::env::args().nth(1).unwrap_or_else(|| {
-        "/workspaces/gui_agent/audio-aura/native/models/sensevoice/test_wavs/zh.wav".into()
-    });
+    let fs = shared::loader!();
+    let p = |rel: &str| fs.resolve(rel).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let base = p("MODELS::zipformer-streaming-zh-en");
+    let wav_path = std::env::args().nth(1).unwrap_or_else(|| p("MODELS::sensevoice/test_wavs/zh.wav"));
 
     eprintln!("[load] streaming Zipformer (with hotwords) …");
     let t = Instant::now();

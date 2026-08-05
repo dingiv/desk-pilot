@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use audio_aura_asr::onnx::{AsrBackend, AsrConfig, OnnxAsr};
 use audio_aura_asr::Asr;
-use audio_aura_store::wav;
+use audio_aura_core::wav;
 
 fn main() -> anyhow::Result<()> {
     let fs = shared::loader!();

@@ -37,5 +37,3 @@ shared = { path = "../../crates/shared" }
 [package.metadata.shared]
 DICT = { dev = "assets/dict", prod = "/usr/share/swift-ime/dict" }
 CONF = { dev = ".", prod = "~/.desk-pilot" }
-
-

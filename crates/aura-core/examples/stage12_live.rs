@@ -13,11 +13,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use audio_aura_asr::executor::{OnnxStage1Executor, Stage1Config};
-use audio_aura_core::{Pipeline, TurnEvent};
-use audio_aura_router::calibrator::Stage2CalibratorImpl;
-use audio_aura_router::Calibrator;
+use audio_aura_core::{Calibrator, Pipeline, Stage2CalibratorImpl, TurnEvent};
 
-const REPORT_DIR: &str = "/workspaces/gui_agent/audio-aura/bench";
+// Repo-relative bench dir (crates/aura-core → desk-pilot/bench). Created on startup.
+const REPORT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench");
 
 fn cell(s: &str) -> String {
     s.replace('|', "/").replace('\n', " ")
@@ -61,6 +60,14 @@ fn main() -> anyhow::Result<()> {
     println!("\n● Pipeline 就绪 (scout {scout_addr}/audio). Ctrl-C 结束.\n");
     Pipeline::new(s1, Box::new(s2)).run(move |ev| match ev {
         TurnEvent::Interim { seq: _, partial, at_s } => println!("  …流式 @{at_s:.1}s: {partial}"),
+        TurnEvent::CalibratedInterim { seq, calibrated, route_ms } => {
+            println!("  ≈ #{seq} 整流中 @{route_ms:.0}ms: {calibrated}");
+            let _ = writeln!(
+                report.lock().unwrap(),
+                "| {seq} | – | {route_ms:.0} | – | – | – | {} | – |",
+                cell(&calibrated)
+            );
+        }
         TurnEvent::Final { utterance: u, decision: d, route_ms } => {
             println!(
                 "▶ #{} @{:.1}s ({}s) [{}] 路由 {:.0}ms\n   流式: {}\n   原文: {}\n   整流: {}\n   回应: {}\n",

@@ -1,13 +1,15 @@
-//! voice-native — thin napi shim over the `voice-router` crate. Keeps the TS dev path
+//! voice-native — thin napi shim over `audio-aura-core`'s `Calibrator` (the merged
+//! 整流+路由 engine, formerly the `voice-router` crate). Keeps the TS dev path
 //! (`VOICE_LOCAL_ROUTER=1` → `native.ts` → this `.node`) working. All model logic lives in
-//! voice-router; here we only wrap it for Node, running inference off the JS thread via AsyncTask.
+//! audio-aura-core; here we only wrap it for Node, running inference off the JS thread via
+//! AsyncTask.
 
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
 use napi::{Env, Task};
 use napi_derive::napi;
-use audio_aura_router::RouterEngine as Inner;
+use audio_aura_core::Calibrator as Inner;
 
 /// Resident router engine exposed to Node. Model loaded once in `load`, kept warm.
 #[napi]
@@ -48,7 +50,7 @@ impl Task for RouteTask {
 
     fn compute(&mut self) -> Result<String> {
         self.inner
-            .route_blocking(&self.raw_text, self.context.as_deref(), &[])
+            .calibrate_blocking(&self.raw_text, self.context.as_deref(), &[])
             .map_err(err)
     }
 
