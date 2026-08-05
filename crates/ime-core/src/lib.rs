@@ -8,6 +8,7 @@ pub mod engine;
 pub mod expander;
 pub mod family;
 pub mod matcher;
+pub mod persistence;
 pub mod recency;
 pub mod special_key;
 pub mod user_bigram;

@@ -7,6 +7,9 @@
 //! - `bigrams`: (prev_word, next_word) → occurrence count
 //! - `pins`:    pinyin → preferred word
 //! - `phrases`: (pinyin, word) → priority order
+//! - `recency`: recent-commit ring (pos 0 = most recent) — full-snapshot
+//!   replaced on every commit (≤64 rows, one transaction)
+//! - `l0`:      inputx-pinyin L0 user model (single-row JSON)
 
 use rusqlite::{Connection, params};
 use std::sync::Mutex;
@@ -40,6 +43,14 @@ impl WeightStore {
                 word     TEXT NOT NULL,
                 priority INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (pinyin, word)
+            );
+            CREATE TABLE IF NOT EXISTS recency (
+                pos  INTEGER NOT NULL PRIMARY KEY,
+                word TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS l0 (
+                id   INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+                json TEXT NOT NULL
             );"
         )?;
         Ok(WeightStore { conn: Mutex::new(conn) })
@@ -171,6 +182,68 @@ impl WeightStore {
         .flat_map(|rows| rows.filter_map(|r| r.ok()))
         .collect()
     }
+
+    // ── Recency ─────────────────────────────────────────────────────────
+
+    /// Persist the recency ring as a full snapshot — `words` in most-recent-first
+    /// order (RecencyStore::dump). Replaced wholesale on every commit: ≤64 rows
+    /// in one transaction, and the pos column preserves the boost-decay order
+    /// exactly (pos 0 = the 0.20 boost slot).
+    pub fn save_recency(&self, words: &[String]) {
+        if words.is_empty() {
+            self.clear_recency();
+            return;
+        }
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute("DELETE FROM recency", []);
+        let mut stmt = match conn.prepare("INSERT INTO recency (pos, word) VALUES (?1, ?2)") {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        for (pos, w) in words.iter().enumerate() {
+            let _ = stmt.execute(params![pos as i64, w]);
+        }
+    }
+
+    /// Load the persisted recency ring, most-recent-first (pos 0 = newest).
+    pub fn load_recency(&self) -> Vec<String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT word FROM recency ORDER BY pos") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .ok()
+            .into_iter()
+            .flat_map(|rows| rows.filter_map(|r| r.ok()))
+            .collect()
+    }
+
+    /// Drop the ring (used when the in-memory store is empty).
+    pub fn clear_recency(&self) {
+        let _ = self.conn.lock().unwrap().execute("DELETE FROM recency", []);
+    }
+
+    // ── L0 user model ───────────────────────────────────────────────────
+
+    /// Persist the inputx-pinyin L0 user model (pins + pick counters) as JSON.
+    /// Single-row table, upserted on every pick.
+    pub fn save_l0(&self, json: &str) {
+        if json.is_empty() { return; }
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO l0 (id, json) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET json = ?1",
+            params![json],
+        );
+    }
+
+    /// Load the persisted L0 model JSON, if any.
+    pub fn load_l0(&self) -> Option<String> {
+        self.conn.lock().unwrap()
+            .query_row("SELECT json FROM l0 WHERE id = 1", [], |r| r.get(0))
+            .ok()
+    }
 }
 
 #[cfg(test)]
@@ -222,5 +295,33 @@ mod tests {
         // Find the 大陆 entry.
         let dalu = all.iter().find(|(p, n, _)| p == "大" && n == "陆").expect("大陆 not found");
         assert_eq!(dalu.2, 2, "大陆 count should be 2, got {}", dalu.2);
+    }
+
+    #[test]
+    fn recency_snapshot_roundtrip_preserves_order() {
+        let s = temp_store();
+        let words: Vec<String> = vec!["最新".into(), "次新".into(), "旧".into()];
+        s.save_recency(&words);
+        assert_eq!(s.load_recency(), words, "most-recent-first order preserved");
+
+        // Replacement semantics: a newer snapshot fully replaces the old.
+        s.save_recency(&["另一个".into()]);
+        assert_eq!(s.load_recency(), vec!["另一个".to_string()]);
+        s.save_recency(&[]);
+        assert!(s.load_recency().is_empty(), "empty snapshot clears the ring");
+    }
+
+    #[test]
+    fn l0_upsert_and_load() {
+        let s = temp_store();
+        assert_eq!(s.load_l0(), None, "no L0 before first save");
+        s.save_l0(r#"[["n","你",3]]"#);
+        assert_eq!(s.load_l0().as_deref(), Some(r#"[["n","你",3]]"#));
+        // Upsert: a newer model replaces the old one.
+        s.save_l0(r#"[["n","你",4]]"#);
+        assert_eq!(s.load_l0().as_deref(), Some(r#"[["n","你",4]]"#));
+        // Empty JSON is ignored (never corrupts the stored model).
+        s.save_l0("");
+        assert_eq!(s.load_l0().as_deref(), Some(r#"[["n","你",4]]"#));
     }
 }

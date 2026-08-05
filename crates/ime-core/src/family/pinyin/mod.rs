@@ -151,8 +151,14 @@ impl PinyinFamily {
     }
 
     /// Record a committed word for recency boosting.
+    /// Double-writes the ring to SQLite (full-snapshot replace, ≤64 rows) so the
+    /// boost-decay order survives restarts.
     pub fn record_commit(&self, word: &str) {
-        self.recency.lock().unwrap().push(word);
+        let mut rec = self.recency.lock().unwrap();
+        rec.push(word);
+        if let Some(ref store) = *self.store.lock().unwrap() {
+            store.save_recency(&rec.dump());
+        }
     }
 
     pub fn bigram_json(&self) -> String {
@@ -194,6 +200,11 @@ impl CandidateFamily for PinyinFamily {
     fn record_pick(&self, pinyin: &str, word: &str) {
         self.engine.dict().record_pick(pinyin, word);
         self.learn_phrase(pinyin, word);
+        // Persist the L0 user model (pins + pick counters) — same double-write
+        // cadence as bigrams, so the 3-pick auto-pin survives restarts.
+        if let Some(ref store) = *self.store.lock().unwrap() {
+            store.save_l0(&self.export_l0_json());
+        }
     }
 
     fn learn_phrase(&self, pinyin: &str, hanzi: &str) {
@@ -243,6 +254,23 @@ impl CandidateFamily for PinyinFamily {
             self.bigram.lock().unwrap().load_bulk(entries);
             eprintln!("[ime-core] pinyin: warmed {count} bigrams from store");
         }
+    }
+
+    fn warm_recencies(&self, entries: Vec<String>) {
+        if !entries.is_empty() {
+            let count = entries.len();
+            // Persisted dump is most-recent-first; load_bulk pushes each entry
+            // to the front, so feed OLDEST first to end with the newest on top.
+            let mut oldest_first = entries;
+            oldest_first.reverse();
+            self.recency.lock().unwrap().load_bulk(&oldest_first);
+            eprintln!("[ime-core] pinyin: warmed {count} recency entries from store");
+        }
+    }
+
+    fn record_commit(&self, word: &str) {
+        // Delegate to the inherent impl (which pushes + persists the ring).
+        PinyinFamily::record_commit(self, word);
     }
 
     fn attach_store(&self, store: std::sync::Arc<WeightStore>) {

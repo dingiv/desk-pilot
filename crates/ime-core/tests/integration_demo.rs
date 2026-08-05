@@ -159,6 +159,91 @@ fn bigram_persistence_warmup() {
 }
 
 #[test]
+fn recency_persistence_across_sessions() {
+    // The recency ring (recently committed words → position-based boost) must
+    // survive restarts: session 1 commits 你好, session 2 (fresh engine +
+    // init_store) gives 你好 a higher score than a never-warmed engine does.
+    let db_path = format!("/tmp/swift-ime-recency-test-{}.db", std::process::id());
+
+    // ── Session 1: commit 你好 → record_commit → save_recency ──
+    {
+        let mut eng = ImeEngine::new();
+        eng.init_store(&db_path);
+        for c in "nihao".chars() { eng.predict(InputEvent::char(c)); }
+        eng.predict(InputEvent::space()); // commits 你好 (top candidate)
+    } // eng drops → store closes
+
+    // ── Session 2: warm the ring from SQLite, verify the boost ──
+    let warm_score = {
+        let mut eng = ImeEngine::new();
+        eng.init_store(&db_path);
+        for c in "nihao".chars() { eng.predict(InputEvent::char(c)); }
+        let detailed = eng.candidates_detailed();
+        detailed.iter().find(|c| c.text == "你好")
+            .map(|c| c.score)
+            .expect("你好 should be a candidate")
+    };
+
+    // Baseline: a fresh engine with NO store has no recency boost.
+    let cold_score = {
+        let mut eng = ImeEngine::new();
+        for c in "nihao".chars() { eng.predict(InputEvent::char(c)); }
+        let detailed = eng.candidates_detailed();
+        detailed.iter().find(|c| c.text == "你好")
+            .map(|c| c.score)
+            .expect("你好 should be a candidate")
+    };
+
+    assert!(warm_score > cold_score,
+        "recency boost restored from store: warm={warm_score:.3} cold={cold_score:.3}");
+
+    // The persisted ring is also directly readable (most-recent-first).
+    let store = ime_core::weight_store::WeightStore::open(&db_path).unwrap();
+    let ring = store.load_recency();
+    assert_eq!(ring.first().map(String::as_str), Some("你好"), "ring: {ring:?}");
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn l0_picks_persist_across_sessions() {
+    // The inputx-pinyin L0 user model (3 picks → auto-pin) must survive
+    // restarts: session 1 picks 你好 three times, session 2 (fresh engine +
+    // init_store) restores it — 你好 ranks #1 and the L0 row exists in SQLite.
+    let db_path = format!("/tmp/swift-ime-l0-test-{}.db", std::process::id());
+
+    // ── Session 1: pick 你好 3× (record_pick → save_l0) ──
+    {
+        let mut eng = ImeEngine::new();
+        eng.init_store(&db_path);
+        for _ in 0..3 {
+            for c in "nihao".chars() { eng.predict(InputEvent::char(c)); }
+            let idx = eng.candidates().iter().position(|c| *c == "你好")
+                .expect("你好 should be a candidate");
+            eng.select_candidate(idx);
+        }
+    }
+
+    // ── Session 2: warm L0 from SQLite, verify the pin wins ──
+    {
+        let mut eng = ImeEngine::new();
+        eng.init_store(&db_path);
+        for c in "nihao".chars() { eng.predict(InputEvent::char(c)); }
+        let cands = eng.candidates();
+        assert_eq!(cands.first().map(String::as_str), Some("你好"),
+            "3 picks in the previous session pin 你好 to #1: {:?}",
+            &cands.iter().take(5).collect::<Vec<_>>());
+    }
+
+    // The L0 model JSON is persisted.
+    let store = ime_core::weight_store::WeightStore::open(&db_path).unwrap();
+    let l0 = store.load_l0().expect("L0 model persisted");
+    assert!(l0.contains("你好") || l0.contains("\"nihao\""), "L0 JSON mentions the pick: {l0}");
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
 fn incremental_composition_recall() {
     let mut eng = ImeEngine::new();
 

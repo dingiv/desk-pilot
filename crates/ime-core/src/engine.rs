@@ -30,10 +30,10 @@ use std::time::Instant;
 use crate::dispatcher::Dispatcher;
 use crate::family::InputContext;
 use crate::family::magic::{MagicFamily, ReqFetcher};
+use crate::persistence::PersistenceManager;
 use crate::platform::ImeView;
 use crate::special_key::{handle_special_key, SpecialKey};
 use crate::state::{StateMachine, StepEnv};
-use crate::weight_store::WeightStore;
 
 // ── InputEvent ──────────────────────────────────────────────────────────
 
@@ -83,7 +83,10 @@ pub struct ImeEngine {
     dispatcher: Dispatcher,
     contexts: Mutex<HashMap<usize, PerContext>>,
     async_waits: Mutex<HashMap<usize, WaitState>>,
-    store: Mutex<Option<std::sync::Arc<WeightStore>>>,
+    /// Unified persistence manager — owns the SQLite store and coordinates all
+    /// user-model persistence (recency / bigrams / phrases / L0). `None` until
+    /// [`init_store`](ImeEngine::init_store).
+    persistence: Mutex<Option<PersistenceManager>>,
     /// The magic command registry — same `Arc` the dispatcher holds. The engine
     /// routes late resource attachment (voice buffer, `#req` base/fetcher) here;
     /// the FSM spawns live member instances from it.
@@ -146,7 +149,7 @@ impl ImeEngine {
             dispatcher: Dispatcher::with_config(matcher, expander, Arc::clone(&magic), pinyin_weights, english_priority, english_weights),
             contexts: Mutex::new(HashMap::new()),
             async_waits: Mutex::new(HashMap::new()),
-            store: Mutex::new(None),
+            persistence: Mutex::new(None),
             magic,
             provider,
         };
@@ -180,10 +183,23 @@ impl ImeEngine {
 
     /// Process a special key (navigation, commit, selection) for a context.
     /// Returns the updated ImeView.
+    ///
+    /// Commit-producing special keys (Space/Enter/Digit) go through the same
+    /// recording as the character and select paths — previously a Space commit
+    /// bypassed `record_bigram`/`record_commit`, so user bigrams and the
+    /// recency ring were never updated by space-commits.
     pub fn special_key_ctx(&self, ctx: usize, key: SpecialKey) -> ImeView {
         self.with_ctx(ctx, |disp, pc| {
-            handle_special_key(&mut pc.sm, key, disp)
-                .unwrap_or_else(|| ImeView::empty())
+            let mut view = handle_special_key(&mut pc.sm, key, disp)
+                .unwrap_or_else(|| ImeView::empty());
+            let committed = ImeView::str_field(&view.commit_text);
+            if !committed.is_empty() {
+                let prev = pc.text_context.last_word.clone();
+                pc.text_context.update(committed);
+                self.record_bigram(&prev, committed);
+                self.dispatcher.record_commit(committed);
+            }
+            view
         })
     }
 
@@ -411,25 +427,17 @@ impl ImeEngine {
                 std::io::ErrorKind::NotFound, "pinyin family not found")))
     }
 
-    /// Initialize the SQLite-backed weight store. Call once at startup.
-    /// Warms the in-memory bigram model AND phrase book from persisted data.
+    /// Initialize the unified persistence manager. Call once at startup —
+    /// warms EVERY persisted user model (bigrams, phrases, recency ring, L0)
+    /// into the in-memory stores, then families double-write from here on.
     pub fn init_store(&self, path: &str) {
-        match WeightStore::open(path) {
-            Ok(store) => {
-                let store = std::sync::Arc::new(store);
-                // Warm the in-memory bigram model from SQLite.
-                let entries = store.load_all_bigrams();
-                if !entries.is_empty() {
-                    self.dispatcher.warm_bigrams(entries);
-                }
-                // Attach store to pinyin family for future phrase persistence,
-                // and warm the phrase book from past sessions.
-                self.dispatcher.set_store(store.clone());
-                self.dispatcher.warm_phrases_from_store();
-                let pins = store.pin_count();
+        match PersistenceManager::open(path) {
+            Ok(pm) => {
+                pm.warm_all(&self.dispatcher);
+                let pins = pm.pin_count();
                 eprintln!("[swift-ime] weight store: {pins} pins, {} bigrams from {path}",
-                    store.max_bigram_count());
-                *self.store.lock().unwrap() = Some(store);
+                    pm.max_bigram_count());
+                *self.persistence.lock().unwrap() = Some(pm);
             }
             Err(e) => eprintln!("[swift-ime] weight store open failed: {e}"),
         }
@@ -439,7 +447,7 @@ impl ImeEngine {
     /// in-memory pinyin family model (immediate ranking boost).
     pub fn record_bigram(&self, prev: &str, next: &str) {
         if prev.is_empty() || next.is_empty() { return; }
-        if let Some(ref s) = *self.store.lock().unwrap() { s.record_bigram(prev, next); }
+        if let Some(ref pm) = *self.persistence.lock().unwrap() { pm.record_bigram(prev, next); }
         self.dispatcher.record_bigram(prev, next);
     }
 
@@ -761,6 +769,27 @@ mod tests {
     }
 
     #[test]
+    fn space_commit_records_recency() {
+        // Regression: Space-commits route through special_key_ctx, which used
+        // to bypass record_commit — the recency ring was never updated by
+        // space-commits (and nothing persisted).
+        use crate::weight_store::WeightStore;
+        let db = format!("/tmp/swift-ime-space-rec-{}.db", std::process::id());
+        let _ = std::fs::remove_file(&db);
+        let mut e = eng();
+        e.init_store(&db);
+        for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
+        e.predict(InputEvent::space()); // commits 你好 via the special-key path
+        let store = WeightStore::open(&db).unwrap();
+        assert_eq!(
+            store.load_recency(),
+            vec!["你好".to_string()],
+            "space-commit must reach the recency ring (and persist it)"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
     fn enter_commits_raw() {
         let mut e = eng();
         for c in "hello".chars() { e.predict(InputEvent::char(c)); }
@@ -1074,7 +1103,7 @@ mod tests {
 
     #[test]
     fn special_keys_pass_through_when_no_candidate_panel() {
-        let mut e = eng();
+        let e = eng();
         // No input yet → panel closed. Navigation/paging keys pass through to the app
         // (typing "-" must reach the application, not vanish into the IME).
         for key in [

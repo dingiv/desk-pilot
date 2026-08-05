@@ -107,6 +107,21 @@ impl Dispatcher {
         }
     }
 
+    /// Warm the pinyin family's recency ring from persisted data.
+    pub fn warm_recencies(&self, entries: Vec<String>) {
+        if let Some(fam) = self.scorer.family("pinyin") {
+            fam.warm_recencies(entries);
+        }
+    }
+
+    /// Restore the inputx-pinyin L0 user model from persisted JSON.
+    /// Returns the number of pins restored (0 if empty/invalid).
+    pub fn import_l0(&self, json: &str) -> usize {
+        self.scorer.family("pinyin")
+            .map(|fam| fam.import_l0_json(json))
+            .unwrap_or(0)
+    }
+
     /// Attach weight store to pinyin family for phrase persistence.
     pub fn set_store(&self, store: Arc<crate::weight_store::WeightStore>) {
         if let Some(fam) = self.scorer.family("pinyin") {
