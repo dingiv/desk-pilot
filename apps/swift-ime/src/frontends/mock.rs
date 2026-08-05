@@ -92,7 +92,18 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<AsrBuffer>, Option<crat
         prefix_ratio: sw_cfg.weights.english.prefix_ratio,
         user_boost: sw_cfg.weights.english.user_boost,
     };
-    let engine = ImeEngine::with_config(weights, sw_cfg.weights.family_priority.english, eng_weights);
+    // Mock/TUI: default provider (live $DATE, empty clipboard) + config snippets.
+    let snippets: Vec<(String, String)> = sw_cfg.snippets
+        .iter()
+        .map(|s| (s.trigger.clone(), s.expand.clone()))
+        .collect();
+    let engine = ImeEngine::with_config(
+        weights,
+        sw_cfg.weights.family_priority.english,
+        eng_weights,
+        Box::new(ime_core::expander::DefaultProvider),
+        snippets,
+    );
 
     if sw_cfg.dicts.rime_ice {
         let loader = shared::loader!("assets");

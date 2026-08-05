@@ -32,6 +32,7 @@ struct CandidateSlot {
 
 struct ImeView {
     char           commit_text[512];
+    uint32_t       commit_cursor;      // caret offset in commit_text ($CURSOR marker; else = len)
     char           preedit_text[512];  // expanded magic anchor (e.g. "🎙 #asr <voice>")
     uint32_t       preedit_cursor;
     CandidateSlot  candidates[CANDIDATE_SLOTS];
@@ -64,6 +65,8 @@ extern "C" {
                               ImeView *out_view);
     /// Reconfigure the `#req` backend base URL at runtime (default http://127.0.0.1:14555/api).
     int  swift_ime_set_req_base(ImeHandle *handle, const char *base);
+    /// Push the current clipboard text — `$CLIPBOARD` snippet templates resolve to it.
+    int  swift_ime_set_clipboard(ImeHandle *handle, const char *text);
     void swift_ime_reset(ImeHandle *handle, void *ctx);
     void swift_ime_activate(ImeHandle *handle, void *ctx);
     void swift_ime_deactivate(ImeHandle *handle, void *ctx);

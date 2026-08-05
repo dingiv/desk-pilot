@@ -60,6 +60,10 @@ pub fn spawn_aura_client(buffer: Arc<AsrBuffer>, aura_addr: Option<&str>) -> Aur
     thread::Builder::new()
         .name("ime-aura-drain".into())
         .spawn(move || loop {
+            // Push aura connectivity so `#asr` shows "语音不可用" while the daemon
+            // is down / not yet connected (the member only surfaces voice data
+            // when Connected).
+            buffer.set_connected(matches!(drain_agent.conn(), AuraConn::Connected));
             for ev in drain_agent.poll_events() {
                 match ev {
                     // ① new Stage1 streaming fragment — raw partial.

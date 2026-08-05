@@ -22,7 +22,7 @@
 //! let v = buf.version();                        // bumps on every write
 //! ```
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// Max retained settled utterances (candidate slots). Oldest evicted past this. Tunable — bump
@@ -45,11 +45,29 @@ pub struct AsrBuffer {
     /// Monotonic change counter — incremented on every write. A frontend compares it to detect
     /// "voice data changed since I last rendered" without holding the lock.
     version: AtomicU64,
+    /// Aura connectivity, pushed by the data-plane client (its `/health` probe).
+    /// Default false — `#asr` shows "语音不可用" until the first Connected report.
+    connected: AtomicBool,
 }
 
 impl AsrBuffer {
     pub fn new() -> Self {
-        AsrBuffer { state: Mutex::new(VoiceState::default()), version: AtomicU64::new(0) }
+        AsrBuffer {
+            state: Mutex::new(VoiceState::default()),
+            version: AtomicU64::new(0),
+            connected: AtomicBool::new(false),
+        }
+    }
+
+    /// Report aura connectivity (the data-plane client's health probe).
+    /// `#asr` surfaces this as "语音不可用" until Connected.
+    pub fn set_connected(&self, connected: bool) {
+        self.connected.store(connected, Ordering::Relaxed);
+    }
+
+    /// Is the aura stream known-connected? `false` also covers "unknown yet".
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
     }
 
     fn bump(&self) {
@@ -120,6 +138,20 @@ mod tests {
         let (f, live) = b.voice_candidates();
         assert!(f.is_empty() && live.is_empty());
         assert_eq!(b.snapshot(), "");
+    }
+
+    #[test]
+    fn connectivity_defaults_false_and_updates() {
+        let b = AsrBuffer::new();
+        assert!(!b.is_connected(), "unknown connectivity = unavailable");
+        b.set_connected(true);
+        assert!(b.is_connected());
+        b.set_connected(false);
+        assert!(!b.is_connected());
+        // Connectivity is not a data write — it must not bump the version counter.
+        let v0 = b.version();
+        b.set_connected(true);
+        assert_eq!(b.version(), v0, "connectivity changes don't bump version");
     }
 
     #[test]

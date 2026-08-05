@@ -52,6 +52,12 @@ impl CandidateSlot {
 #[derive(Debug, Clone, Copy)]
 pub struct ImeView {
     pub commit_text: [u8; 512],
+    /// Byte offset within `commit_text` where the application caret should sit
+    /// after committing. Always ≤ committed length (a `$CURSOR` marker in a
+    /// snippet template places it mid-text; every other commit leaves it at the
+    /// end). Frontends move the caret accordingly — e.g. fcitx5 commits then
+    /// forwards `Left` keys back by `len - commit_cursor`.
+    pub commit_cursor: u32,
     /// Preedit slot: 512 bytes so a magic anchor can expand into the recognized
     /// text (e.g. `🎙 #asr 今天天气真不错…`) — long voice sentences fit whole.
     pub preedit_text: [u8; 512],
@@ -71,6 +77,7 @@ impl ImeView {
     pub fn empty() -> Self {
         ImeView {
             commit_text: [0u8; 512],
+            commit_cursor: 0,
             preedit_text: [0u8; 512],
             preedit_cursor: 0,
             candidates: [CandidateSlot::default(); CANDIDATE_SLOTS],

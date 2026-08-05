@@ -12,10 +12,11 @@
 //! truncation never loses data.
 
 use std::os::raw::c_char;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ime_core::asr_buffer::AsrBuffer;
 use ime_core::engine::ImeEngine;
+use ime_core::expander::{today_str, VariableProvider};
 use ime_core::family::magic::preview_text;
 use ime_core::platform::ImeView;
 
@@ -23,6 +24,31 @@ use ime_core::platform::ImeView;
 /// chars). The panel adapts its width to the longest row — truncating here
 /// keeps the box compact while the full text stays committable.
 const FCITX_CANDIDATE_TEXT_MAX: usize = 8 * 3;
+
+/// Real variable provider for the fcitx5 environment: a live `$DATE` and the
+/// clipboard text pushed by the C++ glue (fcitx5 clipboard events) via
+/// [`swift_ime_set_clipboard`]. `$CLIPBOARD` snippet templates resolve to the
+/// current clipboard.
+#[derive(Default)]
+struct FcitxProvider {
+    clipboard: Mutex<String>,
+}
+
+impl VariableProvider for FcitxProvider {
+    fn resolve(&self, name: &str) -> Option<String> {
+        match name {
+            "DATE" => Some(today_str()),
+            "CLIPBOARD" => Some(self.clipboard.lock().unwrap().clone()),
+            _ => None,
+        }
+    }
+
+    fn set(&self, name: &str, value: &str) {
+        if name == "CLIPBOARD" {
+            *self.clipboard.lock().unwrap() = value.to_string();
+        }
+    }
+}
 
 /// Truncate candidate row texts in place, at the frontend boundary. Pure
 /// display — the engine's internal candidates (and thus what Space commits)
@@ -51,10 +77,16 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
         prefix_ratio: cfg.weights.english.prefix_ratio,
         user_boost: cfg.weights.english.user_boost,
     };
+    let snippets: Vec<(String, String)> = cfg.snippets
+        .iter()
+        .map(|s| (s.trigger.clone(), s.expand.clone()))
+        .collect();
     let engine = ImeEngine::with_config(
         weights,
         cfg.weights.family_priority.english,
         eng_weights,
+        Box::new(FcitxProvider::default()),
+        snippets,
     );
 
     // `#req` backend base URL (config `magic.req_base`, default
@@ -235,6 +267,19 @@ pub extern "C" fn swift_ime_set_req_base(
     if engine.is_null() || base.is_null() { return 0; }
     let s = unsafe { std::ffi::CStr::from_ptr(base) }.to_string_lossy();
     unsafe { &*engine }.set_req_base(&s);
+    1
+}
+
+/// Push the current clipboard text from the frontend (fcitx5 clipboard events).
+/// `$CLIPBOARD` snippet templates resolve to the latest pushed value.
+#[no_mangle]
+pub extern "C" fn swift_ime_set_clipboard(
+    engine: *mut ImeEngine,
+    text: *const c_char,
+) -> i32 {
+    if engine.is_null() || text.is_null() { return 0; }
+    let s = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy();
+    unsafe { &*engine }.set_variable("CLIPBOARD", &s);
     1
 }
 

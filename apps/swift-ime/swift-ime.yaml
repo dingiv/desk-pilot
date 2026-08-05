@@ -11,6 +11,19 @@ dicts:
 magic:
   req_base: http://127.0.0.1:14555/api   # #req backend base URL (CLI --req-base overrides)
 
+# ── Snippets ────────────────────────────────────────────────────────────
+# User-defined text expansions, merged over the engine's built-ins (a config
+# trigger replaces the built-in one). Triggers are '/' or '#'-prefixed and
+# matched longest-prefix. Expansions support variables:
+#   $DATE       today's date (YYYY-MM-DD)
+#   $CLIPBOARD  the current clipboard text (fcitx5 clipboard)
+#   $CURSOR     caret lands here after commit
+snippets:
+  - trigger: "/sig"
+    expand: "Best regards,\nAlice\n$DATE"
+  - trigger: "/clip"
+    expand: "Clip: $CLIPBOARD"
+
 # ── Input ───────────────────────────────────────────────────────────────
 input:
   fuzzy: true         # fuzzy pinyin (z/zh, c/ch, s/sh, n/l, etc.)

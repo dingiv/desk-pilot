@@ -241,8 +241,10 @@ fn asr_command_with_buffer_commits_voice_text() {
     use ime_core::asr_buffer::AsrBuffer;
     let mut eng = ImeEngine::new();
 
-    // Attach a voice buffer with some text.
+    // Attach a voice buffer with some text (connected — otherwise #asr shows
+    // "语音不可用" and commits nothing).
     let buf = std::sync::Arc::new(AsrBuffer::new());
+    buf.set_connected(true);
     buf.update("今天天气不错");
     eng.set_asr_buffer(buf);
 

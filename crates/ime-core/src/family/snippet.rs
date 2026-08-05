@@ -114,7 +114,7 @@ mod tests {
             ("/greet".into(), "你好，我是 AI 秘书".into()),
             ("/sig".into(), "Best regards,\nAlice".into()),
         ];
-        let expander = Expander::new(Box::new(StaticProvider {
+        let expander = Expander::new(std::sync::Arc::new(StaticProvider {
             date: "2026-07-27".into(),
             clipboard: String::new(),
         }));

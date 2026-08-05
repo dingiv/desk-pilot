@@ -199,7 +199,7 @@ mod tests {
 
     fn d() -> Dispatcher {
         let entries = vec![("/greet".into(), "你好,我是 AI 秘书".into()), ("#date".into(), "2026-07-23".into())];
-        Dispatcher::new_for_test(Matcher::new(entries), Expander::new(Box::new(StaticProvider { date: "2026-07-23".into(), clipboard: String::new() })), Box::new(StubPinyin))
+        Dispatcher::new_for_test(Matcher::new(entries), Expander::new(std::sync::Arc::new(StaticProvider { date: "2026-07-23".into(), clipboard: String::new() })), Box::new(StubPinyin))
     }
 
     fn sm() -> StateMachine { StateMachine::new() }
@@ -259,6 +259,45 @@ mod tests {
         let d = d(); let mut s = sm();
         d.process_key('n', &mut s); d.process_key('i', &mut s);
         assert_eq!(ImeView::str_field(&d.select_candidate(1, &mut s).commit_text), "呢");
+    }
+
+    #[test]
+    fn snippet_cursor_places_caret_in_expanded_text() {
+        // Template with a mid-text $CURSOR marker: committing places the caret
+        // at the marker's offset in the EXPANDED text (variables before it are
+        // variable-length, so the offset is computed after expansion).
+        use crate::expander::{Expander, VariableProvider};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct MutableDate {
+            date: Mutex<String>,
+        }
+        impl VariableProvider for MutableDate {
+            fn resolve(&self, name: &str) -> Option<String> {
+                match name {
+                    "DATE" => Some(self.date.lock().unwrap().clone()),
+                    _ => None,
+                }
+            }
+        }
+
+        let entries = vec![("/note".into(), "$DATE 完成: $CURSOR 记得检查".into())];
+        let provider: std::sync::Arc<dyn VariableProvider> = std::sync::Arc::new(MutableDate {
+            date: Mutex::new("2026-08-05".into()),
+        });
+        let d = Dispatcher::new_for_test(
+            Matcher::new(entries),
+            Expander::new(provider),
+            Box::new(StubPinyin),
+        );
+        let mut s = sm();
+        for c in "/note".chars() { d.process_key(c, &mut s); }
+        let v = d.process_key(' ', &mut s);
+        let text = ImeView::str_field(&v.commit_text);
+        // "$DATE" = 10 bytes + " 完成: " = 9 → marker lands at byte 19.
+        assert_eq!(text, "2026-08-05 完成:  记得检查", "marker removed from text");
+        assert_eq!(v.commit_cursor, 19, "caret mid-text, after the date prefix");
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub use voice::{SubmitMember, VoiceMember};
 use req::ReqMember;
 
 use super::{CandidateFamily, ScoredCandidate};
+use crate::expander::today_str;
 
 /// Shared voice-session slot — written by the aura SSE client (via
 /// [`MagicFamily::set_asr_buffer`], late after engine construction), read by the
@@ -101,20 +102,7 @@ impl Clone for StaticCmd {
     }
 }
 
-/// Today's date (YYYY-MM-DD). Naive approximation (no chrono dep) — same
-/// computation the previous static implementation used.
-fn today_str() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    let days = secs / 86400;
-    let year = 1970 + (days / 365);
-    let rem = days % 365;
-    let month = 1 + (rem / 30).min(11);
-    let day = 1 + (rem % 30).min(27);
-    format!("{year:04}-{month:02}-{day:02}")
-}
+// `today_str` lives in the expander (shared by `$DATE` variables + `#date`).
 
 pub struct MagicFamily {
     enabled: bool,

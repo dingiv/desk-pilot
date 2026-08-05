@@ -338,8 +338,21 @@ impl StateMachine {
     }
 
     pub(crate) fn commit_view(text: &str) -> ImeView {
+        // Default: caret at the end of the committed text.
         let mut v = ImeView::empty();
         ImeView::set_str(&mut v.commit_text, text);
+        v.commit_cursor = ImeView::str_field(&v.commit_text).len() as u32;
+        v
+    }
+
+    /// Commit with the application caret placed at `cursor` (byte offset into the
+    /// committed text) — snippet templates with `$CURSOR` land here. Clamped to
+    /// the actually-committed length (the buffer may truncate long text).
+    pub(crate) fn commit_view_at(text: &str, cursor: usize) -> ImeView {
+        let mut v = ImeView::empty();
+        ImeView::set_str(&mut v.commit_text, text);
+        let len = ImeView::str_field(&v.commit_text).len();
+        v.commit_cursor = cursor.min(len) as u32;
         v
     }
 
@@ -431,16 +444,21 @@ impl StateMachine {
             }
             self.magic_hints.clear();
             if let Some(expansion) = self.pending_expansion.take() {
-                let expanded = match env.expander().expand(&expansion) {
+                // Expand tracking the `$CURSOR` marker — the caret lands at its
+                // position in the RESULT (variables before it may vary in length).
+                let (expanded, cursor) = match env.expander().expand_with_cursor(&expansion) {
                     Ok(t) => t,
-                    Err(e) => { tracing::warn!(error = %e, "expand failed"); expansion }
+                    Err(e) => { tracing::warn!(error = %e, "expand failed"); (expansion, None) }
                 };
                 self.reset();
                 // Preview candidates ("语音识别中...") commit empty.
                 if expanded.ends_with("...") {
                     return Self::commit_view("");
                 }
-                return Self::commit_view(&expanded);
+                return match cursor {
+                    Some(pos) => Self::commit_view_at(&expanded, pos),
+                    None => Self::commit_view(&expanded),
+                };
             }
             let raw = std::mem::take(&mut self.buffer);
             self.reset();

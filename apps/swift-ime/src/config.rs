@@ -18,6 +18,22 @@ pub struct SwiftImeConfig {
     pub weights: WeightsConfig,
     #[serde(default)]
     pub magic: MagicConfig,
+    /// User-defined snippets (merged over the engine's built-ins on trigger
+    /// collisions — a config `/sig` replaces the built-in one). Expansions
+    /// support `$DATE` / `$CLIPBOARD` / `$CURSOR` variables.
+    #[serde(default)]
+    pub snippets: Vec<SnippetEntryConfig>,
+}
+
+/// One user-defined snippet trigger → expansion template.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SnippetEntryConfig {
+    /// The trigger string (e.g. "/sig", "#hello").
+    #[serde(default)]
+    pub trigger: String,
+    /// The expansion text — may contain `$DATE`, `$CLIPBOARD`, `$CURSOR`.
+    #[serde(default)]
+    pub expand: String,
 }
 
 /// `#req` magic-command backend configuration.
@@ -161,6 +177,7 @@ impl Default for SwiftImeConfig {
             input: InputConfig { fuzzy: true, page_size: 7 },
             weights: WeightsConfig::default(),
             magic: MagicConfig::default(),
+            snippets: Vec::new(),
         }
     }
 }
@@ -259,6 +276,29 @@ fn seed_from_template(user_path: &Path, template: &Path) -> SeedOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_snippets_section() {
+        let yaml = r#"
+snippets:
+  - trigger: "/sig"
+    expand: "Best regards, $DATE"
+  - trigger: "/clip"
+    expand: "Clip: $CLIPBOARD"
+"#;
+        let cfg: SwiftImeConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.snippets.len(), 2);
+        assert_eq!(cfg.snippets[0].trigger, "/sig");
+        assert_eq!(cfg.snippets[0].expand, "Best regards, $DATE");
+        assert_eq!(cfg.snippets[1].trigger, "/clip");
+        assert_eq!(cfg.snippets[1].expand, "Clip: $CLIPBOARD");
+    }
+
+    #[test]
+    fn snippets_default_to_empty() {
+        let cfg = SwiftImeConfig::default();
+        assert!(cfg.snippets.is_empty());
+    }
 
     #[test]
     fn seed_copies_template_when_user_config_absent() {

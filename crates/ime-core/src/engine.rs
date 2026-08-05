@@ -88,6 +88,9 @@ pub struct ImeEngine {
     /// routes late resource attachment (voice buffer, `#req` base/fetcher) here;
     /// the FSM spawns live member instances from it.
     magic: Arc<MagicFamily>,
+    /// The snippet-variable provider — same `Arc` the dispatcher's expander holds.
+    /// `set_variable` writes through it so `$CLIPBOARD`-style templates resolve fresh.
+    provider: Arc<dyn crate::expander::VariableProvider>,
 }
 
 impl ImeEngine {
@@ -99,14 +102,29 @@ impl ImeEngine {
 
     /// Create engine with custom pinyin family weights (from config file).
     pub fn with_pinyin_weights(weights: crate::family::pinyin::PinyinWeights) -> Self {
-        Self::with_config(weights, 70, crate::family::english::EnglishWeights::default())
+        Self::with_config(
+            weights,
+            70,
+            crate::family::english::EnglishWeights::default(),
+            Box::new(crate::expander::DefaultProvider),
+            Vec::new(),
+        )
     }
 
     /// Create engine with full config (pinyin weights + English priority + English weights).
+    /// `provider` resolves snippet variables (`$DATE`, `$CLIPBOARD`, …) — inject a
+    /// platform provider here; the engine keeps a shared `Arc` so later
+    /// [`set_variable`](ImeEngine::set_variable) updates reach the expander.
+    ///
+    /// `extra_snippets` are user-defined `(trigger, expansion)` pairs merged over
+    /// the built-ins — on trigger collision the config entry wins (trie nodes are
+    /// overwritten last-writer-wins).
     pub fn with_config(
         pinyin_weights: crate::family::pinyin::PinyinWeights,
         english_priority: u32,
         english_weights: crate::family::english::EnglishWeights,
+        provider: Box<dyn crate::expander::VariableProvider>,
+        extra_snippets: Vec<(String, String)>,
     ) -> Self {
         // Magic command entries are generated from the member registry (#asr, #flush,
         // #submit, #req, #date, #password …) — adding a command = one member, nothing
@@ -118,16 +136,19 @@ impl ImeEngine {
             ("/sig".into(), "Best regards,\nAlice".into()),
             ("#wait".into(), "__WAIT_DEMO__".into()),
         ]);
+        // Config snippets override built-ins (later entries overwrite trie nodes).
+        entries.extend(extra_snippets);
         let matcher = crate::Matcher::new(entries);
-        let expander = crate::Expander::new(Box::new(
-            crate::expander::StaticProvider { date: String::from("2026-07-27"), clipboard: String::new() },
-        ));
+        // Shared with the dispatcher's expander — `set_variable` writes through the same Arc.
+        let provider: Arc<dyn crate::expander::VariableProvider> = Arc::from(provider);
+        let expander = crate::Expander::new(Arc::clone(&provider));
         let engine = ImeEngine {
             dispatcher: Dispatcher::with_config(matcher, expander, Arc::clone(&magic), pinyin_weights, english_priority, english_weights),
             contexts: Mutex::new(HashMap::new()),
             async_waits: Mutex::new(HashMap::new()),
             store: Mutex::new(None),
             magic,
+            provider,
         };
         // Load embedded base dictionary (5KB, compiled into binary).
         let count = engine.dispatcher.scorer().family("pinyin")
@@ -442,6 +463,13 @@ impl ImeEngine {
         self.magic.set_req_fetcher(fetcher);
     }
 
+    /// Update a snippet variable's value at runtime — e.g. the fcitx5 frontend
+    /// pushes clipboard changes here (via the C ABI) so `$CLIPBOARD` templates
+    /// expand to the current text. Providers that don't support updates ignore it.
+    pub fn set_variable(&self, name: &str, value: &str) {
+        self.provider.set(name, value);
+    }
+
     /// Poll for changes while a live magic command (`#asr` voice anchor, `#req`
     /// HTTP request, …) is active. If the member's async state advanced, rebuild
     /// the candidate view. Returns the new view, or None if no live command is
@@ -543,6 +571,7 @@ mod tests {
         use crate::asr_buffer::AsrBuffer;
         let mut e = eng();
         let buf = Arc::new(AsrBuffer::new());
+        buf.set_connected(true); // simulate a live aura link
         e.set_asr_buffer(Arc::clone(&buf));
 
         // type #asr → Voice mode, preview candidate (no voice data yet)
@@ -577,6 +606,7 @@ mod tests {
         use crate::asr_buffer::AsrBuffer;
         let mut e = eng();
         let buf = Arc::new(AsrBuffer::new());
+        buf.set_connected(true); // simulate a live aura link
         e.set_asr_buffer(Arc::clone(&buf));
         buf.push_final("识别文本");
         for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
@@ -594,6 +624,7 @@ mod tests {
         use crate::asr_buffer::AsrBuffer;
         let mut e = eng();
         let buf = Arc::new(AsrBuffer::new());
+        buf.set_connected(true); // simulate a live aura link
         e.set_asr_buffer(Arc::clone(&buf));
 
         for c in "#as".chars() { e.predict(InputEvent::char(c)); }
@@ -615,6 +646,7 @@ mod tests {
         use crate::asr_buffer::AsrBuffer;
         let mut e = eng();
         let buf = Arc::new(AsrBuffer::new());
+        buf.set_connected(true); // simulate a live aura link
         e.set_asr_buffer(Arc::clone(&buf));
         for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
         // Member placeholder is #1; rollback (#asr) is the LAST candidate.
@@ -630,6 +662,7 @@ mod tests {
         use crate::asr_buffer::AsrBuffer;
         let mut e = eng();
         let buf = Arc::new(AsrBuffer::new());
+        buf.set_connected(true); // simulate a live aura link
         e.set_asr_buffer(Arc::clone(&buf));
         for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
         // Move highlight to the rollback (last candidate), then Space.
@@ -662,6 +695,7 @@ mod tests {
         use crate::asr_buffer::AsrBuffer;
         let mut e = eng();
         let buf = Arc::new(AsrBuffer::new());
+        buf.set_connected(true); // simulate a live aura link
         e.set_asr_buffer(Arc::clone(&buf));
 
         for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
@@ -681,6 +715,7 @@ mod tests {
         // display (fcitx5 panel), while the TUI shows everything.
         let long = "这是一句相当长的话，超出显示上限。".repeat(2); // ~72 bytes
         let buf = Arc::new(AsrBuffer::new());
+        buf.set_connected(true);
         buf.push_final(&long);
         let mut e = eng();
         e.set_asr_buffer(Arc::clone(&buf));
@@ -703,6 +738,7 @@ mod tests {
         use crate::asr_buffer::AsrBuffer;
         let mut e = eng();
         let buf = Arc::new(AsrBuffer::new());
+        buf.set_connected(true); // simulate a live aura link
         e.set_asr_buffer(Arc::clone(&buf));
         for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
         // two settled finals, then a 3rd utterance starts streaming (live)
@@ -893,6 +929,147 @@ mod tests {
         let v = e.predict(InputEvent::escape());
         assert!(ImeView::str_field(&v.commit_text).is_empty(), "escape commits nothing");
         assert!(e.candidates().is_empty(), "cleared after escape");
+    }
+
+    #[test]
+    fn config_snippet_overrides_builtin_and_expands_variables() {
+        // A config snippet can override a built-in trigger AND use variables:
+        // `/sig` is built-in ("Best regards,\nAlice"); the config version adds
+        // $DATE (resolved via the injected provider), overriding the built-in.
+        use crate::expander::VariableProvider;
+
+        #[derive(Clone)]
+        struct FixedDate;
+        impl VariableProvider for FixedDate {
+            fn resolve(&self, name: &str) -> Option<String> {
+                match name {
+                    "DATE" => Some("2026-08-05".into()),
+                    "CLIPBOARD" => Some(String::new()),
+                    _ => None,
+                }
+            }
+        }
+
+        let e = ImeEngine::with_config(
+            crate::family::pinyin::PinyinWeights::default(),
+            70,
+            crate::family::english::EnglishWeights::default(),
+            Box::new(FixedDate),
+            vec![("/sig".into(), "Best regards,\nAlice\n$DATE".into())],
+        );
+        let mut e = e;
+        for c in "/sig".chars() { e.predict(InputEvent::char(c)); }
+        let v = e.predict(InputEvent::space());
+        assert_eq!(
+            ImeView::str_field(&v.commit_text),
+            "Best regards,\nAlice\n2026-08-05",
+            "config snippet overrides built-in + $DATE expands"
+        );
+    }
+
+    #[test]
+    fn asr_without_aura_connection_shows_unavailable_in_preedit() {
+        // #asr while aura is down (no buffer attached at all, or a disconnected
+        // one): the preedit says the voice path is unavailable instead of
+        // pretending to recognize; Space commits nothing.
+        use std::sync::Arc;
+        use crate::asr_buffer::AsrBuffer;
+        let mut e = eng();
+
+        // Case 1: no buffer attached at all (aura client never spawned).
+        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        let v0 = e.view();
+        let preedit = ImeView::str_field(&v0.preedit_text);
+        assert!(preedit.contains("未连接"), "preedit explains unavailability: {preedit}");
+        assert!(preedit.contains("语音不可用"), "preedit mentions voice unavailable: {preedit}");
+        let v = e.predict(InputEvent::space());
+        assert_eq!(ImeView::str_field(&v.commit_text), "", "Space must not commit the explainer");
+        let v = e.predict(InputEvent::escape());
+        assert!(ImeView::str_field(&v.commit_text).is_empty(), "escape cancels");
+
+        // Case 2: buffer attached but reported disconnected.
+        let buf = Arc::new(AsrBuffer::new());
+        buf.push_final("陈旧语音文本"); // stale data must not masquerade as live
+        e.set_asr_buffer(Arc::clone(&buf));
+        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        let v = e.view();
+        let preedit = ImeView::str_field(&v.preedit_text);
+        assert!(preedit.contains("未连接"), "disconnected buffer still explains: {preedit}");
+        let v = e.predict(InputEvent::space());
+        assert_eq!(ImeView::str_field(&v.commit_text), "", "stale voice text never committed");
+    }
+
+    #[test]
+    fn asr_reconnects_when_aura_comes_back() {
+        // Connection flips don't touch the version counter — tick must still
+        // rebuild when connectivity changes (disconnect → unavailable, reconnect
+        // → normal recognition display).
+        use std::sync::Arc;
+        use crate::asr_buffer::AsrBuffer;
+        let mut e = eng();
+        let buf = Arc::new(AsrBuffer::new());
+        e.set_asr_buffer(Arc::clone(&buf));
+
+        // Not connected → unavailable explainer.
+        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        assert!(ImeView::str_field(&e.view().preedit_text).contains("未连接"));
+
+        // Voice data arrives while still disconnected (version bumps) — tick
+        // rebuilds, but the display stays unavailable.
+        buf.push_final("断线时的文本");
+        assert!(e.magic_tick().is_some(), "tick rebuilds on voice data");
+        assert!(ImeView::str_field(&e.view().preedit_text).contains("未连接"));
+
+        // Connection restored (no new voice data — version unchanged) — tick
+        // must rebuild from the connectivity flip alone.
+        buf.set_connected(true);
+        assert!(e.magic_tick().is_some(), "tick rebuilds on connectivity flip");
+        let v = e.view();
+        let preedit = ImeView::str_field(&v.preedit_text);
+        assert!(!preedit.contains("未连接"), "back to normal after reconnect: {preedit}");
+        assert!(preedit.contains("断线时的文本"), "stale-while-offline text now shown: {preedit}");
+
+        // And the drop again: disconnect with no data change → unavailable.
+        buf.set_connected(false);
+        assert!(e.magic_tick().is_some(), "tick rebuilds on disconnect");
+        let v = e.view();
+        assert!(ImeView::str_field(&v.preedit_text).contains("未连接"));
+    }
+
+    #[test]
+    fn set_variable_reaches_injected_provider() {
+        // The fcitx5 frontend pushes clipboard text via set_variable → the
+        // injected provider (shared with the expander) must observe it.
+        use crate::expander::VariableProvider;
+
+        #[derive(Clone)]
+        struct Recording {
+            values: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        }
+        impl VariableProvider for Recording {
+            fn resolve(&self, _name: &str) -> Option<String> { None }
+            fn set(&self, name: &str, value: &str) {
+                self.values.lock().unwrap().push((name.to_string(), value.to_string()));
+            }
+        }
+
+        let values = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let e = ImeEngine::with_config(
+            crate::family::pinyin::PinyinWeights::default(),
+            70,
+            crate::family::english::EnglishWeights::default(),
+            Box::new(Recording { values: Arc::clone(&values) }),
+            Vec::new(),
+        );
+        e.set_variable("CLIPBOARD", "剪贴板文本");
+        e.set_variable("CLIPBOARD", "更新后的文本");
+        assert_eq!(
+            *values.lock().unwrap(),
+            vec![
+                ("CLIPBOARD".into(), "剪贴板文本".into()),
+                ("CLIPBOARD".into(), "更新后的文本".into()),
+            ]
+        );
     }
 
     #[test]

@@ -387,8 +387,11 @@ impl CandidateFamily for EnglishFamily {
 mod tests {
     use super::*;
 
-    fn temp_dict(content: &str) -> String {
-        let path = std::env::temp_dir().join(format!("en_test_{}.tsv", std::process::id()));
+    /// Unique per-test temp dict — tests run in parallel threads, and a shared
+    /// `en_test_{pid}.tsv` made writers race (one test's content could be
+    /// overwritten before the other read it → flaky `user_dict_overrides_base`).
+    fn temp_dict(tag: &str, content: &str) -> String {
+        let path = std::env::temp_dir().join(format!("en_test_{}_{tag}.tsv", std::process::id()));
         std::fs::write(&path, content).unwrap();
         path.to_string_lossy().to_string()
     }
@@ -431,7 +434,7 @@ mod tests {
     #[test]
     fn user_dict_overrides_base() {
         let fam = EnglishFamily::with_default_dict();
-        fam.load_user_dict_file(&temp_dict("github\nkubernetes\n")).unwrap();
+        fam.load_user_dict_file(&temp_dict("user", "github\nkubernetes\n")).unwrap();
         let cands = fam.predict("github");
         assert!(cands.iter().any(|c| c.text == "github" && c.source == "user"));
     }
@@ -440,7 +443,7 @@ mod tests {
     fn load_external_decile_normalizes() {
         let fam = EnglishFamily::with_default_dict();
         // Create a fake frequency dict
-        let d = temp_dict("# @type: frequency\nhello\t100000\nworld\t50000\nzzz\t1\n");
+        let d = temp_dict("decile", "# @type: frequency\nhello\t100000\nworld\t50000\nzzz\t1\n");
         fam.load_dict_file(&d).unwrap();
         let cands = fam.predict("hello");
         // Should be in user layer now, with decile-normalized score.

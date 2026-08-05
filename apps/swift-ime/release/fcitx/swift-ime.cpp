@@ -11,6 +11,8 @@
 #include <fcitx/candidatelist.h>
 #include <fcitx/userinterfacemanager.h>
 #include <fcitx/instance.h>
+#include <fcitx/addonmanager.h>
+#include <clipboard_public.h>  // fcitx::IClipboard — $CLIPBOARD snippet variable
 #include <fcitx-utils/key.h>
 #include <fcitx-utils/event.h>
 #include <fcitx-utils/log.h>
@@ -50,7 +52,18 @@ void SwiftImeEngine::apply_view(fcitx::InputContext *ic, const ImeView &v) {
     // Commit
     if (v.commit_text[0] != 0) {
         ic->inputPanel().reset();
-        ic->commitString(std::string(v.commit_text));
+        auto text = std::string(v.commit_text);
+        ic->commitString(text);
+        // $CURSOR: commitString always leaves the caret at the end — forward
+        // Left keystrokes back to the marker position (same trick fcitx5-rime
+        // uses for its post-commit cursor moves). No-op when the marker is at
+        // the end (commit_cursor == text.size()).
+        if (v.commit_cursor < text.size()) {
+            auto back = text.size() - v.commit_cursor;
+            for (unsigned int i = 0; i < back; i++) {
+                ic->forwardKey(fcitx::Key(FcitxKey_Left));
+            }
+        }
         ic->updatePreedit();
         ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
         prev = v;
@@ -309,6 +322,22 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
         if (st.isValid()) {
             swift_ime_set_surrounding(handle_, (void *)ic,
                                       st.text().c_str());
+        }
+    }
+
+    // $CLIPBOARD support: while composing a snippet/#-command (preedit starts
+    // with '/' or '#'), push the current clipboard to the engine so the
+    // template expands with live text. The clipboard addon has no public
+    // change signal — querying per composing key is the unicodetempmode
+    // pattern (in-process addon call, microseconds) and only happens while a
+    // trigger is actually being typed.
+    auto &prev = lastViews_[ic];
+    if (prev.preedit_text[0] == '/' || prev.preedit_text[0] == '#') {
+        if (auto *cb = instance_->addonManager().addon("clipboard")) {
+            auto text = cb->call<fcitx::IClipboard::clipboard>(ic);
+            if (!text.empty()) {
+                swift_ime_set_clipboard(handle_, text.c_str());
+            }
         }
     }
 
