@@ -8,8 +8,7 @@ use crate::expander::Expander;
 use crate::family::english::EnglishFamily;
 use crate::family::magic::MagicFamily;
 use crate::family::pinyin::PinyinFamily;
-use crate::family::snippet::SnippetFamily;
-use crate::family::{CandidateFamily, UnifiedScorer};
+use crate::family::UnifiedScorer;
 use crate::matcher::Matcher;
 use crate::family::pinyin::engine::InputxPinyin;
 use crate::platform::ImeView;
@@ -41,17 +40,15 @@ impl Dispatcher {
         english_weights: crate::family::english::EnglishWeights,
         scoring: crate::scoring::ScoringConfig,
     ) -> Self {
+        // Only pinyin + english compete in the unified scorer (中英混输).
+        // Magic (#) and snippet (/) are routed by the FSM via the matcher —
+        // their candidates never pass through the scorer.
         let pinyin_family = PinyinFamily::with_scoring(pinyin_weights, scoring);
-        let snippet_family = SnippetFamily::new(matcher.clone(), expander.clone());
-        let magic_family: Box<dyn CandidateFamily> = Box::new((*magic).clone());
         let english_family = EnglishFamily::with_default_dict()
             .with_config(scoring.priorities.english, english_weights);
 
-        // Build in priority order.
         let scorer = UnifiedScorer::new(vec![
             Box::new(pinyin_family),
-            magic_family,
-            Box::new(snippet_family),
             Box::new(english_family),
         ], scoring.priorities);
 

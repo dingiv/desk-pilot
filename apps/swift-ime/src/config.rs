@@ -74,18 +74,17 @@ pub struct WeightsConfig {
     pub freq_scale: FreqScaleConfig,
 }
 
-/// 各家族的全局优先级(最终分 = raw_score × priority/100)。全部可配。
+/// 各家族的全局优先级(最终分 = raw_score × priority/100)。
+/// 只有拼音与英文参与统一打分(`#`/`/` 前缀分流后,魔法与 snippet 不走 scorer)。
 #[derive(Debug, Clone, Deserialize)]
 pub struct FamilyPriorityConfig {
     #[serde(default = "default_100")] pub pinyin: u32,
-    #[serde(default = "default_95")] pub magic: u32,
-    #[serde(default = "default_75")] pub snippet: u32,
     #[serde(default = "default_70")] pub english: u32,
 }
 
 impl Default for FamilyPriorityConfig {
     fn default() -> Self {
-        FamilyPriorityConfig { pinyin: 100, magic: 95, snippet: 75, english: 70 }
+        FamilyPriorityConfig { pinyin: 100, english: 70 }
     }
 }
 
@@ -159,8 +158,6 @@ impl WeightsConfig {
         ime_core::scoring::ScoringConfig {
             priorities: ime_core::scoring::FamilyPriorities {
                 pinyin: self.family_priority.pinyin,
-                magic: self.family_priority.magic,
-                snippet: self.family_priority.snippet,
                 english: self.family_priority.english,
             },
             recency: ime_core::scoring::RecencyBoosts {
@@ -211,8 +208,6 @@ pub struct EnglishWeightConfig {
 fn default_1_0() -> f64 { 1.0 }
 
 fn default_100() -> u32 { 100 }
-fn default_95() -> u32 { 95 }
-fn default_75() -> u32 { 75 }
 fn default_70() -> u32 { 70 }
 fn default_0_88() -> f64 { 0.88 }
 fn default_0_85() -> f64 { 0.85 }
@@ -425,8 +420,6 @@ weights:
         let cfg: SwiftImeConfig = serde_yaml::from_str(yaml).unwrap();
         let s = cfg.weights.to_scoring();
         assert_eq!(s.priorities.pinyin, 90);
-        assert_eq!(s.priorities.magic, 80);
-        assert_eq!(s.priorities.snippet, 60);
         assert_eq!(s.priorities.english, 50);
         assert_eq!(s.recency.pos0, 0.30);
         assert_eq!(s.recency.pos1, 0.20);

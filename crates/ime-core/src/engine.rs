@@ -869,12 +869,13 @@ mod tests {
     }
 
     /// Poll `magic_tick` until the worker thread's result lands (or fail).
-    /// Budget 2s — under full parallel test load the spawned worker thread can
-    /// be starved past the old 1s budget (flaky "never landed" under load).
+    /// Budget 10s with fine-grained polling — under full parallel test load
+    /// (137 tests, starved CI containers) the spawned worker thread can be
+    /// delayed past smaller budgets; the tests assert correctness, not speed.
     fn wait_req_tick(e: &ImeEngine) {
-        for _ in 0..400 {
+        for _ in 0..5_000 {
             if e.magic_tick().is_some() { return; }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
         panic!("req result never landed");
     }

@@ -8,10 +8,14 @@
 //! families, applies inter-family priority weighting, deduplicates, and
 //! returns a globally ranked list.
 //!
+//! **Only pinyin + english participate in the unified ranking** (中英混输
+//! competition). Magic commands (`#`) and snippets (`/`) have mandatory
+//! trigger prefixes: the FSM routes them into their own composition state and
+//! fills candidates directly from the trie/registry — they never pass through
+//! the scorer.
+//!
 //! ```text
 //! Input → PinyinFamily (priority=100) → [候选A:0.95, 候选B:0.80, ...]  (含 jianpin 组合)
-//!       → MagicFamily   (priority=95)  → [#date:1.0, #asr:1.0, ...]
-//!       → SnippetFamily (priority=75)  → [/greet:1.0, ...]
 //!       → EnglishFamily (priority=70)  → [black:0.88, ...]
 //!                    ↓
 //!       UnifiedScorer::rank()
@@ -346,5 +350,4 @@ mod tests {
 pub mod english;
 pub mod magic;
 pub mod pinyin;
-pub mod snippet;
 

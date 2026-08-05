@@ -34,12 +34,11 @@ input:
 # All values are intentionally conservative — top candidates land in
 # 0.70–0.85 range, leaving headroom for recency/context boosts.
 weights:
-  # 各家族在全局排序中的优先级 (0-100): final_score = raw_score × priority/100。
-  # 默认值即引擎内置值,可整体调权(例如压低英文让中文候选更靠前)。
+  # 全局排序中的优先级 (0-100): final_score = raw_score × priority/100。
+  # 只有拼音与英文参与统一打分(中英混输竞争)——魔法命令(#)与 snippet(/)
+  # 强制前缀分流,候选由引擎直接填充,不走这里的排序。
   family_priority:
     pinyin: 100
-    magic: 95
-    snippet: 75
     english: 70
 
   # Pinyin family internal scores (0.0-1.0)

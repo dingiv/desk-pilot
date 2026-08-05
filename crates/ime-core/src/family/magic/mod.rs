@@ -23,7 +23,6 @@ pub use voice::{SubmitMember, VoiceMember};
 
 use req::ReqMember;
 
-use super::{CandidateFamily, ScoredCandidate};
 use crate::expander::today_str;
 
 /// Shared voice-session slot — written by the aura SSE client (via
@@ -105,7 +104,6 @@ impl Clone for StaticCmd {
 // `today_str` lives in the expander (shared by `$DATE` variables + `#date`).
 
 pub struct MagicFamily {
-    enabled: bool,
     /// Static commands (inline expansion).
     statics: Vec<StaticCmd>,
     /// Live commands, each with an activation token.
@@ -130,7 +128,6 @@ impl MagicFamily {
             }
         }
         MagicFamily {
-            enabled: true,
             statics: vec![
                 StaticCmd::new("#date", "insert today's date", today_str),
                 StaticCmd::new("#password", "password manager", || {
@@ -141,10 +138,6 @@ impl MagicFamily {
             token_map,
             resources,
         }
-    }
-
-    pub fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
     }
 
     /// All matcher entries: static triggers → their trigger itself as a SENTINEL;
@@ -240,7 +233,6 @@ impl MagicFamily {
 impl Clone for MagicFamily {
     fn clone(&self) -> Self {
         MagicFamily {
-            enabled: self.enabled,
             statics: self.statics.clone(),
             members: self.members.clone(),
             token_map: self.token_map.clone(),
@@ -252,71 +244,6 @@ impl Clone for MagicFamily {
 impl Default for MagicFamily {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl CandidateFamily for MagicFamily {
-    fn name(&self) -> &'static str {
-        "magic"
-    }
-
-    fn priority(&self) -> u32 {
-        95
-    }
-
-    fn enabled(&self) -> bool {
-        self.enabled
-    }
-
-    fn top_n(&self) -> usize {
-        4
-    }
-
-    fn predict(&self, input: &str) -> Vec<ScoredCandidate> {
-        if input.is_empty() || !input.starts_with('#') {
-            return Vec::new();
-        }
-
-        let mut out = Vec::new();
-        for s in &self.statics {
-            if s.trigger == input {
-                // Exact match — resolve the expansion.
-                out.push(ScoredCandidate {
-                    text: s.expansion(),
-                    family: "magic",
-                    source: "exact",
-                    raw_score: 1.0,
-                });
-            } else if s.trigger.starts_with(input) {
-                // Prefix match — show the trigger as a hint.
-                out.push(ScoredCandidate {
-                    text: s.trigger.to_string(),
-                    family: "magic",
-                    source: "prefix",
-                    raw_score: 0.9,
-                });
-            }
-        }
-        for m in &self.members {
-            let trigger = format!("#{}", m.name());
-            if trigger == input {
-                out.push(ScoredCandidate {
-                    text: format!("{} — {}", trigger, m.description()),
-                    family: "magic",
-                    source: "exact",
-                    raw_score: 1.0,
-                });
-            } else if trigger.starts_with(input) {
-                out.push(ScoredCandidate {
-                    text: trigger,
-                    family: "magic",
-                    source: "prefix",
-                    raw_score: 0.9,
-                });
-            }
-        }
-        out.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap());
-        out
     }
 }
 
@@ -346,39 +273,6 @@ mod tests {
         // Static commands and unknown tokens are not live commands.
         assert!(fam.spawn("__ASR_SUBMIT__").is_some());
         assert!(fam.spawn("__NOPE__").is_none());
-    }
-
-    #[test]
-    fn exact_date_command() {
-        let fam = MagicFamily::new();
-        let cands = fam.predict("#date");
-        assert_eq!(cands.len(), 1);
-        assert!(cands[0].text.starts_with("202"));
-        assert!((cands[0].raw_score - 1.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn live_command_hint() {
-        let fam = MagicFamily::new();
-        let cands = fam.predict("#asr");
-        assert!(cands.iter().any(|c| c.text.contains("voice input")), "{cands:?}");
-        let cands = fam.predict("#req");
-        assert!(cands.iter().any(|c| c.text.contains("request")), "{cands:?}");
-    }
-
-    #[test]
-    fn prefix_match() {
-        let fam = MagicFamily::new();
-        let cands = fam.predict("#da");
-        assert!(!cands.is_empty());
-        assert!(cands.iter().any(|c| c.text == "#date"));
-    }
-
-    #[test]
-    fn only_activated_by_hash() {
-        let fam = MagicFamily::new();
-        assert!(fam.predict("hello").is_empty());
-        assert!(fam.predict("/greet").is_empty());
     }
 
     #[test]

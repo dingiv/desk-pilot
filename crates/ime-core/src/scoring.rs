@@ -6,17 +6,19 @@
 //! `Default` 与旧的写死值完全一致——不配置时行为不变。
 
 /// 家族优先级(最终分 = raw_score × priority/100)。
+///
+/// 只有拼音与英文参与统一打分(中英混输竞争):`#`/`/` 强制前缀分流后,
+/// 魔法命令与 snippet 的候选由 FSM 直接填充,不再经过 scorer —— 它们不
+/// 参与这里的排序。
 #[derive(Debug, Clone, Copy)]
 pub struct FamilyPriorities {
     pub pinyin: u32,
-    pub magic: u32,
-    pub snippet: u32,
     pub english: u32,
 }
 
 impl Default for FamilyPriorities {
     fn default() -> Self {
-        FamilyPriorities { pinyin: 100, magic: 95, snippet: 75, english: 70 }
+        FamilyPriorities { pinyin: 100, english: 70 }
     }
 }
 
@@ -26,8 +28,6 @@ impl FamilyPriorities {
     pub fn get(&self, family: &str) -> Option<u32> {
         match family {
             "pinyin" => Some(self.pinyin),
-            "magic" => Some(self.magic),
-            "snippet" => Some(self.snippet),
             "english" => Some(self.english),
             _ => None,
         }
@@ -120,8 +120,6 @@ mod tests {
         // 不配置时行为必须与旧的写死值完全一致。
         let s = ScoringConfig::default();
         assert_eq!(s.priorities.pinyin, 100);
-        assert_eq!(s.priorities.magic, 95);
-        assert_eq!(s.priorities.snippet, 75);
         assert_eq!(s.priorities.english, 70);
         assert_eq!(s.recency.pos0, 0.20);
         assert_eq!(s.recency.far, 0.02);
