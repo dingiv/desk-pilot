@@ -35,6 +35,8 @@ pub struct PinyinFamily {
     enabled: bool,
     weights: PinyinWeights,
     store: Mutex<Option<Arc<WeightStore>>>,
+    /// freq→score 映射参数(swift-ime.yaml → weights.freq_scale)。
+    freq_scale: crate::scoring::FreqScale,
 }
 
 /// Configurable scoring weights for the pinyin family.
@@ -75,22 +77,19 @@ impl Default for PinyinWeights {
 
 impl PinyinFamily {
     pub fn new() -> Self {
-        PinyinFamily {
-            engine: inputx_pinyin::PinyinEngine::with_fuzzy(
-                inputx_pinyin::FuzzyConfig::permissive(),
-            ),
-            phrase_book: Mutex::new(PhraseBook::default_phrases()),
-            large_dict: Mutex::new(LargeDict::new()),
-            lattice: Mutex::new(None),
-            bigram: Mutex::new(UserBigram::new()),
-            recency: Mutex::new(RecencyStore::new()),
-            enabled: true,
-            weights: PinyinWeights::default(),
-            store: Mutex::new(None),
-        }
+        Self::with_scoring(PinyinWeights::default(), crate::scoring::ScoringConfig::default())
     }
 
     pub fn with_weights(weights: PinyinWeights) -> Self {
+        Self::with_scoring(weights, crate::scoring::ScoringConfig::default())
+    }
+
+    /// Full construction: pinyin weights + the unified scoring config (recency
+    /// boosts, bigram ceiling, freq→score scale) from `swift-ime.yaml`.
+    pub fn with_scoring(
+        weights: PinyinWeights,
+        scoring: crate::scoring::ScoringConfig,
+    ) -> Self {
         PinyinFamily {
             engine: inputx_pinyin::PinyinEngine::with_fuzzy(
                 inputx_pinyin::FuzzyConfig::permissive(),
@@ -98,17 +97,30 @@ impl PinyinFamily {
             phrase_book: Mutex::new(PhraseBook::default_phrases()),
             large_dict: Mutex::new(LargeDict::new()),
             lattice: Mutex::new(None),
-            bigram: Mutex::new(UserBigram::new()),
-            recency: Mutex::new(RecencyStore::new()),
+            bigram: Mutex::new(UserBigram::with_tuning(scoring.bigram)),
+            recency: Mutex::new(RecencyStore::new(scoring.recency)),
             enabled: true,
             weights,
             store: Mutex::new(None),
+            freq_scale: scoring.freq_scale,
         }
     }
 
     pub fn set_weights(&mut self, w: PinyinWeights) { self.weights = w; }
 
     pub fn with_phrase_book(phrase_book: PhraseBook) -> Self {
+        Self::with_scoring_and_phrase_book(
+            PinyinWeights::default(),
+            crate::scoring::ScoringConfig::default(),
+            phrase_book,
+        )
+    }
+
+    fn with_scoring_and_phrase_book(
+        weights: PinyinWeights,
+        scoring: crate::scoring::ScoringConfig,
+        phrase_book: PhraseBook,
+    ) -> Self {
         PinyinFamily {
             engine: inputx_pinyin::PinyinEngine::with_fuzzy(
                 inputx_pinyin::FuzzyConfig::permissive(),
@@ -116,11 +128,12 @@ impl PinyinFamily {
             phrase_book: Mutex::new(phrase_book),
             large_dict: Mutex::new(LargeDict::new()),
             lattice: Mutex::new(None),
-            bigram: Mutex::new(UserBigram::new()),
-            recency: Mutex::new(RecencyStore::new()),
+            bigram: Mutex::new(UserBigram::with_tuning(scoring.bigram)),
+            recency: Mutex::new(RecencyStore::new(scoring.recency)),
             enabled: true,
-            weights: PinyinWeights::default(),
+            weights,
             store: Mutex::new(None),
+            freq_scale: scoring.freq_scale,
         }
     }
 
@@ -343,7 +356,7 @@ impl CandidateFamily for PinyinFamily {
             if let Some(ref lat) = *lattice_guard {
                 let results = lat.predict(input, self.weights.large_dict_take);
                 for r in results {
-                    let base_score = lattice::LatticeDecoder::freq_to_score(r.freq_score as u64);
+                    let base_score = lat.freq_to_score(&self.freq_scale, r.freq_score as u64);
                     let (source, score) = match r.match_type {
                         lattice::MatchType::Full => ("lattice", base_score),
                         lattice::MatchType::Mixed => ("lattice_mix", base_score * self.weights.jianpin),
@@ -369,12 +382,26 @@ impl CandidateFamily for PinyinFamily {
             }
         }
 
-        // ── PhraseBook: user phrases always win (score 1.0) ──
+        // ── PhraseBook: user phrases promote new words, never downgrade dict hits ──
+        // A learned word that ALSO exists in the dictionary keeps its dict score
+        // when that's higher (previously the phrase entry REPLACED it at the
+        // fixed 0.88 — e.g. 继续's full-pinyin hit dropped below 急须). Only when
+        // the dict hit scores LOWER (rare/low-frequency word the user favors)
+        // does the phrase entry take over.
         {
             let book = self.phrase_book.lock().unwrap();
             for w in book.exact(input) {
-                out.retain(|c| c.text != w);
-                out.push(ScoredCandidate { text: w, family: "pinyin", source: "phrase", raw_score: self.weights.phrase_book });
+                let dict_score = out.iter().find(|c| c.text == w).map(|c| c.raw_score);
+                match dict_score {
+                    Some(s) if s >= self.weights.phrase_book => {
+                        // Dict hit already ≥ phrase score — keep it (do not
+                        // retain-remove + re-add at the lower fixed score).
+                    }
+                    _ => {
+                        out.retain(|c| c.text != w);
+                        out.push(ScoredCandidate { text: w, family: "pinyin", source: "phrase", raw_score: self.weights.phrase_book });
+                    }
+                }
             }
             // ── PhraseBook initials match (lzm → 李正明) ──
             for w in book.by_initials(input) {

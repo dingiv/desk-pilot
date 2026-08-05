@@ -28,21 +28,24 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
-    /// Full constructor with configurable English family settings. `magic` is the
-    /// shared registry — the engine keeps the same `Arc` for resource attachment.
+    /// Full constructor. `magic` is the shared registry — the engine keeps the
+    /// same `Arc` for resource attachment. `scoring` carries the configurable
+    /// priorities/boosts/freq-scale from `swift-ime.yaml` (defaults = the legacy
+    /// hardcoded values); `scoring.priorities` is the single source for every
+    /// family's inter-family priority.
     pub fn with_config(
         matcher: Matcher,
         expander: Expander,
         magic: Arc<MagicFamily>,
         pinyin_weights: crate::family::pinyin::PinyinWeights,
-        english_priority: u32,
         english_weights: crate::family::english::EnglishWeights,
+        scoring: crate::scoring::ScoringConfig,
     ) -> Self {
-        let pinyin_family = PinyinFamily::with_weights(pinyin_weights);
+        let pinyin_family = PinyinFamily::with_scoring(pinyin_weights, scoring);
         let snippet_family = SnippetFamily::new(matcher.clone(), expander.clone());
         let magic_family: Box<dyn CandidateFamily> = Box::new((*magic).clone());
         let english_family = EnglishFamily::with_default_dict()
-            .with_config(english_priority, english_weights);
+            .with_config(scoring.priorities.english, english_weights);
 
         // Build in priority order.
         let scorer = UnifiedScorer::new(vec![
@@ -50,7 +53,7 @@ impl Dispatcher {
             magic_family,
             Box::new(snippet_family),
             Box::new(english_family),
-        ]);
+        ], scoring.priorities);
 
         Dispatcher {
             matcher,
@@ -69,7 +72,10 @@ impl Dispatcher {
     ) -> Self {
         // Minimal scorer for tests — just the pinyin family.
         let pinyin_only = PinyinFamily::new();
-        let scorer = UnifiedScorer::new(vec![Box::new(pinyin_only)]);
+        let scorer = UnifiedScorer::new(
+            vec![Box::new(pinyin_only)],
+            crate::scoring::FamilyPriorities::default(),
+        );
 
         Dispatcher { matcher, expander, pinyin, scorer, magic: Arc::new(MagicFamily::new()) }
     }

@@ -6,18 +6,33 @@
 
 use std::collections::HashMap;
 
+use crate::scoring::BigramTuning;
+
 /// Key: (previous_word, next_word) → occurrence count.
 type BigramKey = (String, String);
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct UserBigram {
     counts: HashMap<BigramKey, u32>,
     /// Max count in the model — for score normalization.
     max_count: u32,
+    /// Boost ceiling above 1.0 (from config; default 0.25 = max +25%).
+    max_boost: f64,
+}
+
+impl Default for UserBigram {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl UserBigram {
-    pub fn new() -> Self { UserBigram::default() }
+    pub fn new() -> Self { UserBigram::with_tuning(BigramTuning::default()) }
+
+    /// Construct with a configurable boost ceiling (`swift-ime.yaml`).
+    pub fn with_tuning(tuning: BigramTuning) -> Self {
+        UserBigram { counts: HashMap::new(), max_count: 0, max_boost: tuning.max_boost }
+    }
 
     pub fn is_empty(&self) -> bool { self.counts.is_empty() }
 
@@ -31,7 +46,7 @@ impl UserBigram {
     }
 
     /// Boost score for a candidate if it frequently follows any context word.
-    /// Returns a multiplier in [1.0, 1.25] based on bigram frequency.
+    /// Returns a multiplier in [1.0, 1.0 + max_boost] based on bigram frequency.
     pub fn boost(&self, context_words: &[String], candidate: &str) -> f64 {
         if candidate.is_empty() || context_words.is_empty() { return 1.0; }
         let mut total: u32 = 0;
@@ -41,9 +56,9 @@ impl UserBigram {
             }
         }
         if total == 0 { return 1.0; }
-        // Normalize: max 25% boost for highest-frequency bigrams.
+        // Normalize: max boost (default 0.25 → +25%) for highest-frequency bigrams.
         let ratio = total as f64 / self.max_count.max(1) as f64;
-        1.0 + ratio * 0.25
+        1.0 + ratio * self.max_boost
     }
 
     /// Export as JSON for persistence.

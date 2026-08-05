@@ -10,6 +10,7 @@ pub mod family;
 pub mod matcher;
 pub mod persistence;
 pub mod recency;
+pub mod scoring;
 pub mod special_key;
 pub mod user_bigram;
 pub mod weight_store;

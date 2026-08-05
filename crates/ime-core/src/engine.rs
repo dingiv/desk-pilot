@@ -60,9 +60,9 @@ struct PerContext {
     text_context: InputContext,
 }
 
-impl Default for PerContext {
-    fn default() -> Self {
-        PerContext { sm: StateMachine::new(), text_context: InputContext::new() }
+impl PerContext {
+    fn with_page_size(page_size: u32) -> Self {
+        PerContext { sm: StateMachine::with_page_size(page_size), text_context: InputContext::new() }
     }
 }
 
@@ -94,6 +94,9 @@ pub struct ImeEngine {
     /// The snippet-variable provider — same `Arc` the dispatcher's expander holds.
     /// `set_variable` writes through it so `$CLIPBOARD`-style templates resolve fresh.
     provider: Arc<dyn crate::expander::VariableProvider>,
+    /// 候选每页条数(swift-ime.yaml → input.page_size;默认 7)。传给每个新建的
+    /// StateMachine —— 之前写死在 `StateMachine::new` 里(FIXME)。
+    page_size: u32,
 }
 
 impl ImeEngine {
@@ -107,14 +110,14 @@ impl ImeEngine {
     pub fn with_pinyin_weights(weights: crate::family::pinyin::PinyinWeights) -> Self {
         Self::with_config(
             weights,
-            70,
             crate::family::english::EnglishWeights::default(),
             Box::new(crate::expander::DefaultProvider),
             Vec::new(),
+            crate::scoring::ScoringConfig::default(),
         )
     }
 
-    /// Create engine with full config (pinyin weights + English priority + English weights).
+    /// Create engine with full config (pinyin weights + English weights).
     /// `provider` resolves snippet variables (`$DATE`, `$CLIPBOARD`, …) — inject a
     /// platform provider here; the engine keeps a shared `Arc` so later
     /// [`set_variable`](ImeEngine::set_variable) updates reach the expander.
@@ -122,12 +125,16 @@ impl ImeEngine {
     /// `extra_snippets` are user-defined `(trigger, expansion)` pairs merged over
     /// the built-ins — on trigger collision the config entry wins (trie nodes are
     /// overwritten last-writer-wins).
+    ///
+    /// `scoring` carries every configurable scoring parameter (family priorities,
+    /// recency boosts, bigram ceiling, freq→score scale) from `swift-ime.yaml`;
+    /// `Default` reproduces the legacy hardcoded values exactly.
     pub fn with_config(
         pinyin_weights: crate::family::pinyin::PinyinWeights,
-        english_priority: u32,
         english_weights: crate::family::english::EnglishWeights,
         provider: Box<dyn crate::expander::VariableProvider>,
         extra_snippets: Vec<(String, String)>,
+        scoring: crate::scoring::ScoringConfig,
     ) -> Self {
         // Magic command entries are generated from the member registry (#asr, #flush,
         // #submit, #req, #date, #password …) — adding a command = one member, nothing
@@ -146,12 +153,13 @@ impl ImeEngine {
         let provider: Arc<dyn crate::expander::VariableProvider> = Arc::from(provider);
         let expander = crate::Expander::new(Arc::clone(&provider));
         let engine = ImeEngine {
-            dispatcher: Dispatcher::with_config(matcher, expander, Arc::clone(&magic), pinyin_weights, english_priority, english_weights),
+            dispatcher: Dispatcher::with_config(matcher, expander, Arc::clone(&magic), pinyin_weights, english_weights, scoring),
             contexts: Mutex::new(HashMap::new()),
             async_waits: Mutex::new(HashMap::new()),
             persistence: Mutex::new(None),
             magic,
             provider,
+            page_size: 7,
         };
         // Load embedded base dictionary (5KB, compiled into binary).
         let count = engine.dispatcher.scorer().family("pinyin")
@@ -170,8 +178,18 @@ impl ImeEngine {
 
     fn with_ctx<T>(&self, ctx: usize, f: impl FnOnce(&Dispatcher, &mut PerContext) -> T) -> T {
         let mut map = self.contexts.lock().unwrap();
-        let pc = map.entry(ctx).or_default();
+        let pc = map.entry(ctx).or_insert_with(|| PerContext::with_page_size(self.page_size));
         f(&self.dispatcher, pc)
+    }
+
+    /// 候选每页条数(默认 7)。frontend 启动时调用(swift-ime.yaml → input.page_size)。
+    /// 已存在的 context 立即生效,后续新建的 context 沿用新值。
+    pub fn set_page_size(&mut self, page_size: u32) {
+        if page_size == 0 { return; }
+        self.page_size = page_size;
+        for pc in self.contexts.lock().unwrap().values_mut() {
+            pc.sm.candidate_page_size = page_size as usize;
+        }
     }
 
     fn remove_ctx(&self, ctx: usize) {
@@ -190,7 +208,7 @@ impl ImeEngine {
     /// recency ring were never updated by space-commits.
     pub fn special_key_ctx(&self, ctx: usize, key: SpecialKey) -> ImeView {
         self.with_ctx(ctx, |disp, pc| {
-            let mut view = handle_special_key(&mut pc.sm, key, disp)
+            let view = handle_special_key(&mut pc.sm, key, disp)
                 .unwrap_or_else(|| ImeView::empty());
             let committed = ImeView::str_field(&view.commit_text);
             if !committed.is_empty() {
@@ -414,7 +432,7 @@ impl ImeEngine {
     /// Manually set the text context (simulates pre-filled text).
     pub fn set_context(&mut self, text: &str) {
         self.contexts.lock().unwrap()
-            .entry(DEFAULT_CTX).or_default()
+            .entry(DEFAULT_CTX).or_insert_with(|| PerContext::with_page_size(self.page_size))
             .text_context.update(text);
     }
 
@@ -981,10 +999,10 @@ mod tests {
 
         let e = ImeEngine::with_config(
             crate::family::pinyin::PinyinWeights::default(),
-            70,
             crate::family::english::EnglishWeights::default(),
             Box::new(FixedDate),
             vec![("/sig".into(), "Best regards,\nAlice\n$DATE".into())],
+            crate::scoring::ScoringConfig::default(),
         );
         let mut e = e;
         for c in "/sig".chars() { e.predict(InputEvent::char(c)); }
@@ -1066,6 +1084,29 @@ mod tests {
     }
 
     #[test]
+    fn scoring_config_priorities_affect_ranking() {
+        // family_priority 来自 swift-ime.yaml:英文优先级配成 0 → black 的
+        // 最终分 = 0(被全局排序压到底),默认 70 时 > 0。
+        let black_score = |english_priority: u32| {
+            let mut scoring = crate::scoring::ScoringConfig::default();
+            scoring.priorities.english = english_priority;
+            let mut e = ImeEngine::with_config(
+                crate::family::pinyin::PinyinWeights::default(),
+                crate::family::english::EnglishWeights::default(),
+                Box::new(crate::expander::DefaultProvider),
+                Vec::new(),
+                scoring,
+            );
+            for c in "black".chars() { e.predict(InputEvent::char(c)); }
+            e.candidates_detailed().iter().find(|c| c.text == "black")
+                .map(|c| c.score)
+                .unwrap_or(0.0)
+        };
+        assert!(black_score(70) > 0.0, "default english priority keeps black ranked");
+        assert_eq!(black_score(0), 0.0, "priority 0 zeroes the final score");
+    }
+
+    #[test]
     fn set_variable_reaches_injected_provider() {
         // The fcitx5 frontend pushes clipboard text via set_variable → the
         // injected provider (shared with the expander) must observe it.
@@ -1085,10 +1126,10 @@ mod tests {
         let values = Arc::new(std::sync::Mutex::new(Vec::new()));
         let e = ImeEngine::with_config(
             crate::family::pinyin::PinyinWeights::default(),
-            70,
             crate::family::english::EnglishWeights::default(),
             Box::new(Recording { values: Arc::clone(&values) }),
             Vec::new(),
+            crate::scoring::ScoringConfig::default(),
         );
         e.set_variable("CLIPBOARD", "剪贴板文本");
         e.set_variable("CLIPBOARD", "更新后的文本");

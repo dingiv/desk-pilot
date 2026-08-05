@@ -63,13 +63,75 @@ pub struct WeightsConfig {
     pub pinyin: PinyinWeightConfig,
     #[serde(default)]
     pub english: EnglishWeightConfig,
+    /// RecencyStore 位置衰减 boost(最近提交环的 5 档)。
+    #[serde(default)]
+    pub recency: RecencyConfig,
+    /// UserBigram 上下文 boost 上限。
+    #[serde(default)]
+    pub bigram: BigramConfig,
+    /// 字典词频 → 内部分值的映射参数。
+    #[serde(default)]
+    pub freq_scale: FreqScaleConfig,
 }
 
-/// English family priority in the global ranking (0-100). The other families'
-/// priorities (pinyin/magic/snippet) are fixed in the engine's scorer.
-#[derive(Debug, Clone, Deserialize, Default)]
+/// 各家族的全局优先级(最终分 = raw_score × priority/100)。全部可配。
+#[derive(Debug, Clone, Deserialize)]
 pub struct FamilyPriorityConfig {
+    #[serde(default = "default_100")] pub pinyin: u32,
+    #[serde(default = "default_95")] pub magic: u32,
+    #[serde(default = "default_75")] pub snippet: u32,
     #[serde(default = "default_70")] pub english: u32,
+}
+
+impl Default for FamilyPriorityConfig {
+    fn default() -> Self {
+        FamilyPriorityConfig { pinyin: 100, magic: 95, snippet: 75, english: 70 }
+    }
+}
+
+/// RecencyStore 的位置衰减 boost。
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecencyConfig {
+    #[serde(default = "default_0_20")] pub pos0: f64,
+    #[serde(default = "default_0_15")] pub pos1: f64,
+    #[serde(default = "default_0_10")] pub pos2: f64,
+    #[serde(default = "default_0_05")] pub mid: f64,
+    #[serde(default = "default_0_02")] pub far: f64,
+}
+
+impl Default for RecencyConfig {
+    fn default() -> Self {
+        RecencyConfig { pos0: 0.20, pos1: 0.15, pos2: 0.10, mid: 0.05, far: 0.02 }
+    }
+}
+
+/// UserBigram 上下文 boost 的归一化上限(1.0 = 无加成,1.25 = +25%)。
+#[derive(Debug, Clone, Deserialize)]
+pub struct BigramConfig {
+    #[serde(default = "default_0_25")] pub max_boost: f64,
+}
+
+impl Default for BigramConfig {
+    fn default() -> Self {
+        BigramConfig { max_boost: 0.25 }
+    }
+}
+
+/// 字典词频 → 内部分值的映射。`max_weight`:
+/// - `0`(默认)= auto:用索引构建时记录的实际最大词频(cache v2)——
+///   映射对齐真实分布,不同词频的词不会被压成同分;
+/// - `> 0` = 显式固定分母。
+#[derive(Debug, Clone, Deserialize)]
+pub struct FreqScaleConfig {
+    #[serde(default)] pub max_weight: f64,
+    #[serde(default = "default_0_25")] pub min_score: f64,
+    #[serde(default = "default_1_0")] pub max_score: f64,
+}
+
+impl Default for FreqScaleConfig {
+    fn default() -> Self {
+        FreqScaleConfig { max_weight: 0.0, min_score: 0.25, max_score: 1.0 }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -87,6 +149,35 @@ pub struct PinyinWeightConfig {
     #[serde(default = "default_96")] pub large_dict_take: usize,
     #[serde(default = "default_48")] pub viterbi_take: usize,
     #[serde(default = "default_8")] pub jianpin_take: usize,
+}
+
+impl WeightsConfig {
+    /// Convert to ime-core's unified [`ScoringConfig`] — family priorities,
+    /// recency boosts, bigram ceiling and the freq→score scale all come from
+    /// `swift-ime.yaml`; missing sections fall back to the legacy defaults.
+    pub fn to_scoring(&self) -> ime_core::scoring::ScoringConfig {
+        ime_core::scoring::ScoringConfig {
+            priorities: ime_core::scoring::FamilyPriorities {
+                pinyin: self.family_priority.pinyin,
+                magic: self.family_priority.magic,
+                snippet: self.family_priority.snippet,
+                english: self.family_priority.english,
+            },
+            recency: ime_core::scoring::RecencyBoosts {
+                pos0: self.recency.pos0,
+                pos1: self.recency.pos1,
+                pos2: self.recency.pos2,
+                mid: self.recency.mid,
+                far: self.recency.far,
+            },
+            bigram: ime_core::scoring::BigramTuning { max_boost: self.bigram.max_boost },
+            freq_scale: ime_core::scoring::FreqScale {
+                max_weight: self.freq_scale.max_weight,
+                min_score: self.freq_scale.min_score,
+                max_score: self.freq_scale.max_score,
+            },
+        }
+    }
 }
 
 impl PinyinWeightConfig {
@@ -119,15 +210,22 @@ pub struct EnglishWeightConfig {
 
 fn default_1_0() -> f64 { 1.0 }
 
+fn default_100() -> u32 { 100 }
+fn default_95() -> u32 { 95 }
+fn default_75() -> u32 { 75 }
 fn default_70() -> u32 { 70 }
 fn default_0_88() -> f64 { 0.88 }
 fn default_0_85() -> f64 { 0.85 }
 fn default_0_55() -> f64 { 0.55 }
 fn default_0_5() -> f64 { 0.5 }
 fn default_0_25() -> f64 { 0.25 }
+fn default_0_20() -> f64 { 0.20 }
+fn default_0_15() -> f64 { 0.15 }
+fn default_0_10() -> f64 { 0.10 }
 fn default_0_6() -> f64 { 0.6 }
 fn default_0_12() -> f64 { 0.12 }
 fn default_0_05() -> f64 { 0.05 }
+fn default_0_02() -> f64 { 0.02 }
 fn default_0_01() -> f64 { 0.01 }
 fn default_48() -> usize { 48 }
 fn default_96() -> usize { 96 }
@@ -138,7 +236,7 @@ fn default_page_size() -> u32 { 7 }
 impl Default for WeightsConfig {
     fn default() -> Self {
         WeightsConfig {
-            family_priority: FamilyPriorityConfig { english: 70 },
+            family_priority: FamilyPriorityConfig::default(),
             pinyin: PinyinWeightConfig {
                 phrase_book: 0.88, large_dict: 0.85, viterbi_base: 0.25, viterbi_scale: 0.55,
                 jianpin: 0.50, single_syl_decay: 0.5, context_boost: 0.12,
@@ -146,6 +244,11 @@ impl Default for WeightsConfig {
                 large_dict_take: 96, viterbi_take: 48, jianpin_take: 8,
             },
             english: EnglishWeightConfig { exact: 0.88, prefix_ratio: 0.6, user_boost: 1.0 },
+            recency: RecencyConfig {
+                pos0: 0.20, pos1: 0.15, pos2: 0.10, mid: 0.05, far: 0.02,
+            },
+            bigram: BigramConfig { max_boost: 0.25 },
+            freq_scale: FreqScaleConfig { max_weight: 0.0, min_score: 0.25, max_score: 1.0 },
         }
     }
 }
@@ -298,6 +401,53 @@ snippets:
     fn snippets_default_to_empty() {
         let cfg = SwiftImeConfig::default();
         assert!(cfg.snippets.is_empty());
+    }
+
+    #[test]
+    fn parses_scoring_sections() {
+        let yaml = r#"
+weights:
+  family_priority:
+    pinyin: 90
+    magic: 80
+    snippet: 60
+    english: 50
+  recency:
+    pos0: 0.30
+    pos1: 0.20
+  bigram:
+    max_boost: 0.40
+  freq_scale:
+    max_weight: 500000
+    min_score: 0.2
+    max_score: 0.95
+"#;
+        let cfg: SwiftImeConfig = serde_yaml::from_str(yaml).unwrap();
+        let s = cfg.weights.to_scoring();
+        assert_eq!(s.priorities.pinyin, 90);
+        assert_eq!(s.priorities.magic, 80);
+        assert_eq!(s.priorities.snippet, 60);
+        assert_eq!(s.priorities.english, 50);
+        assert_eq!(s.recency.pos0, 0.30);
+        assert_eq!(s.recency.pos1, 0.20);
+        assert_eq!(s.recency.far, 0.02, "未指定的档回退默认");
+        assert_eq!(s.bigram.max_boost, 0.40);
+        assert_eq!(s.freq_scale.max_weight, 500_000.0);
+        assert_eq!(s.freq_scale.min_score, 0.2);
+        assert_eq!(s.freq_scale.max_score, 0.95);
+    }
+
+    #[test]
+    fn scoring_sections_default_when_missing() {
+        // 旧配置文件没有这些节 → 全部用引擎默认(与写死值一致)。
+        let yaml = "weights:\n  pinyin: {}\n";
+        let cfg: SwiftImeConfig = serde_yaml::from_str(yaml).unwrap();
+        let s = cfg.weights.to_scoring();
+        assert_eq!(s.priorities.pinyin, 100);
+        assert_eq!(s.priorities.english, 70);
+        assert_eq!(s.recency.pos0, 0.20);
+        assert_eq!(s.bigram.max_boost, 0.25);
+        assert_eq!(s.freq_scale.max_weight, 0.0, "auto by default");
     }
 
     #[test]

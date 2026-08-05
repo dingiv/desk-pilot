@@ -34,9 +34,12 @@ input:
 # All values are intentionally conservative — top candidates land in
 # 0.70–0.85 range, leaving headroom for recency/context boosts.
 weights:
-  # English priority in the global ranking (0-100). The other families'
-  # priorities (pinyin/magic/snippet) are fixed in the engine's scorer.
+  # 各家族在全局排序中的优先级 (0-100): final_score = raw_score × priority/100。
+  # 默认值即引擎内置值,可整体调权(例如压低英文让中文候选更靠前)。
   family_priority:
+    pinyin: 100
+    magic: 95
+    snippet: 75
     english: 70
 
   # Pinyin family internal scores (0.0-1.0)
@@ -59,3 +62,26 @@ weights:
   english:
     exact: 0.88             # exact word match
     prefix_ratio: 0.6       # max score for prefix match (scaled by match ratio)
+    user_boost: 1.0         # user-dict words (all get max priority)
+
+  # RecencyStore 的位置衰减 boost(最近提交环,越新加成越大)
+  recency:
+    pos0: 0.20              # 最近一次提交
+    pos1: 0.15              # 第二次
+    pos2: 0.10              # 第三次
+    mid: 0.05               # 第 3-9 次
+    far: 0.02               # 第 10-63 次
+
+  # UserBigram 上下文 boost 上限(1.0 = 无加成,1.25 = +25%)
+  bigram:
+    max_boost: 0.25
+
+  # 字典词频 → 内部分值的映射(log₂ 归一化后 clamp 到 [min_score, max_score])。
+  # max_weight:
+  #   0 (默认) = auto —— 用索引构建时记录的实际最大词频(cache v2),
+  #   映射对齐真实分布:501276 与 500369 不会被压成同分
+  #   > 0      = 显式固定分母(例如 600000)
+  freq_scale:
+    max_weight: 0
+    min_score: 0.25
+    max_score: 1.0

@@ -144,3 +144,60 @@ fn english_black_still_works() {
     assert!(cands.contains(&"black".to_string()),
         "english word black should be found by EnglishFamily, not rime-ice");
 }
+
+// ── Ranking consistency (jix vs jixu) ───────────────────────────────────
+//
+// Regression: freq_to_score used MAX_WEIGHT=100k with a 0.90 cap, so every
+// common word saturated and 简拼 (jix) candidates all tied — their order was
+// arbitrary and INCONSISTENT with the full-pinyin path (jixu ranked 积蓄
+// above 继续). The two paths must now rank the same words in the same order.
+
+#[test]
+fn jix_and_jixu_rank_consistently() {
+    let mut e = engine_with_rime();
+    let jix = candidates_for(&mut e, "jix");
+    let mut e2 = engine_with_rime();
+    let jixu = candidates_for(&mut e2, "jixu");
+
+    assert_eq!(jix.first().map(String::as_str), Some("继续"),
+        "继续 is #1 on 简拼 jix: {jix:?}");
+    assert_eq!(jixu.first().map(String::as_str), Some("继续"),
+        "继续 is #1 on full pinyin jixu: {jixu:?}");
+    // The candidate SETS differ (jix matches every ji-x* syllable pair, jixu
+    // only ji-xu) — but words present in BOTH must keep the same relative
+    // order, otherwise typing one more letter reshuffles the list.
+    let common: Vec<String> = jix.iter()
+        .filter(|w| jixu.contains(w))
+        .take(6)
+        .cloned()
+        .collect();
+    assert_eq!(common.len(), 6, "enough shared candidates: {common:?}");
+    let jixu_common: Vec<String> = jixu.iter()
+        .filter(|w| common.contains(w))
+        .cloned()
+        .collect();
+    assert_eq!(jixu_common, common,
+        "shared words keep their relative order: jix={common:?} jixu={jixu_common:?}");
+}
+
+#[test]
+fn learned_phrase_does_not_downgrade_dict_hit() {
+    // Selecting 继续 learns it into the PhraseBook. The phrase entry used to
+    // REPLACE the dict hit at a fixed 0.88 score — dropping 继续 below 急须 on
+    // jixu. A learned word that's already in the dict must keep its (higher)
+    // dict ranking.
+    let mut e = engine_with_rime();
+    for c in "jixu".chars() { e.predict(InputEvent::char(c)); }
+    let idx = e.candidates().iter().position(|c| *c == "继续").expect("继续 present");
+    e.select_candidate(idx); // commits + learn_phrase("jixu", "继续")
+
+    let mut e2 = engine_with_rime();
+    // Simulate the same session state: select 继续 once, then re-type jixu.
+    for c in "jixu".chars() { e2.predict(InputEvent::char(c)); }
+    let idx2 = e2.candidates().iter().position(|c| *c == "继续").expect("继续 present");
+    e2.select_candidate(idx2);
+    for c in "jixu".chars() { e2.predict(InputEvent::char(c)); }
+    let cands = e2.candidates();
+    assert_eq!(cands.first().map(String::as_str), Some("继续"),
+        "learned 继续 stays #1 after being picked: {cands:?}");
+}

@@ -97,13 +97,14 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<AsrBuffer>, Option<crat
         .iter()
         .map(|s| (s.trigger.clone(), s.expand.clone()))
         .collect();
-    let engine = ImeEngine::with_config(
+    let mut engine = ImeEngine::with_config(
         weights,
-        sw_cfg.weights.family_priority.english,
         eng_weights,
         Box::new(ime_core::expander::DefaultProvider),
         snippets,
+        sw_cfg.weights.to_scoring(),
     );
+    engine.set_page_size(sw_cfg.input.page_size);
 
     if sw_cfg.dicts.rime_ice {
         let loader = shared::loader!("assets");

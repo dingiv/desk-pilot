@@ -81,13 +81,15 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
         .iter()
         .map(|s| (s.trigger.clone(), s.expand.clone()))
         .collect();
-    let engine = ImeEngine::with_config(
+    let mut engine = ImeEngine::with_config(
         weights,
-        cfg.weights.family_priority.english,
         eng_weights,
         Box::new(FcitxProvider::default()),
         snippets,
+        cfg.weights.to_scoring(),
     );
+    // 候选每页条数(swift-ime.yaml → input.page_size)。
+    engine.set_page_size(cfg.input.page_size);
 
     // `#req` backend base URL (config `magic.req_base`, default
     // http://127.0.0.1:14555/api).

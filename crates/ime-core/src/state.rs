@@ -102,7 +102,16 @@ impl std::fmt::Debug for StateMachine {
 }
 
 impl StateMachine {
-    pub fn new() -> Self { StateMachine { candidate_page_size: 7 /* FIXME: 使用配置指定 */, ..StateMachine::default() } }
+    pub fn new() -> Self {
+        StateMachine::with_page_size(7)
+    }
+
+    /// Construct with a configurable candidate page size (default 7).
+    /// The engine passes `swift-ime.yaml → input.page_size` via
+    /// [`ImeEngine::set_page_size`](crate::engine::ImeEngine::set_page_size).
+    pub fn with_page_size(page_size: u32) -> Self {
+        StateMachine { candidate_page_size: page_size.max(1) as usize, ..StateMachine::default() }
+    }
 
     pub fn step(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
         match self.state {

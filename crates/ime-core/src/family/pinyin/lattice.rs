@@ -129,6 +129,11 @@ pub struct LatticeDecoder {
     /// Size of the .fst on disk at load time; the cache header records it so a newer .fst
     /// (e.g. after a deb upgrade) invalidates the stale cache.
     fst_len: u64,
+    /// Actual max word frequency seen when the index was built — carried in the
+    /// cache v2 header. `0` = unknown (legacy v1 cache) → `FreqScale` auto-mode
+    /// falls back to a fixed denominator. This is what keeps 501276 ≠ 500369:
+    /// the log₂ normalization divides by the REAL top of the distribution.
+    max_freq: f64,
 }
 
 impl LatticeDecoder {
@@ -142,6 +147,7 @@ impl LatticeDecoder {
             initials_index: HashMap::new(),
             fst_path: fst_path.to_string(),
             fst_len,
+            max_freq: 0.0,
         };
         decoder.build_initials_index();
         decoder
@@ -175,12 +181,14 @@ impl LatticeDecoder {
         }
         let start = std::time::Instant::now();
         let mut imap: HashMap<String, Vec<(String, String, u64)>> = HashMap::new();
+        let mut max_freq: u64 = 0;
         self.fst.prefix_for_each(b"", |code, item, value| {
             if let (Ok(pinyin), Ok(word)) = (
                 std::str::from_utf8(code),
                 std::str::from_utf8(item),
             ) {
                 if !pinyin.is_empty() && !word.is_empty() {
+                    max_freq = max_freq.max(value);
                     if let Some(seg) = inputx_pinyin::segment(pinyin).into_iter().next() {
                         let initials: String = seg.syllables.iter()
                             .filter_map(|s| s.chars().next())
@@ -193,6 +201,7 @@ impl LatticeDecoder {
                 }
             }
         });
+        self.max_freq = max_freq as f64;
         for v in imap.values_mut() {
             v.sort_by_key(|(_, _, f)| std::cmp::Reverse(*f));
             v.dedup_by_key(|(_, w, _)| w.clone());
@@ -206,37 +215,62 @@ impl LatticeDecoder {
         self.save_cache();
     }
 
-    /// Cache format: `# swift-ime idx v1 <fst_len>\n` header line, then the binary blob.
-    const CACHE_MAGIC: &str = "# swift-ime idx v1";
+    /// Cache format v1 (pre-2026-08-04): `# swift-ime idx v1 <fst_len>\n` — no
+    /// max_freq; `FreqScale` auto-mode falls back to a fixed denominator.
+    const CACHE_MAGIC_V1: &str = "# swift-ime idx v1";
+    /// Cache format v2: `# swift-ime idx v2 <fst_len> <max_freq>\n` — carries the
+    /// actual top weight so freq→score maps against the REAL distribution.
+    const CACHE_MAGIC_V2: &str = "# swift-ime idx v2";
 
     fn try_load_cache(&mut self) -> bool {
         for cp in Self::cache_paths(&self.fst_path) {
             let Ok(data) = std::fs::read(&cp) else { continue };
-            // New format: `# swift-ime idx v1 <fst_len>\n` header. A different fst_len ⇒ the
-            // .fst changed (deb upgrade) ⇒ stale.
-            if data.starts_with(Self::CACHE_MAGIC.as_bytes()) {
-                let header_end = match data.iter().position(|&b| b == b'\n') {
-                    Some(i) => i,
-                    None => continue,
+            let header_end = match data.iter().position(|&b| b == b'\n') {
+                Some(i) => i,
+                None => continue, // no header line — legacy or corrupt
+            };
+            let header = String::from_utf8_lossy(&data[..header_end]);
+
+            // v2: `# swift-ime idx v2 <fst_len> <max_freq>`. A different fst_len
+            // ⇒ the .fst changed (deb upgrade) ⇒ stale.
+            if let Some(rest) = header.strip_prefix(Self::CACHE_MAGIC_V2) {
+                let mut parts = rest.split_whitespace();
+                let Ok(fst_len) = parts.next().unwrap_or("").parse::<u64>() else {
+                    continue;
                 };
-                let header = String::from_utf8_lossy(&data[..header_end]);
-                let expected = format!("{} {}", Self::CACHE_MAGIC, self.fst_len);
-                if header != expected {
+                if fst_len != self.fst_len {
                     continue; // stale — try the next candidate location
                 }
+                let max_freq: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
                 if self.parse_cache(&data[header_end + 1..]) {
+                    self.max_freq = max_freq;
                     return true;
                 }
-            } else {
-                // Legacy format (pre-2026-08-04, no header): shipped beside the .fst in the
-                // repo. Freshness can't be verified, but it's committed together with the
-                // .fst — trusted. Only accepted from the next-to-fst candidate, never the
-                // user dir (a re-downloaded stale copy there must not win).
-                let first = Self::cache_paths(&self.fst_path).into_iter().next()
-                    .is_some_and(|p| p == cp);
-                if first && self.parse_cache(&data) {
+                continue;
+            }
+
+            // v1 header: fresh only when the fst_len matches; no max_freq.
+            if header.starts_with(Self::CACHE_MAGIC_V1) {
+                let expected = format!("{} {}", Self::CACHE_MAGIC_V1, self.fst_len);
+                if header != expected {
+                    continue; // stale
+                }
+                if self.parse_cache(&data[header_end + 1..]) {
+                    self.max_freq = 0.0; // unknown — FreqScale auto falls back
                     return true;
                 }
+                continue;
+            }
+
+            // Pre-header legacy format: shipped beside the .fst in the repo.
+            // Freshness can't be verified, but it's committed together with the
+            // .fst — trusted. Only accepted from the next-to-fst candidate, never
+            // the user dir (a re-downloaded stale copy there must not win).
+            let first = Self::cache_paths(&self.fst_path).into_iter().next()
+                .is_some_and(|p| p == cp);
+            if first && self.parse_cache(&data) {
+                self.max_freq = 0.0; // unknown
+                return true;
             }
         }
         false
@@ -285,7 +319,7 @@ impl LatticeDecoder {
         // Build the blob once, then write to the first writable candidate (beside the .fst in
         // dev; the user dir when the system dir is read-only). Failing all is fine — next start
         // rebuilds.
-        let mut buf = format!("{} {}\n", Self::CACHE_MAGIC, self.fst_len).into_bytes();
+        let mut buf = format!("{} {} {}\n", Self::CACHE_MAGIC_V2, self.fst_len, self.max_freq).into_bytes();
         for (key, entries) in &self.initials_index {
             buf.push(key.len() as u8);
             buf.extend_from_slice(key.as_bytes());
@@ -312,16 +346,26 @@ impl LatticeDecoder {
         }
     }
 
-    /// Score from rime-ice weight — log₂ normalization.
-    /// MAX_WEIGHT ≈ 100000 (rime-ice max weight).
-    const MAX_WEIGHT: f64 = 100_000.0;
-
-    /// Convert weight to 0.25-0.90 range.
-    /// weight=100000 → 0.90, weight=10000 → 0.85, weight=100 → 0.43
-    pub fn freq_to_score(freq: u64) -> f64 {
+    /// Convert a dict weight to the internal score, parameterized by `scale`.
+    ///
+    /// log₂ normalization against the distribution's REAL top:
+    /// - `scale.max_weight > 0` — explicit fixed denominator (config override);
+    /// - otherwise the actual max weight recorded at index build (cache v2) —
+    ///   501276 (继续) and 500369 (机械) map to 1.0 and ~0.998 instead of tying;
+    /// - legacy caches without a recorded max fall back to a fixed 600k.
+    ///
+    /// clamp to [scale.min_score, scale.max_score] (defaults 0.25..1.0).
+    pub fn freq_to_score(&self, scale: &crate::scoring::FreqScale, freq: u64) -> f64 {
         let w = freq.max(1) as f64;
-        let s = (w + 1.0).log2() / (Self::MAX_WEIGHT + 1.0).log2();
-        s.clamp(0.25, 0.90)
+        let max = if scale.max_weight > 0.0 {
+            scale.max_weight
+        } else if self.max_freq > 0.0 {
+            self.max_freq
+        } else {
+            600_000.0 // legacy cache without recorded max
+        };
+        let s = (w + 1.0).log2() / (max + 1.0).log2();
+        s.clamp(scale.min_score, scale.max_score)
     }
 
     /// Main entry: predict candidates for any pinyin input.
@@ -410,5 +454,33 @@ mod tests {
         let paths = LatticeDecoder::cache_paths("/usr/share/swift-ime/dict/rime-ice.fst");
         assert_eq!(paths[0], std::path::PathBuf::from("/usr/share/swift-ime/dict/rime-ice.fst.idx"));
         assert_eq!(paths[1], std::path::PathBuf::from(format!("{}/.desk-pilot/rime-ice.fst.idx", std::env::var("HOME").unwrap())));
+    }
+
+    #[test]
+    fn freq_to_score_uses_scale_and_actual_max() {
+        // Tiny FST with known weights — the index build records the REAL max
+        // (501276). Auto-mode (max_weight=0) maps against it: the top word gets
+        // 1.0 and a near-top word keeps a strictly smaller score (not tied).
+        let path = format!("/tmp/swift-ime-lattice-scale-{}.fst", std::process::id());
+        let mut b = inputx_fsa::DictBuilder::new();
+        b.insert(b"jix", "机械".as_bytes(), 500_369);
+        b.insert(b"jixu", "继续".as_bytes(), 501_276);
+        b.insert(b"jixu", "急须".as_bytes(), 164_505);
+        let dict = inputx_fsa::Dict::new(b.finish()).expect("dict");
+        let dec = LatticeDecoder::new(dict, &path);
+        let scale = crate::scoring::FreqScale { max_weight: 0.0, min_score: 0.25, max_score: 1.0 };
+        // Auto: the recorded max is the top of the scale.
+        assert!((dec.freq_to_score(&scale, 501_276) - 1.0).abs() < 1e-9, "top word = max_score");
+        let s500 = dec.freq_to_score(&scale, 500_369);
+        assert!(s500 < 1.0 && s500 > 0.99, "near-top keeps separation: {s500}");
+        assert!(dec.freq_to_score(&scale, 164_505) < s500, "lower freq scores lower");
+        // Explicit fixed denominator + tighter clamp override the recorded max.
+        let tight = crate::scoring::FreqScale { max_weight: 100_000.0, min_score: 0.25, max_score: 0.90 };
+        assert!((dec.freq_to_score(&tight, 100_000) - 0.90).abs() < 1e-9, "max_score cap applies");
+        // 10000/100000 → log₂ ratio ≈ 0.80 < 0.90 cap (50000 would hit the cap).
+        assert!((dec.freq_to_score(&tight, 10_000) - 0.80).abs() < 0.01);
+        assert!((dec.freq_to_score(&tight, 1) - 0.25).abs() < 1e-9, "min_score floor applies");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.idx"));
     }
 }
