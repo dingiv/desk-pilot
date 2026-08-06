@@ -19,3 +19,13 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { workspace = true, optional = true }
+shared = { path = "../shared" }
+
+# 用户数据目录(swift-ime 的 data/ 在仓库里与前端共享):
+#   dev:  <repo>/apps/swift-ime/data  (开发期数据文件统一放这里)
+#   prod: ~/.desk-pilot
+[package.metadata.shared]
+DATA = { dev = "../../apps/swift-ime/data", prod = "~/.desk-pilot" }
+
+[build-dependencies]
+shared = { path = "../shared" }

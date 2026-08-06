@@ -130,9 +130,12 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
         }
     }
 
-    // Initialize SQLite weight store.
-    let home = std::env::var("HOME").unwrap_or_default();
-    engine.init_store(&format!("{home}/.desk-pilot/swift-ime.db"));
+    // Initialize SQLite weight store — DATA 命名空间(dev: data/, prod: ~/.desk-pilot/)。
+    let data = shared::loader!(".");
+    let db = data.resolve("DATA::swift-ime.db")
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "data/swift-ime.db".into());
+    engine.init_store(&db);
 
     // ── Voice input: spawn aura SSE client + attach buffer to engine ──
     let asr_buffer = Arc::new(AsrBuffer::new());

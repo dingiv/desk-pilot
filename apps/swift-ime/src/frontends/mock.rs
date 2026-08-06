@@ -157,8 +157,12 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<AsrBuffer>, Option<crat
         None
     };
 
-    let home = std::env::var("HOME").unwrap_or_default();
-    engine.init_store(&format!("{home}/.desk-pilot/swift-ime.db"));
+    // SQLite weight store — DATA 命名空间(dev: data/, prod: ~/.desk-pilot/)。
+    let data = shared::loader!(".");
+    let db = data.resolve("DATA::swift-ime.db")
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "data/swift-ime.db".into());
+    engine.init_store(&db);
     (engine, asr_buffer, aura_status)
 }
 

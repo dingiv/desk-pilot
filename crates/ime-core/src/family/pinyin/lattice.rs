@@ -156,8 +156,9 @@ impl LatticeDecoder {
     /// Candidate cache locations for a given .fst path, in preference order:
     /// 1. **next to the .fst** (`assets/dict/rime-ice.fst.idx`) — dev machines ship one in the
     ///    repo, so startup loads instantly instead of rebuilding the 29万-entry index (~46s).
-    /// 2. **`~/.desk-pilot/`** — the deb's `/usr/share/swift-ime/dict` is read-only, so a first
-    ///    run there can't write beside the .fst and must fall back to the user dir.
+    /// 2. **the `DATA` namespace** — dev: `apps/swift-ime/data/`, prod: `~/.desk-pilot/`
+    ///    (the deb's `/usr/share/swift-ime/dict` is read-only, so a first run there can't
+    ///    write beside the .fst and must fall back to the user data dir).
     /// Loading takes the first that exists; saving takes the first that's writable.
     fn cache_paths(fst_path: &str) -> Vec<std::path::PathBuf> {
         let mut v = Vec::with_capacity(2);
@@ -166,9 +167,10 @@ impl LatticeDecoder {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| fst_path.to_string());
-        v.push(std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
-            .join(".desk-pilot")
-            .join(format!("{name}.idx")));
+        // DATA 命名空间统一用户数据路径(dev/prod 由 Cargo.toml metadata 声明)。
+        if let Some(p) = shared::loader!().resolve(&format!("DATA::{name}.idx")) {
+            v.push(p);
+        }
         v
     }
 
@@ -456,12 +458,16 @@ mod tests {
     }
 
     #[test]
-    fn cache_paths_prefer_next_to_fst_then_user_dir() {
+    fn cache_paths_prefer_next_to_fst_then_data_namespace() {
         // Priority: beside the .fst (dev ships it in the repo → instant startup), then the
-        // user dir (deb system dir is read-only → first run falls back there).
+        // DATA 命名空间(dev: apps/swift-ime/data,prod: ~/.desk-pilot)。
         let paths = LatticeDecoder::cache_paths("/usr/share/swift-ime/dict/rime-ice.fst");
         assert_eq!(paths[0], std::path::PathBuf::from("/usr/share/swift-ime/dict/rime-ice.fst.idx"));
-        assert_eq!(paths[1], std::path::PathBuf::from(format!("{}/.desk-pilot/rime-ice.fst.idx", std::env::var("HOME").unwrap())));
+        assert_eq!(paths[1].file_name().map(|s| s.to_string_lossy().into_owned()),
+            Some("rime-ice.fst.idx".into()), "DATA fallback name: {:?}", paths[1]);
+        // dev 模式:第二候选落在仓库的 apps/swift-ime/data(不再硬编码 HOME)。
+        assert!(paths[1].to_string_lossy().contains("apps/swift-ime/data"),
+            "dev DATA namespace: {:?}", paths[1]);
     }
 
     #[test]

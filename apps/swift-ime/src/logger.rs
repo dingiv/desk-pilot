@@ -63,11 +63,14 @@ pub fn init(path: &str, tee_stderr: bool, max_bytes: u64) {
 }
 
 /// Initialize with sensible defaults.
-/// Path: ~/.desk-pilot/swift-ime.log (resolved via HOME env).
+/// Path: DATA::swift-ime.log — dev: `apps/swift-ime/data/`, prod: `~/.desk-pilot/`
+/// (统一走 FileLoader 命名空间,不硬编码 HOME)。
 /// Dev: also tees to stderr. Release: file only.
 pub fn init_default() {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let path = format!("{home}/.desk-pilot/swift-ime.log");
+    let loader = shared::loader!(".");
+    let path = loader.resolve("DATA::swift-ime.log")
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "/tmp/swift-ime.log".into());
     init(&path, cfg!(debug_assertions), 2 * 1024 * 1024);
 }
 
