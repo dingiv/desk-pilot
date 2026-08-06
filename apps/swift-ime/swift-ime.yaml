@@ -66,13 +66,13 @@ weights:
     prefix_ratio: 0.6       # max score for prefix match (scaled by match ratio)
     user_boost: 1.0         # user-dict words (all get max priority)
 
-  # RecencyStore 的位置衰减 boost(最近提交环,越新加成越大)
+  # Recent member 的时间分档 boost(按距上次使用的时间衰减)
   recency:
-    pos0: 0.20              # 最近一次提交
-    pos1: 0.15              # 第二次
-    pos2: 0.10              # 第三次
-    mid: 0.05               # 第 3-9 次
-    far: 0.02               # 第 10-63 次
+    within_10s: 0.20        # 距上次使用 ≤ 10s
+    within_1h: 0.15         # ≤ 1h
+    within_5h: 0.10         # ≤ 5h
+    within_1d: 0.05         # ≤ 1d
+    within_3d: 0.02         # ≤ 3d(超过 3d 自动移出)
 
   # UserBigram 上下文 boost 上限(1.0 = 无加成,1.25 = +25%)
   bigram:
