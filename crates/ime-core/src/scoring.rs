@@ -36,34 +36,6 @@ impl FamilyPriorities {
     }
 }
 
-/// Recent member 的时间分档 boost —— 按"距上次使用的时间"衰减:
-/// 10s 内最热(0.20),1h/5h/1d/3d 逐档递减;超过 3d 的条目被移出(无加成)。
-#[derive(Debug, Clone, Copy)]
-pub struct RecencyBoosts {
-    /// 距上次使用 ≤ 10s
-    pub within_10s: f64,
-    /// ≤ 1h
-    pub within_1h: f64,
-    /// ≤ 5h
-    pub within_5h: f64,
-    /// ≤ 1d
-    pub within_1d: f64,
-    /// ≤ 3d
-    pub within_3d: f64,
-}
-
-impl Default for RecencyBoosts {
-    fn default() -> Self {
-        RecencyBoosts {
-            within_10s: 0.20,
-            within_1h: 0.15,
-            within_5h: 0.10,
-            within_1d: 0.05,
-            within_3d: 0.02,
-        }
-    }
-}
-
 /// UserBigram 上下文 boost 的归一化上限。
 #[derive(Debug, Clone, Copy)]
 pub struct BigramTuning {
@@ -104,7 +76,6 @@ impl Default for FreqScale {
 #[derive(Debug, Clone, Copy)]
 pub struct ScoringConfig {
     pub priorities: FamilyPriorities,
-    pub recency: RecencyBoosts,
     pub bigram: BigramTuning,
     pub freq_scale: FreqScale,
 }
@@ -113,7 +84,6 @@ impl Default for ScoringConfig {
     fn default() -> Self {
         ScoringConfig {
             priorities: FamilyPriorities::default(),
-            recency: RecencyBoosts::default(),
             bigram: BigramTuning::default(),
             freq_scale: FreqScale::default(),
         }
@@ -131,8 +101,6 @@ mod tests {
         assert_eq!(s.priorities.pinyin, 100);
         assert_eq!(s.priorities.english, 70);
         assert_eq!(s.priorities.emoji, 60);
-        assert_eq!(s.recency.within_10s, 0.20);
-        assert_eq!(s.recency.within_3d, 0.02);
         assert_eq!(s.bigram.max_boost, 0.25);
         assert_eq!(s.freq_scale.max_weight, 0.0, "auto by default");
         assert_eq!((s.freq_scale.min_score, s.freq_scale.max_score), (0.25, 1.0));

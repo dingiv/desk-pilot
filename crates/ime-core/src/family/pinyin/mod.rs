@@ -103,7 +103,7 @@ impl PinyinFamily {
             large_dict: Mutex::new(LargeDict::new()),
             lattice: Mutex::new(None),
             bigram: Mutex::new(UserBigram::with_tuning(scoring.bigram)),
-            recency: Mutex::new(RecentStore::new(scoring.recency)),
+            recency: Mutex::new(RecentStore::new()),
             enabled: true,
             weights,
             store: Mutex::new(None),
@@ -135,7 +135,7 @@ impl PinyinFamily {
             large_dict: Mutex::new(LargeDict::new()),
             lattice: Mutex::new(None),
             bigram: Mutex::new(UserBigram::with_tuning(scoring.bigram)),
-            recency: Mutex::new(RecentStore::new(scoring.recency)),
+            recency: Mutex::new(RecentStore::new()),
             enabled: true,
             weights,
             store: Mutex::new(None),
@@ -490,13 +490,19 @@ impl CandidateFamily for PinyinFamily {
         let mut candidates = self.predict(input);
         if candidates.is_empty() { return candidates; }
 
-        // ── Layer 1: Recent member boost (时间分档衰减) ──
-        // 距上次使用 ≤10s/1h/5h/1d/3d 分档加持;>3d 的条目在查询时被移出。
+        // ── Layer 1: Recent member boost (近期指数 → 权重合成) ──
+        // b = 近期指数(1-5,按距上次使用时间分档;>3d 条目在查询时被移出)。
+        // 合成公式:z = (1-a)(a+b)/8 + a —— 增量与 (1-a) 成比例,低权重词
+        // 获得更大加成,高权重词增量趋零,z 天然 < 1(不会顶满 1.0)。
         let mut recency = self.recency.lock().unwrap();
         if !recency.is_empty() {
             let now = now_ms();
             for c in &mut candidates {
-                c.raw_score = (c.raw_score + recency.boost(&c.text, now)).min(1.0);
+                let b = recency.tier(&c.text, now);
+                if b > 0 {
+                    let a = c.raw_score;
+                    c.raw_score = (1.0 - a) * (a + b as f64) / 8.0 + a;
+                }
             }
         }
         drop(recency);

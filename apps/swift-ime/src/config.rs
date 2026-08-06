@@ -63,9 +63,6 @@ pub struct WeightsConfig {
     pub pinyin: PinyinWeightConfig,
     #[serde(default)]
     pub english: EnglishWeightConfig,
-    /// RecencyStore 位置衰减 boost(最近提交环的 5 档)。
-    #[serde(default)]
-    pub recency: RecencyConfig,
     /// UserBigram 上下文 boost 上限。
     #[serde(default)]
     pub bigram: BigramConfig,
@@ -86,25 +83,6 @@ pub struct FamilyPriorityConfig {
 impl Default for FamilyPriorityConfig {
     fn default() -> Self {
         FamilyPriorityConfig { pinyin: 100, english: 70, emoji: 60 }
-    }
-}
-
-/// Recent member 的时间分档 boost(按距上次使用的时间衰减)。
-#[derive(Debug, Clone, Deserialize)]
-pub struct RecencyConfig {
-    #[serde(default = "default_0_20")] pub within_10s: f64,
-    #[serde(default = "default_0_15")] pub within_1h: f64,
-    #[serde(default = "default_0_10")] pub within_5h: f64,
-    #[serde(default = "default_0_05")] pub within_1d: f64,
-    #[serde(default = "default_0_02")] pub within_3d: f64,
-}
-
-impl Default for RecencyConfig {
-    fn default() -> Self {
-        RecencyConfig {
-            within_10s: 0.20, within_1h: 0.15, within_5h: 0.10,
-            within_1d: 0.05, within_3d: 0.02,
-        }
     }
 }
 
@@ -164,13 +142,6 @@ impl WeightsConfig {
                 pinyin: self.family_priority.pinyin,
                 english: self.family_priority.english,
                 emoji: self.family_priority.emoji,
-            },
-            recency: ime_core::scoring::RecencyBoosts {
-                within_10s: self.recency.within_10s,
-                within_1h: self.recency.within_1h,
-                within_5h: self.recency.within_5h,
-                within_1d: self.recency.within_1d,
-                within_3d: self.recency.within_3d,
             },
             bigram: ime_core::scoring::BigramTuning { max_boost: self.bigram.max_boost },
             freq_scale: ime_core::scoring::FreqScale {
@@ -245,10 +216,6 @@ impl Default for WeightsConfig {
                 large_dict_take: 96, viterbi_take: 48, jianpin_take: 8,
             },
             english: EnglishWeightConfig { exact: 0.88, prefix_ratio: 0.6, user_boost: 1.0 },
-            recency: RecencyConfig {
-                within_10s: 0.20, within_1h: 0.15, within_5h: 0.10,
-                within_1d: 0.05, within_3d: 0.02,
-            },
             bigram: BigramConfig { max_boost: 0.25 },
             freq_scale: FreqScaleConfig { max_weight: 0.0, min_score: 0.25, max_score: 1.0 },
         }
@@ -420,9 +387,6 @@ weights:
     pinyin: 90
     english: 50
     emoji: 40
-  recency:
-    within_10s: 0.30
-    within_1h: 0.20
   bigram:
     max_boost: 0.40
   freq_scale:
@@ -435,9 +399,6 @@ weights:
         assert_eq!(s.priorities.pinyin, 90);
         assert_eq!(s.priorities.english, 50);
         assert_eq!(s.priorities.emoji, 40);
-        assert_eq!(s.recency.within_10s, 0.30);
-        assert_eq!(s.recency.within_1h, 0.20);
-        assert_eq!(s.recency.within_3d, 0.02, "未指定的档回退默认");
         assert_eq!(s.bigram.max_boost, 0.40);
         assert_eq!(s.freq_scale.max_weight, 500_000.0);
         assert_eq!(s.freq_scale.min_score, 0.2);
@@ -453,7 +414,6 @@ weights:
         assert_eq!(s.priorities.pinyin, 100);
         assert_eq!(s.priorities.english, 70);
         assert_eq!(s.priorities.emoji, 60);
-        assert_eq!(s.recency.within_10s, 0.20);
         assert_eq!(s.bigram.max_boost, 0.25);
         assert_eq!(s.freq_scale.max_weight, 0.0, "auto by default");
     }
