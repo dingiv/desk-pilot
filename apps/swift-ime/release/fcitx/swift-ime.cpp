@@ -105,23 +105,27 @@ void SwiftImeEngine::apply_view(fcitx::InputContext *ic, const ImeView &v) {
                 list->append<SwiftCandidateWord>(
                     std::string(v.candidates[i].text), (int)i, this);
             }
-            if (v.candidate_page > 0 && list->toPageable()) {
+            if (list->toPageable()) {
                 auto *p = list->toPageable();
                 for (unsigned int pg = 0;
                      pg < v.candidate_page && p->hasNext(); pg++)
                     p->next();
             }
-            if (v.candidate_highlight > 0 && list->toCursorMovable()) {
-                auto *m = list->toCursorMovable();
-                unsigned int pageSize =
-                    v.candidate_page_size > 0 ? v.candidate_page_size : 7;
-                for (unsigned int h = 0;
-                     h < v.candidate_highlight % pageSize; h++)
-                    m->nextCandidate();
+            // 高亮:直接用全局光标 API,与引擎内部的 candidate_highlight
+            // 精确同步。旧的 nextCandidate 循环从初始 -1 光标起跳,首次调用
+            // 只落到页首而不 +1 —— 高亮永远比引擎差 1(跨页后 UI 高亮与
+            // 空格提交的选项不一致)。
+            if (v.candidate_highlight < v.candidate_count) {
+                list->setGlobalCursorIndex(v.candidate_highlight);
             }
             ic->inputPanel().setCandidateList(std::move(list));
             ic->inputPanel().setAuxUp(
                 fcitx::Text(std::string(v.aux_up)));
+            // 候选列表重建后强制重推 preedit —— str_changed 门控在移动高亮
+            // 时会跳过 setClientPreedit,面板顶部的 preedit 行随之消失。
+            auto preeditText = fcitx::Text(std::string(v.preedit_text));
+            preeditText.setCursor(v.preedit_cursor);
+            ic->inputPanel().setClientPreedit(preeditText);
         } else if (prev.candidate_count > 0) {
             ic->inputPanel().setCandidateList(nullptr);
         }
