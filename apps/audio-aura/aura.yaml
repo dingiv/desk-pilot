@@ -47,3 +47,8 @@ vad:
 # stage_llm:
 #   type: local
 #   model: Qwen3-1.7B-Q8_0.gguf
+
+# ── 音频持久化 (短期记录, 供复盘 + 未来 Stage3) ──
+# recordings_dir: "~/.desk-pilot/data/recordings"   # 覆盖录音根目录 (默认 DATA::recordings)
+recordings_retention_days: 7   # 保留期(天): 超过该天数的录音 + turn 日志被过期清理
+                               # (启动时 + 每 24h 一次)。0/缺省 = 7

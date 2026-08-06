@@ -47,11 +47,22 @@ pub struct TurnRecord {
 /// Open-per-append (utterances arrive every few seconds — crash-safe beats a held handle).
 pub struct TurnLog {
     dir: PathBuf,
+    /// 日志保留期(天)—— 与录音保留期一致,过期日期文件被清理。
+    retention_days: u32,
 }
 
 impl TurnLog {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        TurnLog { dir: dir.into() }
+        TurnLog { dir: dir.into(), retention_days: 7 }
+    }
+
+    /// Set the retention window (days) — the daemon's config value, kept in
+    /// sync with the audio archive's.
+    pub fn with_retention(mut self, days: u32) -> Self {
+        if days > 0 {
+            self.retention_days = days;
+        }
+        self
     }
 
     /// Append one record to today's file.
@@ -69,6 +80,29 @@ impl TurnLog {
             .open(self.dir.join(format!("{day}.jsonl")))?;
         let line = serde_json::to_string(rec).expect("TurnRecord serializes");
         writeln!(f, "{line}")
+    }
+
+    /// Delete day files older than the retention window (ISO date names compare
+    /// lexicographically = chronologically).
+    pub fn cleanup_expired(&self) -> usize {
+        let cutoff = (Local::now() - chrono::Duration::days(self.retention_days as i64))
+            .format("%Y-%m-%d")
+            .to_string();
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return 0;
+        };
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let day = name.strip_suffix(".jsonl").unwrap_or(&name);
+            if day.len() == 10 && day < cutoff.as_str() {
+                match std::fs::remove_file(entry.path()) {
+                    Ok(()) => removed += 1,
+                    Err(e) => warn!(file = %name, error = %e, "expired turn log cleanup failed"),
+                }
+            }
+        }
+        removed
     }
 }
 
@@ -98,14 +132,32 @@ pub struct FinalTurn {
 }
 
 impl Storage {
-    /// `audio`: the (already configured) audio archive. `turns_dir`: day-file directory.
-    pub fn new(audio: Arc<AudioArchive>, turns_dir: impl Into<PathBuf>) -> Self {
+    /// `audio`: the (already configured) audio archive. `turns_dir`: day-file
+    /// directory. `retention_days` is the shared retention window for both the
+    /// audio archive and the turn log.
+    pub fn new(audio: Arc<AudioArchive>, turns_dir: impl Into<PathBuf>, retention_days: u32) -> Self {
         Storage {
             audio,
-            turns: TurnLog::new(turns_dir),
+            turns: TurnLog::new(turns_dir).with_retention(retention_days),
             recent: Mutex::new(VecDeque::new()),
             recent_cap: 100,
         }
+    }
+
+    /// Startup wiring: rebuild the disk index (restart must not "lose" prior
+    /// recordings) and drop everything older than the retention window.
+    /// Returns the number of day dirs/files removed.
+    pub fn init(&self) -> usize {
+        self.audio.scan_disk();
+        self.cleanup_expired()
+    }
+
+    /// 过期清理:删除超过保留期的录音日期目录 + 对应的 turn 日志日期文件
+    /// (两者保留期一致,见配置 `recordings_retention_days`)。
+    pub fn cleanup_expired(&self) -> usize {
+        let removed_audio = self.audio.cleanup_expired();
+        let removed_turns = self.turns.cleanup_expired();
+        removed_audio + removed_turns
     }
 
     /// Record one finalized utterance everywhere it belongs: PCM → audio archive,
@@ -165,7 +217,7 @@ mod tests {
             dir: root.join("recordings"),
             ..Default::default()
         }));
-        Storage::new(audio, root.join("turns"))
+        Storage::new(audio, root.join("turns"), 7)
     }
 
     fn turn(seq: u64) -> FinalTurn {
@@ -221,6 +273,30 @@ mod tests {
         // A different day → a different file (date-named rollover).
         log.append_to_day("2026-07-18", &rec).unwrap();
         assert!(root.join("turns/2026-07-18.jsonl").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_expired_removes_old_days_keeps_recent() {
+        let root = tmp("cleanup");
+        let s = storage(&root);
+        // 造两个过期日期文件 + 一个今天的。
+        let old_day = (Local::now() - chrono::Duration::days(30)).format("%Y-%m-%d").to_string();
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        for day in [&old_day, &today] {
+            std::fs::create_dir_all(root.join("turns")).unwrap();
+            std::fs::write(root.join("turns").join(format!("{day}.jsonl")), "{}").unwrap();
+            // 录音侧同样造一个过期日期目录。
+            let rec = root.join("recordings").join(day);
+            std::fs::create_dir_all(&rec).unwrap();
+            std::fs::write(rec.join("120000_0001.wav"), b"RIFF").unwrap();
+        }
+        let removed = s.cleanup_expired();
+        assert_eq!(removed, 2, "old audio day dir + old turn log removed");
+        assert!(!root.join("recordings").join(&old_day).exists(), "old recordings gone");
+        assert!(!root.join("turns").join(format!("{old_day}.jsonl")).exists(), "old turn log gone");
+        assert!(root.join("recordings").join(&today).exists(), "today kept");
+        assert!(root.join("turns").join(format!("{today}.jsonl")).exists(), "today kept");
         let _ = std::fs::remove_dir_all(&root);
     }
 

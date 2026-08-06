@@ -42,6 +42,9 @@ pub struct ArchiveConfig {
     pub flush_every: Duration,
     /// PCM sample rate (mono S16LE) — 16 kHz across the pipeline.
     pub sample_rate: u32,
+    /// 录音保留期(天)。短期记录供复盘/Stage3 使用;超过该天数的日期目录被
+    /// 过期清理删除(启动时 + 每 24h 一次,见 [`AudioArchive::cleanup_expired`])。
+    pub retention_days: u32,
 }
 
 impl Default for ArchiveConfig {
@@ -51,6 +54,7 @@ impl Default for ArchiveConfig {
             hot_capacity: 30,
             flush_every: Duration::from_secs(10),
             sample_rate: 16_000,
+            retention_days: 7,
         }
     }
 }
@@ -200,22 +204,111 @@ impl AudioArchive {
         self.inner.lock().unwrap().hot.values().filter(|c| !c.flushed).count()
     }
 
+    /// Rebuild the flushed-clip index from disk — call once at startup. The
+    /// run-lifetime `flushed` map starts empty, so without this a daemon restart
+    /// would "lose" every previously recorded clip (files exist, but `/api/audio`
+    /// and `/api/recordings` can't see them). Parses `{HHMMSS}_{seq:04}.wav`
+    /// names under each `<dir>/<YYYY-MM-DD>/` subdir.
+    pub fn scan_disk(&self) -> usize {
+        let mut g = self.inner.lock().unwrap();
+        let mut found = 0;
+        let Ok(entries) = std::fs::read_dir(&self.cfg.dir) else {
+            return 0; // no recordings dir yet — nothing to rebuild
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(&path) else { continue };
+            for f in files.flatten() {
+                let name = f.file_name().to_string_lossy().into_owned();
+                let Some(seq) = parse_wav_seq(&name) else { continue };
+                if g.flushed.insert(seq, f.path()).is_none() {
+                    found += 1;
+                }
+            }
+        }
+        if found > 0 {
+            debug!(found, dir = %self.cfg.dir.display(), "archive index rebuilt from disk");
+        }
+        found
+    }
+
+    /// Delete every recording whose day dir is older than `retention_days`
+    /// (date dir names are ISO `YYYY-MM-DD` — lexicographic comparison == time
+    /// order). Also drops the evicted seqs from the index so stale entries
+    /// don't linger in listings. Runs at startup and on the flusher's daily
+    /// cadence — recordings are short-term (复盘/Stage3), not archival.
+    pub fn cleanup_expired(&self) -> usize {
+        let cutoff = (chrono::Local::now() - chrono::Duration::days(self.cfg.retention_days as i64))
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut g = self.inner.lock().unwrap();
+        let mut removed = 0;
+        let Ok(entries) = std::fs::read_dir(&self.cfg.dir) else {
+            return 0;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(day) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            if day < cutoff.as_str() {
+                // Drop the seqs of this day from the index first (the paths die
+                // with the directory).
+                let doomed: Vec<u64> = g.flushed.iter()
+                    .filter(|(_, p)| p.starts_with(&path))
+                    .map(|(&s, _)| s)
+                    .collect();
+                for s in doomed {
+                    g.flushed.remove(&s);
+                }
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => removed += 1,
+                    Err(e) => warn!(dir = %path.display(), error = %e, "expired recordings cleanup failed"),
+                }
+            }
+        }
+        if removed > 0 {
+            debug!(removed, cutoff, "expired recordings cleaned up");
+        }
+        removed
+    }
+
     /// Spawn the periodic flusher thread. Holds only a `Weak` — the thread exits on its own
     /// once the archive is dropped, so the daemon needs no shutdown plumbing.
+    /// Also runs the daily expired-recording cleanup (24h cadence).
     pub fn spawn_flusher(self: &Arc<Self>) -> thread::JoinHandle<()> {
         let weak: Weak<Self> = Arc::downgrade(self);
         let every = self.cfg.flush_every;
+        let cleanup_every = Duration::from_secs(24 * 3600);
         thread::Builder::new()
             .name("aura-archive".into())
-            .spawn(move || loop {
-                thread::sleep(every);
-                let Some(archive) = weak.upgrade() else { break };
-                if let Err(e) = archive.flush_now() {
-                    error!(error = %e, "periodic archive flush failed");
+            .spawn(move || {
+                let mut last_cleanup = std::time::Instant::now();
+                loop {
+                    thread::sleep(every);
+                    let Some(archive) = weak.upgrade() else { break };
+                    if let Err(e) = archive.flush_now() {
+                        error!(error = %e, "periodic archive flush failed");
+                    }
+                    if last_cleanup.elapsed() >= cleanup_every {
+                        archive.cleanup_expired();
+                        last_cleanup = std::time::Instant::now();
+                    }
                 }
             })
             .expect("spawn aura-archive flusher")
     }
+}
+
+/// Parse `{HHMMSS}_{seq:04}.wav` → the clip's seq (None for anything else).
+fn parse_wav_seq(name: &str) -> Option<u64> {
+    let body = name.strip_suffix(".wav")?;
+    let (_, seq_part) = body.rsplit_once('_')?;
+    seq_part.parse().ok()
 }
 
 fn write_clip(clip: &Clip, sample_rate: u32) -> std::io::Result<()> {
@@ -300,6 +393,49 @@ mod tests {
         a.push(2, 0.2, pcm(2)); // overflow → seq 1 must be written, then evicted
         assert!(p1.exists(), "unflushed clip written before eviction");
         assert!(a.wav(1).is_some(), "still replayable from disk");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_disk_rebuilds_index_after_restart() {
+        // 重启后 flushed 索引是空的;scan_disk 从磁盘文件名重建,
+        // 历史录音恢复可回放(修复"重启后录音丢失")。
+        let dir = tmp("rescan");
+        let a = AudioArchive::new(cfg(&dir, 5));
+        let p = a.push(1, 0.1, pcm(1));
+        a.push(2, 0.2, pcm(2));
+        a.flush_now().unwrap();
+        drop(a);
+
+        // 模拟重启:新实例,flushed 为空。
+        let b = AudioArchive::new(cfg(&dir, 5));
+        assert!(b.list().is_empty(), "fresh instance knows nothing");
+        assert_eq!(b.scan_disk(), 2, "rebuilt from disk");
+        let metas = b.list();
+        assert_eq!(metas.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![1, 2]);
+        let wav1 = b.wav(1).expect("rebuilt index serves replay");
+        assert_eq!(&wav1[..4], b"RIFF");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_expired_removes_old_day_dirs() {
+        let dir = tmp("expire");
+        let a = AudioArchive::new(cfg(&dir, 5));
+        let p = a.push(1, 0.1, pcm(1));
+        a.flush_now().unwrap();
+        // 造一个 30 天前的日期目录 + 文件。
+        let old_day = (chrono::Local::now() - chrono::Duration::days(30))
+            .format("%Y-%m-%d").to_string();
+        let old_dir = dir.join(&old_day);
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("120000_0099.wav"), b"RIFF").unwrap();
+
+        let removed = a.cleanup_expired();
+        assert_eq!(removed, 1, "old day dir removed");
+        assert!(!old_dir.exists(), "old recordings gone");
+        assert!(p.exists(), "today's clip untouched");
+        assert!(a.wav(1).is_some(), "today's clip still replayable");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

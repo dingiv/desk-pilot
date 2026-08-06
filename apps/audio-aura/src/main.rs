@@ -135,6 +135,9 @@ struct AuraConf {
     /// Recordings base dir override (default: DATA::recordings — dev: this crate's data/,
     /// prod: ~/.desk-pilot/data/). Clips land in per-day subdirs (`<YYYY-MM-DD>/`).
     recordings_dir: Option<String>,
+    /// 录音 + turn 日志保留期(天,默认 7)——短期记录供复盘/Stage3;超过该
+    /// 天数的日期目录/文件被过期清理(启动时 + 每 24h)。
+    recordings_retention_days: Option<u32>,
     /// VAD / segmentation overrides (see [`VadConf`]). All-None by default.
     vad: Option<VadConf>,
 }
@@ -223,6 +226,7 @@ struct Settings {
     hotwords: Vec<String>,
     web_dist: Option<String>,
     recordings_dir: Option<String>,
+    recordings_retention_days: u32,
     vad: VadResolved,
 }
 
@@ -263,6 +267,7 @@ fn resolve(cli: Cli, conf: AuraConf) -> Settings {
             .unwrap_or_else(|| SEED_HOTWORDS.iter().map(|s| s.to_string()).collect()),
         web_dist: conf.web_dist,
         recordings_dir: conf.recordings_dir,
+        recordings_retention_days: conf.recordings_retention_days.unwrap_or(7),
         vad,
     }
 }
@@ -361,10 +366,25 @@ fn main() -> Result<()> {
     let turns_dir = data
         .resolve("DATA::turns")
         .unwrap_or_else(|| std::path::PathBuf::from("data/turns"));
-    info!(recordings = %rec_dir.display(), turns = %turns_dir.display(), "storage ready (periodic flush)");
-    let archive = Arc::new(AudioArchive::new(ArchiveConfig { dir: rec_dir, ..Default::default() }));
-    let _flusher = archive.spawn_flusher();
-    let storage = Arc::new(Storage::new(archive, turns_dir));
+    let retention_days = settings.recordings_retention_days.max(1);
+    info!(
+        recordings = %rec_dir.display(),
+        turns = %turns_dir.display(),
+        retention_days,
+        "storage ready (periodic flush + daily expired cleanup)"
+    );
+    let archive = Arc::new(AudioArchive::new(ArchiveConfig {
+        dir: rec_dir,
+        retention_days,
+        ..Default::default()
+    }));
+    let storage = Arc::new(Storage::new(archive, turns_dir, retention_days));
+    // 重启不丢历史:从磁盘重建索引 + 立即清理过期录音/日志。
+    let cleaned = storage.init();
+    if cleaned > 0 {
+        info!(cleaned, "expired recordings/turn-logs cleaned at startup");
+    }
+    let _flusher = storage.audio.spawn_flusher();
 
     info!("loading Stage1 (ONNX) + Stage2 (Qwen calibrator) …");
     let mut cfg = Stage1Config::new(scout_addr.clone());
