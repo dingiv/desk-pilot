@@ -56,7 +56,11 @@ fn run_loop(
     let mut should_quit = false;
 
     while !should_quit {
-        terminal.draw(|f| render(f, &last_view, history, asr_buffer, aura_status))?;
+        terminal.draw(|f| {
+            // 当前预测项的提供者(family/source)与权重(score)。
+            let detailed = engine.candidates_detailed();
+            render(f, &last_view, history, asr_buffer, aura_status, &detailed)
+        })?;
 
         if event::poll(Duration::from_millis(POLL_MS))? {
             if let Event::Key(key) = event::read()? {
@@ -129,6 +133,7 @@ fn render(
     history: &[String],
     asr_buffer: &AsrBuffer,
     aura_status: &Option<AuraConnHandle>,
+    detailed: &[ime_core::family::RankedCandidate],
 ) {
     let area = f.area();
 
@@ -141,7 +146,7 @@ fn render(
     .split(area);
 
     render_preedit(f, rows[0], view);
-    render_candidates(f, rows[1], view);
+    render_candidates(f, rows[1], view, detailed);
     render_history(f, rows[2], history);
     render_status(f, rows[3], view, asr_buffer, aura_status);
 }
@@ -153,7 +158,12 @@ fn render_preedit(f: &mut Frame, area: Rect, view: &ImeView) {
     f.render_widget(p, area);
 }
 
-fn render_candidates(f: &mut Frame, area: Rect, view: &ImeView) {
+fn render_candidates(
+    f: &mut Frame,
+    area: Rect,
+    view: &ImeView,
+    detailed: &[ime_core::family::RankedCandidate],
+) {
     let mut lines: Vec<Line> = Vec::new();
     let page = view.candidate_page as usize;
     let page_size = view.candidate_page_size.max(1) as usize;
@@ -175,10 +185,19 @@ fn render_candidates(f: &mut Frame, area: Rect, view: &ImeView) {
         };
 
         let prefix = if label_text.is_empty() { String::new() } else { format!("{label_text} ") };
-        lines.push(Line::from(vec![
+        // 提供者(family/source)与权重(score) —— 灰色小字,便于调试候选来源。
+        let detail = detailed.iter().find(|d| d.text == text);
+        let mut spans = vec![
             Span::styled(format!("{label} "), Style::new().fg(Color::DarkGray)),
             Span::styled(format!("{prefix}{text}"), style),
-        ]));
+        ];
+        if let Some(d) = detail {
+            spans.push(Span::styled(
+                format!("  [{:.3} {}/{}]", d.score, d.family, d.source),
+                Style::new().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(spans));
     }
 
     if lines.is_empty() {
