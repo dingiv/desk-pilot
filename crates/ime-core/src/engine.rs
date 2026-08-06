@@ -1215,20 +1215,19 @@ mod tests {
     #[test]
     fn special_keys_pass_through_when_no_candidate_panel() {
         let e = eng();
-        // No input yet → panel closed. Navigation/paging keys pass through to the app
-        // (typing "-" must reach the application, not vanish into the IME).
+        // No input yet → panel closed. Navigation/paging keys AND Escape pass
+        // through to the app (typing "-" must reach the application; an idle Esc
+        // must reach the terminal — cancel a command, leave vi insert mode — not
+        // vanish into the IME).
         for key in [
             SpecialKey::Up, SpecialKey::Down, SpecialKey::Left, SpecialKey::Right,
             SpecialKey::Tab, SpecialKey::PageUp, SpecialKey::PageDown,
             SpecialKey::BracketLeft, SpecialKey::BracketRight,
-            SpecialKey::Plus, SpecialKey::Minus,
+            SpecialKey::Plus, SpecialKey::Minus, SpecialKey::Escape,
         ] {
             let v = e.special_key_ctx(0, key);
             assert_eq!(v.key_passthrough, 1, "{key:?} must pass through with no panel");
         }
-        // Commit/edit keys keep IME semantics even with the panel closed.
-        let v = e.special_key_ctx(0, SpecialKey::Escape);
-        assert_eq!(v.key_passthrough, 0, "Escape resets, not passthrough");
     }
 
     #[test]
@@ -1244,5 +1243,20 @@ mod tests {
         // And the page actually moved (panel had >1 page? 20 candidates, page size 7).
         let v2 = e.special_key_ctx(0, SpecialKey::Right);
         assert_eq!(v2.key_passthrough, 0);
+    }
+
+    #[test]
+    fn escape_resets_when_panel_open() {
+        // Panel open (composition active) → Esc keeps its cancel/reset meaning:
+        // no passthrough, candidates cleared.
+        let mut e = eng();
+        for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
+        assert!(!e.candidates().is_empty(), "panel open");
+        let v = e.special_key_ctx(0, SpecialKey::Escape);
+        assert_eq!(v.key_passthrough, 0, "Esc resets, not passthrough, while composing");
+        assert!(e.candidates().is_empty(), "composition cancelled");
+        // Idle again → Esc passes through to the app.
+        let v = e.special_key_ctx(0, SpecialKey::Escape);
+        assert_eq!(v.key_passthrough, 1, "idle Esc reaches the application");
     }
 }

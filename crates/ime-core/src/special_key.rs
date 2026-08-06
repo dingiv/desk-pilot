@@ -79,10 +79,12 @@ impl SpecialKey {
 /// Returns `Some(view)` if handled, `None` if the key should be passed
 /// to normal character prediction.
 ///
-/// Navigation/paging keys (arrows, page, +-, []) only carry their special meaning while the
-/// candidate panel is OPEN. When it's closed (no candidates), they pass through to the
-/// application — typing `-` with no panel up must reach the app, not vanish into the IME.
-/// Selection/commit keys (Space/Enter/Backspace/Escape/Digit) keep their semantics regardless.
+/// Navigation/paging keys (arrows, page, +-, []) and Escape only carry their special
+/// meaning while the candidate panel is OPEN. When it's closed (no candidates), they
+/// pass through to the application — typing `-` must reach the app, and an idle Esc
+/// must reach the terminal (cancel a command, leave vi insert mode, …) instead of
+/// vanishing into the IME. Selection/commit keys (Space/Enter/Backspace/Digit) keep
+/// their semantics regardless.
 pub fn handle_special_key(
     sm: &mut crate::state::StateMachine,
     key: SpecialKey,
@@ -93,11 +95,13 @@ pub fn handle_special_key(
             SpecialKey::Up | SpecialKey::Down | SpecialKey::Left | SpecialKey::Right
             | SpecialKey::Tab | SpecialKey::PageUp | SpecialKey::PageDown
             | SpecialKey::BracketLeft | SpecialKey::BracketRight
-            | SpecialKey::Plus | SpecialKey::Minus => {
-                // Panel closed → these keys are the APPLICATION's (scroll, move caret, type -).
+            | SpecialKey::Plus | SpecialKey::Minus | SpecialKey::Escape => {
+                // Panel closed → these keys are the APPLICATION's (scroll, move caret,
+                // type -, or Esc to the terminal). Escape keeps its reset meaning only
+                // while something is actually composed (panel open).
                 return Some(crate::state::StateMachine::passthrough_view());
             }
-            _ => {} // Space/Enter/Backspace/Escape/Digit keep IME semantics.
+            _ => {} // Space/Enter/Backspace/Digit keep IME semantics.
         }
     }
     match key {
