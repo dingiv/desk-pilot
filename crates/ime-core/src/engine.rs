@@ -1177,10 +1177,14 @@ mod tests {
         let on = score_of(true);
         let off = score_of(false);
         assert!(on > off, "context on boosts 你好 (recency): {on} vs {off}");
-        // 关闭时:只有 PhraseBook 分(0.88 + short_word_bonus 0.01 = 0.89),
-        // recency 加成(0.20)没有加进去 —— 语义上 recency 属于上下文感知。
-        assert!((off - 0.89).abs() < 1e-9,
-            "context off = pure phrase score, no recency boost: {off}");
+        // 修复后词典词(你好)不进 phrase → 关闭时无短语/上下文记忆,分数
+        // 与冷启动(从未提交)完全一致 —— recency 加成确实被跳过。
+        let mut e = eng();
+        for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
+        let cold = e.candidates_detailed().iter().find(|c| c.text == "你好")
+            .map(|c| c.score).unwrap_or(0.0);
+        assert!((off - cold).abs() < 1e-9,
+            "context off == cold start (no phrase memory): {off} vs {cold}");
     }
 
     #[test]

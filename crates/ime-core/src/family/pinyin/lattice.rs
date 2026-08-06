@@ -368,6 +368,14 @@ impl LatticeDecoder {
         s.clamp(scale.min_score, scale.max_score)
     }
 
+    /// Full-pinyin exact hit? (rime-ice contains `pinyin` → `word`) — used by
+    /// learn_phrase to skip words that are already in the dictionary.
+    pub fn has_word(&self, pinyin: &str, word: &str) -> bool {
+        self.fst.get(pinyin.as_bytes())
+            .iter()
+            .any(|(item, _)| item == word.as_bytes())
+    }
+
     /// Main entry: predict candidates for any pinyin input.
     pub fn predict(&self, input: &str, max_results: usize) -> Vec<LatticeResult> {
         if input.is_empty() { return Vec::new(); }

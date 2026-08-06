@@ -19,6 +19,9 @@ use super::initials_from_pinyin;
 struct Phrase {
     text: String,
     order: i32, // 0 = highest priority (fcitx5 CustomPhrase convention)
+    /// 使用次数(选中即 +1)—— phrase 词按使用频率参与排名,
+    /// 而不是所有自造词共享一个固定分。
+    count: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -77,8 +80,9 @@ impl PhraseBook {
     }
 
     /// Add one phrase with a specific priority order (0 = highest).
-    pub fn insert_with_order(&mut self, pinyin: &str, text: &str, order: i32) {
-        let phrase = Phrase { text: text.to_string(), order };
+    /// `count` = 已有使用次数(从持久化恢复时为历史值,新词为 0)。
+    pub fn insert_with_order_count(&mut self, pinyin: &str, text: &str, order: i32, count: u32) {
+        let phrase = Phrase { text: text.to_string(), order, count };
         // Full pinyin index.
         let list = self.entries.entry(pinyin.to_string()).or_default();
         list.retain(|p| p.text != text);
@@ -92,6 +96,40 @@ impl PhraseBook {
             init_list.push(phrase);
             init_list.sort_by_key(|p| p.order);
         }
+    }
+
+    /// Add one phrase with default highest priority (order=0), count starts at 1.
+    pub fn insert_with_order(&mut self, pinyin: &str, text: &str, order: i32) {
+        self.insert_with_order_count(pinyin, text, order, 1);
+    }
+
+    /// 用户再次选中:使用次数 +1(维持 order,不重复插入)。
+    pub fn bump_count(&mut self, pinyin: &str, text: &str) {
+        let mut bumped = false;
+        if let Some(list) = self.entries.get_mut(pinyin) {
+            if let Some(p) = list.iter_mut().find(|p| p.text == text) {
+                p.count = p.count.saturating_add(1);
+                bumped = true;
+            }
+        }
+        if !bumped { return; }
+        // Initials 索引同步。
+        let initials = initials_from_pinyin(pinyin);
+        if initials.len() >= 2 {
+            if let Some(list) = self.initials_index.get_mut(&initials) {
+                if let Some(p) = list.iter_mut().find(|p| p.text == text) {
+                    p.count = p.count.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// 某个 phrase 的使用次数(0 = 不在词本)。
+    pub fn count(&self, pinyin: &str, text: &str) -> u32 {
+        self.entries.get(pinyin)
+            .and_then(|list| list.iter().find(|p| p.text == text))
+            .map(|p| p.count)
+            .unwrap_or(0)
     }
 
     /// Exact match — candidates sorted by order (0 = highest first).

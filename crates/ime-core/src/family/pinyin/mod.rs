@@ -156,8 +156,8 @@ impl PinyinFamily {
             let entries = store.load_all_phrases();
             if !entries.is_empty() {
                 let mut book = self.phrase_book.lock().unwrap();
-                for (pinyin, word, priority) in &entries {
-                    book.insert_with_order(pinyin, word, *priority);
+                for (pinyin, word, priority, count) in &entries {
+                    book.insert_with_order_count(pinyin, word, *priority, *count);
                 }
                 eprintln!("[ime-core] pinyin: warmed {} phrases from store", entries.len());
             }
@@ -196,6 +196,28 @@ impl PinyinFamily {
     pub fn engine(&self) -> &inputx_pinyin::PinyinEngine { &self.engine }
     pub fn phrase_count(&self) -> usize { self.phrase_book.lock().unwrap().len() }
     pub fn large_dict_len(&self) -> usize { self.large_dict.lock().unwrap().len() }
+
+    /// 该词是否已存在于词典(inputx 嵌入大词典或 rime-ice lattice)?
+    fn in_dictionary(&self, pinyin: &str, word: &str) -> bool {
+        if self.engine.dict().lookup(pinyin).iter().any(|w| w == word) {
+            return true;
+        }
+        if let Some(lat) = self.lattice.lock().unwrap().as_ref() {
+            if lat.has_word(pinyin, word) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 自造词的使用次数 → 参与排名的基础分:首次 0.70(低于词典精确分
+    /// 0.85+,不会压过词典词),每次使用 +0.02,封顶 phrase_book 权重
+    /// (默认 0.88)—— 高频自造词随使用逐步靠前,而不是所有 phrase 词
+    /// 共享一个固定高分。
+    fn phrase_score(&self, count: u32) -> f64 {
+        (0.70 + 0.02 * count.saturating_sub(1) as f64)
+            .min(self.weights.phrase_book)
+    }
 }
 
 /// Extract initials from a raw (concatenated) pinyin string.
@@ -228,8 +250,19 @@ impl CandidateFamily for PinyinFamily {
     }
 
     fn learn_phrase(&self, pinyin: &str, hanzi: &str) {
+        // 已在词库(输入x 大词典 / rime-ice)的词不加入单词本 —— phrase 是给
+        // 自造词的(de→的 不该被记入);已学的自造词再次选中只增加使用次数,
+        // 分数随使用频率上升参与排名。
+        if self.in_dictionary(pinyin, hanzi) {
+            return;
+        }
         let mut book = self.phrase_book.lock().unwrap();
-        if !book.exact(pinyin).contains(&hanzi.to_string()) {
+        if book.count(pinyin, hanzi) > 0 {
+            book.bump_count(pinyin, hanzi);
+            if let Some(ref store) = *self.store.lock().unwrap() {
+                store.bump_phrase_count(pinyin, hanzi);
+            }
+        } else {
             book.insert(pinyin, hanzi);
             // Persist to SQLite if store is attached.
             if let Some(ref store) = *self.store.lock().unwrap() {
@@ -402,15 +435,17 @@ impl CandidateFamily for PinyinFamily {
         {
             let book = self.phrase_book.lock().unwrap();
             for w in book.exact(input) {
+                // 使用次数驱动的 phrase 分(首次 0.70,随使用升到 phrase_book)。
+                let score = self.phrase_score(book.count(input, &w));
                 let dict_score = out.iter().find(|c| c.text == w).map(|c| c.raw_score);
                 match dict_score {
-                    Some(s) if s >= self.weights.phrase_book => {
-                        // Dict hit already ≥ phrase score — keep it (do not
-                        // retain-remove + re-add at the lower fixed score).
+                    Some(s) if s >= score => {
+                        // Dict hit already scores higher — keep it (do not
+                        // retain-remove + re-add at a lower score).
                     }
                     _ => {
                         out.retain(|c| c.text != w);
-                        out.push(ScoredCandidate { text: w, family: "pinyin", source: "phrase", raw_score: self.weights.phrase_book });
+                        out.push(ScoredCandidate { text: w, family: "pinyin", source: "phrase", raw_score: score });
                     }
                 }
             }
@@ -418,8 +453,8 @@ impl CandidateFamily for PinyinFamily {
             for w in book.by_initials(input) {
                 if !out.iter().any(|c| c.text == w) {
                     out.push(ScoredCandidate {
-                        text: w, family: "pinyin", source: "phrase_sp",
-                        raw_score: self.weights.phrase_book * 0.95,
+                        text: w.clone(), family: "pinyin", source: "phrase_sp",
+                        raw_score: self.phrase_score(book.count(input, &w)) * 0.95,
                     });
                 }
             }
@@ -525,12 +560,34 @@ mod tests {
     }
 
     #[test]
-    fn phrase_book_recall() {
+    fn phrase_book_recall_and_count_ranking() {
+        // lisa→丽萨 已在 inputx 词典 —— 修复后词典词不再进单词本,
+        // 这里用真正的自造词 lizhengming→李正明。
         let fam = PinyinFamily::new();
-        fam.learn_phrase("lisa", "丽萨");
-        let cands = fam.predict("lisa");
-        assert_eq!(&cands[0].text, "丽萨",
-            "learned phrase should be top, got {:?}", cands.iter().map(|c| &c.text).take(5).collect::<Vec<_>>());
+        fam.learn_phrase("lizhengming", "李正明");
+        let cands = fam.predict("lizhengming");
+        let p = cands.iter().find(|c| c.text == "李正明")
+            .expect("learned phrase recallable");
+        // 首次 0.70 —— 低于词典精确分,自造词不再强制置顶。
+        assert!((p.raw_score - 0.70).abs() < 1e-9, "first use = 0.70: {}", p.raw_score);
+
+        // 多次使用 → count 递增 → 分数随使用频率上升(0.70 + 0.02×2 = 0.74)。
+        fam.learn_phrase("lizhengming", "李正明");
+        fam.learn_phrase("lizhengming", "李正明");
+        let cands = fam.predict("lizhengming");
+        let p = cands.iter().find(|c| c.text == "李正明").unwrap();
+        assert!((p.raw_score - 0.74).abs() < 1e-9, "count 3 → 0.74: {}", p.raw_score);
+    }
+
+    #[test]
+    fn dictionary_words_are_not_learned() {
+        // de→的 在 rime-ice/inputx 词典里 —— learn_phrase 必须跳过,
+        // 否则每个常用词都会被塞进单词本(修复前的行为)。
+        let fam = PinyinFamily::new();
+        let before = fam.phrase_count(); // 含 default_phrases 预置
+        fam.learn_phrase("de", "的");
+        assert_eq!(fam.phrase_count(), before,
+            "dictionary word must not enter the phrase book");
     }
 
     #[test]

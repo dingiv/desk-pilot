@@ -26,6 +26,9 @@ impl WeightStore {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        // 迁移:老库的 phrases 表没有 count 列(SQLite 的 ADD COLUMN 无
+        // IF NOT EXISTS —— 已存在时报错,忽略即可)。
+        let _ = conn.execute("ALTER TABLE phrases ADD COLUMN count INTEGER NOT NULL DEFAULT 1", []);
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS bigrams (
                 prev  TEXT NOT NULL,
@@ -42,6 +45,7 @@ impl WeightStore {
                 pinyin   TEXT NOT NULL,
                 word     TEXT NOT NULL,
                 priority INTEGER NOT NULL DEFAULT 0,
+                count    INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (pinyin, word)
             );
             CREATE TABLE IF NOT EXISTS recency (
@@ -145,13 +149,22 @@ impl WeightStore {
 
     // ── Phrases ─────────────────────────────────────────────────────────
 
-    /// Record a user-learned phrase with priority (0 = highest).
+    /// Record a user-learned phrase with priority (0 = highest), count starts at 1.
     pub fn record_phrase(&self, pinyin: &str, word: &str, priority: i32) {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
-            "INSERT INTO phrases (pinyin, word, priority) VALUES (?1, ?2, ?3)
+            "INSERT INTO phrases (pinyin, word, priority, count) VALUES (?1, ?2, ?3, 1)
              ON CONFLICT(pinyin, word) DO UPDATE SET priority = MIN(priority, ?3)",
             params![pinyin, word, priority],
+        );
+    }
+
+    /// 用户再次选中已学短语:使用次数 +1(参与 phrase 排名)。
+    pub fn bump_phrase_count(&self, pinyin: &str, word: &str) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE phrases SET count = count + 1 WHERE pinyin = ?1 AND word = ?2",
+            params![pinyin, word],
         );
     }
 
@@ -167,15 +180,20 @@ impl WeightStore {
         }).unwrap_or_default()
     }
 
-    /// Load all user-learned phrases for startup warm.
-    pub fn load_all_phrases(&self) -> Vec<(String, String, i32)> {
+    /// Load all user-learned phrases for startup warm — (pinyin, word, priority, count).
+    pub fn load_all_phrases(&self) -> Vec<(String, String, i32, u32)> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare("SELECT pinyin, word, priority FROM phrases ORDER BY pinyin, priority") {
+        let mut stmt = match conn.prepare("SELECT pinyin, word, priority, count FROM phrases ORDER BY pinyin, priority") {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
         stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get(2)?,
+                row.get::<_, u32>(3).unwrap_or(1), // 老库无 count 列时容错
+            ))
         })
         .ok()
         .into_iter()
