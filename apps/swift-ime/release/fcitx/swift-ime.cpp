@@ -316,6 +316,15 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
     auto *ic = keyEvent.inputContext();
     if (!ic) return;
 
+    // 带 Ctrl/Alt 修饰的组合键(Ctrl+/ 注释、Ctrl+C、Alt+Tab 切换…)一律放行
+    // 给应用 —— 输入法只处理无修饰的字符/导航键。keySymToUnicode 对 Ctrl+/
+    // 仍返回 '/',若不在这里拦截,它会被当成 snippet 触发前缀吞掉,编辑器
+    // 永远收不到注释快捷键。
+    auto states = keyEvent.key().states();
+    if (states.testAny(fcitx::KeyState::Ctrl) || states.testAny(fcitx::KeyState::Alt)) {
+        return;
+    }
+
     // Feed surrounding text to the engine for context-aware prediction.
     if (ic->capabilityFlags().test(fcitx::CapabilityFlag::SurroundingText)) {
         auto &st = ic->surroundingText();
