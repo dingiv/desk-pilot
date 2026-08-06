@@ -182,6 +182,12 @@ impl ImeEngine {
         f(&self.dispatcher, pc)
     }
 
+    /// 临时关闭/恢复 pinyin 家族的上下文感知(swift-ime.yaml → input.context_aware)。
+    /// 关闭后 recency / bigram / surrounding 加成全部跳过,候选排序纯频率驱动。
+    pub fn set_context_aware(&mut self, on: bool) {
+        self.dispatcher.set_pinyin_context_aware(on);
+    }
+
     /// 候选每页条数(默认 7)。frontend 启动时调用(swift-ime.yaml → input.page_size)。
     /// 已存在的 context 立即生效,后续新建的 context 沿用新值。
     pub fn set_page_size(&mut self, page_size: u32) {
@@ -1151,6 +1157,30 @@ mod tests {
         let mut e2 = eng();
         for c in "weixiao".chars() { e2.predict(InputEvent::char(c)); }
         assert!(e2.candidates().contains(&"😊".to_string()), "weixiao surfaces 😊: {:?}", e2.candidates());
+    }
+
+    #[test]
+    fn context_aware_off_skips_recency_boost() {
+        // input.context_aware: false 时,recency 加成被跳过 —— 同一词的分数
+        // 与冷启动(无上下文)完全一致。
+        let score_of = |context_aware: bool| {
+            let mut e = eng();
+            e.set_context_aware(context_aware);
+            // 先提交 你好(写入 recency),再查 nihao。
+            for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
+            e.predict(InputEvent::space());
+            for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
+            e.candidates_detailed().iter().find(|c| c.text == "你好")
+                .map(|c| c.score)
+                .unwrap_or(0.0)
+        };
+        let on = score_of(true);
+        let off = score_of(false);
+        assert!(on > off, "context on boosts 你好 (recency): {on} vs {off}");
+        // 关闭时:只有 PhraseBook 分(0.88 + short_word_bonus 0.01 = 0.89),
+        // recency 加成(0.20)没有加进去 —— 语义上 recency 属于上下文感知。
+        assert!((off - 0.89).abs() < 1e-9,
+            "context off = pure phrase score, no recency boost: {off}");
     }
 
     #[test]

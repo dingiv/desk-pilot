@@ -105,6 +105,7 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<AsrBuffer>, Option<crat
         sw_cfg.weights.to_scoring(),
     );
     engine.set_page_size(sw_cfg.input.page_size);
+    engine.set_context_aware(sw_cfg.input.context_aware);
 
     if sw_cfg.dicts.rime_ice {
         let loader = shared::loader!("assets");

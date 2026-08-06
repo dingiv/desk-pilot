@@ -134,6 +134,13 @@ impl Dispatcher {
         }
     }
 
+    /// 临时关闭/恢复 pinyin 家族的上下文感知(swift-ime.yaml → input.context_aware)。
+    pub fn set_pinyin_context_aware(&self, on: bool) {
+        if let Some(fam) = self.scorer.family("pinyin") {
+            fam.set_context_aware(on);
+        }
+    }
+
     /// Warm the phrase book from persisted SQLite data.
     pub fn warm_phrases_from_store(&self) {
         if let Some(fam) = self.scorer.family("pinyin") {

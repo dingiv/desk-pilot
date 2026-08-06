@@ -161,6 +161,11 @@ pub trait CandidateFamily: Send + Sync {
     /// in-memory UserBigram for context-aware ranking.
     fn record_bigram(&self, _prev: &str, _next: &str) {}
 
+    /// 临时关闭/恢复上下文感知(swift-ime.yaml → input.context_aware)。
+    /// Default no-op; PinyinFamily overrides to skip recency/bigram/surrounding
+    /// boosts when off.
+    fn set_context_aware(&self, _on: bool) {}
+
     /// Record a committed word for recency tracking. Default no-op;
     /// PinyinFamily overrides to push to its RecencyStore.
     fn record_commit(&self, _word: &str) {}

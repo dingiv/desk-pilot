@@ -37,6 +37,11 @@ pub struct PinyinFamily {
     store: Mutex<Option<Arc<WeightStore>>>,
     /// freq→score 映射参数(swift-ime.yaml → weights.freq_scale)。
     freq_scale: crate::scoring::FreqScale,
+    /// 上下文感知开关(swift-ime.yaml → input.context_aware,默认开)。
+    /// 关闭时 `predict_with_context` 退化为纯 `predict` —— 不做 recency /
+    /// bigram / surrounding 加成,候选排序完全由词典频率决定。
+    /// `Mutex<bool>` 以便 trait 的 `&self` setter 写入。
+    context_aware: Mutex<bool>,
 }
 
 /// Configurable scoring weights for the pinyin family.
@@ -103,6 +108,7 @@ impl PinyinFamily {
             weights,
             store: Mutex::new(None),
             freq_scale: scoring.freq_scale,
+            context_aware: Mutex::new(true),
         }
     }
 
@@ -134,6 +140,7 @@ impl PinyinFamily {
             weights,
             store: Mutex::new(None),
             freq_scale: scoring.freq_scale,
+            context_aware: Mutex::new(true),
         }
     }
 
@@ -286,6 +293,10 @@ impl CandidateFamily for PinyinFamily {
         PinyinFamily::record_commit(self, word);
     }
 
+    fn set_context_aware(&self, on: bool) {
+        *self.context_aware.lock().unwrap() = on;
+    }
+
     fn attach_store(&self, store: std::sync::Arc<WeightStore>) {
         *self.store.lock().unwrap() = Some(store);
     }
@@ -431,6 +442,11 @@ impl CandidateFamily for PinyinFamily {
     }
 
     fn predict_with_context(&self, input: &str, ctx: &InputContext) -> Vec<ScoredCandidate> {
+        // 上下文感知暂时关闭(input.context_aware: false):候选排序完全由
+        // 词典频率决定,不做 recency / bigram / surrounding 加成。
+        if !*self.context_aware.lock().unwrap() {
+            return self.predict(input);
+        }
         let mut candidates = self.predict(input);
         if candidates.is_empty() { return candidates; }
 

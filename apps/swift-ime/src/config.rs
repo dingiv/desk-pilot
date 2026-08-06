@@ -272,13 +272,17 @@ pub struct InputConfig {
     pub fuzzy: bool,
     #[serde(default = "default_page_size")]
     pub page_size: u32,
+    /// 上下文感知开关:关闭后 pinyin 候选不做 recency / bigram / surrounding
+    /// 加成,排序完全由词典频率决定(用于排查上下文加成导致的怪异排序)。
+    #[serde(default = "default_true")]
+    pub context_aware: bool,
 }
 
 impl Default for SwiftImeConfig {
     fn default() -> Self {
         SwiftImeConfig {
             dicts: DictsConfig::default(),
-            input: InputConfig { fuzzy: true, page_size: 7 },
+            input: InputConfig { fuzzy: true, page_size: 7, context_aware: true },
             weights: WeightsConfig::default(),
             magic: MagicConfig::default(),
             snippets: Vec::new(),
