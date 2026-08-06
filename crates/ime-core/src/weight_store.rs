@@ -7,8 +7,9 @@
 //! - `bigrams`: (prev_word, next_word) → occurrence count
 //! - `pins`:    pinyin → preferred word
 //! - `phrases`: (pinyin, word) → priority order
-//! - `recency`: recent-commit ring (pos 0 = most recent) — full-snapshot
-//!   replaced on every commit (≤64 rows, one transaction)
+//! - `recency`: recent-member table — word → last-used wall-clock ms (unix
+//!   epoch). Full-snapshot replaced on every commit (≤512 rows, one
+//!   transaction); the 3-day window is the store's own eviction rule.
 //! - `l0`:      inputx-pinyin L0 user model (single-row JSON)
 
 use rusqlite::{Connection, params};
@@ -26,9 +27,23 @@ impl WeightStore {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
-        // 迁移:老库的 phrases 表没有 count 列(SQLite 的 ADD COLUMN 无
+        // 迁移 1:老库的 phrases 表没有 count 列(SQLite 的 ADD COLUMN 无
         // IF NOT EXISTS —— 已存在时报错,忽略即可)。
         let _ = conn.execute("ALTER TABLE phrases ADD COLUMN count INTEGER NOT NULL DEFAULT 1", []);
+        // 迁移 2:老格式的 recency (pos, word) 无时间戳 → 重建为 (word, used_at)。
+        // 只在旧结构存在时 DROP —— 每次 open 都删会清掉刚写入的数据。
+        let has_used_at: bool = conn
+            .prepare("PRAGMA table_info(recency)")
+            .map(|mut stmt| {
+                let cols: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(1))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default();
+                cols.iter().any(|c| c == "used_at")
+            })
+            .unwrap_or(false);
+        if !has_used_at {
+            let _ = conn.execute("DROP TABLE IF EXISTS recency", []);
+        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS bigrams (
                 prev  TEXT NOT NULL,
@@ -49,8 +64,8 @@ impl WeightStore {
                 PRIMARY KEY (pinyin, word)
             );
             CREATE TABLE IF NOT EXISTS recency (
-                pos  INTEGER NOT NULL PRIMARY KEY,
-                word TEXT NOT NULL
+                word     TEXT NOT NULL PRIMARY KEY,
+                used_at  INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS l0 (
                 id   INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
@@ -201,43 +216,42 @@ impl WeightStore {
         .collect()
     }
 
-    // ── Recency ─────────────────────────────────────────────────────────
+    // ── Recency (recent member) ─────────────────────────────────────────
 
-    /// Persist the recency ring as a full snapshot — `words` in most-recent-first
-    /// order (RecencyStore::dump). Replaced wholesale on every commit: ≤64 rows
-    /// in one transaction, and the pos column preserves the boost-decay order
-    /// exactly (pos 0 = the 0.20 boost slot).
-    pub fn save_recency(&self, words: &[String]) {
-        if words.is_empty() {
+    /// Persist the recent table as a full snapshot — `(word, last_used_ms)`
+    /// pairs. Replaced wholesale on every commit (≤512 rows, one transaction);
+    /// the 3-day window is the store's own eviction rule.
+    pub fn save_recency(&self, entries: &[(String, i64)]) {
+        if entries.is_empty() {
             self.clear_recency();
             return;
         }
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute("DELETE FROM recency", []);
-        let mut stmt = match conn.prepare("INSERT INTO recency (pos, word) VALUES (?1, ?2)") {
+        let mut stmt = match conn.prepare("INSERT INTO recency (word, used_at) VALUES (?1, ?2)") {
             Ok(s) => s,
             Err(_) => return,
         };
-        for (pos, w) in words.iter().enumerate() {
-            let _ = stmt.execute(params![pos as i64, w]);
+        for (w, t) in entries {
+            let _ = stmt.execute(params![w, t]);
         }
     }
 
-    /// Load the persisted recency ring, most-recent-first (pos 0 = newest).
-    pub fn load_recency(&self) -> Vec<String> {
+    /// Load the persisted recent entries as `(word, last_used_ms)`.
+    pub fn load_recency(&self) -> Vec<(String, i64)> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare("SELECT word FROM recency ORDER BY pos") {
+        let mut stmt = match conn.prepare("SELECT word, used_at FROM recency") {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        stmt.query_map([], |row| row.get::<_, String>(0))
+        stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
             .ok()
             .into_iter()
             .flat_map(|rows| rows.filter_map(|r| r.ok()))
             .collect()
     }
 
-    /// Drop the ring (used when the in-memory store is empty).
+    /// Drop the table (used when the in-memory store is empty).
     pub fn clear_recency(&self) {
         let _ = self.conn.lock().unwrap().execute("DELETE FROM recency", []);
     }
@@ -316,17 +330,18 @@ mod tests {
     }
 
     #[test]
-    fn recency_snapshot_roundtrip_preserves_order() {
+    fn recency_snapshot_roundtrip_preserves_timestamps() {
         let s = temp_store();
-        let words: Vec<String> = vec!["最新".into(), "次新".into(), "旧".into()];
-        s.save_recency(&words);
-        assert_eq!(s.load_recency(), words, "most-recent-first order preserved");
+        let entries: Vec<(String, i64)> =
+            vec![("最新".into(), 1000), ("次新".into(), 2000), ("旧".into(), 3000)];
+        s.save_recency(&entries);
+        assert_eq!(s.load_recency(), entries, "word + timestamp preserved");
 
         // Replacement semantics: a newer snapshot fully replaces the old.
-        s.save_recency(&["另一个".into()]);
-        assert_eq!(s.load_recency(), vec!["另一个".to_string()]);
+        s.save_recency(&[("另一个".into(), 4000)]);
+        assert_eq!(s.load_recency(), vec![("另一个".to_string(), 4000)]);
         s.save_recency(&[]);
-        assert!(s.load_recency().is_empty(), "empty snapshot clears the ring");
+        assert!(s.load_recency().is_empty(), "empty snapshot clears the table");
     }
 
     #[test]

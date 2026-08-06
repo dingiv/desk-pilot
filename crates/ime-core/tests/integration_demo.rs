@@ -197,10 +197,11 @@ fn recency_persistence_across_sessions() {
     assert!(warm_score > cold_score,
         "recency boost restored from store: warm={warm_score:.3} cold={cold_score:.3}");
 
-    // The persisted ring is also directly readable (most-recent-first).
+    // The persisted table is also directly readable (word + last-used ms).
     let store = ime_core::weight_store::WeightStore::open(&db_path).unwrap();
     let ring = store.load_recency();
-    assert_eq!(ring.first().map(String::as_str), Some("你好"), "ring: {ring:?}");
+    assert_eq!(ring.first().map(|(w, _)| w.as_str()), Some("你好"), "ring: {ring:?}");
+    assert!(ring[0].1 > 0, "timestamp persisted: {ring:?}");
 
     let _ = std::fs::remove_file(&db_path);
 }

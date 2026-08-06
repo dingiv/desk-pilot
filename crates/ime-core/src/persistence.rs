@@ -105,14 +105,14 @@ mod tests {
         let pm = PersistenceManager::open(&path).expect("open");
         // All five tables exist (schema migration ran).
         let store = pm.store();
-        store.save_recency(&["a".into(), "b".into()]);
+        store.save_recency(&[("a".into(), 1000), ("b".into(), 2000)]);
         store.record_bigram("你", "好");
         store.record_phrase("ceshi", "测试", 0);
         store.pin_word("nihao", "你好");
         store.save_l0(r#"{"pins":[],"picks":[]}"#);
 
         let pm2 = PersistenceManager::open(&path).expect("reopen");
-        assert_eq!(pm2.store().load_recency(), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(pm2.store().load_recency(), vec![("a".to_string(), 1000), ("b".to_string(), 2000)]);
         assert_eq!(pm2.store().load_all_bigrams().len(), 1);
         assert_eq!(pm2.store().load_all_phrases().len(), 1);
         assert_eq!(pm2.store().pinned_word("nihao").as_deref(), Some("你好"));

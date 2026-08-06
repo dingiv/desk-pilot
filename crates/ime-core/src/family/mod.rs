@@ -174,9 +174,10 @@ pub trait CandidateFamily: Send + Sync {
     /// `entries` is a vec of (prev, next, count) from SQLite.
     fn warm_bigrams(&self, _entries: Vec<(String, String, u32)>) {}
 
-    /// Warm the recency ring from persisted data (most-recent-first).
-    /// Default no-op; PinyinFamily overrides to restore the boost-decay order.
-    fn warm_recencies(&self, _entries: Vec<String>) {}
+    /// Warm the recent-member table from persisted data
+    /// (`(word, last_used_ms)` pairs). Default no-op; PinyinFamily overrides
+    /// to restore the time-decay boosts (expired >3d entries dropped on load).
+    fn warm_recencies(&self, _entries: Vec<(String, i64)>) {}
 
     /// Attach the weight store for persisting learned phrases.
     /// Called once at startup after init_store.

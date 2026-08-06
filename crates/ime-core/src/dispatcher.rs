@@ -112,8 +112,9 @@ impl Dispatcher {
         }
     }
 
-    /// Warm the pinyin family's recency ring from persisted data.
-    pub fn warm_recencies(&self, entries: Vec<String>) {
+    /// Warm the pinyin family's recent-member table from persisted data
+    /// (`(word, last_used_ms)` pairs).
+    pub fn warm_recencies(&self, entries: Vec<(String, i64)>) {
         if let Some(fam) = self.scorer.family("pinyin") {
             fam.warm_recencies(entries);
         }

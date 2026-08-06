@@ -3,7 +3,7 @@
 
 use super::{CandidateFamily, InputContext, ScoredCandidate};
 use self::phrase::PhraseBook;
-use crate::recency::RecencyStore;
+use crate::recency::RecentStore;
 use crate::user_bigram::UserBigram;
 
 pub mod dict;
@@ -31,7 +31,7 @@ pub struct PinyinFamily {
     large_dict: Mutex<LargeDict>,
     lattice: Mutex<Option<lattice::LatticeDecoder>>,
     bigram: Mutex<UserBigram>,
-    recency: Mutex<RecencyStore>,
+    recency: Mutex<RecentStore>,
     enabled: bool,
     weights: PinyinWeights,
     store: Mutex<Option<Arc<WeightStore>>>,
@@ -103,7 +103,7 @@ impl PinyinFamily {
             large_dict: Mutex::new(LargeDict::new()),
             lattice: Mutex::new(None),
             bigram: Mutex::new(UserBigram::with_tuning(scoring.bigram)),
-            recency: Mutex::new(RecencyStore::new(scoring.recency)),
+            recency: Mutex::new(RecentStore::new(scoring.recency)),
             enabled: true,
             weights,
             store: Mutex::new(None),
@@ -135,7 +135,7 @@ impl PinyinFamily {
             large_dict: Mutex::new(LargeDict::new()),
             lattice: Mutex::new(None),
             bigram: Mutex::new(UserBigram::with_tuning(scoring.bigram)),
-            recency: Mutex::new(RecencyStore::new(scoring.recency)),
+            recency: Mutex::new(RecentStore::new(scoring.recency)),
             enabled: true,
             weights,
             store: Mutex::new(None),
@@ -170,12 +170,12 @@ impl PinyinFamily {
         self.bigram.lock().unwrap().record(prev, next);
     }
 
-    /// Record a committed word for recency boosting.
-    /// Double-writes the ring to SQLite (full-snapshot replace, ≤64 rows) so the
-    /// boost-decay order survives restarts.
+    /// Record a committed word for the recent member: stamps the current
+    /// wall-clock time and double-writes the table to SQLite (full-snapshot
+    /// replace, ≤512 rows) so the time-decay survives restarts.
     pub fn record_commit(&self, word: &str) {
         let mut rec = self.recency.lock().unwrap();
-        rec.push(word);
+        rec.record(word, now_ms());
         if let Some(ref store) = *self.store.lock().unwrap() {
             store.save_recency(&rec.dump());
         }
@@ -231,6 +231,14 @@ pub fn initials_from_pinyin(raw: &str) -> String {
 
 impl Default for PinyinFamily {
     fn default() -> Self { Self::new() }
+}
+
+/// 当前 wall-clock 毫秒(unix epoch)—— recent member 的时间基准。
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 impl CandidateFamily for PinyinFamily {
@@ -309,14 +317,11 @@ impl CandidateFamily for PinyinFamily {
         }
     }
 
-    fn warm_recencies(&self, entries: Vec<String>) {
+    fn warm_recencies(&self, entries: Vec<(String, i64)>) {
         if !entries.is_empty() {
             let count = entries.len();
-            // Persisted dump is most-recent-first; load_bulk pushes each entry
-            // to the front, so feed OLDEST first to end with the newest on top.
-            let mut oldest_first = entries;
-            oldest_first.reverse();
-            self.recency.lock().unwrap().load_bulk(&oldest_first);
+            // 加载时丢弃超过 3d 窗口的过期条目(RecentStore::load_bulk)。
+            self.recency.lock().unwrap().load_bulk(entries, now_ms());
             eprintln!("[ime-core] pinyin: warmed {count} recency entries from store");
         }
     }
@@ -485,11 +490,13 @@ impl CandidateFamily for PinyinFamily {
         let mut candidates = self.predict(input);
         if candidates.is_empty() { return candidates; }
 
-        // ── Layer 1: Recency boost (short-term memory) ──
-        let recency = self.recency.lock().unwrap();
+        // ── Layer 1: Recent member boost (时间分档衰减) ──
+        // 距上次使用 ≤10s/1h/5h/1d/3d 分档加持;>3d 的条目在查询时被移出。
+        let mut recency = self.recency.lock().unwrap();
         if !recency.is_empty() {
+            let now = now_ms();
             for c in &mut candidates {
-                c.raw_score = (c.raw_score + recency.boost(&c.text)).min(1.0);
+                c.raw_score = (c.raw_score + recency.boost(&c.text, now)).min(1.0);
             }
         }
         drop(recency);

@@ -842,11 +842,10 @@ mod tests {
         for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
         e.predict(InputEvent::space()); // commits 你好 via the special-key path
         let store = WeightStore::open(&db).unwrap();
-        assert_eq!(
-            store.load_recency(),
-            vec!["你好".to_string()],
-            "space-commit must reach the recency ring (and persist it)"
-        );
+        let rec = store.load_recency();
+        assert_eq!(rec.len(), 1, "space-commit must reach the recency table");
+        assert_eq!(rec[0].0, "你好", "recorded word: {rec:?}");
+        assert!(rec[0].1 > 0, "with a wall-clock timestamp: {rec:?}");
         let _ = std::fs::remove_file(&db);
     }
 
