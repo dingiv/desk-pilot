@@ -331,7 +331,7 @@ fn main() -> Result<()> {
     // (dev: human-readable; release: JSON lines; RUST_LOG filter, default info).
     shared::init_tracing();
     let s = resolve(Cli::parse(), AuraConf::load());
-    let Settings { scout_addr, port, stage3_on, model, asr_backend, asr_language, asr_provider, asr_threads, asr_kind, asr_endpoint, llm_kind, llm_endpoint, llm_model, hotwords: seed_hotwords, web_dist, recordings_dir, vad } = s;
+    let Settings { scout_addr, port, stage3_on, model, asr_backend, asr_language, asr_provider, asr_threads, asr_kind, asr_endpoint, llm_kind, llm_endpoint, llm_model, hotwords: seed_hotwords, web_dist, recordings_dir, recordings_retention_days, vad } = s;
 
     // Connection toggle + shared snapshot state, shared across the Pipeline thread + socket
     // handlers. (No event bus — SSE pings off the `version` counter; data lives in the snapshot.)
@@ -366,7 +366,7 @@ fn main() -> Result<()> {
     let turns_dir = data
         .resolve("DATA::turns")
         .unwrap_or_else(|| std::path::PathBuf::from("data/turns"));
-    let retention_days = settings.recordings_retention_days.max(1);
+    let retention_days = recordings_retention_days.max(1);
     info!(
         recordings = %rec_dir.display(),
         turns = %turns_dir.display(),
