@@ -1187,6 +1187,29 @@ mod tests {
     }
 
     #[test]
+    fn composed_selection_joins_phrase_even_if_in_dictionary() {
+        // 自生词模式:多字拼音 + 数字键逐字选择(你→好)组成的整体无条件
+        // 加入单词本 —— 即使 你好 在词典里(与直接提交不同,直接提交时
+        // 词典词不进 phrase,见 dictionary_words_are_not_learned)。
+        let mut e = eng();
+        for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
+        // 数字键选 single 单字"你"(partial commit,进入自生词模式)
+        let ni = e.candidates().iter().position(|c| *c == "你").expect("你 as single option");
+        e.select_candidate(ni);
+        // 余下 "hao":继续选"好"(full commit,所有输入字都有归属)
+        let hao = e.candidates().iter().position(|c| *c == "好").expect("好");
+        let v = e.select_candidate(hao);
+        assert_eq!(ImeView::str_field(&v.commit_text), "你好");
+
+        // 再查 nihao → 你好 来自 phrase(自生词无条件加入生效)。
+        for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
+        let detailed = e.candidates_detailed();
+        assert!(detailed.iter().any(|d| d.text == "你好" && d.source == "phrase"),
+            "composed 你好 must be in the phrase book: {:?}",
+            detailed.iter().map(|d| (&d.text, d.source)).take(8).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn scoring_config_priorities_affect_ranking() {
         // family_priority 来自 swift-ime.yaml:英文优先级配成 0 → black 的
         // 最终分 = 0(被全局排序压到底),默认 70 时 > 0。

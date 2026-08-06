@@ -198,6 +198,11 @@ impl StepEnv for Dispatcher {
             fam.learn_phrase(pinyin, hanzi);
         }
     }
+    fn learn_composed_phrase(&self, pinyin: &str, hanzi: &str) {
+        if let Some(fam) = self.scorer.family("pinyin") {
+            fam.learn_composed_phrase(pinyin, hanzi);
+        }
+    }
     fn magic(&self) -> &MagicFamily {
         &self.magic
     }

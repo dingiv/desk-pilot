@@ -247,9 +247,14 @@ impl StateMachine {
             };
             // Record the FULL composed word, not just the last character.
             env.record_pick(&full_pinyin, &final_text);
-            // Always save to PhraseBook — L0 only boosts words already in
-            // the dictionary; Viterbi-composed words need PhraseBook recall.
-            env.learn_phrase(&full_pinyin, &final_text);
+            // 自生词模式(经历过 ≥1 次数字键逐字选择,committed_text 非空):
+            // 主动造词成果无条件加入单词本 —— 不因词典里恰好有该词而跳过。
+            // 直接提交(未逐字选择)走 learn_phrase(词典词不进单词本)。
+            if self.committed_text.is_empty() {
+                env.learn_phrase(&full_pinyin, &final_text);
+            } else {
+                env.learn_composed_phrase(&full_pinyin, &final_text);
+            }
             self.context.update(&final_text);
             self.reset();
             Self::commit_view(&final_text)
@@ -760,6 +765,10 @@ pub trait StepEnv {
 
     /// Called after a multi-step composition completes.
     fn learn_phrase(&self, pinyin: &str, hanzi: &str);
+
+    /// Called after a composed (自生词) multi-step selection completes — the
+    /// result joins the phrase book unconditionally.
+    fn learn_composed_phrase(&self, pinyin: &str, hanzi: &str);
 
     /// The magic command registry — spawns live member instances on trigger
     /// completion, holds the shared resources (voice slot, req config).

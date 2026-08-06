@@ -210,6 +210,23 @@ impl PinyinFamily {
         false
     }
 
+    /// 加入/递增单词本的公共实现(已通过词典检查或自生词无条件路径)。
+    fn learn_phrase_inner(&self, pinyin: &str, hanzi: &str) {
+        let mut book = self.phrase_book.lock().unwrap();
+        if book.count(pinyin, hanzi) > 0 {
+            book.bump_count(pinyin, hanzi);
+            if let Some(ref store) = *self.store.lock().unwrap() {
+                store.bump_phrase_count(pinyin, hanzi);
+            }
+        } else {
+            book.insert(pinyin, hanzi);
+            // Persist to SQLite if store is attached.
+            if let Some(ref store) = *self.store.lock().unwrap() {
+                store.record_phrase(pinyin, hanzi, 0);
+            }
+        }
+    }
+
     /// 自造词的使用次数 → 参与排名的基础分:首次 0.70(低于词典精确分
     /// 0.85+,不会压过词典词),每次使用 +0.02,封顶 phrase_book 权重
     /// (默认 0.88)—— 高频自造词随使用逐步靠前,而不是所有 phrase 词
@@ -264,19 +281,13 @@ impl CandidateFamily for PinyinFamily {
         if self.in_dictionary(pinyin, hanzi) {
             return;
         }
-        let mut book = self.phrase_book.lock().unwrap();
-        if book.count(pinyin, hanzi) > 0 {
-            book.bump_count(pinyin, hanzi);
-            if let Some(ref store) = *self.store.lock().unwrap() {
-                store.bump_phrase_count(pinyin, hanzi);
-            }
-        } else {
-            book.insert(pinyin, hanzi);
-            // Persist to SQLite if store is attached.
-            if let Some(ref store) = *self.store.lock().unwrap() {
-                store.record_phrase(pinyin, hanzi, 0);
-            }
-        }
+        self.learn_phrase_inner(pinyin, hanzi);
+    }
+
+    fn learn_composed_phrase(&self, pinyin: &str, hanzi: &str) {
+        // 自生词流程:用户输入多字拼音后通过数字键逐字选择组成的整体,
+        // 无条件加入单词本(主动造词,不因词典里恰好有该词而跳过)。
+        self.learn_phrase_inner(pinyin, hanzi);
     }
 
     fn export_l0_json(&self) -> String {

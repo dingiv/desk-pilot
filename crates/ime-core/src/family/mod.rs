@@ -150,6 +150,14 @@ pub trait CandidateFamily: Send + Sync {
     /// Learn a new phrase for future recall.
     fn learn_phrase(&self, _pinyin: &str, _word: &str) {}
 
+    /// 自生词流程的成果(多字拼音 + 数字键逐字选择组成的整体)—— 无条件加入
+    /// 单词本,不做词典存在性检查(用户主动逐字造词,词典里有没有都要记住)。
+    /// Default: 委托 [`learn_phrase`];PinyinFamily overrides to skip the
+    /// in-dictionary skip.
+    fn learn_composed_phrase(&self, pinyin: &str, word: &str) {
+        self.learn_phrase(pinyin, word);
+    }
+
     /// Export L0 user model as JSON (pins + pick counters).
     fn export_l0_json(&self) -> String { String::new() }
 
