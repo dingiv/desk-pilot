@@ -14,18 +14,17 @@ pub mod buffer;
 pub mod scout;
 pub mod source;
 
-/// The ONNX-runtime side of the dual-runtime architecture (see docs/aura/runtime-selection.md):
-/// VAD (Silero) + ASR (SenseVoice) via the OFFICIAL `sherpa-onnx` crate, which owns the single
-/// onnxruntime instance. Gated behind `onnx` so the pure-DSP core builds without it.
-#[cfg(feature = "onnx")]
-pub mod onnx;
-
 /// Stage1 stage-boundary abstractions: `Stage1Executor` (capture+VAD+two-pass ASR → events) +
 /// the `Utterance`/`Stage1Event` data contract. The data types are always compiled (so the
 /// Stage2 crate can reference `Utterance` without enabling the heavy `onnx` feature); the
 /// executor impl + its config are `onnx`-gated.
 #[cfg(feature = "onnx")]
 pub mod executor;
+
+// ── ONNX 语音栈已迁至 dp-models ─────────────────────────────────────────
+// VAD (Silero) + 流式 ASR (Zipformer) + batch ASR (SenseVoice/…) 的 sherpa-onnx 封装
+// 在 `dp_models::onnx`(feature `speech`)。本 crate 的 `onnx` feature 转发开启它:
+// audio-aura 不再直接依赖 sherpa-onnx。VAD 数据契约经 dp_models re-export。
 
 // ── Stage1 → Stage2 data contract (NOT onnx-gated; plain data) ─────────────────
 /// One finalized utterance from Stage1 (the batch final is authoritative; the streaming final
@@ -137,17 +136,8 @@ pub struct SpeechEvent {
 }
 
 // ── VAD (port of livekit VADEvent + Silero state machine, energy-based) ─────────
-#[derive(Debug, Clone, Copy)]
-pub enum VadEventKind {
-    StartOfSpeech,
-    EndOfSpeech,
-}
-
-pub struct VadEvent {
-    pub kind: VadEventKind,
-    /// The accumulated utterance PCM (only on EndOfSpeech; empty on StartOfSpeech).
-    pub pcm: Vec<i16>,
-}
+// 数据契约定义在 dp-models(与 sherpa 的 OnnxVad 共用),这里 re-export。
+pub use dp_models::{VadEvent, VadEventKind};
 
 /// Config mirrors livekit Silero defaults (activation/min-durations), adapted to energy gating.
 #[derive(Debug, Clone)]

@@ -13,7 +13,30 @@
 pub mod config;
 pub mod http;
 
+/// ONNX 实时语音栈(feature `speech`):VAD (Silero) + 流式 ASR (Zipformer) +
+/// batch ASR (SenseVoice/Qwen3-ASR/Whisper),通过 sherpa-onnx。
+/// 从 aura-asr 迁入——audio-aura 不再直接依赖 sherpa-onnx。
+#[cfg(feature = "speech")]
+pub mod onnx;
+
 pub use config::ProviderKind;
+
+// ── VAD 数据契约(纯数据,不依赖 sherpa;由 onnx 模块与 aura-asr 的 EnergyVad 共用)──
+
+/// VAD 事件类型(port of livekit VadEventKind)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VadEventKind {
+    StartOfSpeech,
+    EndOfSpeech,
+}
+
+/// 一次 VAD 事件(port of livekit VADEvent + Silero state machine)。
+#[derive(Debug, Clone)]
+pub struct VadEvent {
+    pub kind: VadEventKind,
+    /// The accumulated utterance PCM (only on EndOfSpeech; empty on StartOfSpeech).
+    pub pcm: Vec<i16>,
+}
 
 /// 语音转文字 (ASR): 输入 PCM i16 mono, 返回转写文本。
 pub trait AsrProvider: Send + Sync {

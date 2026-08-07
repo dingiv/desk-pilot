@@ -11,6 +11,15 @@ serde_json = "1"
 anyhow = "1"
 thiserror = "2"
 base64 = { workspace = true }
+tracing = { workspace = true }
+# ONNX 实时语音(VAD/流式 ASR/batch ASR fallback)via sherpa-onnx —— 重依赖,默认不开启;
+# audio-aura 通过其 onnx feature 转发开启。目的:把重依赖从业务进程隔离到 dp-models。
+sherpa-onnx = { version = "1.13", default-features = false, features = ["shared"], optional = true }
+
+[features]
+default = []
+# 实时语音栈:VAD (Silero) + 流式 ASR (Zipformer) + batch ASR (SenseVoice/Qwen3-ASR/Whisper)。
+speech = ["dep:sherpa-onnx"]
 
 [[example]]
 name = "remote"

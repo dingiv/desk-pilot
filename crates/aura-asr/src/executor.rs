@@ -22,12 +22,13 @@ use anyhow::Result;
 use tracing::debug;
 
 use crate::buffer::AudioRing;
-use crate::onnx::{
+use crate::scout::ScoutAudioSource;
+use crate::{Stage1Action, Stage1Event, Utterance, VadEventKind};
+// ONNX 语音栈在 dp-models(feature `speech`)——audio-aura 不再直接依赖 sherpa-onnx。
+use dp_models::onnx::{
     AsrBackend, AsrConfig, OnlineAsr, OnnxRuntimeManager, StreamingAsrConfig, StreamingSession,
     VadConfig, WINDOW,
 };
-use crate::scout::ScoutAudioSource;
-use crate::{Stage1Action, Stage1Event, Utterance, VadEventKind};
 use dp_models::{http::HttpAsr, AsrProvider, ProviderKind};
 
 /// Default ring capacity: 10 min @ 16 kHz mono (~19 MB).

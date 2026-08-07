@@ -16,7 +16,7 @@
 //! mgr.asr().unwrap().recognize(&pcm, 16000)?;
 //! ```
 
-use crate::{Asr, VadEvent, VadEventKind};
+use crate::{AsrProvider as Asr, VadEvent, VadEventKind};
 
 use anyhow::Result;
 use sherpa_onnx::{

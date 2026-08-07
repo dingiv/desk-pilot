@@ -1,168 +1,92 @@
-# dp-models 整改方案：模型生命周期管理库
+# dp-models 设计：LocalAI 接管模型部署 + Rust 保留实时语音
 
-> 状态：🟡 **设计 / 未实现**（2026-07-23）。当前 dp-models 已是"trait + remote"抽象层（见
-> `crates/dp-models/`），本文是把它**升级为模型生命周期管理库**的整改方案。实现时以代码为准。
+> 状态：🟡 **设计**（2026-08-07 第二轮 pivot）。结论：
+> **模型部署由 LocalAI（Go 服务）统一接管；VAD + 流式 ASR 留在 Rust（dp-models crate）；
+> Audio Aura 不再直接依赖 sherpa-onnx。** 实现时以代码为准。
 
-## 背景（为什么）
-
-desk-pilot 多子系统（aura 语音 / visual-rover 视觉 / 未来更多）都要本地或远程模型推理。现状
-是**模型启动逻辑分散**：aura-asr 自己 `OnnxAsr::new`（sherpa）、aura-dcl 自己
-`Calibrator::load_default`（mistral.rs）、daemon 在 `main.rs` 手写 `if asr_kind / if llm_kind`
-工厂拼装。每加一个模型 / 换一个后端，daemon 和各 crate 都要改。
-
-dp-models 已经把"调用"统一成了 Provider trait（AsrProvider/LlmProvider/VlmProvider + Http*
-remote），但**启动/加载仍散在各 crate**。本方案把"启动"也收进来——dp-models 成为**唯一的模型
-入口**，上层只声明"要什么模型"，dp-models 负责启动/连接并返回 Provider。
-
-## 定位
-
-**dp-models = 模型生命周期管理库**（启动 + 抽象）：
-- 向上层提供统一的 **Provider 抽象**，4 个子类：`Asr` / `Llm` / `Tts` / `Vlm`。
-- 支持 **3 种后端**启动模型：
-  - `Onnx` — 通过 sherpa-onnx 启动本地 onnx 模型（ASR / 未来 TTS）。
-  - `MistralRs` — 通过 mistral.rs 启动本地 GGUF 模型（LLM / 未来 VLM）。
-  - `Remote` — 远程连接（HTTP，OpenAI 兼容，API key 认证）。
-- 上层提供**构造参数**（模型类型 + 名称 + 后端类型 + 后端参数），dp-models 选后端启动。
-
-上层（daemon / visual-rover app）不再 `OnnxAsr::new` / `Calibrator::load_default` / 手写
-if/else，只：
-```rust
-let asr = dp_models::build_asr(ModelSpec{ task:Asr, name:"qwen3-asr-1.7b", backend:Backend::Onnx, params:.. })?;
-let llm = dp_models::build_llm(ModelSpec{ task:Llm, name:"Qwen3-1.7B-Q8_0.gguf", backend:Backend::MistralRs, params:.. })?;
-```
-
-## 目标架构
+## 一、最终架构
 
 ```
-dp-models/  (模型生命周期管理库)
-├── lib.rs                  Provider trait (4) + ModelSpec + Backend + build() 工厂
-├── spec.rs                 ModelSpec / Task / Backend / BackendParams
-├── factory.rs              build_asr / build_llm / build_tts / build_vlm (按 spec 选后端)
-├── backend/
-│   ├── mod.rs              Backend trait (start() → Provider)
-│   ├── onnx.rs             onnx 后端 (feature onnx, sherpa-onnx): OfflineRecognizer/TTS
-│   ├── mistral.rs          mistral.rs 后端 (feature mistralrs): GGUF LLM
-│   └── remote.rs           remote 后端 (默认): Http* + Bearer api_key
-├── http.rs                 Http* (remote 实现, 已有)
-└── config.rs               ProviderKind (已有, 保留向下兼容)
+[audio-aura (Rust) 业务进程]
+   ├── Stage1 帧循环 (20ms):
+   │     VAD (Silero)  +  流式 ASR (Zipformer)   ← crates/dp-models (Rust, sherpa-onnx 保留于此)
+   │     └── batch ASR (SenseVoice / Qwen3-ASR)  ← LocalAI (OpenAI /v1/audio/transcriptions)
+   ├── Stage2/3: LLM (整流/路由)                 ← LocalAI (/v1/chat/completions)
+   └── Provider 抽象 + Http* 客户端               ← crates/dp-models (已有)
+            │  OpenAI 兼容 HTTP
+            ▼
+[LocalAI (Go) 模型服务]   ← 引入 Go 依赖, 模型部署由它接管
+   ├── sherpa-onnx 后端      (batch ASR: SenseVoice/Whisper/Qwen3-ASR; TTS)
+   ├── transformers / qwen-asr / vllm 后端 (Transformers 生态)
+   └── llama-cpp 后端        (GGUF)
 ```
 
-**依赖**：dp-models 不再是纯叶子——`onnx` / `mistralrs` feature 分别拉 sherpa-onnx / mistral.rs
-（重依赖，按需开）。`remote` 后端是默认（轻，只 reqwest）。
+### 职责边界
 
-## 核心抽象
-
-### 4 个 Provider trait（已有 3 个，加 Tts）
-
-```rust
-pub trait AsrProvider: Send + Sync { fn recognize(&self, pcm: &[i16], sr: u32) -> Result<String>; }
-pub trait LlmProvider: Send + Sync { fn complete(&self, system: &str, user: &str) -> Result<String>; }
-pub trait TtsProvider: Send + Sync { fn synthesize(&self, text: &str) -> Result<Vec<i16 /* pcm */>>; }  // 新增
-pub trait VlmProvider: Send + Sync { fn complete(&self, system:&str, user:&str, image_png:&[u8]) -> Result<String>; }
-```
-
-### ModelSpec（上层构造参数）
-
-```rust
-pub enum Task { Asr, Llm, Tts, Vlm }
-
-pub enum Backend {
-    Onnx,                                      // 本地 sherpa-onnx
-    MistralRs,                                 // 本地 mistral.rs GGUF
-    Remote { endpoint: String, api_key: Option<String> },  // 远程 OpenAI 兼容
-}
-
-pub enum BackendParams {
-    Onnx(OnnxParams),        // { model_paths, tokens, language?, backend_kind, threads, provider }
-    Mistral(MistralParams),  // { model_path (GGUF) }
-    Remote(RemoteParams),    // { model_id (传给 API), api_key }
-}
-
-pub struct ModelSpec {
-    pub task: Task,
-    pub name: String,            // 模型名 (qwen3-asr-1.7b / Qwen3-1.7B-Q8_0.gguf / 远程 model id)
-    pub backend: Backend,
-    pub params: BackendParams,
-}
-```
-
-### build 工厂（feature-gated）
-
-```rust
-// 按 task 分 4 个工厂（返回值类型不同）；内部按 backend 选实现。
-pub fn build_asr(spec: ModelSpec)  -> Result<Arc<dyn AsrProvider>>;
-pub fn build_llm(spec: ModelSpec)  -> Result<Arc<dyn LlmProvider>>;
-pub fn build_tts(spec: ModelSpec)  -> Result<Arc<dyn TtsProvider>>;
-pub fn build_vlm(spec: ModelSpec)  -> Result<Arc<dyn VlmProvider>>;
-```
-
-## 3 后端详解
-
-| 后端 | feature | 启动方式 | 覆盖 task | 依赖 |
-|---|---|---|---|---|
-| `Onnx` | `onnx` | sherpa-onnx OfflineRecognizer / OfflineTTS | ASR ✓, TTS（未来 Kokoro/Piper） | sherpa-onnx（重）|
-| `MistralRs` | `mistralrs` | mistral.rs GgufModelBuilder | LLM ✓, VLM（未来 candle） | mistral.rs（重）|
-| `Remote` | 默认 | reqwest::blocking Http* + Bearer | 全 4 task | reqwest（轻）|
-
-## 现状 vs 目标
-
-| 维度 | 现状 | 目标 |
+| 组件 | 职责 | 关键技术 |
 |---|---|---|
-| dp-models 职责 | trait + remote（纯抽象） | 启动 + 抽象（管理库）|
-| dp-models 依赖 | 纯叶子（reqwest）| feature-gated 拉 sherpa/mistral.rs |
-| OnnxAsr 加载 | aura-asr | → dp-models onnx 后端 |
-| Calibrator 加载 | aura-dcl | → dp-models mistralrs 后端 |
-| daemon 工厂 | main.rs 散 if asr_kind/llm_kind | 一行 `dp_models::build(spec)` |
-| aura-asr/aura-dcl | 厚（加载+推理） | 变薄（Stage1 管线 / Stage2 提示词）|
-| TTS | NoopTts 孤岛 | TtsProvider trait + onnx/remote 后端 |
-| 模型路径 | shared FileLoader MODELS namespace（aura-asr/aura-dcl 各声明） | 经 ModelSpec.params 传入（路径解析仍用 shared）|
+| **crates/dp-models**（Rust） | ① **VAD + 流式 ASR**（从 aura-asr 迁移）② Provider trait（Asr/Llm/Tts/Vlm）③ Http* 客户端 ④ build 工厂 | sherpa-onnx（仅 VAD/流式用）、reqwest |
+| **audio-aura**（Rust） | Stage1 帧循环组装、Stage2/3 业务逻辑 | **不再依赖 sherpa-onnx** |
+| **LocalAI**（Go） | 模型部署层：batch ASR / LLM / TTS / 未来多模态；加载/卸载/生命周期/VRAM | Go，引入项目（go.mod） |
 
-## 关键设计决策（推荐，待确认）
+### 为什么这样切（决策依据）
 
-1. **dp-models 直接依赖 sherpa-onnx + mistral.rs（feature-gated）**。
-   - 推荐 ✅：启动逻辑真集中，daemon 只依赖 dp-models。重依赖按 feature 开（不开 = 纯 remote，轻）。
-   - 代价：OnnxAsr / Calibrator 加载逻辑从 aura-asr/aura-dcl 迁移过来。
+1. **VAD + 流式留 Rust**：与 Stage1 的 20ms 帧循环深度耦合，走 HTTP 有延迟/吞吐顾虑；sherpa-onnx
+   的 OnlineRecognizer/VAD 是成熟 Rust 资产，迁移到 dp-models 后 Audio Aura 与 sherpa 解耦。
+2. **batch ASR + LLM 交给 LocalAI**：它们是"一个请求一个结果"的形态，天然适合服务化；LocalAI
+   的 sherpa-onnx 后端（OfflineRecognizer/OfflineTts）和 transformers/vllm/llama-cpp 后端全覆盖
+   我们的三生态需求。
+3. **LocalAI 而非自研 Python 服务**：LocalAI 已实现我们需要的全部管理机制（模型注册表、声明式
+   配置、加载/卸载/VRAM、健康自愈、多后端），避免重复造轮子。
 
-2. **VAD / 流式 Zipformer 留 aura-asr（不进 dp-models）**。
-   - 它们是 Stage1 管线特有（非"一个模型"），不属于 4 task Provider。
-   - dp-models onnx 后端**只管 batch ASR**（OfflineRecognizer）。aura-asr 的 Stage1Executor 仍组装
-     VAD + streaming + batch（batch 从 dp-models build_asr 拿）。
+## 二、迁移影响
 
-3. **BackendParams 用 enum（类型安全 + 可扩展）**。
-   - 每后端一个 struct，ModelSpec.params: BackendParams。加新后端 = 加一个 enum variant。
+### crates/dp-models（Rust）——从"纯客户端"变为"客户端 + 实时语音"
 
-4. **模型路径仍走 shared FileLoader**（dev `assets/models` / prod `~/.desk-pilot/models`）。
-   - ModelSpec.params 里的路径由上层（daemon）用 `shared::loader!()` 解析后传入，dp-models 不
-     自己解析 namespace（保持解耦）。
+- **迁入**：`aura-asr` 的 VAD（`OnnxVad`/`EnergyVad`）+ 流式 ASR（`OnlineAsr`，Zipformer）→
+  dp-models 新模块（如 `speech/`）。sherpa-onnx 依赖迁入 dp-models。
+- **保留**：`AsrProvider/LlmProvider/TtsProvider/VlmProvider` trait、Http* 客户端、build 工厂。
+- **新增**：流式/实时语音的 trait（供 Stage1 帧循环用）。
 
-## 迁移影响（实现时要动的）
+### audio-aura —— 删除 sherpa-onnx 依赖
 
-- **aura-asr**：`OnnxAsr`（+ OfflineRecognizer 构造逻辑）移到 dp-models `backend/onnx.rs`。
-  aura-asr 保留 VAD / streaming / Stage1Executor / `Asr` re-export（`Asr = AsrProvider`）。
-- **aura-dcl**：`Calibrator`（GGUF 加载）移到 dp-models `backend/mistral.rs`。aura-dcl 保留
-  `Stage2CalibratorImpl`（提示词 / ContextWindow / 热词）+ `impl LlmProvider`（或直接用 dp-models）。
-- **aura-tts**：NoopTts `impl TtsProvider`；未来 sherpa Kokoro/Piper 在 dp-models onnx 后端。
-- **apps/audio-aura**：删 main.rs 的 ASR/LLM if/else 工厂，改 `dp_models::build_*(spec)`。aura.json
-  从 `asr_kind/llm_kind` 升级为 `ModelSpec` 描述（task+name+backend+params）。
+- Stage1Executor 改造：VAD/流式从 dp-models 拿；batch ASR 改调 LocalAI（HttpAsr）。
+- `aura-asr` crate 变薄：OnnxAsr/OnlineAsr/OnnxVad 迁走后，保留 Asr trait re-export + 管线组装。
+- `aura-core` 的 `Calibrator`（mistral.rs）→ LocalAI（HttpLlm）；Stage2CalibratorImpl 保留
+  （提示词/热词/上下文），内部 LLM 调用走 LocalAI。
 
-## 分步实施（建议）
+### 引入 Go + LocalAI
 
-1. **dp-models 加 onnx 后端**（feature onnx）：移 OnnxAsr 加载 → `backend/onnx.rs` + `build_asr`。
-   aura-asr 的 OnnxAsr 改为 re-export / 委托 dp-models。daemon asr 走 `build_asr`。
-2. **dp-models 加 mistralrs 后端**（feature mistralrs）：移 Calibrator 加载 → `backend/mistral.rs`
-   + `build_llm`。daemon llm 走 `build_llm`。
-3. **加 TtsProvider trait + build_tts**：aura-tts NoopTts impl；未来 sherpa TTS 填 onnx 后端。
-4. **daemon 工厂重写**：aura.json 升级为 ModelSpec 描述，main.rs 删 if/else，全走 `build_*`。
-5. **（可选）model registry**：dp-models 加"模型目录"（id → spec），daemon 只传 id。等
-   多模型切换需求再做。
+- 环境：安装 Go（已完成：go1.26）。
+- 项目：LocalAI 源码进入仓库（或作为子模块/vendored）；文档化启动方式（models 目录声明 +
+  `local-ai run`）。
+- 模型声明：LocalAI 的 `models/*.yaml`（name/backend/parameters.model）即我们的 ModelSpec 落地。
 
-每步独立可验证（编译 + 回归）。
+## 三、分步实施
 
-## 开放问题
+1. **dp-models 迁入 VAD + 流式**：从 aura-asr 移动 OnnxVad/OnlineAsr 到 dp-models；
+   aura-asr 改为 re-export/委托；确认 Stage1 帧循环不受影响（回归测试）。
+2. **搭建 LocalAI**：安装 Go（✓）、LocalAI 可构建（✓ 已验证）、配置 batch ASR 模型
+   （sherpa-onnx 后端 SenseVoice）+ LLM 模型（llama-cpp），业务侧 Http* 连通验证。
+3. **audio-aura 切换 batch ASR 到 LocalAI**：Stage1Executor 的 batch 路径改调服务；
+   删除 aura-asr 的 OnnxAsr（或保留为 fallback）。
+4. **Stage2/3 切换 LLM 到 LocalAI**：Calibrator → HttpLlm；删除 mistral.rs 依赖。
+5. **audio-aura 删除 sherpa-onnx 依赖**：确认 VAD/流式走 dp-models 后清理。
+6. **（可选）TTS/未来模型**：LocalAI sherpa-onnx TTS 后端接入。
 
-- **candle 后端**？candle Qwen3-ASR PR#3509 merge 后，可能加第 4 个后端 `Candle`（纯 Rust，绕过
-  onnxruntime）。先观察，merge 后再评估。
-- **API key 管理**：remote 后端的 api_key 存哪（aura.json 明文 / env / keyring）？建议 env 优先，
-  aura.json 可选。
-- **模型热切换**：daemon 运行时换模型（不重启）？当前 build 一次性，热切换要 Provider 可重建 +
-  Pipeline 重启。后续需求。
+每步独立可验证（编译 + 回归 + 端到端）。
+
+## 四、已决策记录（2026-08-07）
+
+- ONNX 语音（VAD/流式）留 Rust（dp-models）；batch ASR 走 LocalAI。
+- 模型部署层用 LocalAI（Go），不自研 Python 服务。
+- Transformers/GGUF 生态由 LocalAI 的后端体系覆盖（transformers/vllm/llama-cpp）。
+- **LocalAI 引入方式**：在 `apps/dp-models` 下新增 Go 项目（LocalAI 源码），独立进程形态运行。
+- **batch ASR 双轨**：OnnxAsr 迁入 dp-models 保留为 fallback（删除为时过早，先放着）。
+- **sherpa-onnx 依赖**：dp-models 直接依赖 sherpa-onnx crate（feature-gated，默认不开启——
+  本模块的目的就是把重依赖从 aura 进程隔离）。
+- **batch 调用形态**：先按现状每段一个 HTTP 请求（HttpAsr 同步调用）；延迟问题后续实测再定。
+
+## 五、开放问题
+
+（已全部决策，无遗留。Stage1 的 batch 延迟实测为后续验证项。）
