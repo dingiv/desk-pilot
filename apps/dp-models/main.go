@@ -1,8 +1,9 @@
 // dp-models — desk-pilot 模型服务进程(独立进程形态)。
 //
-// 以 SDK 方式引入 LocalAI(不复制源码),库式启动:
-//   application.New(opts...) → http.API(app) → Start(addr)
-// 模型声明在 models/ 目录(YAML, LocalAI 格式: name/backend/parameters.model)。
+// 以 Go module 方式引入 LocalAI SDK(v1.40.0, github.com/go-skynet/LocalAI),
+// 库式启动: api.App(opts...) → fiber App → Listen(addr)。
+// 模型声明在 models/ 目录(LocalAI YAML 格式: name/backend/parameters.model);
+// 后端二进制(如 llama-cpp)在首次加载模型时从 gallery 按需下载。
 //
 // 用法: go run . [--models dir] [--addr :8080]
 package main
@@ -13,48 +14,31 @@ import (
 	"log"
 	"path/filepath"
 
-	"github.com/mudler/LocalAI/core/application"
-	"github.com/mudler/LocalAI/core/config"
-	"github.com/mudler/LocalAI/core/http"
-	"github.com/mudler/LocalAI/pkg/modelartifacts"
-	"github.com/mudler/LocalAI/pkg/system"
+	api "github.com/go-skynet/LocalAI/api"
+	"github.com/go-skynet/LocalAI/api/options"
+	"github.com/go-skynet/LocalAI/pkg/model"
 )
 
 func main() {
 	modelsPath := flag.String("models", "models", "模型声明目录(含 *.yaml)")
 	addr := flag.String("addr", ":8080", "监听地址")
+	threads := flag.Int("threads", 8, "推理线程数")
 	flag.Parse()
 
-	// 与 LocalAI CLI 相同的启动序列(RunCMD.Run 的最小复刻):
-	//   system state(模型/后端路径) → AppOption 链 → application.New → http.API → Start
-	systemState, err := system.GetSystemState(
-		system.WithModelPath(*modelsPath),
-		system.WithBackendPath(filepath.Join(*modelsPath, "backend-assets")),
-		system.WithBackendSystemPath(filepath.Join(*modelsPath, "backend-assets")),
-	)
-	if err != nil {
-		log.Fatalf("system state: %v", err)
+	opts := []options.AppOption{
+		options.WithContext(context.Background()),
+		options.WithModelLoader(model.NewModelLoader(*modelsPath)),
+		options.WithConfigFile(filepath.Join(*modelsPath, "models.yaml")),
+		options.WithThreads(*threads),
 	}
 
-	opts := []config.AppOption{
-		config.WithContext(context.Background()),
-		config.WithSystemState(systemState),
-		config.WithConfigFile(filepath.Join(*modelsPath, "models.yaml")),
-		config.WithModelArtifactMaterializer(modelartifacts.NewDefaultManager()),
-	}
-
-	app, err := application.New(opts...)
+	app, err := api.App(opts...)
 	if err != nil {
-		log.Fatalf("application.New: %v", err)
-	}
-
-	appHTTP, err := http.API(app)
-	if err != nil {
-		log.Fatalf("http.API: %v", err)
+		log.Fatalf("api.App: %v", err)
 	}
 
 	log.Printf("dp-models (LocalAI) 启动: %s, models=%s", *addr, *modelsPath)
-	if err := appHTTP.Start(*addr); err != nil {
+	if err := app.Listen(*addr); err != nil {
 		log.Fatalf("server: %v", err)
 	}
 }
