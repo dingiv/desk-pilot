@@ -39,9 +39,12 @@ pub struct PinyinFamily {
     freq_scale: crate::scoring::FreqScale,
     /// 上下文感知开关(swift-ime.yaml → input.context_aware,默认开)。
     /// 关闭时 `predict_with_context` 退化为纯 `predict` —— 不做 recency /
-    /// bigram / surrounding 加成,候选排序完全由词典频率决定。
+    /// 整词联想加成,候选排序完全由词典频率决定。
     /// `Mutex<bool>` 以便 trait 的 `&self` setter 写入。
     context_aware: Mutex<bool>,
+    /// 上一次提交的 (word, pinyin) —— 前缀整词联想的上下文来源。
+    /// 例:提交 中(zhong)后输入 de,联想 zhong+de="zhongde" 的整词。
+    last_commit: Mutex<(String, String)>,
 }
 
 /// Configurable scoring weights for the pinyin family.
@@ -109,6 +112,7 @@ impl PinyinFamily {
             store: Mutex::new(None),
             freq_scale: scoring.freq_scale,
             context_aware: Mutex::new(true),
+            last_commit: Mutex::new((String::new(), String::new())),
         }
     }
 
@@ -141,6 +145,7 @@ impl PinyinFamily {
             store: Mutex::new(None),
             freq_scale: scoring.freq_scale,
             context_aware: Mutex::new(true),
+            last_commit: Mutex::new((String::new(), String::new())),
         }
     }
 
@@ -266,6 +271,8 @@ impl CandidateFamily for PinyinFamily {
 
     fn record_pick(&self, pinyin: &str, word: &str) {
         self.engine.dict().record_pick(pinyin, word);
+        // 前缀整词联想的上下文:记录本次提交的 (word, pinyin)。
+        *self.last_commit.lock().unwrap() = (word.to_string(), pinyin.to_string());
         self.learn_phrase(pinyin, word);
         // Persist the L0 user model (pins + pick counters) — same double-write
         // cadence as bigrams, so the 3-pick auto-pin survives restarts.
@@ -492,9 +499,9 @@ impl CandidateFamily for PinyinFamily {
         out
     }
 
-    fn predict_with_context(&self, input: &str, ctx: &InputContext) -> Vec<ScoredCandidate> {
+    fn predict_with_context(&self, input: &str, _ctx: &InputContext) -> Vec<ScoredCandidate> {
         // 上下文感知暂时关闭(input.context_aware: false):候选排序完全由
-        // 词典频率决定,不做 recency / bigram / surrounding 加成。
+        // 词典频率决定,不做 recency / 整词联想加成。
         if !*self.context_aware.lock().unwrap() {
             return self.predict(input);
         }
@@ -518,46 +525,41 @@ impl CandidateFamily for PinyinFamily {
         }
         drop(recency);
 
-        let dict = self.engine.dict();
-        let bigram = self.bigram.lock().unwrap();
-        // Build context word list: recent commits + last word + surrounding text.
-        let surr_words: Vec<&str> = ctx.surrounding.split_whitespace().collect();
-        let ctx_words: Vec<String> = ctx.recent_text.split_whitespace()
-            .chain(std::iter::once(ctx.last_word.as_str()))
-            .chain(surr_words.iter().copied())
-            .filter(|w| !w.is_empty())
-            .map(|w| w.to_string())
-            .collect();
-        if !bigram.is_empty() {
-            for c in &mut candidates {
-                let boost = bigram.boost(&ctx_words, &c.text);
-                c.raw_score = (c.raw_score * boost).min(1.0);
-            }
-        }
-
-        // ── HistoryBigram-style word-level boosting ────
-        // For each word in the recent context, boost candidates that form
-        // known bigrams with that word. This mirrors libime's UserLanguageModel.
-        for ctx_word in ctx.recent_text.split_whitespace().chain(
-            std::iter::once(ctx.last_word.as_str())
-        ) {
-            if ctx_word.is_empty() || ctx_word.chars().count() < 1 { continue; }
-            for c in &mut candidates {
-                // Check if ctx_word + candidate[0] forms a known word.
-                let first_c = c.text.chars().next().unwrap_or('\0');
-                if first_c == '\0' { continue; }
-                let combined: String = ctx_word.chars().chain(std::iter::once(first_c)).collect();
-                // Quick check: look up the combined word in the dictionary.
-                for py_ctx in inputx_pinyin::char_to_pinyin(ctx_word.chars().next().unwrap()) {
-                    for py_cand in inputx_pinyin::char_to_pinyin(first_c) {
-                        let combined_py = format!("{py_ctx}{py_cand}");
-                        if dict.lookup(&combined_py).iter().any(|w| w.starts_with(&combined)) {
-                            c.raw_score = (c.raw_score + self.weights.context_boost).min(1.0);
+        // ── Layer 2: 前缀整词联想(替换旧的 bigram/surrounding/字符级 boost)──
+        // 上一提交词的拼音 + 当前输入拼音 → 查词典整词;整词以上一词开头的,
+        // 剩余尾字作为候选,权重 = 整词的词频权重。
+        // 例:提交 中(zhong)后输入 de → "zhongde" → 中的(9307)→ 尾字"的"以
+        // "中的"的权重出现;"shide" → 是的(350380)→ "的" 权重极高。
+        // 权重来自整词频率,不顶满 1.0,也不做加法/乘法噪声。
+        let last = self.last_commit.lock().unwrap();
+        if !last.0.is_empty() && !last.1.is_empty() {
+            let joined = format!("{}{}", last.1, input);
+            if let Some(lat) = self.lattice.lock().unwrap().as_ref() {
+                for (word, freq) in lat.words_for(&joined) {
+                    if let Some(tail) = word.strip_prefix(last.0.as_str()) {
+                        if !tail.is_empty() {
+                            let score = lat.freq_to_score(&self.freq_scale, freq);
+                            match candidates.iter_mut().find(|c| c.text == tail) {
+                                // 尾字已在候选(几乎总是):整词权重更高则提升。
+                                Some(existing) if score > existing.raw_score => {
+                                    existing.raw_score = score;
+                                    existing.source = "context_comp";
+                                }
+                                Some(_) => {}
+                                // 尾字不在候选(罕见):直接加入。
+                                None => candidates.push(ScoredCandidate {
+                                    text: tail.to_string(),
+                                    family: "pinyin",
+                                    source: "context_comp",
+                                    raw_score: score,
+                                }),
+                            }
                         }
                     }
                 }
             }
         }
+        drop(last);
 
         candidates.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap());
         candidates
@@ -601,6 +603,45 @@ mod tests {
         let cands = fam.predict("lizhengming");
         let p = cands.iter().find(|c| c.text == "李正明").unwrap();
         assert!((p.raw_score - 0.74).abs() < 1e-9, "count 3 → 0.74: {}", p.raw_score);
+    }
+
+    #[test]
+    fn context_prefix_association_boosts_tail_word() {
+        // 前缀整词联想:提交 中(zhong)后输入 de → "zhongde" → 中的(9307)
+        // → 尾字"的"以整词权重提升(source = context_comp)。
+        use crate::family::CandidateFamily;
+        let path = format!("/tmp/swift-ime-ctx-{}.fst", std::process::id());
+        let mut b = inputx_fsa::DictBuilder::new();
+        b.insert(b"zhongde", "中的".as_bytes(), 9307);
+        b.insert(b"de", "的".as_bytes(), 200_000); // 单字 freq 更高 → 不提升
+        std::fs::write(&path, b.finish()).unwrap();
+        let fam = PinyinFamily::new();
+        fam.load_dict(&path).unwrap();
+        CandidateFamily::record_pick(&fam, "zhong", "中");
+        let cands = fam.predict_with_context("de", &InputContext::new());
+        let di = cands.iter().find(|c| c.text == "的").expect("的 present");
+        assert!(di.raw_score >= 0.68, "整词权重提升: {}", di.raw_score);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.idx"));
+    }
+
+    #[test]
+    fn context_association_off_when_context_aware_disabled() {
+        use crate::family::CandidateFamily;
+        let path = format!("/tmp/swift-ime-ctxoff-{}.fst", std::process::id());
+        let mut b = inputx_fsa::DictBuilder::new();
+        b.insert(b"zhongde", "中的".as_bytes(), 9307);
+        b.insert(b"de", "的".as_bytes(), 200_000);
+        std::fs::write(&path, b.finish()).unwrap();
+        let fam = PinyinFamily::new();
+        fam.load_dict(&path).unwrap();
+        CandidateFamily::record_pick(&fam, "zhong", "中");
+        fam.set_context_aware(false);
+        let cands = fam.predict_with_context("de", &InputContext::new());
+        let di = cands.iter().find(|c| c.text == "的").expect("的 present");
+        assert_ne!(di.source, "context_comp", "关闭后无整词联想");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.idx"));
     }
 
     #[test]

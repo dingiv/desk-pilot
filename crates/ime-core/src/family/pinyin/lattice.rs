@@ -378,6 +378,15 @@ impl LatticeDecoder {
             .any(|(item, _)| item == word.as_bytes())
     }
 
+    /// 全拼命中的所有 (word, freq) 对 —— 供上下文感知的"前缀整词联想"
+    /// (prev_pinyin + input 拼起来查整词)。
+    pub fn words_for(&self, pinyin: &str) -> Vec<(String, u64)> {
+        self.fst.get(pinyin.as_bytes())
+            .iter()
+            .map(|(item, value)| (String::from_utf8_lossy(item).into_owned(), *value))
+            .collect()
+    }
+
     /// Main entry: predict candidates for any pinyin input.
     pub fn predict(&self, input: &str, max_results: usize) -> Vec<LatticeResult> {
         if input.is_empty() { return Vec::new(); }

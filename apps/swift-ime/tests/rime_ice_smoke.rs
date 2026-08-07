@@ -145,6 +145,26 @@ fn english_black_still_works() {
         "english word black should be found by EnglishFamily, not rime-ice");
 }
 
+// ── 前缀整词联想(上下文感知)───────────────────────────────────────────
+
+#[test]
+fn context_prefix_association_boosts_tail_word() {
+    // 提交 是(shi)后输入 de → "shide" → 是的(350380)→ 尾字"的"以整词
+    // 权重提升(高于单字候选的词典分)。
+    let mut e = engine_with_rime();
+    for c in "shi".chars() { e.predict(InputEvent::char(c)); }
+    let idx = e.candidates().iter().position(|c| *c == "是").expect("是 present");
+    e.select_candidate(idx);
+
+    for c in "de".chars() { e.predict(InputEvent::char(c)); }
+    let detailed = e.candidates_detailed();
+    let di = detailed.iter().find(|d| d.text == "的").expect("的 present");
+    assert_eq!(di.source, "context_comp",
+        "的 should come from prefix association (shide→是的): {:?}",
+        detailed.iter().map(|d| (&d.text, d.source)).take(5).collect::<Vec<_>>());
+    assert!(di.score >= 0.9, "整词权重(是的 350380): {}", di.score);
+}
+
 // ── Ranking consistency (jix vs jixu) ───────────────────────────────────
 //
 // Regression: freq_to_score used MAX_WEIGHT=100k with a 0.90 cap, so every

@@ -29,7 +29,7 @@ snippets:
 input:
   fuzzy: true         # fuzzy pinyin (z/zh, c/ch, s/sh, n/l, etc.)
   page_size: 7        # candidates per page
-  context_aware: true # 上下文感知(recency/bigram/surrounding 加成);排查怪异排序时可临时关闭
+  context_aware: false # 上下文感知(recency/bigram/surrounding 加成);排查怪异排序时可临时关闭
 
 # ── Weights (scoring parameters for each prediction layer) ──────────────
 # Final score = raw_score × (family_priority / 100), then ranked.
