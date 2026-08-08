@@ -120,20 +120,32 @@ void SwiftImeEngine::apply_view(fcitx::InputContext *ic, const ImeView &v) {
                 list->setGlobalCursorIndex(v.candidate_highlight);
             }
             ic->inputPanel().setCandidateList(std::move(list));
-            ic->inputPanel().setAuxUp(
-                fcitx::Text(std::string(v.aux_up)));
-            // 候选列表重建后强制重推 preedit —— str_changed 门控在移动高亮
-            // 时会跳过 setClientPreedit,面板顶部的 preedit 行随之消失。
-            auto preeditText = fcitx::Text(std::string(v.preedit_text));
-            preeditText.setCursor(v.preedit_cursor);
-            ic->inputPanel().setClientPreedit(preeditText);
         } else if (prev.candidate_count > 0) {
             ic->inputPanel().setCandidateList(nullptr);
         }
     }
 
+    // AuxUp(候选框顶部 preedit):独立检测变化。之前 auxUp 绑在
+    // cands_changed 里 —— 当候选词不变但输入增长(如 feichag→feichagn,
+    // 前 8 个候选恰好相同)时 cands_changed=false,auxUp 停在旧值
+    // ("feichag" 少了一个 n)。
+    if (str_changed(v.aux_up, prev.aux_up) || cands_changed) {
+        if (v.aux_up[0] != 0) {
+            ic->inputPanel().setAuxUp(fcitx::Text(std::string(v.aux_up)));
+        }
+    }
+
+    // 候选框的 panel preedit 也独立更新(与 clientPreedit 同步)。
+    if (str_changed(v.preedit_text, prev.preedit_text)
+        || v.preedit_cursor != prev.preedit_cursor || cands_changed) {
+        auto preeditText = fcitx::Text(std::string(v.preedit_text));
+        preeditText.setCursor(v.preedit_cursor);
+        ic->inputPanel().setClientPreedit(preeditText);
+    }
+
     // Aux up when preedit exists without candidates
-    if (v.preedit_text[0] != 0 && v.candidate_count == 0) {
+    if (v.preedit_text[0] != 0 && v.candidate_count == 0
+        && v.aux_up[0] == 0) {
         ic->inputPanel().setAuxUp(
             fcitx::Text(std::string(v.preedit_text)));
     }
