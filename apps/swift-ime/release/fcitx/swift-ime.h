@@ -28,6 +28,7 @@ static const unsigned int CANDIDATE_SLOTS = 16;
 struct CandidateSlot {
     char text[128];
     char label[8];
+    char meta[32];  // debug mode: "[score family/source]" — rendered as comment
 };
 
 struct ImeView {
@@ -135,8 +136,8 @@ private:
 
 class SwiftCandidateWord : public fcitx::CandidateWord {
 public:
-    SwiftCandidateWord(const std::string &text, int index,
-                       SwiftImeEngine *engine);
+    SwiftCandidateWord(const std::string &text, const std::string &meta,
+                       int index, SwiftImeEngine *engine);
     void select(fcitx::InputContext *inputContext) const override;
 private:
     int index_;

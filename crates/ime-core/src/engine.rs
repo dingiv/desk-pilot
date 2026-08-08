@@ -61,8 +61,10 @@ struct PerContext {
 }
 
 impl PerContext {
-    fn with_page_size(page_size: u32) -> Self {
-        PerContext { sm: StateMachine::with_page_size(page_size), text_context: InputContext::new() }
+    fn with_page_size(page_size: u32, candidate_meta: bool) -> Self {
+        let mut sm = StateMachine::with_page_size(page_size);
+        sm.candidate_meta_enabled = candidate_meta;
+        PerContext { sm, text_context: InputContext::new() }
     }
 }
 
@@ -97,6 +99,8 @@ pub struct ImeEngine {
     /// 候选每页条数(swift-ime.yaml → input.page_size;默认 7)。传给每个新建的
     /// StateMachine —— 之前写死在 `StateMachine::new` 里(FIXME)。
     page_size: u32,
+    /// 调试模式:候选词显示提供者与权重(swift-ime.yaml → debug.candidate_meta)。
+    candidate_meta: bool,
 }
 
 impl ImeEngine {
@@ -160,6 +164,7 @@ impl ImeEngine {
             magic,
             provider,
             page_size: 7,
+            candidate_meta: false,
         };
         // Load embedded base dictionary (5KB, compiled into binary).
         let count = engine.dispatcher.scorer().family("pinyin")
@@ -178,8 +183,17 @@ impl ImeEngine {
 
     fn with_ctx<T>(&self, ctx: usize, f: impl FnOnce(&Dispatcher, &mut PerContext) -> T) -> T {
         let mut map = self.contexts.lock().unwrap();
-        let pc = map.entry(ctx).or_insert_with(|| PerContext::with_page_size(self.page_size));
+        let pc = map.entry(ctx).or_insert_with(|| PerContext::with_page_size(self.page_size, self.candidate_meta));
         f(&self.dispatcher, pc)
+    }
+
+    /// 调试模式:候选词后显示提供者与权重(swift-ime.yaml → debug.candidate_meta)。
+    /// 已存在的 context 立即生效,后续新建的 context 沿用。
+    pub fn set_candidate_meta(&mut self, on: bool) {
+        self.candidate_meta = on;
+        for pc in self.contexts.lock().unwrap().values_mut() {
+            pc.sm.candidate_meta_enabled = on;
+        }
     }
 
     /// 临时关闭/恢复 pinyin 家族的上下文感知(swift-ime.yaml → input.context_aware)。
@@ -375,6 +389,13 @@ impl ImeEngine {
                 v.candidate_page_size = pc.sm.candidate_page_size as u32;
                 for (i, c) in pc.sm.candidates.iter().take(16).enumerate() {
                     ImeView::set_str(&mut v.candidates[i].text, c);
+                    // 调试模式:meta 与 fill_view 对齐。
+                    if pc.sm.candidate_meta_enabled {
+                        if let Some((score, fam, src)) = pc.sm.last_meta().get(i) {
+                            ImeView::set_str(&mut v.candidates[i].meta,
+                                &format!("[{score:.3} {fam}/{src}]"));
+                        }
+                    }
                 }
                 ImeView::set_str(&mut v.preedit_text, &pc.sm.preedit);
                 v.preedit_cursor = pc.sm.cursor as u32;
@@ -438,7 +459,7 @@ impl ImeEngine {
     /// Manually set the text context (simulates pre-filled text).
     pub fn set_context(&mut self, text: &str) {
         self.contexts.lock().unwrap()
-            .entry(DEFAULT_CTX).or_insert_with(|| PerContext::with_page_size(self.page_size))
+            .entry(DEFAULT_CTX).or_insert_with(|| PerContext::with_page_size(self.page_size, self.candidate_meta))
             .text_context.update(text);
     }
 
@@ -1156,6 +1177,28 @@ mod tests {
         let mut e2 = eng();
         for c in "weixiao".chars() { e2.predict(InputEvent::char(c)); }
         assert!(e2.candidates().contains(&"😊".to_string()), "weixiao surfaces 😊: {:?}", e2.candidates());
+    }
+
+    #[test]
+    fn candidate_meta_shows_provider_and_weight_in_debug_mode() {
+        // 调试模式开启时,候选槽的 meta 字段填充 [score family/source]。
+        let mut e = eng();
+        e.set_candidate_meta(true);
+        for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
+        let v = e.view();
+        assert!(v.candidate_count > 0);
+        let meta = ImeView::str_field(&v.candidates[0].meta);
+        assert!(meta.starts_with('[') && meta.contains('/'),
+            "meta shows [score family/source]: {meta:?}");
+        assert!(meta.contains("pinyin"), "family in meta: {meta:?}");
+
+        // 关闭后 meta 为空。
+        let mut e2 = eng();
+        e2.set_candidate_meta(false);
+        for c in "nihao".chars() { e2.predict(InputEvent::char(c)); }
+        let v = e2.view();
+        assert_eq!(ImeView::str_field(&v.candidates[0].meta), "",
+            "debug off → no meta");
     }
 
     #[test]

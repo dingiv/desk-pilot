@@ -31,10 +31,15 @@ pub const CANDIDATE_SLOTS: usize = 16;
 pub struct CandidateSlot {
     pub text: [u8; 128],
     pub label: [u8; 8],
+    /// 调试模式元数据:候选词的提供者与权重,如 `[0.960 pinyin/lattice]`。
+    /// 仅 `candidate_meta_enabled` 时填充;前端(如 fcitx 的候选 comment)据此显示。
+    pub meta: [u8; 32],
 }
 
 impl Default for CandidateSlot {
-    fn default() -> Self { CandidateSlot { text: [0u8; 128], label: [0u8; 8] } }
+    fn default() -> Self {
+        CandidateSlot { text: [0u8; 128], label: [0u8; 8], meta: [0u8; 32] }
+    }
 }
 
 impl CandidateSlot {

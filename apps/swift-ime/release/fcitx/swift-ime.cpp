@@ -103,7 +103,8 @@ void SwiftImeEngine::apply_view(fcitx::InputContext *ic, const ImeView &v) {
             for (unsigned int i = 0;
                  i < v.candidate_count && i < CANDIDATE_SLOTS; i++) {
                 list->append<SwiftCandidateWord>(
-                    std::string(v.candidates[i].text), (int)i, this);
+                    std::string(v.candidates[i].text),
+                    std::string(v.candidates[i].meta), (int)i, this);
             }
             if (list->toPageable()) {
                 auto *p = list->toPageable();
@@ -223,11 +224,18 @@ void SwiftImeEngine::startMagicPoll() {
 
 // ── Candidate word ──────────────────────────────────────────────────────
 
-SwiftCandidateWord::SwiftCandidateWord(const std::string &text, int index,
+SwiftCandidateWord::SwiftCandidateWord(const std::string &text,
+                                       const std::string &meta, int index,
                                        SwiftImeEngine *engine)
     : fcitx::CandidateWord(fcitx::Text(text)),
       index_(index),
-      engine_(engine) {}
+      engine_(engine) {
+    // 调试模式(swift-ime.yaml → debug.candidate_meta):meta 显示在候选词
+    // 右侧注释(灰色小字),空时 fcitx 不渲染。
+    if (!meta.empty()) {
+        setComment(fcitx::Text(meta));
+    }
+}
 
 void SwiftCandidateWord::select(
     fcitx::InputContext *inputContext) const

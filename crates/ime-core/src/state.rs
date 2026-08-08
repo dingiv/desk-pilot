@@ -82,6 +82,18 @@ pub struct StateMachine {
     /// `Some` only while in [`Magic`](ComposeState::Magic) state. Each activation
     /// spawns a fresh instance from the [`MagicFamily`] registry.
     pub magic_member: Option<Box<dyn MagicMember>>,
+    /// 调试模式:候选词显示提供者与权重(`[score family/source]`)。
+    pub candidate_meta_enabled: bool,
+    /// 最近一次排名的详细结果(score, family, source)——与 candidates 对齐,
+    /// 供 fill_view 填充 meta。
+    last_meta: Vec<(f64, &'static str, &'static str)>,
+}
+
+impl StateMachine {
+    /// 最近一次排名的 (score, family, source)(engine.view 的调试视图用)。
+    pub fn last_meta(&self) -> &[(f64, &'static str, &'static str)] {
+        &self.last_meta
+    }
 }
 
 impl std::fmt::Debug for StateMachine {
@@ -334,6 +346,13 @@ impl StateMachine {
             // Mark single-char partial-commit candidates with ">" label.
             if self.partial_commit_indices.get(i).copied().unwrap_or(false) {
                 ImeView::set_str(&mut view.candidates[i].label, ">");
+            }
+            // 调试模式:候选词后附提供者与权重。
+            if self.candidate_meta_enabled {
+                if let Some((score, fam, src)) = self.last_meta.get(i) {
+                    let meta = format!("[{score:.3} {fam}/{src}]");
+                    ImeView::set_str(&mut view.candidates[i].meta, &meta);
+                }
             }
         }
         view.candidate_count = n as u32;
@@ -590,7 +609,11 @@ impl StateMachine {
     fn query_pinyin(&mut self, env: &dyn StepEnv) -> ImeView {
         // Unified scorer: collects candidates from all enabled families,
         // ranks them by weighted score, returns deduplicated text list.
-        let cands = env.scorer().rank_with_context(&self.buffer, &self.context);
+        let ranked = env.scorer().rank_detailed(&self.buffer, &self.context);
+        self.last_meta = ranked.iter()
+            .map(|c| (c.score, c.family, c.source))
+            .collect();
+        let cands: Vec<String> = ranked.into_iter().map(|c| c.text).collect();
 
         let mut merged = Vec::new();
         self.partial_commit_indices.clear();

@@ -23,6 +23,9 @@ pub struct SwiftImeConfig {
     /// support `$DATE` / `$CLIPBOARD` / `$CURSOR` variables.
     #[serde(default)]
     pub snippets: Vec<SnippetEntryConfig>,
+    /// 调试模式配置。
+    #[serde(default)]
+    pub debug: DebugConfig,
 }
 
 /// One user-defined snippet trigger → expansion template.
@@ -34,6 +37,21 @@ pub struct SnippetEntryConfig {
     /// The expansion text — may contain `$DATE`, `$CLIPBOARD`, `$CURSOR`.
     #[serde(default)]
     pub expand: String,
+}
+
+/// 调试模式(swift-ime.yaml → debug 节)。
+#[derive(Debug, Clone, Deserialize)]
+pub struct DebugConfig {
+    /// 候选词后显示提供者与权重 `[score family/source]`(fcitx 显示在候选
+    /// 词右侧注释,TUI 已有同样的详细视图)。
+    #[serde(default)]
+    pub candidate_meta: bool,
+}
+
+impl Default for DebugConfig {
+    fn default() -> Self {
+        DebugConfig { candidate_meta: false }
+    }
 }
 
 /// `#req` magic-command backend configuration.
@@ -257,6 +275,7 @@ impl Default for SwiftImeConfig {
             weights: WeightsConfig::default(),
             magic: MagicConfig::default(),
             snippets: Vec::new(),
+            debug: DebugConfig::default(),
         }
     }
 }

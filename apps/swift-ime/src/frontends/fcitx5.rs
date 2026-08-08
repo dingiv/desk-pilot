@@ -92,6 +92,8 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
     engine.set_page_size(cfg.input.page_size);
     // 上下文感知开关(swift-ime.yaml → input.context_aware)。
     engine.set_context_aware(cfg.input.context_aware);
+    // 调试模式:候选词显示提供者与权重。
+    engine.set_candidate_meta(cfg.debug.candidate_meta);
 
     // `#req` backend base URL (config `magic.req_base`, default
     // http://127.0.0.1:14555/api).
