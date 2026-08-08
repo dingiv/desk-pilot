@@ -371,7 +371,12 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
     } else {
         uint32_t ch = fcitx::Key::keySymToUnicode(sym);
         if (ch == 0) return;  // unmapped non-character (F1, …) — let fcitx handle it
+        FCITX_DEBUG() << "[key] char='" << (char)ch << "' (0x" << std::hex << ch
+                      << std::dec << ") special=" << sp;
         swift_ime_process_key(handle_, (void *)ic, ch, &view);
+        FCITX_DEBUG() << "[key] after: preedit='" << view.preedit_text
+                      << "' cursor=" << view.preedit_cursor
+                      << " candidates=" << view.candidate_count;
     }
 
     if (view.key_passthrough) {
