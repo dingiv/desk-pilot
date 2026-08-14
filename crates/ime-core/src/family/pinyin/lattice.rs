@@ -105,6 +105,8 @@ pub struct LatticeResult {
     pub freq_score: f64,
     /// Match type for scoring weight.
     pub match_type: MatchType,
+    /// 该词的完整拼音 code(前缀联想按"剩余未输入长度"衰减用)。
+    pub pinyin: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -115,6 +117,10 @@ pub enum MatchType {
     Mixed,
     /// Pure initials (every segment is Initial).
     Initials,
+    /// 全拼前缀联想:输入是词条拼音的前缀(如 naozh → naozhong 闹钟)。
+    /// 覆盖 greedy_parse 切不开的"半截音节"输入(zh 不是合法音节,
+    /// 旧 Mixed 路径段数膨胀导致永远匹配不上)。
+    Prefix,
 }
 
 /// Lattice decoder backed by a FST dict + initials index.
@@ -387,6 +393,37 @@ impl LatticeDecoder {
             .collect()
     }
 
+    /// 前缀联想扫描上限:FST 按字典序遍历、回调无法中断,宽前缀
+    /// (如两字母声母)可能命中几千条 —— 到此上限后停止收集(已够排序)。
+    const PREFIX_SCAN_CAP: usize = 256;
+
+    /// 全拼前缀联想:所有拼音以 `input` 为前缀的词条(词频降序)。
+    /// `naozh` → `naozhong`(闹钟)—— 用户还在打字,联想出目标词。
+    pub fn predict_prefix(&self, input: &str, max_results: usize) -> Vec<LatticeResult> {
+        let mut results = Vec::new();
+        self.fst.prefix_for_each(input.as_bytes(), |code, item, value| {
+            if results.len() >= Self::PREFIX_SCAN_CAP {
+                return;
+            }
+            if let (Ok(word), Ok(pinyin)) = (
+                std::str::from_utf8(item),
+                std::str::from_utf8(code),
+            ) {
+                if !word.is_empty() && !pinyin.is_empty() {
+                    results.push(LatticeResult {
+                        text: word.to_string(),
+                        freq_score: value as f64,
+                        match_type: MatchType::Prefix,
+                        pinyin: pinyin.to_string(),
+                    });
+                }
+            }
+        });
+        results.sort_by(|a, b| b.freq_score.partial_cmp(&a.freq_score).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(max_results);
+        results
+    }
+
     /// Main entry: predict candidates for any pinyin input.
     pub fn predict(&self, input: &str, max_results: usize) -> Vec<LatticeResult> {
         if input.is_empty() { return Vec::new(); }
@@ -407,6 +444,7 @@ impl LatticeDecoder {
                     if let Ok(word) = String::from_utf8(item) {
                         results.push(LatticeResult {
                             text: word, freq_score: value as f64, match_type: MatchType::Full,
+                            pinyin: input.to_string(),
                         });
                     }
                 });
@@ -425,6 +463,7 @@ impl LatticeDecoder {
             if pattern_match(code, &segments) {
                 results.push(LatticeResult {
                     text: word.clone(), freq_score: *freq as f64, match_type,
+                    pinyin: code.clone(),
                 });
             }
         }

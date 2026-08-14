@@ -57,6 +57,8 @@ pub struct PinyinWeights {
     pub viterbi_base: f64,
     pub viterbi_scale: f64,
     pub jianpin: f64,
+    /// 全拼前缀联想折扣(naozh → naozhong 闹钟)。
+    pub prefix_lookup: f64,
     pub single_syl_decay: f64,
     pub context_boost: f64,
     // ── Post-merge adjustments ──
@@ -74,7 +76,7 @@ impl Default for PinyinWeights {
         PinyinWeights {
             phrase_book: 0.88, large_dict: 0.85,
             viterbi_base: 0.25, viterbi_scale: 0.55,
-            jianpin: 0.50,
+            jianpin: 0.50, prefix_lookup: 0.75,
             single_syl_decay: 0.5, context_boost: 0.12,
             stopword_penalty: 0.5, confirm_bonus: 0.05, short_word_bonus: 0.01,
             large_dict_take: 96, viterbi_take: 48,
@@ -428,11 +430,38 @@ impl CandidateFamily for PinyinFamily {
                         lattice::MatchType::Full => ("lattice", base_score),
                         lattice::MatchType::Mixed => ("lattice_mix", base_score * self.weights.jianpin),
                         lattice::MatchType::Initials => ("lattice_jp", base_score * self.weights.jianpin),
+                        // predict() 不产 Prefix(前缀联想走单独的 predict_prefix
+                        // 合并分支);此处不可达,防御性兜底。
+                        lattice::MatchType::Prefix => ("lattice_prefix", base_score * self.weights.prefix_lookup),
                     };
                     out.push(ScoredCandidate {
                         text: r.text, family: "pinyin", source,
                         raw_score: score,
                     });
+                }
+            }
+            // ── 全拼前缀联想:输入是词条拼音的前缀(naozh → naozhong 闹钟)──
+            // 覆盖 greedy_parse 切不开的半截音节(zh 非法 → 拆 z+h 两段,
+            // pattern_match 段数对不上,旧路径永远联想不出目标词)。
+            // 权重 = 词频权重 × prefix_lookup(低于全拼精确,高于 emoji/简拼)。
+            if let Some(lat) = lattice_guard.as_ref() {
+                for r in lat.predict_prefix(input, 16) {
+                    if !out.iter().any(|c| c.text == r.text) {
+                        let base_score = lat.freq_to_score(&self.freq_scale, r.freq_score as u64);
+                        // 距离衰减:联想词拼音比输入长越多,越不可信。剩余
+                        // ≤2 字符视为"马上打完"不衰减(naozh→naozhong 与
+                        // naozh→naozhe 同权,拼词频,闹钟胜);超出部分按
+                        // 0.85^剩余 衰减 —— jix→jixiaokao(d=6)这类宽前缀
+                        // 捞到的高频长词自然沉底,不淹没 mixed/简拼的目标短词。
+                        let d = (r.pinyin.chars().count())
+                            .saturating_sub(input.chars().count())
+                            .saturating_sub(2) as f64;
+                        let decay = 0.85_f64.powf(d);
+                        out.push(ScoredCandidate {
+                            text: r.text, family: "pinyin", source: "lattice_prefix",
+                            raw_score: base_score * self.weights.prefix_lookup * decay,
+                        });
+                    }
                 }
             }
             drop(lattice_guard);

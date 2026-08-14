@@ -165,6 +165,24 @@ fn context_prefix_association_boosts_tail_word() {
     assert!(di.score >= 0.9, "整词权重(是的 350380): {}", di.score);
 }
 
+// ── 全拼前缀联想(naozh → 闹钟)────────────────────────────────────────
+
+#[test]
+fn prefix_lookup_associates_partial_pinyin() {
+    // naozh 是 naozhong 的半截(zh 非法音节,greedy_parse 拆 z+h 两段,
+    // 旧 Mixed 路径段数膨胀永远匹配不上)。前缀联想让目标词在打字途中
+    // 就出现,且中文候选压过 emoji 前缀命中(⏰ 0.48)。
+    let mut e = engine_with_rime();
+    let cands = candidates_for(&mut e, "naozh");
+    assert_eq!(cands.first().map(String::as_str), Some("闹钟"),
+        "naozh → 闹钟 #1 (prefix association): {cands:?}");
+
+    // 继续输入到全拼:无缝切换到精确匹配(权重更高)。
+    let mut e2 = engine_with_rime();
+    let cands2 = candidates_for(&mut e2, "naozhong");
+    assert_eq!(cands2.first().map(String::as_str), Some("闹钟"));
+}
+
 // ── Ranking consistency (jix vs jixu) ───────────────────────────────────
 //
 // Regression: freq_to_score used MAX_WEIGHT=100k with a 0.90 cap, so every

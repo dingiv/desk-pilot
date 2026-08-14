@@ -140,6 +140,7 @@ pub struct PinyinWeightConfig {
     #[serde(default = "default_0_25")] pub viterbi_base: f64,
     #[serde(default = "default_0_55")] pub viterbi_scale: f64,
     #[serde(default = "default_0_5")] pub jianpin: f64,
+    #[serde(default = "default_0_75")] pub prefix_lookup: f64,
     #[serde(default = "default_0_5")] pub single_syl_decay: f64,
     #[serde(default = "default_0_12")] pub context_boost: f64,
     #[serde(default = "default_0_5")] pub stopword_penalty: f64,
@@ -180,6 +181,7 @@ impl PinyinWeightConfig {
             viterbi_base: self.viterbi_base,
             viterbi_scale: self.viterbi_scale,
             jianpin: self.jianpin,
+            prefix_lookup: self.prefix_lookup,
             single_syl_decay: self.single_syl_decay,
             context_boost: self.context_boost,
             stopword_penalty: self.stopword_penalty,
@@ -213,6 +215,7 @@ fn default_0_20() -> f64 { 0.20 }
 fn default_0_15() -> f64 { 0.15 }
 fn default_0_10() -> f64 { 0.10 }
 fn default_0_6() -> f64 { 0.6 }
+fn default_0_75() -> f64 { 0.75 }
 fn default_0_12() -> f64 { 0.12 }
 fn default_0_05() -> f64 { 0.05 }
 fn default_0_02() -> f64 { 0.02 }
@@ -229,7 +232,7 @@ impl Default for WeightsConfig {
             family_priority: FamilyPriorityConfig::default(),
             pinyin: PinyinWeightConfig {
                 phrase_book: 0.88, large_dict: 0.85, viterbi_base: 0.25, viterbi_scale: 0.55,
-                jianpin: 0.50, single_syl_decay: 0.5, context_boost: 0.12,
+                jianpin: 0.50, prefix_lookup: 0.75, single_syl_decay: 0.5, context_boost: 0.12,
                 stopword_penalty: 0.5, confirm_bonus: 0.05, short_word_bonus: 0.01,
                 large_dict_take: 96, viterbi_take: 48, jianpin_take: 8,
             },
