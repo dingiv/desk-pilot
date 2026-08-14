@@ -1,132 +1,231 @@
 # 权重评价系统
 
-> **状态: ✅ 已实现。** 2026-07-31 实测 Top-1 87.5%, Top-3 100%。
+> **状态: ✅ 已实现(2026-08-10 大改版)。** 打分参数全部可配(`swift-ime.yaml` →
+> `weights`);调试模式(`debug.candidate_meta`)可在候选词后直接显示
+> `[score family/source]`。
 
-## 问题诊断（已修复）
-
-### 根因
-
-`fetch_dict.sh` 原来用 `cut -f1,2` 砍掉了 rime-ice YAML 的第 3 列（weight 字段）。
-所有词进入 FST 时权重相同（occurrence count = 1），`freq_to_score()` 归一化后全部 0.25。
+## 总览:三层打分架构
 
 ```
-rime-ice YAML (3 列: word, pinyin, weight)
-  │
-  │ fetch_dict.sh OLD: cut -f1,2   ← 砍掉 weight
-  │ fetch_dict.sh NEW: awk 保留 3 列
-  ↓
-rime-ice.tsv (3 列: pinyin, word, weight)
-  │
-  │ build_dict.rs: 读第 3 列 → DictBuilder.insert(pinyin, word, weight)
-  ↓
-FST binary (value = rime-ice weight, 100-500266)
-  │
-  │ lattice::freq_to_score(weight)
-  ↓
-差异化候选评分 ✅
+候选原始分 (family 内部, 0.0~1.0)
+  × 家族优先级/100 (pinyin 100 / english 70 / emoji 60)
+  + 叠加层(recent member 权重合成、short_word_bonus)
+  → 全局排序
 ```
 
-## 评分公式
+`#`(magic)与 `/`(snippet)强制前缀分流,候选由 FSM 直填,**不参与**统一打分。
+
+---
+
+## 1. 词典词分数链(rime-ice lattice)
+
+### 词频归一化
 
 ```
-freq_score(weight) = log₂(weight + 1) / log₂(MAX_WEIGHT + 1)
-  clamped to [0.25, 0.90]
-
-where MAX_WEIGHT = 100_000
+freq_to_score(f) = log₂(f+1) / log₂(max_freq+1)   clamp [0.25, 1.0]
 ```
 
-| weight | log₂(w+1) | 归一化 | clamp |
-|--------|-----------|--------|-------|
-| 500266 | 18.9 | 1.21 | **0.90** |
-| 100000 | 16.6 | 1.06 | **0.90** |
-| 10000  | 13.3 | 0.85 | **0.85** |
-| 1000   | 10.0 | 0.64 | **0.64** |
-| 100    | 6.7  | 0.43 | **0.43** |
-| 1      | 1.0  | 0.06 | **0.25** |
+- `max_freq` = **构建索引时记录的实际最大词频**(rime-ice ≈ 501,276),随
+  cache v2 头持久化 —— 映射对齐真实分布,高频词不会饱和成同分。
+- 可通过 `weights.freq_scale.max_weight` 显式覆盖(`0` = auto,默认)。
 
-评分实现在 `crates/ime-core/src/family/pinyin/lattice.rs:257-261`:
-```rust
-pub fn freq_to_score(freq: u64) -> f64 {
-    let w = freq.max(1) as f64;
-    let s = (w + 1.0).log2() / (Self::MAX_WEIGHT + 1.0).log2();
-    s.clamp(0.25, 0.90)
-}
+| 词频 | 分数 | 实例 |
+|---|---|---|
+| 501,276 | 1.000 | 继续(顶流) |
+| 164,505 | 0.915 | 急须 |
+| 73,750 | 0.854 | 积蓄 |
+| 22,600 | 0.764 | 几许 |
+| 12,495 | 0.719 | 记叙 |
+
+### 匹配类型折扣
+
+| source | 触发 | 分数 |
+|---|---|---|
+| `lattice` | 全拼精确 | freq 分 × 1.0 |
+| `lattice_mix` | 全拼+声母混写 | freq 分 × `jianpin`(0.50) |
+| `lattice_jp` | 纯简拼(nh→你好) | freq 分 × `jianpin`(0.50) |
+| `lattice_prefix` | **前缀联想**(naozh→闹钟) | freq 分 × `prefix_lookup`(0.75) × 距离衰减 |
+| `single` | 单音节(de→的) | 1.0 按位衰减 × `single_syl_decay` |
+| `decomp` | Viterbi 造词兜底 | 0.40 |
+
+### 前缀联想距离衰减
+
+联想词拼音比输入长越多越不可信:剩余 **≤2 字符免费**("马上打完"),
+超出按 `0.85^超出` 衰减。作用:`jix→jixiaokao(绩效考核,剩6)` 这类宽前缀
+捞到的高频长词沉底,不淹没 `jix→继续(剩1)`。
+
+### 为什么需要前缀联想
+
+`greedy_parse` 切不开"半截声母":`naozh` 中 `zh` 非法音节 → 拆 `z+h` 两段
+→ 输入 3 段 vs `naozhong` 2 音节 → `pattern_match` 永远 false。FST 原生
+前缀遍历(`predict_prefix`,256 条扫描上限)补上这个洞。
+
+---
+
+## 2. 自生词分数链(PhraseBook 单词本)
+
+### count 曲线
+
+```
+phrase_score(count) = min(0.70 + 0.02 × (count-1), 0.88)
 ```
 
-## 当前数据源（统一 Lattice 后，5 个主 source）
+| 使用次数 | 分数 | 等价词典词频 | 词典中的位置 |
+|---|---|---|---|
+| 1(刚造) | 0.700 | ~9,800 | 中等偏冷 |
+| 5 | 0.780 | ~27,900 | 中频 |
+| 10+(封顶) | 0.880 | ~104,000 | 高频 |
+| — 对照 | 1.000 | 501,276 | 顶流(继续)|
 
-| source | 数据源 | 评分 | 触发条件 |
-|--------|--------|------|---------|
-| `single` | inputx `dict.lookup()` | 1.0→0.4 | 有效单音节 |
-| `lattice` | LatticeDecoder FST 全拼 | freq_to_score(weight) | 全拼精确匹配 |
-| `lattice_mix` | LatticeDecoder 混写 | freq_to_score(weight) | 全拼+首字母混合 |
-| `lattice_jp` | LatticeDecoder 简拼 | freq_to_score(weight) | 纯首字母 |
-| `decomp` | Viterbi 分解 | 0.40 | 造词兜底 |
-| `session` | inputx Session | 0.5 | 始终 |
-| `phrase` | PhraseBook | 1.0 | 用户自造词置顶 |
+**设计意图**:新造词从"中等偏冷词典词"起步,用 10 次升到"高频词典词",
+封顶 0.88 永远够不到词典顶流 —— 高频学习不霸榜。
 
-## 权重配置
+声母召回(lzm→李正明):phrase 分 × 0.95。
 
-所有参数可通过 `swift-ime.yaml` → `weights.pinyin` 节调整（`apps/swift-ime/config.rs`）：
+### 两条学习路径
+
+| 路径 | 判定 | 词典检查 |
+|---|---|---|
+| 直接提交(空格选 top) | `committed_text` 为空 | ✅ 词典词**不学**(de→的 不污染) |
+| 自生词流程(数字键逐字选) | 经历 ≥1 次 partial commit | ❌ 无条件学(主动造词) |
+
+学习入口只收 **汉字+ASCII 字母数字** 组成的词("Bevy引擎" ✓,📀 ✗)——
+emoji 提交不进拼音单词本(它们会吃 phrase+recent 双重加成霸榜)。
+存量污染在 warm 时过滤,无需清库。
+
+---
+
+## 3. 自生词 × 词典词关系(2026-08-10 分析)
+
+### 实测交叉点
+
+| 场景 | 自生词 | 词典词 | 判定 |
+|---|---|---|---|
+| 全拼 `lizhengming` | 李正明 0.700(phrase) | decomp 0.400 | ✓ 造词召回是刚需 |
+| 简拼 `nh` | 你好 0.710(phrase 声母) | 女孩 0.503(lattice_jp) | ⚠️ P1 |
+| recent 后(b=5) | c≥10: 0.88→0.968 | 0.852 词→0.960 | ⚠️ P2 |
+| 全拼封顶 | phrase ≤0.88 | 顶流 1.0 | ✓ P3 保护 |
+
+### 已知问题(权衡,未修)
+
+- **P1 简拼压制过强(+0.167)**:词典简拼打 0.5 折,自生词声母只打 0.95 折。
+  首次学习的自生词(c=1)在简拼下就压过词典顶流。可调:声母折扣 0.95→0.80。
+- **P2 recent 叠加后反超**:c≥10 自生词+recent(0.968)> 词典 0.852 词+recent
+  (0.960)。强用户偏好压过词典高频,勉强合理;根因是 recent 对两者同权。
+- **P3 全拼封顶隔离(保护,合理)**:词典顶流(的/了/继续级)始终安全。
+
+---
+
+## 4. 叠加层
+
+### Recent member(近期指数权重合成)
+
+提交时记录词 + wall-clock 时间戳;候选再次出现时按距上次使用分档:
+
+| 距上次使用 | 近期指数 b |
+|---|---|
+| ≤10s | 5 |
+| ≤1h | 4 |
+| ≤5h | 3 |
+| ≤1d | 2 |
+| ≤3d | 1 |
+| >3d | 移出 |
+
+```
+z = (1-a) × (a+b) / 8 + a        a = 候选原权重, b = 近期指数
+```
+
+性质:增量与 (1-a) 成比例 —— 低权重词获更大加成、高权重词增量趋零,
+**z 天然 < 1,不会顶满**(取代旧的"加固定值再 min(1.0)"做法)。
+
+| a \ b | 1 | 5 |
+|---|---|---|
+| 0.70 | 0.764 | 0.914 |
+| 0.88 | 0.892 | 0.968 |
+
+### 前缀整词联想(上下文感知)
+
+提交词的拼音 + 当前输入拼音 → 拼接查词典 → 整词以上一词开头的,**尾字**
+以**整词权重**提升(source `context_comp`)。例:提交 是(shi)后输入 de →
+`shide`→是的(350,380)→ 的 提升至 0.960。整词权重低于候选现分则不动
+(只升不降)。开关:`input.context_aware`。
+
+### 其他
+
+- `short_word_bonus`(0.01):2 字词加成
+- `stopword_penalty`(0.5):全虚词组合折扣
+
+---
+
+## 5. 其他家族关键规则
+
+**emoji**(优先级 60):
+- exact 完整命中 1.0;前缀 0.6 + 距离衰减(剩余 ≤2 免费,超出 0.85^超出)
+- **≤2 字母关键词(cd→📀、ok→👍)即使完整命中也降为前缀档** —— 两字母
+  输入几乎总是中文简拼或 ASCII 缩写
+- 关键词表 = 内置 28 + CLDR 生成(`emoji.tsv`,英文+**拼音**关键词,汉字
+  关键词无法在拼音 buffer 触发所以转换) + 用户表
+
+**english**(优先级 70):exact 0.88,prefix 按匹配比例(≤0.6)。
+
+---
+
+## 6. 全部可配参数(swift-ime.yaml → weights)
 
 ```yaml
 weights:
+  family_priority:
+    pinyin: 100
+    english: 70
+    emoji: 60
   pinyin:
-    phrase_book: 1.0
-    large_dict: 0.95
-    viterbi_base: 0.3
-    viterbi_scale: 0.65
-    session: 0.5
-    prefix: 0.3
-    phrase_book_prefix: 0.85
-    jianpin: 0.70
-    single_syl_decay: 0.6
-    context_boost: 0.15
-    stopword_penalty: 0.5
-    confirm_bonus: 0.05
-    short_word_bonus: 0.02
-    large_dict_take: 96
-    viterbi_take: 48
-    jianpin_take: 8
-    prefix_take: 256
+    phrase_book: 0.88       # 自生词封顶
+    large_dict: 0.85
+    jianpin: 0.50           # 混写/简拼折扣
+    prefix_lookup: 0.75     # 前缀联想折扣(naozh→闹钟)
+    single_syl_decay: 0.5
+    short_word_bonus: 0.01
+    # …(viterbi/context/stopword 等见 yaml 注释)
+  bigram:
+    max_boost: 0.25
+  freq_scale:
+    max_weight: 0           # 0=auto(实际最大词频), >0 显式分母
+    min_score: 0.25
+    max_score: 1.0
 ```
 
-## 实测结果
+固定不可配:recent 合成公式、前缀/emoji 距离衰减(0.85 底数)、
+emoji ≤2 字母降权、phrase count 曲线斜率(0.02/次,起点 0.70)。
 
-测试用例 `assets/testcase/tc_draft.txt`（16 条），使用 rime-ice 900K 词条 + FST 权重：
+## 7. 调试
 
-```
-═══════════════════════════════════
-  Total:        16
-  Top-1:        14  (87.5%)
-  Top-3:        16  (100.0%)
-  Top-10:       16  (100.0%)
-═══════════════════════════════════
+```yaml
+debug:
+  candidate_meta: true   # fcitx 候选词右侧显示 [score family/source]
 ```
 
-仅 2 条未达 Top-1：
-- `jishi → 即使` (#2)
-- `chushi → 初始` (#2)
+TUI 始终显示;mock `--verbose` 同样输出。
+
+---
 
 ## 数据流
 
 ```
-rime-ice YAML (word, pinyin_with_tone, weight)
-  │
+rime-ice YAML (word, pinyin, weight)
   │ fetch_dict.sh: awk 去声调 + 保留 weight
   ↓
-rime-ice.tsv (pinyin\tword\tweight)
-  │
-  │ build_dict.rs: DictBuilder.insert(pinyin, word, weight)
+rime-ice.tsv → build_dict.rs → rime-ice.fst (~22MB)
   ↓
-rime-ice.fst (~50MB binary)
-  │
-  │ LatticeDecoder::new(fst)
-  │   ├─ 构建 initials_index (O(n) 全表扫描, ~47s)
-  │   └─ 缓存到 .fst.jianpin (~50ms 下次启动)
+LatticeDecoder::new(fst)
+  ├─ initials_index 构建(~46s 首次)→ cache v2(记录实际 max_freq)→ DATA:: 命名空间
   ↓
 predict(input)
-  ├─ 全拼 → FST.get() O(1) → freq_to_score(weight)
-  ├─ 简拼 → initials_index HashMap O(1) + pattern_match
-  └─ 混写 → initials_index + pattern_match
+  ├─ 全拼 → FST.get() O(1) → freq_to_score
+  ├─ 简拼/混写 → initials_index + pattern_match × jianpin
+  └─ 前缀联想 → FST.prefix_for_each × prefix_lookup × 距离衰减
 ```
+
+## 历史基线
+
+2026-07-31(rime-ice 权重修复后):Top-1 87.5%, Top-3 100%
+(用例 `assets/testcase/tc_draft.txt`,16 条;`jishi→即使`、`chushi→初始` #2)。
