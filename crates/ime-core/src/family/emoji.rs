@@ -164,15 +164,27 @@ impl CandidateFamily for EmojiFamily {
         }
         let entries = self.entries.lock().unwrap();
         let mut out = Vec::new();
+        let input_len = input.chars().count();
         for (kw, emoji) in entries.iter() {
             if kw.starts_with(input) {
-                // Exact keyword → 1.0; prefix → 0.8 (below english exact).
                 let exact = kw == input;
+                // 前缀分 0.6 + 距离衰减:用户打中文途中(weishenm →
+                // weishenme→🤌)emoji 只前缀命中时,应明显低于拼音家族的
+                // 联想候选(0.5+),不插队。剩余 ≤2 字符视为"马上打完"
+                // 不衰减(与拼音前缀联想同规则),超出按 0.85^剩余 衰减。
+                let score = if exact {
+                    1.0
+                } else {
+                    let excess = (kw.chars().count())
+                        .saturating_sub(input_len)
+                        .saturating_sub(2) as f64;
+                    0.6 * 0.85_f64.powf(excess)
+                };
                 out.push(ScoredCandidate {
                     text: emoji.clone(),
                     family: "emoji",
                     source: if exact { "exact" } else { "prefix" },
-                    raw_score: if exact { 1.0 } else { 0.8 },
+                    raw_score: score,
                 });
             }
         }
@@ -207,7 +219,8 @@ mod tests {
         let fam = EmojiFamily::new();
         let cands = fam.predict("smil");
         assert!(cands.iter().any(|c| c.text == "😊"), "{cands:?}");
-        assert_eq!(cands[0].raw_score, 0.8, "prefix match scores 0.8");
+        // smil→smile 剩余 1(≤2 免衰减)→ 前缀基础分 0.6。
+        assert_eq!(cands[0].raw_score, 0.6, "prefix match scores 0.6");
     }
 
     #[test]
@@ -274,8 +287,28 @@ mod tests {
         let cands = fam.predict("ok");
         assert_eq!(cands[0].text, "👍", "{cands:?}");
         assert_eq!(cands[0].raw_score, 1.0);
-        // All remaining candidates are prefix matches (≤ 0.8).
-        assert!(cands.iter().skip(1).all(|c| c.raw_score <= 0.8), "{cands:?}");
+        // All remaining candidates are prefix matches (≤ 0.6).
+        assert!(cands.iter().skip(1).all(|c| c.raw_score <= 0.6), "{cands:?}");
+    }
+
+    #[test]
+    fn long_keyword_prefix_decays() {
+        // 前缀命中长关键词:剩余超过 2 字符后按 0.85^剩余 衰减。
+        // weishenm(8) → weishenme(9) 剩 1 → 0.6(不衰减);
+        // weis(4) → weishenme(9) 剩 5 → 0.6 × 0.85³ ≈ 0.368。
+        let fam = EmojiFamily::new();
+        let path = std::env::temp_dir().join(format!("emoji_decay_{}.tsv", std::process::id()));
+        std::fs::write(&path, "weishenme\t🤌\n").unwrap();
+        fam.load_tsv(&path.to_string_lossy()).unwrap();
+
+        let near = fam.predict("weishenm");
+        let e = near.iter().find(|c| c.text == "🤌").unwrap();
+        assert!((e.raw_score - 0.6).abs() < 1e-9, "剩 1 不衰减: {}", e.raw_score);
+
+        let far = fam.predict("weis");
+        let e2 = far.iter().find(|c| c.text == "🤌").unwrap();
+        assert!(e2.raw_score < 0.45, "剩 5 衰减后明显更低: {}", e2.raw_score);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
