@@ -164,6 +164,11 @@ impl PinyinFamily {
             if !entries.is_empty() {
                 let mut book = self.phrase_book.lock().unwrap();
                 for (pinyin, word, priority, count) in &entries {
+                    // 存量过滤:早期版本把 emoji 也学进了 phrase(见
+                    // learn_phrase_inner),加载时丢弃。
+                    if !is_learnable_word(word) {
+                        continue;
+                    }
                     book.insert_with_order_count(pinyin, word, *priority, *count);
                 }
                 eprintln!("[ime-core] pinyin: warmed {} phrases from store", entries.len());
@@ -218,7 +223,13 @@ impl PinyinFamily {
     }
 
     /// 加入/递增单词本的公共实现(已通过词典检查或自生词无条件路径)。
+    /// 只收汉字/字母数字组成的词:emoji 等符号候选(提交 cd→📀 后被学成
+    /// pinyin/phrase,吃 phrase+recent 双重加成霸榜)不进拼音单词本 ——
+    /// emoji 有自己的关键词表,学习走 emoji 体系。
     fn learn_phrase_inner(&self, pinyin: &str, hanzi: &str) {
+        if !is_learnable_word(hanzi) {
+            return;
+        }
         let mut book = self.phrase_book.lock().unwrap();
         if book.count(pinyin, hanzi) > 0 {
             book.bump_count(pinyin, hanzi);
@@ -255,6 +266,19 @@ pub fn initials_from_pinyin(raw: &str) -> String {
 
 impl Default for PinyinFamily {
     fn default() -> Self { Self::new() }
+}
+
+/// 单词本只收汉字 + ASCII 字母数字组成的词(可含混合,如 "Bevy引擎");
+/// emoji / 表情符号 / 其他标点符号一律不学 —— 它们不是拼音自造词。
+fn is_learnable_word(word: &str) -> bool {
+    word.chars().any(|c| is_cjk(c) || c.is_ascii_alphanumeric())
+        && word.chars().all(|c| is_cjk(c) || c.is_ascii_alphanumeric())
+}
+
+/// CJK 统一表意文字(含扩展A)。
+fn is_cjk(c: char) -> bool {
+    let p = c as u32;
+    (0x4E00..=0x9FFF).contains(&p) || (0x3400..=0x4DBF).contains(&p)
 }
 
 /// 当前 wall-clock 毫秒(unix epoch)—— recent member 的时间基准。
@@ -671,6 +695,24 @@ mod tests {
         assert_ne!(di.source, "context_comp", "关闭后无整词联想");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}.idx"));
+    }
+
+    #[test]
+    fn emoji_candidates_are_not_learned_into_phrase_book() {
+        // 提交 emoji(cd→📀)不该把它学进拼音单词本 —— 否则它成了 pinyin
+        // 候选,吃 phrase + recent 双重加成霸榜(0.945)。emoji 有自己的
+        // 关键词表,不缺这条学习路径。
+        let fam = PinyinFamily::new();
+        let before = fam.phrase_count();
+        use crate::family::CandidateFamily;
+        CandidateFamily::record_pick(&fam, "cd", "📀");
+        assert_eq!(fam.phrase_count(), before, "emoji must not enter the phrase book");
+        // 自生词路径同样拒收。
+        fam.learn_composed_phrase("cd", "📀");
+        assert_eq!(fam.phrase_count(), before, "composed path also rejects emoji");
+        // 汉字 + ASCII 混合词正常学习。
+        fam.learn_composed_phrase("bevyyinqing", "Bevy引擎");
+        assert_eq!(fam.phrase_count(), before + 1, "mixed CJK+ASCII word is learnable");
     }
 
     #[test]
