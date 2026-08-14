@@ -128,10 +128,28 @@ impl Dispatcher {
             .unwrap_or(0)
     }
 
-    /// Attach weight store to pinyin family for phrase persistence.
+    /// Attach weight store to families for persistence (pinyin phrases +
+    /// english learned words).
     pub fn set_store(&self, store: Arc<crate::weight_store::WeightStore>) {
         if let Some(fam) = self.scorer.family("pinyin") {
+            fam.attach_store(Arc::clone(&store));
+        }
+        if let Some(fam) = self.scorer.family("english") {
             fam.attach_store(store);
+        }
+    }
+
+    /// 学习英文自生词(Enter 强选 raw 文本提交时)。
+    pub fn record_english_word(&self, word: &str) {
+        if let Some(fam) = self.scorer.family("english") {
+            fam.record_learned_word(word);
+        }
+    }
+
+    /// Warm the english user layer from persisted 英文自生词。
+    pub fn warm_en_user(&self, words: Vec<(String, u32)>) {
+        if let Some(fam) = self.scorer.family("english") {
+            fam.warm_learned_words(&words);
         }
     }
 

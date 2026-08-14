@@ -10,6 +10,7 @@
 //! - `recency`: recent-member table — word → last-used wall-clock ms (unix
 //!   epoch). Full-snapshot replaced on every commit (≤512 rows, one
 //!   transaction); the 3-day window is the store's own eviction rule.
+//! - `en_user`: 英文自生词 word → 使用次数(Enter 强选 raw 文本时学习)
 //! - `l0`:      inputx-pinyin L0 user model (single-row JSON)
 
 use rusqlite::{Connection, params};
@@ -66,6 +67,10 @@ impl WeightStore {
             CREATE TABLE IF NOT EXISTS recency (
                 word     TEXT NOT NULL PRIMARY KEY,
                 used_at  INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS en_user (
+                word  TEXT NOT NULL PRIMARY KEY,
+                count INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE IF NOT EXISTS l0 (
                 id   INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
@@ -254,6 +259,33 @@ impl WeightStore {
     /// Drop the table (used when the in-memory store is empty).
     pub fn clear_recency(&self) {
         let _ = self.conn.lock().unwrap().execute("DELETE FROM recency", []);
+    }
+
+    // ── 英文自生词 ──────────────────────────────────────────────────────
+
+    /// 学习/递增一个英文自生词(Enter 强制提交 raw 文本,如 cd)。
+    pub fn record_en_user(&self, word: &str) {
+        if word.is_empty() { return; }
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO en_user (word, count) VALUES (?1, 1)
+             ON CONFLICT(word) DO UPDATE SET count = count + 1",
+            params![word],
+        );
+    }
+
+    /// 全部英文自生词 → (word, count),启动 warm 用。
+    pub fn load_all_en_user(&self) -> Vec<(String, u32)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT word, count FROM en_user") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)))
+            .ok()
+            .into_iter()
+            .flat_map(|rows| rows.filter_map(|r| r.ok()))
+            .collect()
     }
 
     // ── L0 user model ───────────────────────────────────────────────────

@@ -187,6 +187,13 @@ pub trait CandidateFamily: Send + Sync {
     /// to restore the time-decay boosts (expired >3d entries dropped on load).
     fn warm_recencies(&self, _entries: Vec<(String, i64)>) {}
 
+    /// 学习一个英文自生词(Enter 强选 raw 文本提交时)。
+    /// Default no-op; EnglishFamily overrides.
+    fn record_learned_word(&self, _word: &str) {}
+
+    /// Warm 英文自生词 from persisted data. Default no-op.
+    fn warm_learned_words(&self, _words: &[(String, u32)]) {}
+
     /// Attach the weight store for persisting learned phrases.
     /// Called once at startup after init_store.
     fn attach_store(&self, _store: std::sync::Arc<crate::weight_store::WeightStore>) {}

@@ -55,6 +55,13 @@ impl PersistenceManager {
         // Phrases → PhraseBook.
         disp.warm_phrases_from_store();
 
+        // 英文自生词 → EnglishFamily user 层。
+        let en_user = self.store.load_all_en_user();
+        if !en_user.is_empty() {
+            disp.warm_en_user(en_user);
+            eprintln!("[ime-core] english: warmed learned words");
+        }
+
         // Recency ring (most-recent-first; the family reverses for load_bulk).
         let recency = self.store.load_recency();
         if !recency.is_empty() {

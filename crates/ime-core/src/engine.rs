@@ -236,6 +236,7 @@ impl ImeEngine {
                 pc.text_context.update(committed);
                 self.record_bigram(&prev, committed);
                 self.dispatcher.record_commit(committed);
+                self.learn_english_if_ascii(committed);
             }
             view
         })
@@ -275,6 +276,7 @@ impl ImeEngine {
                 // Record bigram: prev_word → committed_word (both SQLite + in-memory).
                 self.record_bigram(&prev, committed);
                 self.dispatcher.record_commit(committed);
+                self.learn_english_if_ascii(committed);
             }
             // #wait demo interceptor.
             if ImeView::str_field(&view.commit_text) == "__WAIT_DEMO__" {
@@ -301,6 +303,7 @@ impl ImeEngine {
                 pc.text_context.update(committed);
                 self.record_bigram(&prev, committed);
                 self.dispatcher.record_commit(committed);
+                self.learn_english_if_ascii(committed);
             }
             view
         })
@@ -485,6 +488,16 @@ impl ImeEngine {
                 *self.persistence.lock().unwrap() = Some(pm);
             }
             Err(e) => eprintln!("[swift-ime] weight store open failed: {e}"),
+        }
+    }
+
+    /// 提交文本是纯 ASCII 字母数字(如 cd)时,学入英文家族 user 层
+    /// (英文自生词)。汉字/emoji/符号不触发。Enter 强选 raw 的主路径。
+    fn learn_english_if_ascii(&self, committed: &str) {
+        if !committed.is_empty()
+            && committed.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            self.dispatcher.record_english_word(committed);
         }
     }
 
@@ -1250,6 +1263,43 @@ mod tests {
         assert!(detailed.iter().any(|d| d.text == "你好" && d.source == "phrase"),
             "composed 你好 must be in the phrase book: {:?}",
             detailed.iter().map(|d| (&d.text, d.source)).take(8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn english_learned_word_survives_restart() {
+        // cd + Enter(强制提交 raw)→ 学成英文自生词,重启后 warm,
+        // cd 作为 english/user 候选 #1(0.616,压过 emoji 前缀与中文简拼)。
+        let db = format!("/tmp/swift-ime-enlearn-{}.db", std::process::id());
+        let _ = std::fs::remove_file(&db);
+        {
+            let mut e = eng();
+            e.init_store(&db);
+            for c in "cd".chars() { e.predict(InputEvent::char(c)); }
+            let v = e.predict(InputEvent::enter());
+            assert_eq!(ImeView::str_field(&v.commit_text), "cd", "Enter commits raw");
+        }
+        {
+            let mut e = eng();
+            e.init_store(&db);
+            for c in "cd".chars() { e.predict(InputEvent::char(c)); }
+            let detailed = e.candidates_detailed();
+            let cd = detailed.iter().find(|d| d.text == "cd")
+                .expect("learned cd is a candidate");
+            assert_eq!(cd.family, "english");
+            assert_eq!(cd.source, "user");
+            assert_eq!(detailed[0].text, "cd", "learned word ranks #1");
+        }
+        // 中文提交不触发英文学习。
+        {
+            let mut e = eng();
+            e.init_store(&db);
+            for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
+            e.predict(InputEvent::space());
+            let store = crate::weight_store::WeightStore::open(&db).unwrap();
+            let en = store.load_all_en_user();
+            assert_eq!(en, vec![("cd".to_string(), 1)], "chinese commit doesn't learn: {en:?}");
+        }
+        let _ = std::fs::remove_file(&db);
     }
 
     #[test]

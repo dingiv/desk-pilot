@@ -25,7 +25,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::{CandidateFamily, ScoredCandidate};
 
@@ -122,6 +122,8 @@ pub struct EnglishFamily {
     user_words: Mutex<Vec<(String, u32)>>,
     priority: u32,
     weights: EnglishWeights,
+    /// 持久化句柄(英文自生词 en_user 表),init_store 后由 dispatcher 注入。
+    store: Mutex<Option<Arc<crate::weight_store::WeightStore>>>,
 }
 
 impl EnglishFamily {
@@ -132,6 +134,7 @@ impl EnglishFamily {
             user_words: Mutex::new(Vec::new()),
             priority: 70,
             weights: EnglishWeights::default(),
+            store: Mutex::new(None),
         }
     }
 
@@ -201,6 +204,25 @@ impl EnglishFamily {
     pub fn set_enabled(&mut self, enabled: bool) { self.enabled = enabled; }
 
     // ── Dictionary loading ─────────────────────────────────────────────
+
+    /// 学习一个英文自生词:Enter 强制提交 raw 文本(如 cd)时调用。
+    /// 内存进 user 层(exact 0.88 × priority 70 ≈ 0.62,压过 emoji 前缀与
+    /// 中文简拼)+ SQLite en_user 表持久化。
+    pub fn record_learned_word(&self, word: &str) {
+        if word.is_empty() || !word.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return;
+        }
+        self.merge_into_user(&[(word.to_string(), 10_000)]);
+        if let Some(ref store) = *self.store.lock().unwrap() {
+            store.record_en_user(word);
+        }
+    }
+
+    /// Warm the user layer from persisted 英文自生词。
+    pub fn warm_learned_words(&self, words: &[(String, u32)]) {
+        if words.is_empty() { return; }
+        self.merge_into_user(words);
+    }
 
     /// Merge `words` into the user word layer.
     fn merge_into_user(&self, words: &[(String, u32)]) {
@@ -376,6 +398,19 @@ impl CandidateFamily for EnglishFamily {
 
     fn load_dict(&self, path: &str) -> std::io::Result<usize> {
         self.load_dict_file(path)
+    }
+
+    fn attach_store(&self, store: Arc<crate::weight_store::WeightStore>) {
+        *self.store.lock().unwrap() = Some(store);
+    }
+
+    fn record_learned_word(&self, word: &str) {
+        // 委托 inherent 实现(dispatcher 经 trait 对象调用)。
+        EnglishFamily::record_learned_word(self, word);
+    }
+
+    fn warm_learned_words(&self, words: &[(String, u32)]) {
+        EnglishFamily::warm_learned_words(self, words);
     }
 
     fn load_user_dict(&self, path: &str) -> std::io::Result<usize> {
