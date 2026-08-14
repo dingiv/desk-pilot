@@ -172,7 +172,12 @@ impl CandidateFamily for EmojiFamily {
                 // weishenme→🤌)emoji 只前缀命中时,应明显低于拼音家族的
                 // 联想候选(0.5+),不插队。剩余 ≤2 字符视为"马上打完"
                 // 不衰减(与拼音前缀联想同规则),超出按 0.85^剩余 衰减。
-                let score = if exact {
+                //
+                // ≤2 字母的短关键词(cd→📀、ok→👍)即使完整命中也降为
+                // 前缀档:两字母输入几乎总是中文简拼(承担/程度/成都)或
+                // 常用英文缩写,emoji 不该压过它们。
+                let short_kw = kw.chars().count() <= 2;
+                let score = if exact && !short_kw {
                     1.0
                 } else {
                     let excess = (kw.chars().count())
@@ -283,12 +288,22 @@ mod tests {
     #[test]
     fn exact_beats_prefix_in_ranking() {
         let fam = EmojiFamily::new();
-        // "ok" matches 👍 exact (1.0) — and nothing else exact; prefix hits stay lower.
-        let cands = fam.predict("ok");
-        assert_eq!(cands[0].text, "👍", "{cands:?}");
+        // 长关键词 exact:smile → 😊 1.0。
+        let cands = fam.predict("smile");
+        assert_eq!(cands[0].text, "😊", "{cands:?}");
         assert_eq!(cands[0].raw_score, 1.0);
-        // All remaining candidates are prefix matches (≤ 0.6).
-        assert!(cands.iter().skip(1).all(|c| c.raw_score <= 0.6), "{cands:?}");
+    }
+
+    #[test]
+    fn two_letter_keyword_demoted_even_on_exact() {
+        // ≤2 字母关键词(ok→👍、cd→📀)即使完整命中也降为前缀档 0.6:
+        // 两字母输入几乎总是中文简拼(承担/程度/成都)或常用英文缩写,
+        // emoji 不该压过它们。
+        let fam = EmojiFamily::new();
+        let cands = fam.predict("ok");
+        let ok = cands.iter().find(|c| c.text == "👍").unwrap();
+        assert!((ok.raw_score - 0.6).abs() < 1e-9,
+            "two-letter exact demoted to prefix tier: {}", ok.raw_score);
     }
 
     #[test]
