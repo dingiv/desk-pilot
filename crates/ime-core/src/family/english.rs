@@ -353,7 +353,13 @@ impl EnglishFamily {
             } else {
                 let freq_score = Self::freq_to_score(*freq);
                 let len_ratio = input.len() as f64 / word.len() as f64;
-                let score = (freq_score * prefix_ratio * len_ratio).clamp(0.15, 0.85);
+                // 地板 + 质量:0.60 地板与 emoji 前缀基础对齐(英文本尊
+                // clea→clean 必须压过同名词的 emoji 关键词 clean→🧼;经
+                // priority 70 后 0.42,高于 emoji 前缀 0.36、低于中文简拼
+                // 0.503),词频 × 匹配率在 [0.60, 0.85] 内提供区分度 ——
+                // smile(匹配 4/5)排在 smilacaceous(4/13)前,而非全体
+                // 贴地板后退化成字母序。
+                let score = 0.60 + 0.25 * freq_score * prefix_ratio * len_ratio;
                 out.push(ScoredCandidate {
                     text: word.clone(), family: "english", source,
                     raw_score: score,
