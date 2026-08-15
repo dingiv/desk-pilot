@@ -330,7 +330,8 @@ impl EnglishFamily {
     fn query_layer(
         words: &[(String, u32)],
         input: &str,
-        source: &'static str,
+        exact_label: &'static str,
+        prefix_label: &'static str,
         exact_score: f64,
         prefix_ratio: f64,
         seen: &mut std::collections::HashSet<String>,
@@ -347,7 +348,7 @@ impl EnglishFamily {
 
             if *word == input {
                 out.push(ScoredCandidate {
-                    text: word.clone(), family: "english", source,
+                    text: word.clone(), family: "english", source: exact_label,
                     raw_score: exact_score,
                 });
             } else {
@@ -361,7 +362,7 @@ impl EnglishFamily {
                 // 贴地板后退化成字母序。
                 let score = 0.60 + 0.25 * freq_score * prefix_ratio * len_ratio;
                 out.push(ScoredCandidate {
-                    text: word.clone(), family: "english", source,
+                    text: word.clone(), family: "english", source: prefix_label,
                     raw_score: score,
                 });
             }
@@ -391,11 +392,11 @@ impl CandidateFamily for EnglishFamily {
         // Layer 1: user dict (highest priority).
         let user = self.user_words.lock().unwrap();
         let user_exact = (self.weights.exact * self.weights.user_boost).min(1.0);
-        Self::query_layer(&user, &input_lower, "user", user_exact, self.weights.prefix_ratio * 1.1, &mut seen, &mut out);
+        Self::query_layer(&user, &input_lower, "user", "user_prefix", user_exact, self.weights.prefix_ratio * 1.1, &mut seen, &mut out);
         drop(user);
 
         // Layer 2: base dict.
-        Self::query_layer(&self.base_words, &input_lower, "exact", self.weights.exact, self.weights.prefix_ratio, &mut seen, &mut out);
+        Self::query_layer(&self.base_words, &input_lower, "exact", "prefix", self.weights.exact, self.weights.prefix_ratio, &mut seen, &mut out);
 
         out.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap());
         out.truncate(16);

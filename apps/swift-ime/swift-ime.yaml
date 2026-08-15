@@ -40,18 +40,18 @@ weights:
   # 拼音 / 英文 / emoji 参与统一打分(中英混输 + emoji 竞争)——魔法命令(#)
   # 与 snippet(/) 强制前缀分流,候选由引擎直接填充,不走这里的排序。
   family_priority:
-    pinyin: 100
+    pinyin: 80
     english: 70
-    emoji: 60
+    emoji: 50
 
   # Pinyin family internal scores (0.0-1.0)
   pinyin:
     phrase_book: 0.88       # user-learned phrases
-    large_dict: 0.85        # rime-ice exact match
+    large_dict: 0.75        # rime-ice exact match
     viterbi_base: 0.25      # Viterbi min score
     viterbi_scale: 0.55     # Viterbi score range (max = base + scale = 0.80)
     jianpin: 0.50           # initials-only match discount (nh→你好)
-    prefix_lookup: 0.75     # full-pinyin prefix association (naozh→闹钟)
+    prefix_lookup: 0.65     # full-pinyin prefix association (naozh→闹钟)
     single_syl_decay: 0.5   # score decay per position in single-syllable lookup
     context_boost: 0.12     # bonus for bigram match with previous word
     stopword_penalty: 0.5   # multiplier for all-stopword compositions
@@ -86,5 +86,6 @@ weights:
 
 # ── Debug 调试模式 ──────────────────────────────────────────────────────
 debug:
-  candidate_meta: false   # 候选词后显示提供者与权重 [score family/source]
+  candidate_meta: true   # 候选词后显示提供者与权重 [score family/source]
                           # (fcitx 显示在候选词右侧注释,TUI 始终显示)
+
