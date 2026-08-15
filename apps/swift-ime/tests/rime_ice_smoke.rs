@@ -162,7 +162,8 @@ fn context_prefix_association_boosts_tail_word() {
     assert_eq!(di.source, "context_comp",
         "的 should come from prefix association (shide→是的): {:?}",
         detailed.iter().map(|d| (&d.text, d.source)).take(5).collect::<Vec<_>>());
-    assert!(di.score >= 0.9, "整词权重(是的 350380): {}", di.score);
+    // 整词权重经线性重标(顶流封顶 0.90):是的 350380 → ~0.81。
+    assert!(di.score >= 0.78, "整词权重(是的 350380, rescaled): {}", di.score);
 }
 
 // ── 全拼前缀联想(naozh → 闹钟)────────────────────────────────────────

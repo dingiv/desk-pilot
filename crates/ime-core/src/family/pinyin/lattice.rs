@@ -362,7 +362,12 @@ impl LatticeDecoder {
     ///   501276 (继续) and 500369 (机械) map to 1.0 and ~0.998 instead of tying;
     /// - legacy caches without a recorded max fall back to a fixed 600k.
     ///
-    /// clamp to [scale.min_score, scale.max_score] (defaults 0.25..1.0).
+    /// **线性重标**(不是 clamp)到 [scale.min_score, scale.max_score]
+    /// (默认 0.25..0.90):score = min + (max-min) × log₂ 归一化比值。
+    /// - 保持严格单调 —— 高频段(501276 继续 vs 164505 急须)不会像 clamp
+    ///   那样贴顶同分、退化成稳定序;
+    /// - 顶流封顶 max_score(0.90),给 recent/context 合成公式留加成空间
+    ///   ((1-a)(a+b)/8+a 在 a→1 时失效)。
     pub fn freq_to_score(&self, scale: &crate::scoring::FreqScale, freq: u64) -> f64 {
         let w = freq.max(1) as f64;
         let max = if scale.max_weight > 0.0 {
@@ -372,8 +377,8 @@ impl LatticeDecoder {
         } else {
             600_000.0 // legacy cache without recorded max
         };
-        let s = (w + 1.0).log2() / (max + 1.0).log2();
-        s.clamp(scale.min_score, scale.max_score)
+        let ratio = (w + 1.0).log2() / (max + 1.0).log2();
+        scale.min_score + (scale.max_score - scale.min_score) * ratio
     }
 
     /// Full-pinyin exact hit? (rime-ice contains `pinyin` → `word`) — used by
@@ -393,9 +398,12 @@ impl LatticeDecoder {
             .collect()
     }
 
-    /// 前缀联想扫描上限:FST 按字典序遍历、回调无法中断,宽前缀
-    /// (如两字母声母)可能命中几千条 —— 到此上限后停止收集(已够排序)。
-    const PREFIX_SCAN_CAP: usize = 256;
+    /// 前缀联想收集池上限:FST 按字典序遍历、回调无法中断,宽前缀
+    /// (如两字母声母)可能命中几千条。池必须足够大 —— 字典序 ≠ 频率序,
+    /// 256 会把字典序靠后的高频词挡在门外(jixu/继续 排在几百个 jixi*
+    /// 词之后)。收集后按词频排序取 top(截断在排序后),池大只影响
+    /// 遍历耗时(~1024 条回调 <5ms)。
+    const PREFIX_SCAN_CAP: usize = 1024;
 
     /// 全拼前缀联想:所有拼音以 `input` 为前缀的词条(词频降序)。
     /// `naozh` → `naozhong`(闹钟)—— 用户还在打字,联想出目标词。
@@ -531,17 +539,23 @@ mod tests {
         let dict = inputx_fsa::Dict::new(b.finish()).expect("dict");
         let dec = LatticeDecoder::new(dict, &path);
         let scale = crate::scoring::FreqScale { max_weight: 0.0, min_score: 0.25, max_score: 1.0 };
-        // Auto: the recorded max is the top of the scale.
+        // Auto + 线性重标:min + (max-min) × log₂ 比值。top word = max_score,
+        // 近顶词保持严格更小(不贴顶同分)。
         assert!((dec.freq_to_score(&scale, 501_276) - 1.0).abs() < 1e-9, "top word = max_score");
         let s500 = dec.freq_to_score(&scale, 500_369);
         assert!(s500 < 1.0 && s500 > 0.99, "near-top keeps separation: {s500}");
         assert!(dec.freq_to_score(&scale, 164_505) < s500, "lower freq scores lower");
-        // Explicit fixed denominator + tighter clamp override the recorded max.
+        // 显式分母 + 更紧的 [min,max]:重标保持单调,顶 = max_score、底 = min_score。
         let tight = crate::scoring::FreqScale { max_weight: 100_000.0, min_score: 0.25, max_score: 0.90 };
-        assert!((dec.freq_to_score(&tight, 100_000) - 0.90).abs() < 1e-9, "max_score cap applies");
-        // 10000/100000 → log₂ ratio ≈ 0.80 < 0.90 cap (50000 would hit the cap).
-        assert!((dec.freq_to_score(&tight, 10_000) - 0.80).abs() < 0.01);
-        assert!((dec.freq_to_score(&tight, 1) - 0.25).abs() < 1e-9, "min_score floor applies");
+        assert!((dec.freq_to_score(&tight, 100_000) - 0.90).abs() < 1e-9, "top = max_score");
+        // 10000/100000 → log₂ 比值 = 13.29/16.61 ≈ 0.800 → 0.25 + 0.65×0.800
+        // ≈ 0.770(单调线性重标;clamp 时代此处为 0.80 贴段)。
+        let s10k = dec.freq_to_score(&tight, 10_000);
+        assert!((s10k - 0.770).abs() < 0.01, "rescaled mid: {s10k}");
+        assert!(s10k < 0.90 && s10k > 0.25);
+        // f=1:ratio = log₂2/log₂100001 ≈ 0.060 → 0.25 + 0.65×0.060 ≈ 0.289
+        //(线性重标下最低频不精确落在 min_score,但严格大于它且单调)。
+        assert!((dec.freq_to_score(&tight, 1) - 0.289).abs() < 0.01, "bottom near min");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}.idx"));
     }

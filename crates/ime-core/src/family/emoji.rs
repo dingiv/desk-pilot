@@ -171,7 +171,8 @@ impl CandidateFamily for EmojiFamily {
                 // 前缀分 0.6 + 距离衰减:用户打中文途中(weishenm →
                 // weishenme→🤌)emoji 只前缀命中时,应明显低于拼音家族的
                 // 联想候选(0.5+),不插队。剩余 ≤2 字符视为"马上打完"
-                // 不衰减(与拼音前缀联想同规则),超出按 0.85^剩余 衰减。
+                // 不衰减(与拼音前缀联想同规则,免费额度 3),超出按
+                // 0.85^超出 衰减。
                 //
                 // ≤2 字母的短关键词(cd→📀、ok→👍)即使完整命中也降为
                 // 前缀档:两字母输入几乎总是中文简拼(承担/程度/成都)或
@@ -182,7 +183,7 @@ impl CandidateFamily for EmojiFamily {
                 } else {
                     let excess = (kw.chars().count())
                         .saturating_sub(input_len)
-                        .saturating_sub(2) as f64;
+                        .saturating_sub(3) as f64;
                     0.6 * 0.85_f64.powf(excess)
                 };
                 out.push(ScoredCandidate {

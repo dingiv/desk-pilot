@@ -124,12 +124,12 @@ impl Default for BigramConfig {
 pub struct FreqScaleConfig {
     #[serde(default)] pub max_weight: f64,
     #[serde(default = "default_0_25")] pub min_score: f64,
-    #[serde(default = "default_1_0")] pub max_score: f64,
+    #[serde(default = "default_0_9")] pub max_score: f64,
 }
 
 impl Default for FreqScaleConfig {
     fn default() -> Self {
-        FreqScaleConfig { max_weight: 0.0, min_score: 0.25, max_score: 1.0 }
+        FreqScaleConfig { max_weight: 0.0, min_score: 0.25, max_score: 0.90 }
     }
 }
 
@@ -202,6 +202,7 @@ pub struct EnglishWeightConfig {
 }
 
 fn default_1_0() -> f64 { 1.0 }
+fn default_0_9() -> f64 { 0.9 }
 
 fn default_100() -> u32 { 100 }
 fn default_70() -> u32 { 70 }
@@ -438,6 +439,7 @@ weights:
         assert_eq!(s.priorities.emoji, 60);
         assert_eq!(s.bigram.max_boost, 0.25);
         assert_eq!(s.freq_scale.max_weight, 0.0, "auto by default");
+        assert_eq!(s.freq_scale.max_score, 0.90, "top headroom");
     }
 
     #[test]

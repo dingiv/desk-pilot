@@ -268,10 +268,11 @@ impl Default for PinyinFamily {
     fn default() -> Self { Self::new() }
 }
 
-/// 单词本只收汉字 + ASCII 字母数字组成的词(可含混合,如 "Bevy引擎");
-/// emoji / 表情符号 / 其他标点符号一律不学 —— 它们不是拼音自造词。
+/// 单词本只收**含汉字**的词(纯汉字或汉字+ASCII 混合,如 "Bevy引擎");
+/// 纯 ASCII 英文词(name/cd)走英文自生词体系(en_user),emoji / 符号
+/// 一律不学 —— 都不是拼音自造词。
 fn is_learnable_word(word: &str) -> bool {
-    word.chars().any(|c| is_cjk(c) || c.is_ascii_alphanumeric())
+    word.chars().any(is_cjk)
         && word.chars().all(|c| is_cjk(c) || c.is_ascii_alphanumeric())
 }
 
@@ -470,21 +471,33 @@ impl CandidateFamily for PinyinFamily {
             // 权重 = 词频权重 × prefix_lookup(低于全拼精确,高于 emoji/简拼)。
             if let Some(lat) = lattice_guard.as_ref() {
                 for r in lat.predict_prefix(input, 16) {
-                    if !out.iter().any(|c| c.text == r.text) {
+                    // 同文本候选取高分(先到的 mix/简拼版本若分更低,前缀
+                    // 联想版本提升之 —— 旧的"已存在则跳过"让低分 mix 挡掉
+                    // 高分前缀联想,继续 0.45 挡 0.675,机械的 0.59 反超 #1)。
+                    let prefix_score = {
                         let base_score = lat.freq_to_score(&self.freq_scale, r.freq_score as u64);
                         // 距离衰减:联想词拼音比输入长越多,越不可信。剩余
-                        // ≤2 字符视为"马上打完"不衰减(naozh→naozhong 与
-                        // naozh→naozhe 同权,拼词频,闹钟胜);超出部分按
-                        // 0.85^剩余 衰减 —— jix→jixiaokao(d=6)这类宽前缀
-                        // 捞到的高频长词自然沉底,不淹没 mixed/简拼的目标短词。
+                        // ≤3 字符视为"马上打完"不衰减 —— 覆盖"半截声母到
+                        // 完整音节"的典型差(zh→zhong 差 3):naozh 到 naozhong
+                        // 与到 naozhe 同权,拼词频,高频的闹钟胜;超出部分按
+                        // 0.85^超出 衰减 —— jix→jixiaokao(差 6,超出 3)这类
+                        // 宽前缀捞到的高频长词沉底,不淹没目标短词。
                         let d = (r.pinyin.chars().count())
                             .saturating_sub(input.chars().count())
-                            .saturating_sub(2) as f64;
+                            .saturating_sub(3) as f64;
                         let decay = 0.85_f64.powf(d);
-                        out.push(ScoredCandidate {
+                        base_score * self.weights.prefix_lookup * decay
+                    };
+                    match out.iter_mut().find(|c| c.text == r.text) {
+                        Some(existing) if prefix_score > existing.raw_score => {
+                            existing.raw_score = prefix_score;
+                            existing.source = "lattice_prefix";
+                        }
+                        Some(_) => {}
+                        None => out.push(ScoredCandidate {
                             text: r.text, family: "pinyin", source: "lattice_prefix",
-                            raw_score: base_score * self.weights.prefix_lookup * decay,
-                        });
+                            raw_score: prefix_score,
+                        }),
                     }
                 }
             }

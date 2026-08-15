@@ -82,7 +82,7 @@ weights:
   freq_scale:
     max_weight: 0
     min_score: 0.25
-    max_score: 1.0
+    max_score: 0.90       # 顶流封顶 0.90 —— 给 recent/context 加成留空间
 
 # ── Debug 调试模式 ──────────────────────────────────────────────────────
 debug:
