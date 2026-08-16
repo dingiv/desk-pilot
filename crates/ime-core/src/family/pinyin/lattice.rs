@@ -163,8 +163,9 @@ impl LatticeDecoder {
     /// 1. **next to the .fst** (`assets/dict/rime-ice.fst.idx`) — dev machines ship one in the
     ///    repo, so startup loads instantly instead of rebuilding the 29万-entry index (~46s).
     /// 2. **the `DATA` namespace** — dev: `apps/swift-ime/data/`, prod: `~/.desk-pilot/`
-    ///    (the deb's `/usr/share/swift-ime/dict` is read-only, so a first run there can't
-    ///    write beside the .fst and must fall back to the user data dir).
+    ///    (the deb's `/usr/share/swift-ime/dict` is read-only, so a first run there
+    ///    can't write beside the .fst and must fall back to the user data dir).
+    ///
     /// Loading takes the first that exists; saving takes the first that's writable.
     fn cache_paths(fst_path: &str) -> Vec<std::path::PathBuf> {
         let mut v = Vec::with_capacity(2);

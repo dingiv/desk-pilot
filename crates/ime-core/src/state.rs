@@ -175,11 +175,12 @@ impl StateMachine {
             self.reset();
             return ImeView::empty();
         };
-        let out = match member.on_key(self, ch, env) {
+        
+        match member.on_key(self, ch, env) {
             MemberAction::View(view) => {
                 self.magic_member = Some(member);
                 self.assemble_magic_tail(env);
-                view
+                *view
             }
             MemberAction::Commit(text) => {
                 member.deactivate();
@@ -191,8 +192,7 @@ impl StateMachine {
                 self.reset();
                 ImeView::empty()
             }
-        };
-        out
+        }
     }
 
     /// Commit the raw trigger text (`#asr`) as a rollback: deactivate the member, leave
@@ -326,7 +326,9 @@ impl StateMachine {
             .clamp(0, self.candidates.len() as i32 - 1) as usize;
         self.candidate_highlight = new;
         if self.candidate_page_size > 0 {
-            self.candidate_page = new / self.candidate_page_size;
+            self.candidate_page = (new as u32)
+                .checked_div(self.candidate_page_size as u32)
+                .unwrap_or(0) as usize;
         }
     }
 
@@ -649,8 +651,7 @@ impl StateMachine {
 
                     // Remaining full comps.
                     let full_tail: Vec<String> = cands.iter()
-                        .skip(max_full).cloned()
-                        .filter(|c| !merged.contains(c))
+                        .skip(max_full).filter(|&c| !merged.contains(c)).cloned()
                         .collect();
                     for _ in 0..full_tail.len() {
                         self.partial_commit_indices.push(false);

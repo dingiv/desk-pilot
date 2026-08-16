@@ -190,7 +190,7 @@ fn show_candidates_with_async(
     for c in input.chars() { engine.predict(InputEvent::char(c)); }
 
     let cands = engine.candidates();
-    let is_preview = cands.first().map_or(false, |c| c.ends_with("..."));
+    let is_preview = cands.first().is_some_and(|c| c.ends_with("..."));
 
     if is_preview && async_wait_secs > 0 {
         let timeout = Duration::from_secs(async_wait_secs);
@@ -214,10 +214,9 @@ fn show_candidates_with_async(
         let detailed = engine.candidates_detailed();
         print_candidates_verbose(input, &detailed, top_n);
     } else {
-        let n = candidates.len().min(top_n);
-        for i in 0..n {
-            let marker = if candidates[i].ends_with("...") { "⚡" } else { "" };
-            println!("{}{}", marker, &candidates[i]);
+        for c in candidates.iter().take(top_n) {
+            let marker = if c.ends_with("...") { "⚡" } else { "" };
+            println!("{marker}{c}");
         }
         if candidates.is_empty() { println!("(no candidates)"); }
     }
@@ -227,18 +226,16 @@ fn show_candidates_with_async(
 }
 
 fn print_candidates_verbose(input: &str, detailed: &[ime_core::family::RankedCandidate], top_n: usize) {
-    let n = detailed.len().min(top_n);
     println!();
     println!("── {input} ──");
-    for i in 0..n {
-        let d = &detailed[i];
+    for (i, d) in detailed.iter().enumerate().take(top_n) {
         let marker = if i == 0 { "★" } else { " " };
         let kind = if d.text.ends_with("...") { "⚡preview" } else { "" };
         println!("  [{:>2}] {} {:<24} {:>5.3}  {}/{}  {}",
             i + 1, marker, d.text, d.score, d.family, d.source, kind);
     }
     if detailed.is_empty() { println!("  (no candidates)"); }
-    else if detailed.len() > n { println!("  ... {} more", detailed.len() - n); }
+    else if detailed.len() > top_n { println!("  ... {} more", detailed.len() - top_n); }
 }
 
 // ── Commit display ─────────────────────────────────────────────────────
@@ -264,7 +261,7 @@ fn show_commit(engine: &mut ImeEngine, input: &str, verbose: bool) {
     let committed = ImeView::str_field(&commit_view.commit_text);
     println!();
     if committed.is_empty() {
-        let was_preview = engine.candidates().first().map_or(false, |c| c.ends_with("..."));
+        let was_preview = engine.candidates().first().is_some_and(|c| c.ends_with("..."));
         if was_preview { println!("── {input} (commit) → (empty — preview, no voice data yet)"); }
         else { println!("── {input} (commit) → (empty — no voice data or unknown command)"); }
     } else {
@@ -308,8 +305,8 @@ fn run_cases(engine: &mut ImeEngine, path: &str, verbose: bool) {
         let cands = engine.candidates();
         let pos = cands.iter().position(|c| c == &tc.expected);
         if pos == Some(0) { top1 += 1; }
-        if pos.map_or(false, |p| p < 3) { top3 += 1; }
-        if pos.map_or(false, |p| p < 10) { top10 += 1; }
+        if pos.is_some_and(|p| p < 3) { top3 += 1; }
+        if pos.is_some_and(|p| p < 10) { top10 += 1; }
         if verbose || pos.is_none() {
             let pos_str = pos.map_or("-".to_string(), |p| format!("#{}", p + 1));
             let icon = match pos { Some(0) => "✅", Some(_) => "⚠️", None => "❌" };

@@ -230,7 +230,7 @@ impl ImeEngine {
     pub fn special_key_ctx(&self, ctx: usize, key: SpecialKey) -> ImeView {
         self.with_ctx(ctx, |disp, pc| {
             let view = handle_special_key(&mut pc.sm, key, disp)
-                .unwrap_or_else(|| ImeView::empty());
+                .unwrap_or_else(ImeView::empty);
             let committed = ImeView::str_field(&view.commit_text);
             if !committed.is_empty() {
                 pc.text_context.update(committed);

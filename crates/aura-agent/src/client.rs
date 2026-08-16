@@ -136,20 +136,15 @@ impl AuraClient {
                         let mut bytes = resp.bytes_stream();
                         let mut buf = String::new();
                         // Drive this connection until it ends/errors, then fall through to reconnect.
-                        loop {
-                            match bytes.next().await {
-                                Some(Ok(chunk)) => {
-                                    // SSE frames are ASCII (JSON pings / keep-alive comments) —
-                                    // lossy utf8 is safe and never splits a multi-byte char mid-frame.
-                                    buf.push_str(&String::from_utf8_lossy(&chunk));
-                                    while let Some(idx) = buf.find("\n\n") {
-                                        let frame: String = buf.drain(..idx + 2).collect();
-                                        for payload in data_payloads(&frame) {
-                                            yield payload.to_string();
-                                        }
-                                    }
+                        while let Some(Ok(chunk)) = bytes.next().await {
+                            // SSE frames are ASCII (JSON pings / keep-alive comments) —
+                            // lossy utf8 is safe and never splits a multi-byte char mid-frame.
+                            buf.push_str(&String::from_utf8_lossy(&chunk));
+                            while let Some(idx) = buf.find("\n\n") {
+                                let frame: String = buf.drain(..idx + 2).collect();
+                                for payload in data_payloads(&frame) {
+                                    yield payload.to_string();
                                 }
-                                _ => break, // chunk error or clean end → reconnect
                             }
                         }
                     }

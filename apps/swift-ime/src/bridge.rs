@@ -81,12 +81,11 @@ pub fn spawn_aura_client(buffer: Arc<AsrBuffer>, aura_addr: Option<&str>) -> Aur
                         }
                     }
                     // ③ the merged paragraph settled — authoritative calibrated text.
-                    AgentEvent::TurnFinal(u) => {
-                        if !u.calibrated.is_empty() {
+                    AgentEvent::TurnFinal(u)
+                        if !u.calibrated.is_empty() => {
                             buffer.push_final(&u.calibrated);
                             tracing::info!(text = %u.calibrated, "asr final → candidate #1");
                         }
-                    }
                     _ => {} // snapshots / corrections / conn changes aren't voice-buffer input
                 }
             }

@@ -205,7 +205,7 @@ fn render_candidates(
     }
 
     let total = if view.candidate_count > 0 {
-        (view.candidate_count as usize + page_size - 1) / page_size
+        (view.candidate_count as usize).div_ceil(page_size)
     } else { 1 };
     let title = format!("Candidates (page {}/{total})", page + 1);
 

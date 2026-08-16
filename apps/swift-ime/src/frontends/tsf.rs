@@ -5,6 +5,12 @@ use ime_core::ImeView;
 
 pub struct TsfAdapter;
 
+impl Default for TsfAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TsfAdapter {
     pub fn new() -> Self { TsfAdapter }
 }

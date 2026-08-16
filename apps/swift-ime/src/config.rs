@@ -41,6 +41,7 @@ pub struct SnippetEntryConfig {
 
 /// 调试模式(swift-ime.yaml → debug 节)。
 #[derive(Debug, Clone, Deserialize)]
+#[derive(Default)]
 pub struct DebugConfig {
     /// 候选词后显示提供者与权重 `[score family/source]`(fcitx 显示在候选
     /// 词右侧注释,TUI 已有同样的详细视图)。
@@ -48,11 +49,6 @@ pub struct DebugConfig {
     pub candidate_meta: bool,
 }
 
-impl Default for DebugConfig {
-    fn default() -> Self {
-        DebugConfig { candidate_meta: false }
-    }
-}
 
 /// `#req` magic-command backend configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -196,14 +192,10 @@ fn default_0_85() -> f64 { 0.85 }
 fn default_0_55() -> f64 { 0.55 }
 fn default_0_5() -> f64 { 0.5 }
 fn default_0_25() -> f64 { 0.25 }
-fn default_0_20() -> f64 { 0.20 }
-fn default_0_15() -> f64 { 0.15 }
-fn default_0_10() -> f64 { 0.10 }
 fn default_0_6() -> f64 { 0.6 }
 fn default_0_75() -> f64 { 0.75 }
 fn default_0_12() -> f64 { 0.12 }
 fn default_0_05() -> f64 { 0.05 }
-fn default_0_02() -> f64 { 0.02 }
 fn default_0_01() -> f64 { 0.01 }
 fn default_48() -> usize { 48 }
 fn default_96() -> usize { 96 }

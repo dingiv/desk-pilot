@@ -5,6 +5,12 @@ use ime_core::ImeView;
 
 pub struct ImkAdapter;
 
+impl Default for ImkAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ImkAdapter {
     pub fn new() -> Self { ImkAdapter }
 }

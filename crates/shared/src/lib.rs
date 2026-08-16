@@ -10,7 +10,7 @@
 //! ```
 //!
 //! Add a one-line `build.rs`:
-//! ```rust
+//! ```rust,ignore
 //! fn main() { shared::emit_namespaces(); }
 //! ```
 //!
@@ -312,6 +312,27 @@ fn expand_tilde(path: &str) -> PathBuf {
 
 // ── shared's own build.rs (generates its own empty namespace table) ──────────
 
+/// Initialize the process-wide `tracing` subscriber. Call ONCE at the very top of a binary's
+/// `main` (init-stage side effect; lib crates only use the `tracing` facade macros).
+///
+/// - **Dev builds** (`debug_assertions`): human-readable colored output.
+/// - **Release builds**: one JSON object per line — machine-parseable for ELK/Loki.
+/// - **Level control**: the standard `RUST_LOG` env filter (e.g. `RUST_LOG=debug`,
+///   `RUST_LOG=aura_daemon=trace,info`); defaults to `info` when unset.
+/// - **Writer**: stderr, always. Log rotation/shipping is the HOST's job
+///   (journald / logrotate / docker log-driver) — the process never writes log files itself.
+#[cfg(feature = "log")]
+pub fn init_tracing() {
+    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let registry = tracing_subscriber::registry().with(filter);
+    if cfg!(debug_assertions) {
+        registry.with(fmt::layer().with_writer(std::io::stderr)).init();
+    } else {
+        registry.with(fmt::layer().json().with_writer(std::io::stderr)).init();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,24 +417,3 @@ mod tests {
 }
 
 // ── logging: process-wide tracing subscriber init (binaries only; `log` feature) ──
-
-/// Initialize the process-wide `tracing` subscriber. Call ONCE at the very top of a binary's
-/// `main` (init-stage side effect; lib crates only use the `tracing` facade macros).
-///
-/// - **Dev builds** (`debug_assertions`): human-readable colored output.
-/// - **Release builds**: one JSON object per line — machine-parseable for ELK/Loki.
-/// - **Level control**: the standard `RUST_LOG` env filter (e.g. `RUST_LOG=debug`,
-///   `RUST_LOG=aura_daemon=trace,info`); defaults to `info` when unset.
-/// - **Writer**: stderr, always. Log rotation/shipping is the HOST's job
-///   (journald / logrotate / docker log-driver) — the process never writes log files itself.
-#[cfg(feature = "log")]
-pub fn init_tracing() {
-    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let registry = tracing_subscriber::registry().with(filter);
-    if cfg!(debug_assertions) {
-        registry.with(fmt::layer().with_writer(std::io::stderr)).init();
-    } else {
-        registry.with(fmt::layer().json().with_writer(std::io::stderr)).init();
-    }
-}

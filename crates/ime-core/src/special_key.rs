@@ -224,7 +224,7 @@ impl crate::state::StateMachine {
     pub fn change_page(&mut self, delta: i32) {
         let n = self.candidates.len();
         if n == 0 || self.candidate_page_size == 0 { return; }
-        let total_pages = (n + self.candidate_page_size - 1) / self.candidate_page_size;
+        let total_pages = n.div_ceil(self.candidate_page_size);
         if total_pages <= 1 { return; }
         let new_page = (self.candidate_page as i32 + delta)
             .clamp(0, total_pages as i32 - 1) as usize;

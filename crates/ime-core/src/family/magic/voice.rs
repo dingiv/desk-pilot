@@ -155,14 +155,14 @@ impl MagicMember for VoiceMember {
                 match self.full.get(idx) {
                     Some(t) => MemberAction::Commit(t.clone()),
                     // No such candidate — let the application have the digit.
-                    None => MemberAction::View(StateMachine::passthrough_view()),
+                    None => MemberAction::View(Box::new(StateMachine::passthrough_view())),
                 }
             }
             // Enter: force-commit the trigger text (`#asr`) and exit the session —
             // "回车强制 '#asr' 上屏". Esc/Backspace still cancel.
             '\n' | '\r' => MemberAction::Commit(format!("#{}", self.name())),
             '\x1b' | '\x08' => MemberAction::Exit,
-            _ => MemberAction::View(StateMachine::passthrough_view()),
+            _ => MemberAction::View(Box::new(StateMachine::passthrough_view())),
         }
     }
 
@@ -245,7 +245,7 @@ impl MagicMember for SubmitMember {
             // Enter: force-commit the trigger text (`#submit`) and exit. Esc/Backspace cancel.
             '\n' | '\r' => MemberAction::Commit(format!("#{}", self.name())),
             '\x1b' | '\x08' => MemberAction::Exit,
-            _ => MemberAction::View(StateMachine::passthrough_view()),
+            _ => MemberAction::View(Box::new(StateMachine::passthrough_view())),
         }
     }
 

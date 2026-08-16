@@ -81,19 +81,12 @@ impl Default for FreqScale {
 
 /// 全部可配置打分参数的聚合,注入 `ImeEngine::with_config`。
 #[derive(Debug, Clone, Copy)]
+#[derive(Default)]
 pub struct ScoringConfig {
     pub priorities: FamilyPriorities,
     pub freq_scale: FreqScale,
 }
 
-impl Default for ScoringConfig {
-    fn default() -> Self {
-        ScoringConfig {
-            priorities: FamilyPriorities::default(),
-            freq_scale: FreqScale::default(),
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -73,7 +73,8 @@ impl RecentStore {
             return 0;
         };
         let age = now_ms - last;
-        let t = if age <= T10S {
+        
+        if age <= T10S {
             5
         } else if age <= T1H {
             4
@@ -86,9 +87,8 @@ impl RecentStore {
         } else {
             // 超过 3d:移出(惰性淘汰),不再有加成。
             self.entries.remove(word);
-            return 0;
-        };
-        t
+            0
+        }
     }
 
     /// 当前记录条数(诊断/测试)。

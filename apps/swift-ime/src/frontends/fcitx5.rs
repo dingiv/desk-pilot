@@ -10,6 +10,16 @@
 //! its own space — the fcitx5 panel is short, so rows get a compact preview;
 //! the TUI shows everything. Commit always uses the engine's full text, so
 //! truncation never loses data.
+//!
+//! # Safety(FFI 边界)
+//!
+//! 本模块的全部公开函数是 C ABI 入口,裸指针(`*mut ImeEngine` /
+//! `*const c_char`)由 C++ 胶水层(swift-ime.cpp)按 addon 契约持有并传入:
+//! 每个 handle 由 `swift_ime_create` 唯一创建、`swift_ime_destroy` 唯一
+//! 销毁,C 侧不存在悬垂/别名调用。Rust 侧的 `unsafe` 标记对 C 调用方
+//! 无意义(C 无此概念),故在此关闭 clippy 的 not_unsafe_ptr_arg_deref ——
+//! 该 lint 只对**Rust 调用方**有保护价值,而这里没有 Rust 调用方。
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::os::raw::c_char;
 use std::sync::{Arc, Mutex};
@@ -56,7 +66,7 @@ impl VariableProvider for FcitxProvider {
 fn truncate_candidate_rows(view: &mut ImeView) {
     for i in 0..view.candidate_count as usize {
         let text = ImeView::str_field(&view.candidates[i].text);
-        let preview = preview_text(&text, FCITX_CANDIDATE_TEXT_MAX);
+        let preview = preview_text(text, FCITX_CANDIDATE_TEXT_MAX);
         if preview != text {
             ImeView::set_str(&mut view.candidates[i].text, &preview);
         }

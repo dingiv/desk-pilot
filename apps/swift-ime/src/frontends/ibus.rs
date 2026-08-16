@@ -4,6 +4,12 @@ use ime_core::ImeView;
 
 pub struct IbusAdapter;
 
+impl Default for IbusAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IbusAdapter {
     pub fn new() -> Self { IbusAdapter }
 }

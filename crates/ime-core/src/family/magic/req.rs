@@ -78,8 +78,10 @@ impl ReqFetcher for ReqwestFetcher {
 /// Async status of one `#req` session. The worker thread writes it; `tick` reads
 /// it; `version` gates view rebuilds.
 #[derive(Debug)]
+#[derive(Default)]
 enum ReqStatus {
     /// Not fired yet — the user is still typing the suffix.
+    #[default]
     Idle,
     /// Worker thread in flight.
     InFlight,
@@ -95,11 +97,6 @@ struct ReqAsync {
     version: AtomicU64,
 }
 
-impl Default for ReqStatus {
-    fn default() -> Self {
-        ReqStatus::Idle
-    }
-}
 
 pub struct ReqMember {
     resources: Arc<MagicResources>,
@@ -208,7 +205,7 @@ impl MagicMember for ReqMember {
             '\x08' => {
                 if self.arg.pop().is_some() {
                     self.invalidate_result();
-                    MemberAction::View(self.rebuild(sm))
+                    MemberAction::View(Box::new(self.rebuild(sm)))
                 } else {
                     // Suffix already empty — Backspace cancels the session.
                     MemberAction::Exit
@@ -226,7 +223,7 @@ impl MagicMember for ReqMember {
                     // Idle/Failed → fire the request; InFlight → ignore (view refresh).
                     None => {
                         self.fire();
-                        MemberAction::View(self.rebuild(sm))
+                        MemberAction::View(Box::new(self.rebuild(sm)))
                     }
                 }
             }
@@ -237,12 +234,12 @@ impl MagicMember for ReqMember {
                     // Only one candidate (the whole body) — digit 1 selects it.
                     match (d == '1').then(|| self.full.clone()).flatten() {
                         Some(t) => MemberAction::Commit(t),
-                        None => MemberAction::View(self.rebuild(sm)),
+                        None => MemberAction::View(Box::new(self.rebuild(sm))),
                     }
                 } else {
                     // No result yet — digits are URL characters, extend the suffix.
                     self.arg.push(d);
-                    MemberAction::View(self.rebuild(sm))
+                    MemberAction::View(Box::new(self.rebuild(sm)))
                 }
             }
             // URL-ish characters extend the suffix (path + query). Alphanumerics
@@ -251,9 +248,9 @@ impl MagicMember for ReqMember {
             c if c.is_ascii_alphanumeric() || "/?&=:.%+-_~!$'()*,;@[]".contains(c) => {
                 self.arg.push(c);
                 self.invalidate_result();
-                MemberAction::View(self.rebuild(sm))
+                MemberAction::View(Box::new(self.rebuild(sm)))
             }
-            _ => MemberAction::View(StateMachine::passthrough_view()),
+            _ => MemberAction::View(Box::new(StateMachine::passthrough_view())),
         }
     }
 

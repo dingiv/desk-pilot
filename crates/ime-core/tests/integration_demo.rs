@@ -14,7 +14,7 @@ fn predict_nihao_top_is_hello() {
     let mut eng = ImeEngine::new();
     for c in "nihao".chars() { eng.predict(InputEvent::char(c)); }
     let cands = eng.candidates();
-    assert!(cands.first().map_or(false, |c| c.contains("你好")),
+    assert!(cands.first().is_some_and(|c| c.contains("你好")),
         "top should be 你好, got {:?}", &cands[..5.min(cands.len())]);
 }
 
@@ -31,7 +31,7 @@ fn incremental_composition_full_flow() {
     let mut eng = ImeEngine::new();
 
     for c in "lizhengming".chars() { eng.predict(InputEvent::char(c)); }
-    eprintln!("lizhengming: {:?}", &eng.candidates());
+    eprintln!("lizhengming: {:?}", eng.candidates());
 
     let li_idx = eng.candidates().iter().position(|c| *c == "李").expect("李 not found");
     eng.select_candidate(li_idx);
@@ -194,7 +194,7 @@ fn l0_picks_persist_across_sessions() {
         let cands = eng.candidates();
         assert_eq!(cands.first().map(String::as_str), Some("你好"),
             "3 picks in the previous session pin 你好 to #1: {:?}",
-            &cands.iter().take(5).collect::<Vec<_>>());
+            cands.iter().take(5).collect::<Vec<_>>());
     }
 
     // The L0 model JSON is persisted.
@@ -222,10 +222,10 @@ fn incremental_composition_recall() {
     // Now type the same pinyin again — the phrase should be recalled.
     for c in "lizhengming".chars() { eng.predict(InputEvent::char(c)); }
     let cands = eng.candidates();
-    eprintln!("Recall candidates for lizhengming: {:?}", &cands.iter().take(5).collect::<Vec<_>>());
+    eprintln!("Recall candidates for lizhengming: {:?}", cands.iter().take(5).collect::<Vec<_>>());
     assert!(cands.contains(&"李正明".to_string()),
         "李正明 should be recallable after composition, top-5: {:?}",
-        &cands.iter().take(5).collect::<Vec<_>>());
+        cands.iter().take(5).collect::<Vec<_>>());
     // It should be rank #1 (phrase score = 1.0).
     assert_eq!(cands[0], "李正明",
         "李正明 should be #1 after learning, got {:?} at #1", cands[0]);
@@ -257,10 +257,10 @@ fn phrase_persistence_across_sessions() {
 
         for c in "lizhengming".chars() { eng.predict(InputEvent::char(c)); }
         let cands = eng.candidates();
-        eprintln!("Session 2 recall: {:?}", &cands.iter().take(5).collect::<Vec<_>>());
+        eprintln!("Session 2 recall: {:?}", cands.iter().take(5).collect::<Vec<_>>());
         assert!(cands.contains(&"李正明".to_string()),
             "李正明 should survive restart via SQLite, top-5: {:?}",
-            &cands.iter().take(5).collect::<Vec<_>>());
+            cands.iter().take(5).collect::<Vec<_>>());
         assert_eq!(cands[0], "李正明",
             "李正明 should be #1 after cross-session warm, got {:?}", cands[0]);
     }
@@ -326,7 +326,7 @@ fn recency_boost_promotes_recent_word() {
     let cands = eng.candidates();
     let lu_pos = cands.iter().position(|c| c == "陆");
     eprintln!("After recency push(大): 陆 position = {lu_pos:?}, top-5: {:?}",
-        &cands.iter().take(5).collect::<Vec<_>>());
+        cands.iter().take(5).collect::<Vec<_>>());
     assert!(lu_pos.is_some(), "陆 should be in candidates after recency push");
 }
 
@@ -347,7 +347,7 @@ fn phrase_initials_recall() {
     // Now type initials "lzm" — should recall 李正明.
     for c in "lzm".chars() { eng.predict(InputEvent::char(c)); }
     let cands = eng.candidates();
-    eprintln!("lzm recall: {:?}", &cands.iter().take(5).collect::<Vec<_>>());
+    eprintln!("lzm recall: {:?}", cands.iter().take(5).collect::<Vec<_>>());
     assert!(cands.contains(&"李正明".to_string()),
-        "lzm should recall 李正明, got {:?}", &cands.iter().take(5).collect::<Vec<_>>());
+        "lzm should recall 李正明, got {:?}", cands.iter().take(5).collect::<Vec<_>>());
 }

@@ -18,7 +18,9 @@ use crate::state::{StateMachine, StepEnv};
 #[derive(Debug)]
 pub enum MemberAction {
     /// The member consumed the key — show this view and stay active.
-    View(ImeView),
+    /// Boxed: [`ImeView`] is ~3.5 KB(repr(C) 候选槽数组),裸存会把每个
+    /// 瞬态 MemberAction(包括 24 字节的 Commit/Exit)都撑到同尺寸。
+    View(Box<ImeView>),
     /// The member is done — commit this text and return to Idle.
     Commit(String),
     /// The member is done — exit without committing (cancel).

@@ -78,7 +78,7 @@ fn decile_normalize(mut entries: Vec<(String, u32)>) -> Vec<(String, u32)> {
     if entries.is_empty() { return entries; }
 
     // Sort descending by raw frequency.
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|(_, f)| std::cmp::Reverse(*f));
 
     let total = entries.len();
     let group_size = (total / 10).max(1);
@@ -179,7 +179,8 @@ impl EnglishFamily {
         if map.is_empty() { return Vec::new(); }
 
         let entries: Vec<(String, u32)> = map.into_iter().collect();
-        let words = match dict_type {
+        
+        match dict_type {
             DictType::Grade => {
                 let mut w = entries;
                 w.sort_by(|a, b| a.0.cmp(&b.0));
@@ -191,8 +192,7 @@ impl EnglishFamily {
                 w.sort_by(|a, b| a.0.cmp(&b.0));
                 w
             }
-        };
-        words
+        }
     }
 
     pub fn with_config(mut self, priority: u32, weights: EnglishWeights) -> Self {
@@ -327,6 +327,9 @@ impl EnglishFamily {
 
     // ── Query helpers ──────────────────────────────────────────────────
 
+    /// 私有查询助手(标签×2 + 分数×2 + 双入参),不对外 —— 参数数是
+    /// 刻意的展开,不值得为消 lint 引入配置结构体。
+    #[allow(clippy::too_many_arguments)]
     fn query_layer(
         words: &[(String, u32)],
         input: &str,

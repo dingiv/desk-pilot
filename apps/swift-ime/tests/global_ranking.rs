@@ -14,7 +14,7 @@ use std::path::Path;
 fn dict(name: &str) -> Option<String> {
     let pkg = env!("CARGO_MANIFEST_DIR");
     let p = format!("{pkg}/assets/dict/{name}");
-    Path::new(&p).exists().then(|| p)
+    Path::new(&p).exists().then_some(p)
 }
 
 /// 默认权重 + rime-ice + emoji 词表的引擎。

@@ -25,6 +25,7 @@ struct Phrase {
 }
 
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct PhraseBook {
     /// pinyin (no spaces) → list of hanzi phrases
     entries: HashMap<String, Vec<Phrase>>,
@@ -34,15 +35,6 @@ pub struct PhraseBook {
     keys_by_len: Vec<String>,
 }
 
-impl Default for PhraseBook {
-    fn default() -> Self {
-        PhraseBook {
-            entries: HashMap::new(),
-            initials_index: HashMap::new(),
-            keys_by_len: Vec::new(),
-        }
-    }
-}
 
 impl PhraseBook {
     pub fn new() -> Self {
@@ -170,7 +162,7 @@ impl PhraseBook {
     /// Rebuild the sorted key list (call after bulk insert).
     pub fn reindex(&mut self) {
         let mut keys: Vec<String> = self.entries.keys().cloned().collect();
-        keys.sort_by(|a, b| b.len().cmp(&a.len()));
+        keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
         self.keys_by_len = keys;
     }
 

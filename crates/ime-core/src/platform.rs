@@ -42,14 +42,6 @@ impl Default for CandidateSlot {
     }
 }
 
-impl CandidateSlot {
-    pub fn from_str(text: &str) -> Self {
-        let mut s = CandidateSlot::default();
-        ImeView::set_str(&mut s.text, text);
-        s
-    }
-}
-
 /// Complete UI state snapshot produced by the engine after processing one key
 /// event. The platform frontend diffs this against the previous frame and
 /// applies only the changes — like React's virtual DOM reconciliation.
