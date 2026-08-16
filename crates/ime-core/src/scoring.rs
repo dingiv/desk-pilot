@@ -36,18 +36,22 @@ impl FamilyPriorities {
     }
 }
 
-/// UserBigram 上下文 boost 的归一化上限。
-#[derive(Debug, Clone, Copy)]
-pub struct BigramTuning {
-    /// 最高频 bigram 的加成倍数上限(1.0 = 无加成,1.25 = +25%)。
-    pub max_boost: f64,
+/// 前缀联想的共享距离衰减 —— 联想词比输入长越多越不可信。
+///
+/// `diff` = 联想词拼音/关键词长度 − 输入长度(字符数)。**前 3 个字符的
+/// 剩余免费**(覆盖"半截声母到完整音节"的典型差,zh→zhong 差 3):更近的
+/// 联想与目标词拼词频;超出部分按 0.85^超出 衰减,宽前缀捞到的高频长词
+/// (jix→jixiaokao)自然沉底。
+///
+/// pinyin(前缀联想)与 emoji(关键词前缀)共用此公式;english 的前缀是
+/// **质量式**(0.60 地板 + 0.25×词频×匹配率,无距离项)—— 语义不同,
+/// 表达"这个词本身多常用、匹配多完整",不是"联想多可信",故不共用。
+pub fn prefix_decay(diff_chars: usize) -> f64 {
+    0.85_f64.powf(diff_chars.saturating_sub(PREFIX_DECAY_FREE) as f64)
 }
 
-impl Default for BigramTuning {
-    fn default() -> Self {
-        BigramTuning { max_boost: 0.25 }
-    }
-}
+/// 前缀衰减的免费额度(字符)。
+pub const PREFIX_DECAY_FREE: usize = 3;
 
 /// 字典词频 → 内部分值的映射参数。
 ///
@@ -79,7 +83,6 @@ impl Default for FreqScale {
 #[derive(Debug, Clone, Copy)]
 pub struct ScoringConfig {
     pub priorities: FamilyPriorities,
-    pub bigram: BigramTuning,
     pub freq_scale: FreqScale,
 }
 
@@ -87,7 +90,6 @@ impl Default for ScoringConfig {
     fn default() -> Self {
         ScoringConfig {
             priorities: FamilyPriorities::default(),
-            bigram: BigramTuning::default(),
             freq_scale: FreqScale::default(),
         }
     }
@@ -104,7 +106,6 @@ mod tests {
         assert_eq!(s.priorities.pinyin, 100);
         assert_eq!(s.priorities.english, 70);
         assert_eq!(s.priorities.emoji, 60);
-        assert_eq!(s.bigram.max_boost, 0.25);
         assert_eq!(s.freq_scale.max_weight, 0.0, "auto by default");
         assert_eq!((s.freq_scale.min_score, s.freq_scale.max_score), (0.25, 0.90));
     }

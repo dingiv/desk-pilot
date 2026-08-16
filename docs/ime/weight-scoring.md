@@ -45,14 +45,16 @@ freq_to_score(f) = log₂(f+1) / log₂(max_freq+1)   clamp [0.25, 1.0]
 | `lattice_mix` | 全拼+声母混写 | freq 分 × `jianpin`(0.50) |
 | `lattice_jp` | 纯简拼(nh→你好) | freq 分 × `jianpin`(0.50) |
 | `lattice_prefix` | **前缀联想**(naozh→闹钟) | freq 分 × `prefix_lookup`(0.75) × 距离衰减 |
-| `single` | 单音节(de→的) | 1.0 按位衰减 × `single_syl_decay` |
+| `single` | 单音节(de→的) | **`large_dict` 为基础分**,按位衰减 × `single_syl_decay`(注意:`large_dict` 不是死参数——它正是单字候选的基础分) |
 | `decomp` | Viterbi 造词兜底 | 0.40 |
 
-### 前缀联想距离衰减
+### 前缀联想距离衰减(`scoring::prefix_decay`,pinyin/emoji 共享)
 
-联想词拼音比输入长越多越不可信:剩余 **≤2 字符免费**("马上打完"),
-超出按 `0.85^超出` 衰减。作用:`jix→jixiaokao(绩效考核,剩6)` 这类宽前缀
-捞到的高频长词沉底,不淹没 `jix→继续(剩1)`。
+联想词拼音比输入长越多越不可信:剩余 **≤3 字符免费**(覆盖"半截声母到
+完整音节"的典型差,zh→zhong 差 3),超出按 `0.85^超出` 衰减。作用:
+`jix→jixiaokao(差6)` 这类宽前缀捞到的高频长词沉底,不淹没
+`jix→继续(差1)`。english 的前缀是**质量式**(0.60 地板 + 0.25×词频×
+匹配率,无距离项)—— 语义不同,不共享此 helper。
 
 ### 为什么需要前缀联想
 

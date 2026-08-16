@@ -120,45 +120,6 @@ fn multi_context_isolation() {
 }
 
 #[test]
-fn bigram_persistence_warmup() {
-    // Use a unique temp db to avoid cross-test interference.
-    let db_path = format!("/tmp/swift-ime-bigram-test-{}.db", std::process::id());
-
-    // ── Session 1: record a bigram ──
-    {
-        let mut eng = ImeEngine::new();
-        eng.init_store(&db_path);
-        // Simulate user committing "大" then "陆".
-        for c in "da".chars() { eng.predict(InputEvent::char(c)); }
-        eng.predict(InputEvent::space());
-        for c in "lu".chars() { eng.predict(InputEvent::char(c)); }
-        eng.predict(InputEvent::space());
-        // Explicitly record the bigram (space commits via select_candidate internally).
-        eng.record_bigram("大", "陆");
-    } // eng drops → store closes
-
-    // ── Session 2: warm from SQLite, verify boost ──
-    {
-        let mut eng = ImeEngine::new();
-        eng.init_store(&db_path);
-
-        // Type "lu" with "大" context.
-        eng.set_context("大");
-        for c in "lu".chars() { eng.predict(InputEvent::char(c)); }
-        let cands = eng.candidates();
-
-        eprintln!("After warmup: bigram 大→陆 boost check, top-5: {:?}",
-            &cands.iter().take(5).collect::<Vec<_>>());
-        // 陆 should be present and ranked high.
-        let lu_pos = cands.iter().position(|c| *c == "陆");
-        assert!(lu_pos.is_some(), "陆 should be in candidates after bigram warmup");
-    }
-
-    // Cleanup.
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[test]
 fn recency_persistence_across_sessions() {
     // The recency ring (recently committed words → position-based boost) must
     // survive restarts: session 1 commits 你好, session 2 (fresh engine +
@@ -352,16 +313,6 @@ fn asr_prefix_shows_command_name() {
     // The buffer shows the accumulated prefix.
     assert!(!eng.buffer().is_empty(), "should have buffer for '#as'");
     assert!(eng.buffer().starts_with("#as"), "buffer should start with '#as', got {:?}", eng.buffer());
-}
-
-#[test]
-fn surrounding_text_stored_and_accessible() {
-    let eng = ImeEngine::new();
-    eng.set_surrounding(0, "中国的首都是北京");
-    // Verify it doesn't crash and context is set.
-    let v = eng.predict_ctx(0, 'n');
-    assert!(v.candidate_count > 0 || v.preedit_text[0] != 0,
-        "should handle surrounding text without panicking");
 }
 
 #[test]

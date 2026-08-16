@@ -38,8 +38,6 @@ struct Args {
     #[arg(long)]
     aura_addr: Option<String>,
     #[arg(long)]
-    surrounding: Option<String>,
-    #[arg(long)]
     en_user_dict: Option<String>,
     #[arg(long)]
     en_dicts: Vec<String>,
@@ -56,7 +54,6 @@ fn main() {
         config: args.config, asr_text: args.asr_text,
         commit: args.commit, async_wait: args.async_wait,
         connect_aura: args.aura, aura_addr: args.aura_addr,
-        surrounding: args.surrounding,
         en_user_dict: args.en_user_dict, en_dicts: args.en_dicts,
         req_base: args.req_base,
     };

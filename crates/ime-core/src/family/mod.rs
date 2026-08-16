@@ -67,10 +67,6 @@ pub struct InputContext {
     pub recent_text: String,
     /// Last committed word (single word boundary).
     pub last_word: String,
-    /// fcitx5-surrounding text (text before cursor in the application,
-    /// up to ~100 chars). Provided by the application when available;
-    /// empty when not supported.
-    pub surrounding: String,
 }
 
 impl InputContext {
@@ -84,13 +80,6 @@ impl InputContext {
             let skip = self.recent_text.chars().count() - 20;
             self.recent_text = self.recent_text.chars().skip(skip).collect();
         }
-    }
-
-    /// Set surrounding text from the application (fcitx5 callback).
-    /// Keeps only the last 100 characters.
-    pub fn set_surrounding(&mut self, text: &str) {
-        self.surrounding = text.chars().rev().take(100)
-            .collect::<String>().chars().rev().collect();
     }
 }
 
@@ -164,11 +153,6 @@ pub trait CandidateFamily: Send + Sync {
     /// Import L0 user model from JSON. Returns pins restored.
     fn import_l0_json(&self, _json: &str) -> usize { 0 }
 
-    /// Record a bigram (prev_word, next_word) co-occurrence in this family's
-    /// user model. Default no-op; PinyinFamily overrides to update its
-    /// in-memory UserBigram for context-aware ranking.
-    fn record_bigram(&self, _prev: &str, _next: &str) {}
-
     /// 临时关闭/恢复上下文感知(swift-ime.yaml → input.context_aware)。
     /// Default no-op; PinyinFamily overrides to skip recency/bigram/surrounding
     /// boosts when off.
@@ -177,10 +161,6 @@ pub trait CandidateFamily: Send + Sync {
     /// Record a committed word for recency tracking. Default no-op;
     /// PinyinFamily overrides to push to its RecencyStore.
     fn record_commit(&self, _word: &str) {}
-
-    /// Warm the in-memory bigram model from persisted data.
-    /// `entries` is a vec of (prev, next, count) from SQLite.
-    fn warm_bigrams(&self, _entries: Vec<(String, String, u32)>) {}
 
     /// Warm the recent-member table from persisted data
     /// (`(word, last_used_ms)` pairs). Default no-op; PinyinFamily overrides

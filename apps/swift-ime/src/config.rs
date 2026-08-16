@@ -81,9 +81,6 @@ pub struct WeightsConfig {
     pub pinyin: PinyinWeightConfig,
     #[serde(default)]
     pub english: EnglishWeightConfig,
-    /// UserBigram 上下文 boost 上限。
-    #[serde(default)]
-    pub bigram: BigramConfig,
     /// 字典词频 → 内部分值的映射参数。
     #[serde(default)]
     pub freq_scale: FreqScaleConfig,
@@ -101,18 +98,6 @@ pub struct FamilyPriorityConfig {
 impl Default for FamilyPriorityConfig {
     fn default() -> Self {
         FamilyPriorityConfig { pinyin: 100, english: 70, emoji: 60 }
-    }
-}
-
-/// UserBigram 上下文 boost 的归一化上限(1.0 = 无加成,1.25 = +25%)。
-#[derive(Debug, Clone, Deserialize)]
-pub struct BigramConfig {
-    #[serde(default = "default_0_25")] pub max_boost: f64,
-}
-
-impl Default for BigramConfig {
-    fn default() -> Self {
-        BigramConfig { max_boost: 0.25 }
     }
 }
 
@@ -153,7 +138,7 @@ pub struct PinyinWeightConfig {
 
 impl WeightsConfig {
     /// Convert to ime-core's unified [`ScoringConfig`] — family priorities,
-    /// recency boosts, bigram ceiling and the freq→score scale all come from
+    /// family priorities and the freq→score scale all come from
     /// `swift-ime.yaml`; missing sections fall back to the legacy defaults.
     pub fn to_scoring(&self) -> ime_core::scoring::ScoringConfig {
         ime_core::scoring::ScoringConfig {
@@ -162,7 +147,6 @@ impl WeightsConfig {
                 english: self.family_priority.english,
                 emoji: self.family_priority.emoji,
             },
-            bigram: ime_core::scoring::BigramTuning { max_boost: self.bigram.max_boost },
             freq_scale: ime_core::scoring::FreqScale {
                 max_weight: self.freq_scale.max_weight,
                 min_score: self.freq_scale.min_score,
@@ -238,7 +222,6 @@ impl Default for WeightsConfig {
                 large_dict_take: 96, viterbi_take: 48, jianpin_take: 8,
             },
             english: EnglishWeightConfig { exact: 0.88, prefix_ratio: 0.6, user_boost: 1.0 },
-            bigram: BigramConfig { max_boost: 0.25 },
             freq_scale: FreqScaleConfig { max_weight: 0.0, min_score: 0.25, max_score: 1.0 },
         }
     }
@@ -410,8 +393,6 @@ weights:
     pinyin: 90
     english: 50
     emoji: 40
-  bigram:
-    max_boost: 0.40
   freq_scale:
     max_weight: 500000
     min_score: 0.2
@@ -422,7 +403,6 @@ weights:
         assert_eq!(s.priorities.pinyin, 90);
         assert_eq!(s.priorities.english, 50);
         assert_eq!(s.priorities.emoji, 40);
-        assert_eq!(s.bigram.max_boost, 0.40);
         assert_eq!(s.freq_scale.max_weight, 500_000.0);
         assert_eq!(s.freq_scale.min_score, 0.2);
         assert_eq!(s.freq_scale.max_score, 0.95);
@@ -437,7 +417,6 @@ weights:
         assert_eq!(s.priorities.pinyin, 100);
         assert_eq!(s.priorities.english, 70);
         assert_eq!(s.priorities.emoji, 60);
-        assert_eq!(s.bigram.max_boost, 0.25);
         assert_eq!(s.freq_scale.max_weight, 0.0, "auto by default");
         assert_eq!(s.freq_scale.max_score, 0.90, "top headroom");
     }

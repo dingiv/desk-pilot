@@ -71,8 +71,6 @@ extern "C" {
     void swift_ime_reset(ImeHandle *handle, void *ctx);
     void swift_ime_activate(ImeHandle *handle, void *ctx);
     void swift_ime_deactivate(ImeHandle *handle, void *ctx);
-    void swift_ime_set_surrounding(ImeHandle *handle, void *ctx,
-                                   const char *text);
     int  swift_ime_special_key(ImeHandle *handle, void *ctx,
                                 int code, ImeView *out_view);
 }

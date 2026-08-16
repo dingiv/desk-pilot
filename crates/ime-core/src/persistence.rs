@@ -46,12 +46,6 @@ impl PersistenceManager {
         // Families double-write through this Arc (recency / L0 / phrases).
         disp.set_store(self.store());
 
-        // Bigrams → UserBigram.
-        let bigrams = self.store.load_all_bigrams();
-        if !bigrams.is_empty() {
-            disp.warm_bigrams(bigrams);
-        }
-
         // Phrases → PhraseBook.
         disp.warm_phrases_from_store();
 
@@ -79,19 +73,14 @@ impl PersistenceManager {
 
     // ── Forwarding accessors (the engine's persistence surface) ─────────
 
-    /// Record a bigram — SQLite + in-memory (via the family).
-    pub fn record_bigram(&self, prev: &str, next: &str) {
-        self.store.record_bigram(prev, next);
+    /// 学习词条数(启动日志用)。
+    pub fn phrase_count(&self) -> usize {
+        self.store.phrase_count()
     }
 
-    /// Number of pinned words (diagnostics).
-    pub fn pin_count(&self) -> usize {
-        self.store.pin_count()
-    }
-
-    /// Max bigram count (diagnostics).
-    pub fn max_bigram_count(&self) -> u32 {
-        self.store.max_bigram_count()
+    /// 英文自生词数(启动日志用)。
+    pub fn en_user_count(&self) -> usize {
+        self.store.en_user_count()
     }
 }
 
@@ -113,25 +102,21 @@ mod tests {
         // All five tables exist (schema migration ran).
         let store = pm.store();
         store.save_recency(&[("a".into(), 1000), ("b".into(), 2000)]);
-        store.record_bigram("你", "好");
         store.record_phrase("ceshi", "测试", 0);
-        store.pin_word("nihao", "你好");
         store.save_l0(r#"{"pins":[],"picks":[]}"#);
 
         let pm2 = PersistenceManager::open(&path).expect("reopen");
         assert_eq!(pm2.store().load_recency(), vec![("a".to_string(), 1000), ("b".to_string(), 2000)]);
-        assert_eq!(pm2.store().load_all_bigrams().len(), 1);
         assert_eq!(pm2.store().load_all_phrases().len(), 1);
-        assert_eq!(pm2.store().pinned_word("nihao").as_deref(), Some("你好"));
         assert_eq!(pm2.store().load_l0().as_deref(), Some(r#"{"pins":[],"picks":[]}"#));
     }
 
     #[test]
     fn forwarding_accessors_work() {
         let pm = PersistenceManager::open(&temp_path()).expect("open");
-        pm.record_bigram("中", "国");
-        assert_eq!(pm.max_bigram_count(), 1);
-        pm.store().pin_word("zhong", "中");
-        assert_eq!(pm.pin_count(), 1);
+        pm.store().record_phrase("ceshi", "测试", 0);
+        assert_eq!(pm.phrase_count(), 1);
+        pm.store().record_en_user("cd");
+        assert_eq!(pm.en_user_count(), 1);
     }
 }

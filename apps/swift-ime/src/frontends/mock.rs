@@ -27,7 +27,6 @@ pub struct MockConfig {
     pub async_wait: u64,
     pub connect_aura: bool,
     pub aura_addr: Option<String>,
-    pub surrounding: Option<String>,
     pub en_user_dict: Option<String>,
     pub en_dicts: Vec<String>,
     /// `#req` backend base URL — CLI override of `magic.req_base` config.
@@ -43,7 +42,6 @@ impl Default for MockConfig {
             config: None, asr_text: None,
             commit: false, async_wait: 0,
             connect_aura: false, aura_addr: None,
-            surrounding: None,
             en_user_dict: None, en_dicts: Vec::new(),
         }
     }

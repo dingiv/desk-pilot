@@ -197,7 +197,7 @@ impl ImeEngine {
     }
 
     /// 临时关闭/恢复 pinyin 家族的上下文感知(swift-ime.yaml → input.context_aware)。
-    /// 关闭后 recency / bigram / surrounding 加成全部跳过,候选排序纯频率驱动。
+    /// 关闭后 recency / 整词联想加成全部跳过,候选排序纯频率驱动。
     pub fn set_context_aware(&mut self, on: bool) {
         self.dispatcher.set_pinyin_context_aware(on);
     }
@@ -224,7 +224,7 @@ impl ImeEngine {
     ///
     /// Commit-producing special keys (Space/Enter/Digit) go through the same
     /// recording as the character and select paths — previously a Space commit
-    /// bypassed `record_bigram`/`record_commit`, so user bigrams and the
+    /// bypassed `record_commit`, so the recency ring and the
     /// recency ring were never updated by space-commits.
     pub fn special_key_ctx(&self, ctx: usize, key: SpecialKey) -> ImeView {
         self.with_ctx(ctx, |disp, pc| {
@@ -232,9 +232,7 @@ impl ImeEngine {
                 .unwrap_or_else(|| ImeView::empty());
             let committed = ImeView::str_field(&view.commit_text);
             if !committed.is_empty() {
-                let prev = pc.text_context.last_word.clone();
                 pc.text_context.update(committed);
-                self.record_bigram(&prev, committed);
                 self.dispatcher.record_commit(committed);
                 self.learn_english_if_ascii(committed);
             }
@@ -268,13 +266,11 @@ impl ImeEngine {
 
         self.with_ctx(ctx, |disp, pc| {
             pc.sm.context = pc.text_context.clone();
-            let prev = pc.text_context.last_word.clone();
             let mut view = disp.process_key(ch, &mut pc.sm);
             let committed = ImeView::str_field(&view.commit_text);
             if !committed.is_empty() {
                 pc.text_context.update(committed);
                 // Record bigram: prev_word → committed_word (both SQLite + in-memory).
-                self.record_bigram(&prev, committed);
                 self.dispatcher.record_commit(committed);
                 self.learn_english_if_ascii(committed);
             }
@@ -299,9 +295,7 @@ impl ImeEngine {
             let view = disp.select_candidate(index, &mut pc.sm);
             let committed = ImeView::str_field(&view.commit_text);
             if !committed.is_empty() {
-                let prev = pc.text_context.last_word.clone();
                 pc.text_context.update(committed);
-                self.record_bigram(&prev, committed);
                 self.dispatcher.record_commit(committed);
                 self.learn_english_if_ascii(committed);
             }
@@ -322,13 +316,6 @@ impl ImeEngine {
     /// Set surrounding text from the application (fcitx5 callback).
     /// The text is stored in per-context `InputContext` and used by
     /// prediction families for broader context matching.
-    pub fn set_surrounding(&self, ctx: usize, text: &str) {
-        let mut map = self.contexts.lock().unwrap();
-        if let Some(pc) = map.get_mut(&ctx) {
-            pc.text_context.set_surrounding(text);
-        }
-    }
-
     /// Commit any pending composition for a context.
     pub fn commit_pending_ctx(&self, ctx: usize) -> ImeView {
         let map = self.contexts.lock().unwrap();
@@ -482,9 +469,8 @@ impl ImeEngine {
         match PersistenceManager::open(path) {
             Ok(pm) => {
                 pm.warm_all(&self.dispatcher);
-                let pins = pm.pin_count();
-                eprintln!("[swift-ime] weight store: {pins} pins, {} bigrams from {path}",
-                    pm.max_bigram_count());
+                eprintln!("[swift-ime] weight store: {} phrases, {} en-words from {path}",
+                    pm.phrase_count(), pm.en_user_count());
                 *self.persistence.lock().unwrap() = Some(pm);
             }
             Err(e) => eprintln!("[swift-ime] weight store open failed: {e}"),
@@ -499,14 +485,6 @@ impl ImeEngine {
         {
             self.dispatcher.record_english_word(committed);
         }
-    }
-
-    /// Record a bigram to BOTH the SQLite store (persistence) and the
-    /// in-memory pinyin family model (immediate ranking boost).
-    pub fn record_bigram(&self, prev: &str, next: &str) {
-        if prev.is_empty() || next.is_empty() { return; }
-        if let Some(ref pm) = *self.persistence.lock().unwrap() { pm.record_bigram(prev, next); }
-        self.dispatcher.record_bigram(prev, next);
     }
 
     /// Attach the voice buffer so `#asr` resolves to live voice recognition

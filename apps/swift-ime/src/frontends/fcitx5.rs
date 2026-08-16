@@ -237,18 +237,6 @@ pub extern "C" fn swift_ime_commit_pending(
 }
 
 #[no_mangle]
-pub extern "C" fn swift_ime_set_surrounding(
-    engine: *mut ImeEngine,
-    ctx: *const std::ffi::c_void,
-    text: *const c_char,
-) {
-    if engine.is_null() || text.is_null() { return; }
-    let s = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy();
-    if s.is_empty() { return; }
-    unsafe { &*engine }.set_surrounding(ctx as usize, &s);
-}
-
-#[no_mangle]
 pub extern "C" fn swift_ime_poll_async(
     engine: *mut ImeEngine,
     ctx: *const std::ffi::c_void,

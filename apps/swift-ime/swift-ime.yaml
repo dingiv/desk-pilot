@@ -70,10 +70,6 @@ weights:
   # Recent member:近期指数按距上次使用时间分档(10s→5,1h→4,5h→3,1d→2,
   # 3d→1,>3d 移出),权重合成公式固定:z = (1-a)(a+b)/8 + a —— 无需配置。
 
-  # UserBigram 上下文 boost 上限(1.0 = 无加成,1.25 = +25%)
-  bigram:
-    max_boost: 0.25
-
   # 字典词频 → 内部分值的映射(log₂ 归一化后 clamp 到 [min_score, max_score])。
   # max_weight:
   #   0 (默认) = auto —— 用索引构建时记录的实际最大词频(cache v2),

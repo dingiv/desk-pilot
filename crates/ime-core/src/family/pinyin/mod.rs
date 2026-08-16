@@ -4,7 +4,6 @@
 use super::{CandidateFamily, InputContext, ScoredCandidate};
 use self::phrase::PhraseBook;
 use crate::recency::RecentStore;
-use crate::user_bigram::UserBigram;
 
 pub mod dict;
 pub mod engine;
@@ -30,7 +29,6 @@ pub struct PinyinFamily {
     phrase_book: Mutex<PhraseBook>,
     large_dict: Mutex<LargeDict>,
     lattice: Mutex<Option<lattice::LatticeDecoder>>,
-    bigram: Mutex<UserBigram>,
     recency: Mutex<RecentStore>,
     enabled: bool,
     weights: PinyinWeights,
@@ -107,7 +105,6 @@ impl PinyinFamily {
             phrase_book: Mutex::new(PhraseBook::default_phrases()),
             large_dict: Mutex::new(LargeDict::new()),
             lattice: Mutex::new(None),
-            bigram: Mutex::new(UserBigram::with_tuning(scoring.bigram)),
             recency: Mutex::new(RecentStore::new()),
             enabled: true,
             weights,
@@ -140,7 +137,6 @@ impl PinyinFamily {
             phrase_book: Mutex::new(phrase_book),
             large_dict: Mutex::new(LargeDict::new()),
             lattice: Mutex::new(None),
-            bigram: Mutex::new(UserBigram::with_tuning(scoring.bigram)),
             recency: Mutex::new(RecentStore::new()),
             enabled: true,
             weights,
@@ -178,10 +174,6 @@ impl PinyinFamily {
 
     pub fn set_enabled(&mut self, enabled: bool) { self.enabled = enabled; }
 
-    pub fn record_bigram(&self, prev: &str, next: &str) {
-        self.bigram.lock().unwrap().record(prev, next);
-    }
-
     /// Record a committed word for the recent member: stamps the current
     /// wall-clock time and double-writes the table to SQLite (full-snapshot
     /// replace, ≤512 rows) so the time-decay survives restarts.
@@ -191,14 +183,6 @@ impl PinyinFamily {
         if let Some(ref store) = *self.store.lock().unwrap() {
             store.save_recency(&rec.dump());
         }
-    }
-
-    pub fn bigram_json(&self) -> String {
-        self.bigram.lock().unwrap().export_json()
-    }
-
-    pub fn import_bigram_json(&self, json: &str) {
-        self.bigram.lock().unwrap().import_json(json);
     }
 
     pub fn record_pick(&self, pinyin: &str, word: &str) {
@@ -350,18 +334,6 @@ impl CandidateFamily for PinyinFamily {
         } else { 0 }
     }
 
-    fn record_bigram(&self, prev: &str, next: &str) {
-        self.bigram.lock().unwrap().record(prev, next);
-    }
-
-    fn warm_bigrams(&self, entries: Vec<(String, String, u32)>) {
-        if !entries.is_empty() {
-            let count = entries.len();
-            self.bigram.lock().unwrap().load_bulk(entries);
-            eprintln!("[ime-core] pinyin: warmed {count} bigrams from store");
-        }
-    }
-
     fn warm_recencies(&self, entries: Vec<(String, i64)>) {
         if !entries.is_empty() {
             let count = entries.len();
@@ -482,10 +454,9 @@ impl CandidateFamily for PinyinFamily {
                         // 与到 naozhe 同权,拼词频,高频的闹钟胜;超出部分按
                         // 0.85^超出 衰减 —— jix→jixiaokao(差 6,超出 3)这类
                         // 宽前缀捞到的高频长词沉底,不淹没目标短词。
-                        let d = (r.pinyin.chars().count())
-                            .saturating_sub(input.chars().count())
-                            .saturating_sub(3) as f64;
-                        let decay = 0.85_f64.powf(d);
+                        let diff = r.pinyin.chars().count()
+                            .saturating_sub(input.chars().count());
+                        let decay = crate::scoring::prefix_decay(diff);
                         base_score * self.weights.prefix_lookup * decay
                     };
                     match out.iter_mut().find(|c| c.text == r.text) {

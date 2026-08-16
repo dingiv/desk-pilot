@@ -12,7 +12,6 @@ pub mod persistence;
 pub mod recency;
 pub mod scoring;
 pub mod special_key;
-pub mod user_bigram;
 pub mod weight_store;
 pub mod platform;
 pub mod snippet_store;

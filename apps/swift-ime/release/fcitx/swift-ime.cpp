@@ -349,15 +349,6 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
         return;
     }
 
-    // Feed surrounding text to the engine for context-aware prediction.
-    if (ic->capabilityFlags().test(fcitx::CapabilityFlag::SurroundingText)) {
-        auto &st = ic->surroundingText();
-        if (st.isValid()) {
-            swift_ime_set_surrounding(handle_, (void *)ic,
-                                      st.text().c_str());
-        }
-    }
-
     // $CLIPBOARD support: while composing a snippet/#-command (preedit starts
     // with '/' or '#'), push the current clipboard to the engine so the
     // template expands with live text. The clipboard addon has no public

@@ -181,10 +181,8 @@ impl CandidateFamily for EmojiFamily {
                 let score = if exact && !short_kw {
                     1.0
                 } else {
-                    let excess = (kw.chars().count())
-                        .saturating_sub(input_len)
-                        .saturating_sub(3) as f64;
-                    0.6 * 0.85_f64.powf(excess)
+                    let diff = kw.chars().count().saturating_sub(input_len);
+                    0.6 * crate::scoring::prefix_decay(diff)
                 };
                 out.push(ScoredCandidate {
                     text: emoji.clone(),

@@ -91,24 +91,10 @@ impl Dispatcher {
         sm.reset();
     }
 
-    /// Record a bigram to the in-memory pinyin family model.
-    pub fn record_bigram(&self, prev: &str, next: &str) {
-        if let Some(fam) = self.scorer.family("pinyin") {
-            fam.record_bigram(prev, next);
-        }
-    }
-
     /// Record a committed word for recency boosting.
     pub fn record_commit(&self, word: &str) {
         if let Some(fam) = self.scorer.family("pinyin") {
             fam.record_commit(word);
-        }
-    }
-
-    /// Warm the pinyin family's in-memory bigram model from persisted SQLite data.
-    pub fn warm_bigrams(&self, entries: Vec<(String, String, u32)>) {
-        if let Some(fam) = self.scorer.family("pinyin") {
-            fam.warm_bigrams(entries);
         }
     }
 
