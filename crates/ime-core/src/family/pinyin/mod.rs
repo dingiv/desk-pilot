@@ -13,7 +13,7 @@ pub mod phrase;
 use dict::LargeDict;
 use std::sync::{Arc, Mutex};
 
-use crate::weight_store::WeightStore;
+use crate::store::WeightStore;
 
 /// Full-pinyin prediction family.
 ///

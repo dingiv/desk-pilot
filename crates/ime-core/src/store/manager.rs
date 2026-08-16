@@ -1,4 +1,3 @@
-//! persistence — 统一持久化管理模块。
 //!
 //! Owns the single SQLite connection and coordinates EVERY user-model
 //! persistence path: recency ring, bigrams, pins, phrases, and the inputx-pinyin
@@ -8,7 +7,7 @@
 //! (they hold the same `Arc<WeightStore>` via `attach_store`).
 //!
 //! ```
-//! use ime_core::persistence::PersistenceManager;
+//! use ime_core::store::PersistenceManager;
 //! // engine startup: open once, warm everything
 //! let pm = PersistenceManager::open("/tmp/swift-ime-docex.db")?;
 //! // pm.warm_all(&dispatcher);  // the engine does this in init_store
@@ -19,7 +18,7 @@
 use std::sync::Arc;
 
 use crate::dispatcher::Dispatcher;
-use crate::weight_store::WeightStore;
+use super::sqlite::WeightStore;
 
 /// Unified persistence manager — the engine's single handle to the SQLite
 /// store. Clone is cheap (shared connection behind an `Arc`).

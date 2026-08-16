@@ -8,12 +8,11 @@ pub mod engine;
 pub mod expander;
 pub mod family;
 pub mod matcher;
-pub mod persistence;
 pub mod recency;
 pub mod scoring;
 pub mod special_key;
-pub mod weight_store;
 pub mod platform;
+pub mod store;
 pub mod snippet_store;
 pub mod state;
 

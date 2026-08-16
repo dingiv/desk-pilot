@@ -9,7 +9,6 @@
 //! Run: cargo test -p swift-ime --test global_ranking
 
 use ime_core::engine::{ImeEngine, InputEvent};
-use ime_core::platform::ImeView;
 use std::path::Path;
 
 fn dict(name: &str) -> Option<String> {
@@ -20,7 +19,7 @@ fn dict(name: &str) -> Option<String> {
 
 /// 默认权重 + rime-ice + emoji 词表的引擎。
 fn engine() -> ImeEngine {
-    let mut e = ImeEngine::new();
+    let e = ImeEngine::new();
     let fst = dict("rime-ice.fst").expect("rime-ice.fst missing (run fetch_dict.sh)");
     e.load_dict(&fst).expect("load rime-ice");
     if let Some(emoji) = dict("emoji.tsv") {
@@ -67,8 +66,8 @@ fn full_pinyin_keeps_frequency_discrimination() {
     let mut e2 = engine();
     for c in "jixu".chars() { e2.predict(InputEvent::char(c)); }
     let detailed = e2.candidates_detailed();
-    let jiXu = detailed.iter().find(|d| d.text == "继续").unwrap();
-    assert!(jiXu.score < 0.95, "顶流应封顶留白: {}", jiXu.score);
+    let ji_xu = detailed.iter().find(|d| d.text == "继续").unwrap();
+    assert!(ji_xu.score < 0.95, "顶流应封顶留白: {}", ji_xu.score);
 }
 
 // ── 拼音前缀联想:高频远词 > 低频近词;SCAN_CAP 不饿死高频 ──────────────

@@ -159,7 +159,7 @@ fn recency_persistence_across_sessions() {
         "recency boost restored from store: warm={warm_score:.3} cold={cold_score:.3}");
 
     // The persisted table is also directly readable (word + last-used ms).
-    let store = ime_core::weight_store::WeightStore::open(&db_path).unwrap();
+    let store = ime_core::store::WeightStore::open(&db_path).unwrap();
     let ring = store.load_recency();
     assert_eq!(ring.first().map(|(w, _)| w.as_str()), Some("你好"), "ring: {ring:?}");
     assert!(ring[0].1 > 0, "timestamp persisted: {ring:?}");
@@ -198,7 +198,7 @@ fn l0_picks_persist_across_sessions() {
     }
 
     // The L0 model JSON is persisted.
-    let store = ime_core::weight_store::WeightStore::open(&db_path).unwrap();
+    let store = ime_core::store::WeightStore::open(&db_path).unwrap();
     let l0 = store.load_l0().expect("L0 model persisted");
     assert!(l0.contains("你好") || l0.contains("\"nihao\""), "L0 JSON mentions the pick: {l0}");
 

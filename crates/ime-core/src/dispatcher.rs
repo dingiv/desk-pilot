@@ -116,7 +116,7 @@ impl Dispatcher {
 
     /// Attach weight store to families for persistence (pinyin phrases +
     /// english learned words).
-    pub fn set_store(&self, store: Arc<crate::weight_store::WeightStore>) {
+    pub fn set_store(&self, store: Arc<crate::store::WeightStore>) {
         if let Some(fam) = self.scorer.family("pinyin") {
             fam.attach_store(Arc::clone(&store));
         }

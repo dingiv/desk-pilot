@@ -123,7 +123,7 @@ pub struct EnglishFamily {
     priority: u32,
     weights: EnglishWeights,
     /// 持久化句柄(英文自生词 en_user 表),init_store 后由 dispatcher 注入。
-    store: Mutex<Option<Arc<crate::weight_store::WeightStore>>>,
+    store: Mutex<Option<Arc<crate::store::WeightStore>>>,
 }
 
 impl EnglishFamily {
@@ -407,7 +407,7 @@ impl CandidateFamily for EnglishFamily {
         self.load_dict_file(path)
     }
 
-    fn attach_store(&self, store: Arc<crate::weight_store::WeightStore>) {
+    fn attach_store(&self, store: Arc<crate::store::WeightStore>) {
         *self.store.lock().unwrap() = Some(store);
     }
 

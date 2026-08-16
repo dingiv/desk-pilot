@@ -30,7 +30,7 @@ use std::time::Instant;
 use crate::dispatcher::Dispatcher;
 use crate::family::InputContext;
 use crate::family::magic::{MagicFamily, ReqFetcher};
-use crate::persistence::PersistenceManager;
+use crate::store::PersistenceManager;
 use crate::platform::ImeView;
 use crate::special_key::{handle_special_key, SpecialKey};
 use crate::state::{StateMachine, StepEnv};
@@ -182,6 +182,7 @@ impl ImeEngine {
     // ── ctx helpers ─────────────────────────────────────────────────────
 
     fn with_ctx<T>(&self, ctx: usize, f: impl FnOnce(&Dispatcher, &mut PerContext) -> T) -> T {
+        // FIXME: 一处不必要的 unwrap
         let mut map = self.contexts.lock().unwrap();
         let pc = map.entry(ctx).or_insert_with(|| PerContext::with_page_size(self.page_size, self.candidate_meta));
         f(&self.dispatcher, pc)
@@ -275,6 +276,7 @@ impl ImeEngine {
                 self.learn_english_if_ascii(committed);
             }
             // #wait demo interceptor.
+            // FIXME: 删除 demo 代码
             if ImeView::str_field(&view.commit_text) == "__WAIT_DEMO__" {
                 self.async_waits.lock().unwrap().insert(ctx, WaitState {
                     trigger_time: Instant::now(),
@@ -846,7 +848,7 @@ mod tests {
         // Regression: Space-commits route through special_key_ctx, which used
         // to bypass record_commit — the recency ring was never updated by
         // space-commits (and nothing persisted).
-        use crate::weight_store::WeightStore;
+        use crate::store::WeightStore;
         let db = format!("/tmp/swift-ime-space-rec-{}.db", std::process::id());
         let _ = std::fs::remove_file(&db);
         let mut e = eng();
@@ -902,11 +904,12 @@ mod tests {
     }
 
     /// Poll `magic_tick` until the worker thread's result lands (or fail).
-    /// Budget 10s with fine-grained polling — under full parallel test load
-    /// (137 tests, starved CI containers) the spawned worker thread can be
-    /// delayed past smaller budgets; the tests assert correctness, not speed.
+    /// Budget 30s with fine-grained polling — under full parallel test load
+    /// (150+ tests, starved CI containers) the spawned worker thread can be
+    /// delayed tens of seconds; the tests assert correctness, not speed.
+    /// (10s still tripped on an 11.6s-loaded run — last flake, 2026-08-15.)
     fn wait_req_tick(e: &ImeEngine) {
-        for _ in 0..5_000 {
+        for _ in 0..15_000 {
             if e.magic_tick().is_some() { return; }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
@@ -1273,7 +1276,7 @@ mod tests {
             e.init_store(&db);
             for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
             e.predict(InputEvent::space());
-            let store = crate::weight_store::WeightStore::open(&db).unwrap();
+            let store = crate::store::WeightStore::open(&db).unwrap();
             let en = store.load_all_en_user();
             assert_eq!(en, vec![("cd".to_string(), 1)], "chinese commit doesn't learn: {en:?}");
         }

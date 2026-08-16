@@ -176,7 +176,7 @@ pub trait CandidateFamily: Send + Sync {
 
     /// Attach the weight store for persisting learned phrases.
     /// Called once at startup after init_store.
-    fn attach_store(&self, _store: std::sync::Arc<crate::weight_store::WeightStore>) {}
+    fn attach_store(&self, _store: std::sync::Arc<crate::store::WeightStore>) {}
 
     /// Warm the phrase book from persisted SQLite data.
     fn warm_phrases_from_store(&self) {}
