@@ -1172,10 +1172,11 @@ mod tests {
         let cands = e.candidates_detailed();
         assert!(cands.iter().all(|d| d.family != "emoji"),
             "no emoji candidates when disabled: {cands:?}");
-        // 恢复后候选回来。
-        e.set_family_enabled("emoji", true);
-        for c in "smile".chars() { e.predict(InputEvent::char(c)); }
-        assert!(e.candidates_detailed().iter().any(|d| d.family == "emoji"),
+        // 恢复后候选回来(新引擎,避免上一段的 buffer 残留)。
+        let mut e2 = eng();
+        e2.set_family_enabled("emoji", true);
+        for c in "smile".chars() { e2.predict(InputEvent::char(c)); }
+        assert!(e2.candidates_detailed().iter().any(|d| d.family == "emoji"),
             "emoji candidates return when re-enabled");
     }
 
