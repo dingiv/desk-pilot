@@ -88,10 +88,10 @@ phrase_score(count) = min(0.70 + 0.02 × (count-1), 0.88)
 
 ### 两条学习路径
 
-| 路径 | 判定 | 词典检查 |
+| 路径 | 判定 | 学习? |
 |---|---|---|
-| 直接提交(空格选 top) | `committed_text` 为空 | ✅ 词典词**不学**(de→的 不污染) |
-| 自生词流程(数字键逐字选) | 经历 ≥1 次 partial commit | ❌ 无条件学(主动造词) |
+| 直接提交(空格选 top) | `committed_text` 为空 | ❌ **不学**——decomp 词 Viterbi 下次重新组合,无需入本(qingqiuti→请求提 回归) |
+| 自生词流程(数字键逐字选) | 经历 ≥1 次 partial commit | ✅ 唯一学习入口,无条件入本(主动造词) |
 
 学习入口只收 **汉字+ASCII 字母数字** 组成的词("Bevy引擎" ✓,📀 ✗)——
 emoji 提交不进拼音单词本(它们会吃 phrase+recent 双重加成霸榜)。

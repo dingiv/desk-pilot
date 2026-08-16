@@ -259,12 +259,11 @@ impl StateMachine {
             };
             // Record the FULL composed word, not just the last character.
             env.record_pick(&full_pinyin, &final_text);
-            // 自生词模式(经历过 ≥1 次数字键逐字选择,committed_text 非空):
-            // 主动造词成果无条件加入单词本 —— 不因词典里恰好有该词而跳过。
-            // 直接提交(未逐字选择)走 learn_phrase(词典词不进单词本)。
-            if self.committed_text.is_empty() {
-                env.learn_phrase(&full_pinyin, &final_text);
-            } else {
+            // 自生词模式:唯一的学习入口。经历过 ≥1 次数字键逐字选择
+            // (committed_text 非空)后提交,整体无条件加入单词本。
+            // 直接提交(空格选 top,未逐字选择)**不学** —— decomp 选项
+            // 下次输入时 Viterbi 会重新组合出同样的候选,无需入本。
+            if !self.committed_text.is_empty() {
                 env.learn_composed_phrase(&full_pinyin, &final_text);
             }
             self.context.update(&final_text);

@@ -284,9 +284,11 @@ impl CandidateFamily for PinyinFamily {
         self.engine.dict().record_pick(pinyin, word);
         // 前缀整词联想的上下文:记录本次提交的 (word, pinyin)。
         *self.last_commit.lock().unwrap() = (word.to_string(), pinyin.to_string());
-        self.learn_phrase(pinyin, word);
+        // 注意:此处**不**调 learn_phrase —— 单词本的唯一入口是造词路径
+        // (learn_composed_phrase,见 state.rs select)。record_pick 在逐字
+        // 选择时对**单字**也会调用,学短语会把"李"这类单字塞进单词本。
         // Persist the L0 user model (pins + pick counters) — same double-write
-        // cadence as bigrams, so the 3-pick auto-pin survives restarts.
+        // cadence as recency, so the 3-pick auto-pin survives restarts.
         if let Some(ref store) = *self.store.lock().unwrap() {
             store.save_l0(&self.export_l0_json());
         }

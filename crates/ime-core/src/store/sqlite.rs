@@ -117,6 +117,13 @@ impl WeightStore {
         );
     }
 
+    /// 删除一条自生词(污染清理用)。
+    pub fn delete_phrase(&self, pinyin: &str, word: &str) -> usize {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM phrases WHERE pinyin = ?1 AND word = ?2", params![pinyin, word])
+            .unwrap_or(0)
+    }
+
     /// Get phrases for a pinyin, sorted by priority ascending (0 first).
     pub fn phrases_for(&self, pinyin: &str) -> Vec<(String, i32)> {
         let conn = self.conn.lock().unwrap();

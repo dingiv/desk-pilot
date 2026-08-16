@@ -1224,6 +1224,31 @@ mod tests {
     }
 
     #[test]
+    fn direct_space_commit_of_decomp_never_becomes_phrase() {
+        // 用户场景(qingqiuti→请求提 回归):直接空格提交 decomp 选项
+        // **不学**进单词本 —— 自生词的唯一入口是数字键逐字选择路径。
+        // decomp 词下次输入时 Viterbi 重新组合出同样的候选,无需入本。
+        let mut e = eng();
+        // 多音节输入,候选含 decomp(Viterbi 造词)。
+        for c in "qingqiuti".chars() { e.predict(InputEvent::char(c)); }
+        let cands = e.candidates();
+        assert!(cands.iter().any(|c| c == "请求提"),
+            "decomp 请求提 present: {cands:?}");
+        // 直接空格提交 top(decomp)。
+        e.predict(InputEvent::space());
+
+        // 再次输入:仍是 decomp 来源。若被学进单词本,phrase(0.70)会盖过
+        // decomp(0.32)且 source 变 "phrase"(即用户截图中的
+        // `[0.708 pinyin/phrase]`)—— source 检测即 bug 的直接证据。
+        for c in "qingqiuti".chars() { e.predict(InputEvent::char(c)); }
+        let detailed = e.candidates_detailed();
+        let req = detailed.iter().find(|d| d.text == "请求提")
+            .expect("请求提 still a candidate (via decomp)");
+        assert_eq!(req.source, "decomp",
+            "direct space commit must NOT learn: {req:?}\n{detailed:?}");
+    }
+
+    #[test]
     fn composed_selection_joins_phrase_even_if_in_dictionary() {
         // 自生词模式:多字拼音 + 数字键逐字选择(你→好)组成的整体无条件
         // 加入单词本 —— 即使 你好 在词典里(与直接提交不同,直接提交时
