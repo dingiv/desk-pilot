@@ -19,6 +19,7 @@
 //! Later loads override earlier ones per keyword (user wins over external,
 //! external over base); the entry POSITION is kept so ranking stays stable.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use super::{CandidateFamily, ScoredCandidate};
@@ -64,7 +65,7 @@ const EMOJI_TABLE: &[EmojiEntry] = &[
 ];
 
 pub struct EmojiFamily {
-    enabled: bool,
+    enabled: AtomicBool,
     /// (keyword, emoji) in insertion order — base table first, then loaded
     /// dicts. Merging keeps the original position of an existing keyword
     /// (stable ranking) while replacing its emoji (later load wins).
@@ -79,11 +80,11 @@ impl EmojiFamily {
                 entries.push((k.to_string(), e.emoji.to_string()));
             }
         }
-        EmojiFamily { enabled: true, entries: Mutex::new(entries) }
+        EmojiFamily { enabled: AtomicBool::new(true), entries: Mutex::new(entries) }
     }
 
-    pub fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
     }
 
     /// Merge loaded rows into the table. A keyword already present keeps its
@@ -149,7 +150,12 @@ impl CandidateFamily for EmojiFamily {
     }
 
     fn enabled(&self) -> bool {
-        self.enabled
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// 运行时开关(swift-ime.yaml → dicts.emoji: false 全家族禁用)。
+    fn set_family_enabled(&self, on: bool) {
+        self.set_enabled(on);
     }
 
     fn top_n(&self) -> usize {

@@ -101,6 +101,10 @@ pub trait CandidateFamily: Send + Sync {
         true
     }
 
+    /// 运行时启/禁家族(默认 no-op)。EmojiFamily 覆盖:
+    /// `dicts.emoji: false` 时整个家族退出统一打分。
+    fn set_family_enabled(&self, _on: bool) {}
+
     /// How many top candidates this family sends to the inter-family
     /// competition. Default: 8.
     fn top_n(&self) -> usize {

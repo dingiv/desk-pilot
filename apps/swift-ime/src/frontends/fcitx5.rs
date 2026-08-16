@@ -122,6 +122,11 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
         }
     }
 
+    // ── Emoji 家族开关:dicts.emoji: false → 整个家族禁用(无 emoji 候选)──
+    if !cfg.dicts.emoji {
+        engine.set_family_enabled("emoji", false);
+    }
+
     // ── Emoji keyword table (CLDR-generated) + user mapping ──
     if cfg.dicts.emoji {
         let loader = shared::loader!("assets");

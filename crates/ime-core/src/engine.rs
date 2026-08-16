@@ -197,6 +197,11 @@ impl ImeEngine {
         }
     }
 
+    /// 运行时启/禁某家族(`dicts.emoji: false` → "emoji" 禁用,无 emoji 候选)。
+    pub fn set_family_enabled(&self, name: &str, on: bool) {
+        self.dispatcher.set_family_enabled(name, on);
+    }
+
     /// 临时关闭/恢复 pinyin 家族的上下文感知(swift-ime.yaml → input.context_aware)。
     /// 关闭后 recency / 整词联想加成全部跳过,候选排序纯频率驱动。
     pub fn set_context_aware(&mut self, on: bool) {
@@ -1156,6 +1161,22 @@ mod tests {
         assert!(e.candidates().contains(&"🥦".to_string()),
             "ganlan surfaces 🥦: {:?}", e.candidates());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn emoji_family_can_be_disabled_at_runtime() {
+        // dicts.emoji: false → 整个家族退出统一打分,无任何 emoji 候选。
+        let mut e = eng();
+        e.set_family_enabled("emoji", false);
+        for c in "smile".chars() { e.predict(InputEvent::char(c)); }
+        let cands = e.candidates_detailed();
+        assert!(cands.iter().all(|d| d.family != "emoji"),
+            "no emoji candidates when disabled: {cands:?}");
+        // 恢复后候选回来。
+        e.set_family_enabled("emoji", true);
+        for c in "smile".chars() { e.predict(InputEvent::char(c)); }
+        assert!(e.candidates_detailed().iter().any(|d| d.family == "emoji"),
+            "emoji candidates return when re-enabled");
     }
 
     #[test]

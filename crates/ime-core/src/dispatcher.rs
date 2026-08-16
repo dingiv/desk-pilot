@@ -139,6 +139,13 @@ impl Dispatcher {
         }
     }
 
+    /// 运行时启/禁某家族(`dicts.emoji: false` → "emoji" 全家族禁用)。
+    pub fn set_family_enabled(&self, name: &str, on: bool) {
+        if let Some(fam) = self.scorer.family(name) {
+            fam.set_family_enabled(on);
+        }
+    }
+
     /// 临时关闭/恢复 pinyin 家族的上下文感知(swift-ime.yaml → input.context_aware)。
     pub fn set_pinyin_context_aware(&self, on: bool) {
         if let Some(fam) = self.scorer.family("pinyin") {
