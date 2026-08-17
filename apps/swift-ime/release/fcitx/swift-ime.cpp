@@ -310,28 +310,10 @@ void SwiftImeEngine::reset(const fcitx::InputMethodEntry &entry,
 
 // ── Key event ───────────────────────────────────────────────────────────
 
-// Special keys are handled by the engine via swift_ime_special_key (navigation, paging, cursor
-// movement, +- paging); everything else falls through to the character path. These must be
-// intercepted HERE — keySymToUnicode returns 0 for arrows/PgUp/PgDn (they'd be silently eaten)
-// and '+','-','=','[',']' have unicode (they'd commit the preedit and insert a symbol).
-static int special_key_code(fcitx::KeySym sym) {
-    switch (sym) {
-        case FcitxKey_Up:        return 1;   // SpecialKey::Up
-        case FcitxKey_Down:      return 2;   // SpecialKey::Down
-        case FcitxKey_Left:      return 3;   // SpecialKey::Left
-        case FcitxKey_Right:     return 4;   // SpecialKey::Right
-        case FcitxKey_Tab:       return 5;   // SpecialKey::Tab
-        case FcitxKey_Page_Up:   return 6;   // SpecialKey::PageUp
-        case FcitxKey_Page_Down: return 7;   // SpecialKey::PageDown
-        case FcitxKey_bracketleft:  return 20; // SpecialKey::BracketLeft (cursor left)
-        case FcitxKey_bracketright: return 21; // SpecialKey::BracketRight (cursor right)
-        case FcitxKey_plus:
-        case FcitxKey_equal:     return 22;  // SpecialKey::Plus (next page)
-        case FcitxKey_minus:     return 23;  // SpecialKey::Minus (prev page)
-        default:                 return 0;
-    }
-}
-
+// 忠实转发:这里不做任何键拦截或映射 —— 特殊键、Ctrl/Shift/Alt 修饰状态
+// 原样打包给引擎的输入路由层(状态机表),由它决定键属于输入法还是应用,
+// 返回的 ImeView::action 告诉我们如何反应。keySymToUnicode 对方向键等返回
+// 0,所以 keysym 也要一并传递。
 void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
                                fcitx::KeyEvent &keyEvent) {
     FCITX_UNUSED(entry);
@@ -339,15 +321,6 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
 
     auto *ic = keyEvent.inputContext();
     if (!ic) return;
-
-    // 带 Ctrl/Alt 修饰的组合键(Ctrl+/ 注释、Ctrl+C、Alt+Tab 切换…)一律放行
-    // 给应用 —— 输入法只处理无修饰的字符/导航键。keySymToUnicode 对 Ctrl+/
-    // 仍返回 '/',若不在这里拦截,它会被当成 snippet 触发前缀吞掉,编辑器
-    // 永远收不到注释快捷键。
-    auto states = keyEvent.key().states();
-    if (states.testAny(fcitx::KeyState::Ctrl) || states.testAny(fcitx::KeyState::Alt)) {
-        return;
-    }
 
     // $CLIPBOARD support: while composing a snippet/#-command (preedit starts
     // with '/' or '#'), push the current clipboard to the engine so the
@@ -365,24 +338,23 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
         }
     }
 
-    ImeView view;
+    // Pack the key faithfully — sym + unicode + modifier states, nothing else.
     auto sym = keyEvent.key().sym();
-    int sp = special_key_code(sym);
-    if (sp != 0) {
-        // Navigation / paging / cursor / +- — never a character.
-        swift_ime_special_key(handle_, (void *)ic, sp, &view);
-    } else {
-        uint32_t ch = fcitx::Key::keySymToUnicode(sym);
-        if (ch == 0) return;  // unmapped non-character (F1, …) — let fcitx handle it
-        FCITX_DEBUG() << "[key] char='" << (char)ch << "' (0x" << std::hex << ch
-                      << std::dec << ") special=" << sp;
-        swift_ime_process_key(handle_, (void *)ic, ch, &view);
-        FCITX_DEBUG() << "[key] after: preedit='" << view.preedit_text
-                      << "' cursor=" << view.preedit_cursor
-                      << " candidates=" << view.candidate_count;
-    }
+    auto states = keyEvent.key().states();
+    SwiftKeyPacket pkt;
+    pkt.sym = static_cast<uint32_t>(sym);
+    pkt.unicode = fcitx::Key::keySymToUnicode(sym);
+    pkt.ctrl = states.testAny(fcitx::KeyState::Ctrl) ? 1 : 0;
+    pkt.shift = states.testAny(fcitx::KeyState::Shift) ? 1 : 0;
+    pkt.alt = states.testAny(fcitx::KeyState::Alt) ? 1 : 0;
 
-    if (view.key_passthrough) {
+    ImeView view;
+    swift_ime_key(handle_, (void *)ic, &pkt, &view);
+
+    // Action-driven reaction: HANDLED unset → the key belongs to the
+    // application (idle Esc/'-'/arrows, Ctrl/Alt shortcuts…). Not calling
+    // filterAndAccept lets it fall through untouched.
+    if (!(view.action & SWIFT_ACTION_HANDLED)) {
         apply_view(ic, view);
         return;
     }

@@ -1,17 +1,19 @@
 //! TUI frontend — passes keys directly to the engine and renders ImeView.
 //!
-//! No navigation logic here — Space, Enter, Escape, Backspace, digits
-//! are all handled by the engine's built-in special key layer.
+//! 不做任何键拦截:crossterm 事件(含 Ctrl/Alt/Shift 修饰状态)忠实转成
+//! [`KeyEvent`](ime_core::router::KeyEvent) 喂给引擎的输入路由层,再按
+//! `ImeView::action` 反应 —— `COMMIT` 追加历史,PASSTHROUGH 的组合键
+//! (Ctrl+Q/Ctrl+C)退出。
 
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::ExecutableCommand;
 use ime_core::asr_buffer::AsrBuffer;
 use ime_core::engine::ImeEngine;
-use ime_core::special_key::SpecialKey;
+use ime_core::router::{KeyKind, KeyEvent};
 use ime_core::ImeView;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -59,42 +61,25 @@ fn run_loop(
         terminal.draw(|f| {
             // 当前预测项的提供者(family/source)与权重(score)。
             let detailed = engine.candidates_detailed();
-            render(f, &last_view, history, asr_buffer, aura_status, &detailed)
+            let flags = engine.state_flags();
+            render(f, &last_view, history, asr_buffer, aura_status, &detailed, flags)
         })?;
 
         if event::poll(Duration::from_millis(POLL_MS))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press { continue; }
 
-                // ── Non-character special keys → engine.special_key_ctx ──
-                let sk = match key.code {
-                    KeyCode::Esc     => { should_quit = true; continue; }
-                    KeyCode::Up      => SpecialKey::Up,
-                    KeyCode::Down    => SpecialKey::Down,
-                    KeyCode::Left    => SpecialKey::Left,
-                    KeyCode::Right   => SpecialKey::Right,
-                    KeyCode::Tab     => SpecialKey::Tab,
-                    KeyCode::PageUp  => SpecialKey::PageUp,
-                    KeyCode::PageDown=> SpecialKey::PageDown,
-                    KeyCode::Backspace => SpecialKey::Backspace,
-                    KeyCode::Enter   => SpecialKey::Enter,
-                    _ => {
-                        // ── Character keys → engine.predict_ctx ──
-                        // Space, digits, letters all go through here.
-                        // The engine's special key layer intercepts Space/Enter/BS/Esc/1-9.
-                        if let KeyCode::Char(c) = key.code {
-                            last_view = engine.predict_ctx(0, c);
-                            let committed = ImeView::str_field(&last_view.commit_text);
-                            if !committed.is_empty() {
-                                history.push(committed.to_string());
-                            }
-                        }
-                        continue;
-                    }
-                };
+                // ── 忠实转换:键 + 修饰状态 → 统一键事件,交给路由层 ──
+                let ev = crossterm_to_key(&key);
 
-                // Non-character special key (arrows, page, tab).
-                last_view = engine.special_key_ctx(0, sk);
+                // TUI 自身是"应用":引擎对 Ctrl 组合返回 PASSTHROUGH,
+                // Ctrl+Q / Ctrl+C 在此退出。
+                if ev.ctrl && matches!(ev.kind, KeyKind::Char('q') | KeyKind::Char('c')) {
+                    should_quit = true;
+                    continue;
+                }
+
+                last_view = engine.key(ev);
                 let committed = ImeView::str_field(&last_view.commit_text);
                 if !committed.is_empty() {
                     history.push(committed.to_string());
@@ -125,6 +110,39 @@ fn run_loop(
     Ok(())
 }
 
+// ── Key conversion ──────────────────────────────────────────────────────
+
+/// crossterm 事件 → 统一键事件(忠实转换:键类 + Ctrl/Shift/Alt 状态)。
+/// 字符经 [`KeyEvent::char`] 归一化(空格/数字/翻页符号各自成类)。
+fn crossterm_to_key(key: &crossterm::event::KeyEvent) -> KeyEvent {
+    let kind = match key.code {
+        KeyCode::Char(c) => KeyEvent::char(c).kind,
+        KeyCode::Enter => KeyKind::Enter,
+        KeyCode::Backspace => KeyKind::Backspace,
+        KeyCode::Esc => KeyKind::Escape,
+        KeyCode::Tab => KeyKind::Tab,
+        KeyCode::Up => KeyKind::Up,
+        KeyCode::Down => KeyKind::Down,
+        KeyCode::Left => KeyKind::Left,
+        KeyCode::Right => KeyKind::Right,
+        KeyCode::PageUp => KeyKind::PageUp,
+        KeyCode::PageDown => KeyKind::PageDown,
+        KeyCode::Home => KeyKind::Home,
+        KeyCode::End => KeyKind::End,
+        KeyCode::Delete => KeyKind::Delete,
+        KeyCode::Insert => KeyKind::Insert,
+        KeyCode::F(n) => KeyKind::Function(n),
+        _ => KeyKind::Other(0),
+    };
+    let m = key.modifiers;
+    KeyEvent {
+        kind,
+        ctrl: m.contains(KeyModifiers::CONTROL),
+        shift: m.contains(KeyModifiers::SHIFT),
+        alt: m.contains(KeyModifiers::ALT),
+    }
+}
+
 // ── Render ─────────────────────────────────────────────────────────────
 
 fn render(
@@ -134,6 +152,7 @@ fn render(
     asr_buffer: &AsrBuffer,
     aura_status: &Option<AuraConnHandle>,
     detailed: &[ime_core::family::RankedCandidate],
+    flags: ime_core::router::StateFlags,
 ) {
     let area = f.area();
 
@@ -148,7 +167,7 @@ fn render(
     render_preedit(f, rows[0], view);
     render_candidates(f, rows[1], view, detailed);
     render_history(f, rows[2], history);
-    render_status(f, rows[3], view, asr_buffer, aura_status);
+    render_status(f, rows[3], asr_buffer, aura_status, flags);
 }
 
 fn render_preedit(f: &mut Frame, area: Rect, view: &ImeView) {
@@ -223,10 +242,10 @@ fn render_history(f: &mut Frame, area: Rect, history: &[String]) {
 
 fn render_status(
     f: &mut Frame,
-    _area: Rect,
-    view: &ImeView,
+    area: Rect,
     asr_buffer: &AsrBuffer,
     aura_status: &Option<AuraConnHandle>,
+    flags: ime_core::router::StateFlags,
 ) {
     let voice = asr_buffer.snapshot();
     let vs = if voice.is_empty() { "ASR: idle".into() } else { format!("ASR: {}", &voice[..voice.len().min(30)]) };
@@ -238,16 +257,22 @@ fn render_status(
         },
         None => Span::styled(" aura:off ", Style::new().fg(Color::DarkGray)),
     };
+    // 输入路由层的状态机表 —— 当前处于哪些输入状态。
+    let flags_str = if flags.labels().is_empty() {
+        "IDLE".to_string()
+    } else {
+        flags.labels().join("|")
+    };
     let line = Line::from(vec![
-        Span::styled(" ESC:quit ", Style::new().fg(Color::DarkGray)),
+        Span::styled(" Ctrl+Q:quit ", Style::new().fg(Color::DarkGray)),
+        Span::styled(" Esc:cancel ", Style::new().fg(Color::DarkGray)),
         Span::styled(" Space:commit ", Style::new().fg(Color::Green)),
         Span::styled(" ↑↓←→:nav ", Style::new().fg(Color::DarkGray)),
-        Span::styled(" Tab:next ", Style::new().fg(Color::DarkGray)),
         Span::styled(" PgUp/Dn:page ", Style::new().fg(Color::DarkGray)),
         Span::styled(" 1-9:select ", Style::new().fg(Color::DarkGray)),
+        Span::styled(format!(" [{flags_str}]"), Style::new().fg(Color::Blue)),
         aura,
         Span::styled(format!(" | {vs}"), Style::new().fg(Color::Gray)),
     ]);
-    let _ = view;
-    f.render_widget(Paragraph::new(line), _area);
+    f.render_widget(Paragraph::new(line), area);
 }

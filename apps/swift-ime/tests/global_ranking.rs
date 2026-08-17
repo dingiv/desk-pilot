@@ -8,7 +8,7 @@
 //!
 //! Run: cargo test -p swift-ime --test global_ranking
 
-use ime_core::engine::{ImeEngine, InputEvent};
+use ime_core::engine::{ImeEngine, KeyEvent};
 use std::path::Path;
 
 fn dict(name: &str) -> Option<String> {
@@ -30,7 +30,7 @@ fn engine() -> ImeEngine {
 
 fn rank(e: &mut ImeEngine, input: &str) -> Vec<(String, String, String)> {
     for c in input.chars() {
-        e.predict(InputEvent::char(c));
+        e.predict(KeyEvent::char(c));
     }
     e.candidates_detailed()
         .into_iter()
@@ -64,7 +64,7 @@ fn full_pinyin_keeps_frequency_discrimination() {
     assert_above("jixu", &r, "继续", "急须");
     // 顶流封顶 0.90(经 short_word_bonus 0.91),不顶满 1.0。
     let mut e2 = engine();
-    for c in "jixu".chars() { e2.predict(InputEvent::char(c)); }
+    for c in "jixu".chars() { e2.predict(KeyEvent::char(c)); }
     let detailed = e2.candidates_detailed();
     let ji_xu = detailed.iter().find(|d| d.text == "继续").unwrap();
     assert!(ji_xu.score < 0.95, "顶流应封顶留白: {}", ji_xu.score);
@@ -144,15 +144,15 @@ fn pure_ascii_never_becomes_pinyin_phrase() {
     // name(纯英文)即使被提交也不能以 pinyin/phrase 身份出现 —— 英文自生词
     // 走 english/user 体系。回归:name 曾以 0.937 pinyin/phrase 霸榜。
     let mut e = engine();
-    for c in "name".chars() { e.predict(InputEvent::char(c)); }
+    for c in "name".chars() { e.predict(KeyEvent::char(c)); }
     let idx = e.candidates().iter().position(|c| c == "那么").expect("那么 present");
     e.select_candidate(idx); // 提交 那么(中文,正常学习路径)
     // 再提交一次英文 name(选中英文候选,若存在)。
-    for c in "name".chars() { e.predict(InputEvent::char(c)); }
+    for c in "name".chars() { e.predict(KeyEvent::char(c)); }
     if let Some(i) = e.candidates().iter().position(|c| c == "name") {
         e.select_candidate(i);
     }
-    for c in "name".chars() { e.predict(InputEvent::char(c)); }
+    for c in "name".chars() { e.predict(KeyEvent::char(c)); }
     let detailed = e.candidates_detailed();
     let name_cand = detailed.iter().find(|d| d.text == "name");
     if let Some(d) = name_cand {

@@ -42,7 +42,26 @@ struct ImeView {
     uint32_t       candidate_page;
     uint32_t       candidate_page_size;
     char           aux_up[512];
-    uint8_t        key_passthrough;
+    uint32_t       action;             // action bitflags — see SWIFT_ACTION_* below
+};
+
+// ── Action bitflags (mirror of Rust platform::action) ─────────────────────
+// The engine owns ALL key policy; C++ reacts to these bits only.
+#define SWIFT_ACTION_NONE        0u
+#define SWIFT_ACTION_HANDLED     (1u << 0)  // key consumed → filterAndAccept
+#define SWIFT_ACTION_PASSTHROUGH (1u << 1)  // key must reach the application
+#define SWIFT_ACTION_COMMIT      (1u << 2)  // commit_text produced this round
+
+// ── SwiftKeyPacket: faithful key forwarding (must match Rust CKeyEvent) ────
+// The C++ side does NOT intercept or translate keys — it packs sym + unicode +
+// modifier states and lets the engine's input router decide.
+
+struct SwiftKeyPacket {
+    uint32_t sym;      // X keysym (FcitxKey_*; ASCII printable == unicode)
+    uint32_t unicode;  // keySymToUnicode(sym), 0 when unmapped
+    uint8_t  ctrl;
+    uint8_t  shift;
+    uint8_t  alt;
 };
 
 // ── C ABI — every function takes the ImeHandle* as first argument ──────────
@@ -51,8 +70,11 @@ extern "C" {
     ImeHandle *swift_ime_create(const char *config_path);
     void       swift_ime_destroy(ImeHandle *handle);
 
-    int  swift_ime_process_key(ImeHandle *handle, void *ctx,
-                               unsigned int ch, ImeView *out_view);
+    /// Unified key entry: EVERY key (special keys and Ctrl/Shift/Alt states
+    /// included) is forwarded faithfully; the returned ImeView::action tells
+    /// the caller how to react (HANDLED unset → do NOT filterAndAccept).
+    int  swift_ime_key(ImeHandle *handle, void *ctx,
+                       const SwiftKeyPacket *ev, ImeView *out_view);
     int  swift_ime_select_candidate(ImeHandle *handle, void *ctx,
                                     unsigned int index, ImeView *out_view);
     int  swift_ime_commit_pending(ImeHandle *handle, void *ctx,
@@ -71,25 +93,7 @@ extern "C" {
     void swift_ime_reset(ImeHandle *handle, void *ctx);
     void swift_ime_activate(ImeHandle *handle, void *ctx);
     void swift_ime_deactivate(ImeHandle *handle, void *ctx);
-    int  swift_ime_special_key(ImeHandle *handle, void *ctx,
-                                int code, ImeView *out_view);
 }
-
-// ── Special key codes (passed to swift_ime_special_key) ─────────────────
-#define SWIFT_KEY_UP           1
-#define SWIFT_KEY_DOWN         2
-#define SWIFT_KEY_LEFT         3
-#define SWIFT_KEY_RIGHT        4
-#define SWIFT_KEY_TAB          5
-#define SWIFT_KEY_PAGEUP       6
-#define SWIFT_KEY_PAGEDOWN     7
-#define SWIFT_KEY_SPACE       10
-#define SWIFT_KEY_ENTER       11
-#define SWIFT_KEY_ESCAPE      12
-#define SWIFT_KEY_BACKSPACE   13
-#define SWIFT_KEY_BRACKET_LEFT  20
-#define SWIFT_KEY_BRACKET_RIGHT 21
-#define SWIFT_KEY_DIGIT(n)    (100 + (n))  // n = 1..9
 
 // ── fcitx5 engine ───────────────────────────────────────────────────────────
 

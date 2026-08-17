@@ -178,16 +178,38 @@ pub extern "C" fn swift_ime_destroy(engine: *mut ImeEngine) {
     unsafe { drop(Box::from_raw(engine)); }
 }
 
+/// C ABI 的键事件包 —— C++ 胶水**忠实组包**(keysym + unicode + 修饰键
+/// 状态),不做任何拦截或映射;键类归一与修饰键策略全部由引擎的输入
+/// 路由层决定。字段布局必须与 swift-ime.h 的 SwiftKeyPacket 一致。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CKeyEvent {
+    /// X keysym(FcitxKey_*;ASCII 可打印区与 unicode 同值)。
+    pub sym: u32,
+    /// `keySymToUnicode(sym)`,无映射时为 0。
+    pub unicode: u32,
+    pub ctrl: u8,
+    pub shift: u8,
+    pub alt: u8,
+}
+
+/// 统一键入口:所有键(含特殊键与 Ctrl/Shift/Alt 状态)都走这里。
+/// 返回的 `ImeView::action` 告诉 C++ 侧如何反应 —— `HANDLED` 未置位即
+/// 不 filterAndAccept,键自然到达应用。
 #[no_mangle]
-pub extern "C" fn swift_ime_process_key(
+pub extern "C" fn swift_ime_key(
     engine: *mut ImeEngine,
     ctx: *const std::ffi::c_void,
-    ch: u32,
+    ev: *const CKeyEvent,
     out_view: *mut ImeView,
 ) -> i32 {
-    let c = char::from_u32(ch).unwrap_or('\0');
-    if c == '\0' || engine.is_null() || out_view.is_null() { return 0; }
-    let mut view = unsafe { &*engine }.predict_ctx(ctx as usize, c);
+    if engine.is_null() || out_view.is_null() || ev.is_null() { return 0; }
+    let ev = unsafe { *ev };
+    let key = ime_core::router::KeyEvent::from_fcitx(
+        ev.sym, ev.unicode,
+        ev.ctrl != 0, ev.shift != 0, ev.alt != 0,
+    );
+    let mut view = unsafe { &*engine }.key_ctx(ctx as usize, key);
     truncate_candidate_rows(&mut view);
     unsafe { *out_view = view; }
     1
@@ -211,20 +233,6 @@ pub extern "C" fn swift_ime_select_candidate(
 pub extern "C" fn swift_ime_reset(engine: *mut ImeEngine, ctx: *const std::ffi::c_void) {
     if engine.is_null() { return; }
     unsafe { &*engine }.reset_ctx(ctx as usize);
-}
-
-#[no_mangle]
-pub extern "C" fn swift_ime_special_key(
-    engine: *mut ImeEngine,
-    ctx: *const std::ffi::c_void,
-    code: i32,
-    out_view: *mut ImeView,
-) -> i32 {
-    if engine.is_null() || out_view.is_null() { return 0; }
-    let mut view = unsafe { &*engine }.special_key_code_ctx(ctx as usize, code);
-    truncate_candidate_rows(&mut view);
-    unsafe { *out_view = view; }
-    1
 }
 
 #[no_mangle]

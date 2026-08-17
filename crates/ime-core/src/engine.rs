@@ -18,9 +18,9 @@
 //! ```ignore
 //! let mut eng = ImeEngine::new();
 //! for c in "nihao".chars() {
-//!     eng.predict(InputEvent::char(c));
+//!     eng.predict(KeyEvent::char(c));
 //! }
-//! eng.predict(InputEvent::space());
+//! eng.predict(KeyEvent::space());
 //! ```
 
 use std::collections::HashMap;
@@ -30,33 +30,19 @@ use std::time::Instant;
 use crate::dispatcher::Dispatcher;
 use crate::family::InputContext;
 use crate::family::magic::{MagicFamily, ReqFetcher};
+use crate::router::{StateMachineTable, StateFlags};
+// 统一键事件由输入路由层定义(旧名 InputEvent;构造器同名,测试平移)。
+pub use crate::router::KeyEvent;
 use crate::store::PersistenceManager;
 use crate::platform::ImeView;
-use crate::special_key::{handle_special_key, SpecialKey};
 use crate::state::{StateMachine, StepEnv};
-
-// ── InputEvent ──────────────────────────────────────────────────────────
-
-/// A single input event from the frontend.
-#[derive(Debug, Clone, Copy)]
-pub struct InputEvent {
-    pub ch: u32,
-    pub ctrl: bool,
-    pub shift: bool,
-}
-
-impl InputEvent {
-    pub fn char(c: char) -> Self { InputEvent { ch: c as u32, ctrl: false, shift: false } }
-    pub fn backspace() -> Self { InputEvent { ch: '\x08' as u32, ctrl: false, shift: false } }
-    pub fn enter() -> Self { InputEvent { ch: '\n' as u32, ctrl: false, shift: false } }
-    pub fn space() -> Self { InputEvent { ch: ' ' as u32, ctrl: false, shift: false } }
-    pub fn escape() -> Self { InputEvent { ch: 0x1B, ctrl: false, shift: false } }
-}
 
 // ── PerContext ──────────────────────────────────────────────────────────
 
 struct PerContext {
     sm: StateMachine,
+    /// 输入路由层的状态机表(标志位寄存器)—— 每键路由后同步。
+    table: StateMachineTable,
     text_context: InputContext,
 }
 
@@ -64,7 +50,7 @@ impl PerContext {
     fn with_page_size(page_size: u32, candidate_meta: bool) -> Self {
         let mut sm = StateMachine::with_page_size(page_size);
         sm.candidate_meta_enabled = candidate_meta;
-        PerContext { sm, text_context: InputContext::new() }
+        PerContext { sm, table: StateMachineTable::new(), text_context: InputContext::new() }
     }
 }
 
@@ -225,54 +211,15 @@ impl ImeEngine {
 
     // ── Multi-context API (used by fcitx5 C ABI) ────────────────────────
 
-    /// Process a special key (navigation, commit, selection) for a context.
-    /// Returns the updated ImeView.
-    ///
-    /// Commit-producing special keys (Space/Enter/Digit) go through the same
-    /// recording as the character and select paths — previously a Space commit
-    /// bypassed `record_commit`, so the recency ring and the
-    /// recency ring were never updated by space-commits.
-    pub fn special_key_ctx(&self, ctx: usize, key: SpecialKey) -> ImeView {
-        self.with_ctx(ctx, |disp, pc| {
-            let view = handle_special_key(&mut pc.sm, key, disp)
-                .unwrap_or_else(ImeView::empty);
-            let committed = ImeView::str_field(&view.commit_text);
-            if !committed.is_empty() {
-                pc.text_context.update(committed);
-                self.dispatcher.record_commit(committed);
-                self.learn_english_if_ascii(committed);
-            }
-            view
-        })
-    }
-
-    /// Process a special key code from the C ABI.
-    pub fn special_key_code_ctx(&self, ctx: usize, code: i32) -> ImeView {
-        match SpecialKey::from_code(code) {
-            Some(key) => self.special_key_ctx(ctx, key),
-            None => ImeView::empty(),
-        }
-    }
-
-    /// Process a key for a given input context. Returns the UI snapshot.
-    pub fn predict_ctx(&self, ctx: usize, ch: char) -> ImeView {
-        // ── Special key layer ──
-        // Check if the character maps to a special key before prediction.
-        let key_opt = match ch {
-            ' ' => Some(SpecialKey::Space),
-            '\n' | '\r' => Some(SpecialKey::Enter),
-            '\x08' => Some(SpecialKey::Backspace),
-            '\x1b' => Some(SpecialKey::Escape),
-            d @ '1'..='9' => Some(SpecialKey::Digit(d as u8 - b'0')),
-            _ => None,
-        };
-        if let Some(key) = key_opt {
-            return self.special_key_ctx(ctx, key);
-        }
-
+    /// **统一键入口**:所有前端把键(含特殊键与 Ctrl/Shift/Alt 修饰状态)
+    /// 忠实地转成 [`KeyEvent`] 喂到这里。输入路由层(状态机表)查表决定
+    /// 这枚键属于输入法还是应用,驱动组合状态机迁移,返回带 action 位
+    /// 标志的视图 —— 外界按 [`action`](crate::platform::action) 反应即可,
+    /// 不再自行拦截任何键。
+    pub fn key_ctx(&self, ctx: usize, key: KeyEvent) -> ImeView {
         self.with_ctx(ctx, |disp, pc| {
             pc.sm.context = pc.text_context.clone();
-            let mut view = disp.process_key(ch, &mut pc.sm);
+            let mut view = pc.table.route(&mut pc.sm, key, disp);
             let committed = ImeView::str_field(&view.commit_text);
             if !committed.is_empty() {
                 pc.text_context.update(committed);
@@ -295,6 +242,20 @@ impl ImeEngine {
         })
     }
 
+    /// 当前输入上下文的状态标志位(状态机表)。TUI 状态栏 / 调试用。
+    pub fn state_flags_ctx(&self, ctx: usize) -> StateFlags {
+        self.contexts.lock().unwrap()
+            .get(&ctx)
+            .map(|pc| pc.table.flags())
+            .unwrap_or_else(StateFlags::empty)
+    }
+
+    /// Process a character key for a given input context(旧字符入口的薄包装,
+    /// 归一化后走 [`key_ctx`])。
+    pub fn predict_ctx(&self, ctx: usize, ch: char) -> ImeView {
+        self.key_ctx(ctx, KeyEvent::char(ch))
+    }
+
     /// Select a candidate by index for a given context.
     pub fn select_ctx(&self, ctx: usize, index: usize) -> ImeView {
         self.with_ctx(ctx, |disp, pc| {
@@ -306,13 +267,18 @@ impl ImeEngine {
                 self.dispatcher.record_commit(committed);
                 self.learn_english_if_ascii(committed);
             }
+            // 路由之外的 sm 变更 —— 状态机表重新同步。
+            pc.table.sync_from(&pc.sm);
             view
         })
     }
 
     /// Reset engine state for a context.
     pub fn reset_ctx(&self, ctx: usize) {
-        self.with_ctx(ctx, |disp, pc| disp.reset(&mut pc.sm));
+        self.with_ctx(ctx, |disp, pc| {
+            disp.reset(&mut pc.sm);
+            pc.table.sync_from(&pc.sm);
+        });
     }
 
     /// Deactivate (clean up) a context — removes its state and async waits.
@@ -356,11 +322,20 @@ impl ImeEngine {
 
     // ── Single-context convenience API (tests / mock) ───────────────────
 
-    /// Feed an InputEvent into the default context (ctx=0).
-    pub fn predict(&mut self, event: InputEvent) -> ImeView {
-        let ch = char::from_u32(event.ch).unwrap_or('\0');
-        if ch == '\0' && event.ch != 0 { return ImeView::empty(); }
-        self.predict_ctx(DEFAULT_CTX, ch)
+    /// Feed a [`KeyEvent`] into the default context (ctx=0) — 单上下文版的
+    /// [`key_ctx`](ImeEngine::key_ctx)。
+    pub fn key(&mut self, key: KeyEvent) -> ImeView {
+        self.key_ctx(DEFAULT_CTX, key)
+    }
+
+    /// Feed an KeyEvent(= [`KeyEvent`],旧名)into the default context.
+    pub fn predict(&mut self, event: KeyEvent) -> ImeView {
+        self.key(event)
+    }
+
+    /// 当前(default ctx)状态标志位。
+    pub fn state_flags(&self) -> StateFlags {
+        self.state_flags_ctx(DEFAULT_CTX)
     }
 
     /// Select a candidate in the default context.
@@ -543,6 +518,8 @@ impl ImeEngine {
             pc.sm.magic_member = Some(member);
             // The member rebuilt its candidates — re-assemble the preview tail.
             pc.sm.assemble_magic_tail(disp);
+            // 路由之外的 sm 变更 —— 状态机表重新同步。
+            pc.table.sync_from(&pc.sm);
             changed
         })
     }
@@ -590,16 +567,16 @@ mod tests {
     #[test]
     fn type_pinyin_and_commit() {
         let mut e = eng();
-        for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
+        for c in "nihao".chars() { e.predict(KeyEvent::char(c)); }
         assert!(e.candidates().iter().any(|c| c.contains("你好")));
-        let v = e.predict(InputEvent::space());
+        let v = e.predict(KeyEvent::space());
         assert!(ImeView::str_field(&v.commit_text).contains("你"));
     }
 
     #[test]
     fn incremental_composition() {
         let mut e = eng();
-        for c in "lizhengming".chars() { e.predict(InputEvent::char(c)); }
+        for c in "lizhengming".chars() { e.predict(KeyEvent::char(c)); }
         let li = e.candidates().iter().position(|c| c == "李").unwrap();
         e.select_candidate(li);
         let zheng = e.candidates().iter().position(|c| c == "正").unwrap();
@@ -613,7 +590,7 @@ mod tests {
     fn snippet_expansion() {
         let mut e = eng();
         for c in "/greet".chars() {
-            let v = e.predict(InputEvent::char(c));
+            let v = e.predict(KeyEvent::char(c));
             if ImeView::str_field(&v.commit_text) == "你好，我是 AI 秘书" { return; }
         }
         // Default engine has empty Matcher, so snippet won't expand.
@@ -623,12 +600,12 @@ mod tests {
     #[test]
     fn backspace_clears() {
         let mut e = eng();
-        e.predict(InputEvent::char('n'));
-        e.predict(InputEvent::char('i'));
+        e.predict(KeyEvent::char('n'));
+        e.predict(KeyEvent::char('i'));
         assert_eq!(e.buffer(), "ni");
-        e.predict(InputEvent::backspace());
+        e.predict(KeyEvent::backspace());
         assert_eq!(e.buffer(), "n");
-        e.predict(InputEvent::backspace());
+        e.predict(KeyEvent::backspace());
         assert!(e.buffer().is_empty());
     }
 
@@ -642,7 +619,7 @@ mod tests {
         e.set_asr_buffer(Arc::clone(&buf));
 
         // type #asr → Voice mode, preview candidate (no voice data yet)
-        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
         let cands = e.candidates();
         assert!(cands.iter().any(|c| c.contains("语音识别中")), "preview when empty: {cands:?}");
 
@@ -662,7 +639,7 @@ mod tests {
         assert!(e.magic_tick().is_none(), "no rebuild when version unchanged");
 
         // space commits #1 → 上屏; back to idle
-        let v = e.predict(InputEvent::space());
+        let v = e.predict(KeyEvent::space());
         assert_eq!(ImeView::str_field(&v.commit_text), "你好世界");
         assert!(e.candidates().is_empty(), "candidates cleared after commit");
     }
@@ -676,10 +653,10 @@ mod tests {
         buf.set_connected(true); // simulate a live aura link
         e.set_asr_buffer(Arc::clone(&buf));
         buf.push_final("识别文本");
-        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
         e.magic_tick();
         // Escape → cancel (no commit), back to idle
-        let v = e.predict(InputEvent::escape());
+        let v = e.predict(KeyEvent::escape());
         assert!(ImeView::str_field(&v.commit_text).is_empty(), "escape commits nothing");
         assert!(e.candidates().is_empty(), "cleared after escape");
     }
@@ -694,14 +671,14 @@ mod tests {
         buf.set_connected(true); // simulate a live aura link
         e.set_asr_buffer(Arc::clone(&buf));
 
-        for c in "#as".chars() { e.predict(InputEvent::char(c)); }
+        for c in "#as".chars() { e.predict(KeyEvent::char(c)); }
         // Hint: completion candidate (#asr) + raw (#as).
         let cands = e.candidates();
         assert!(cands.contains(&"#asr".to_string()), "completion hint shown: {cands:?}");
         assert!(cands.contains(&"#as".to_string()), "raw kept as fallback: {cands:?}");
 
         // Space → enters Voice mode (like #asr), does NOT commit "#as".
-        let v = e.predict(InputEvent::space());
+        let v = e.predict(KeyEvent::space());
         assert_eq!(ImeView::str_field(&v.commit_text), "", "space must not commit raw #as");
         assert!(e.candidates().iter().any(|c| c.contains("语音识别中")), "now in asr mode: {:?}", e.candidates());
     }
@@ -715,7 +692,7 @@ mod tests {
         let buf = Arc::new(AsrBuffer::new());
         buf.set_connected(true); // simulate a live aura link
         e.set_asr_buffer(Arc::clone(&buf));
-        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
         // Member placeholder is #1; rollback (#asr) is the LAST candidate.
         let cands = e.candidates();
         assert!(cands.first().map(|c| c.contains("语音识别中")).unwrap_or(false), "member candidate first: {cands:?}");
@@ -731,13 +708,13 @@ mod tests {
         let buf = Arc::new(AsrBuffer::new());
         buf.set_connected(true); // simulate a live aura link
         e.set_asr_buffer(Arc::clone(&buf));
-        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
         // Move highlight to the rollback (last candidate), then Space.
         let n = e.candidates().len();
         for _ in 0..(n - 1) {
-            e.special_key_ctx(0, SpecialKey::Down);
+            e.key(KeyEvent { kind: crate::router::KeyKind::Down, ctrl: false, shift: false, alt: false });
         }
-        let v = e.predict(InputEvent::space());
+        let v = e.predict(KeyEvent::space());
         assert_eq!(ImeView::str_field(&v.commit_text), "#asr", "rollback commits #asr");
         assert!(e.candidates().is_empty(), "exited preview");
     }
@@ -747,18 +724,18 @@ mod tests {
         // `/unknown` (no trie match) → the raw text is a fallback candidate;
         // Space commits it — the trie never swallows unknown `/` input.
         let mut e = eng();
-        for c in "/unknown".chars() { e.predict(InputEvent::char(c)); }
+        for c in "/unknown".chars() { e.predict(KeyEvent::char(c)); }
         let cands = e.candidates();
         assert_eq!(cands, vec!["/unknown".to_string()], "raw fallback: {cands:?}");
 
-        let v = e.predict(InputEvent::space());
+        let v = e.predict(KeyEvent::space());
         assert_eq!(ImeView::str_field(&v.commit_text), "/unknown", "space commits raw");
         assert!(e.candidates().is_empty(), "cleared after commit");
 
         // Escape cancels instead of committing.
         let mut e2 = eng();
-        for c in "/unknown".chars() { e2.predict(InputEvent::char(c)); }
-        let v = e2.predict(InputEvent::escape());
+        for c in "/unknown".chars() { e2.predict(KeyEvent::char(c)); }
+        let v = e2.predict(KeyEvent::escape());
         assert!(ImeView::str_field(&v.commit_text).is_empty(), "escape cancels");
         assert!(e2.candidates().is_empty(), "cleared after escape");
     }
@@ -767,11 +744,11 @@ mod tests {
     fn unknown_magic_space_commits_raw() {
         // `#x` (no magic match) → raw kept as candidate; Space commits it.
         let mut e = eng();
-        for c in "#x".chars() { e.predict(InputEvent::char(c)); }
+        for c in "#x".chars() { e.predict(KeyEvent::char(c)); }
         let cands = e.candidates();
         assert_eq!(cands, vec!["#x".to_string()], "raw only: {cands:?}");
 
-        let v = e.predict(InputEvent::space());
+        let v = e.predict(KeyEvent::space());
         assert_eq!(ImeView::str_field(&v.commit_text), "#x", "space commits raw #x");
         assert!(e.candidates().is_empty(), "cleared after commit");
     }
@@ -786,10 +763,10 @@ mod tests {
         buf.set_connected(true); // simulate a live aura link
         e.set_asr_buffer(Arc::clone(&buf));
 
-        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
         assert!(e.candidates().iter().any(|c| c.contains("语音识别中")), "in asr mode: {:?}", e.candidates());
 
-        let v = e.predict(InputEvent::enter());
+        let v = e.predict(KeyEvent::enter());
         assert_eq!(ImeView::str_field(&v.commit_text), "#asr", "Enter force-commits the trigger");
         assert!(e.candidates().is_empty(), "exited magic mode");
     }
@@ -807,7 +784,7 @@ mod tests {
         buf.push_final(&long);
         let mut e = eng();
         e.set_asr_buffer(Arc::clone(&buf));
-        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
         e.magic_tick();
         let cands = e.candidates();
         assert_eq!(cands[0], long, "engine candidate is the full text: {cands:?}");
@@ -816,7 +793,7 @@ mod tests {
         let preedit = ImeView::str_field(&v0.preedit_text);
         assert_eq!(preedit, format!("🎙 #asr {long}"), "preedit shows the voice text");
         // Space commits the FULL text (from voice_full), not any display preview.
-        let v = e.predict(InputEvent::space());
+        let v = e.predict(KeyEvent::space());
         assert_eq!(ImeView::str_field(&v.commit_text), long);
     }
 
@@ -828,7 +805,7 @@ mod tests {
         let buf = Arc::new(AsrBuffer::new());
         buf.set_connected(true); // simulate a live aura link
         e.set_asr_buffer(Arc::clone(&buf));
-        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
         // two settled finals, then a 3rd utterance starts streaming (live)
         buf.push_final("第一句");
         buf.push_final("第二句");
@@ -850,16 +827,15 @@ mod tests {
 
     #[test]
     fn space_commit_records_recency() {
-        // Regression: Space-commits route through special_key_ctx, which used
-        // to bypass record_commit — the recency ring was never updated by
-        // space-commits (and nothing persisted).
+        // Regression: Space-commits used to bypass record_commit — the recency
+        // ring was never updated by space-commits (and nothing persisted).
         use crate::store::WeightStore;
         let db = format!("/tmp/swift-ime-space-rec-{}.db", std::process::id());
         let _ = std::fs::remove_file(&db);
         let mut e = eng();
         e.init_store(&db);
-        for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
-        e.predict(InputEvent::space()); // commits 你好 via the special-key path
+        for c in "nihao".chars() { e.predict(KeyEvent::char(c)); }
+        e.predict(KeyEvent::space()); // commits 你好 via the special-key path
         let store = WeightStore::open(&db).unwrap();
         let rec = store.load_recency();
         assert_eq!(rec.len(), 1, "space-commit must reach the recency table");
@@ -871,8 +847,8 @@ mod tests {
     #[test]
     fn enter_commits_raw() {
         let mut e = eng();
-        for c in "hello".chars() { e.predict(InputEvent::char(c)); }
-        let v = e.predict(InputEvent::enter());
+        for c in "hello".chars() { e.predict(KeyEvent::char(c)); }
+        let v = e.predict(KeyEvent::enter());
         assert_eq!(ImeView::str_field(&v.commit_text), "hello");
     }
 
@@ -934,20 +910,20 @@ mod tests {
     #[test]
     fn req_anchor_hint_then_enter_fires_then_space_commits() {
         let (mut e, fake) = req_eng();
-        for c in "#req".chars() { e.predict(InputEvent::char(c)); }
+        for c in "#req".chars() { e.predict(KeyEvent::char(c)); }
         // Activation: hint candidate with the full URL
         let cands = e.candidates();
         assert!(cands.iter().any(|c| c.contains("http://127.0.0.1:14555/api")), "hint: {cands:?}");
 
         // Enter fires the request → result lands on the worker thread
-        e.predict(InputEvent::enter());
+        e.predict(KeyEvent::enter());
         wait_req_tick(&e);
         let cands = e.candidates();
         assert!(cands.iter().any(|c| c.contains("这是本地服务返回的正文内容")), "body shown: {cands:?}");
         assert_eq!(fake.urls.lock().unwrap().as_slice(), ["http://127.0.0.1:14555/api"], "fired the base URL");
 
         // Space commits the body; member exits, back to idle
-        let v = e.predict(InputEvent::space());
+        let v = e.predict(KeyEvent::space());
         assert_eq!(ImeView::str_field(&v.commit_text), "这是本地服务返回的正文内容");
         assert!(e.candidates().is_empty(), "cleared after commit");
     }
@@ -955,11 +931,11 @@ mod tests {
     #[test]
     fn req_suffix_extends_url() {
         let (mut e, fake) = req_eng();
-        for c in "#req/news?query=soccer".chars() { e.predict(InputEvent::char(c)); }
+        for c in "#req/news?query=soccer".chars() { e.predict(KeyEvent::char(c)); }
         let cands = e.candidates();
         assert!(cands.iter().any(|c| c.contains("http://127.0.0.1:14555/api/news?query=soccer")), "hint shows full URL: {cands:?}");
 
-        e.predict(InputEvent::enter());
+        e.predict(KeyEvent::enter());
         wait_req_tick(&e);
         assert_eq!(fake.urls.lock().unwrap().as_slice(), ["http://127.0.0.1:14555/api/news?query=soccer"], "fired with suffix");
     }
@@ -969,8 +945,8 @@ mod tests {
         let body = "长正文".repeat(30); // 270 bytes, ≫ 60
         let mut e = eng();
         e.set_req_fetcher(Arc::new(FakeFetcher { result: Ok(body.clone()), urls: Arc::new(Mutex::new(Vec::new())) }));
-        for c in "#req".chars() { e.predict(InputEvent::char(c)); }
-        e.predict(InputEvent::enter());
+        for c in "#req".chars() { e.predict(KeyEvent::char(c)); }
+        e.predict(KeyEvent::enter());
         wait_req_tick(&e);
         let cands = e.candidates();
         // Preview panel: [member body] + [rollback #req]. The body is #1.
@@ -979,7 +955,7 @@ mod tests {
         assert!(cands[0].chars().count() <= 60, "preview ≤ 60 chars: {}", cands[0]);
         assert_eq!(cands.last(), Some(&"#req".to_string()), "rollback is the last candidate");
         // Space on the member candidate commits the FULL body, not the preview
-        let v = e.predict(InputEvent::space());
+        let v = e.predict(KeyEvent::space());
         assert_eq!(ImeView::str_field(&v.commit_text), body);
     }
 
@@ -987,18 +963,18 @@ mod tests {
     fn req_failure_shows_error_and_never_commits_it() {
         let mut e = eng();
         e.set_req_fetcher(Arc::new(FakeFetcher { result: Err("HTTP 500".into()), urls: Arc::new(Mutex::new(Vec::new())) }));
-        for c in "#req".chars() { e.predict(InputEvent::char(c)); }
-        e.predict(InputEvent::enter());
+        for c in "#req".chars() { e.predict(KeyEvent::char(c)); }
+        e.predict(KeyEvent::enter());
         wait_req_tick(&e);
         let cands = e.candidates();
         assert!(cands.iter().any(|c| c.contains("请求失败") && c.contains("HTTP 500")), "error shown: {cands:?}");
 
         // Space on a failed state re-fires (no garbage commit)
-        let v = e.predict(InputEvent::space());
+        let v = e.predict(KeyEvent::space());
         assert!(ImeView::str_field(&v.commit_text).is_empty(), "error text never committed");
         wait_req_tick(&e);
         // Escape cancels the session
-        let v = e.predict(InputEvent::escape());
+        let v = e.predict(KeyEvent::escape());
         assert!(ImeView::str_field(&v.commit_text).is_empty());
         assert!(e.candidates().is_empty(), "cleared after escape");
     }
@@ -1006,30 +982,30 @@ mod tests {
     #[test]
     fn req_backspace_edits_suffix_then_exits() {
         let (mut e, _fake) = req_eng();
-        for c in "#req/news".chars() { e.predict(InputEvent::char(c)); }
+        for c in "#req/news".chars() { e.predict(KeyEvent::char(c)); }
         // Backspace pops one suffix char
-        e.predict(InputEvent::backspace());
+        e.predict(KeyEvent::backspace());
         let cands = e.candidates();
         assert!(cands.iter().any(|c| c.contains("/new") && !c.contains("/news")), "suffix edited: {cands:?}");
         // Delete the rest — when the suffix is empty, Backspace exits the member
-        for _ in 0..5 { e.predict(InputEvent::backspace()); }
+        for _ in 0..5 { e.predict(KeyEvent::backspace()); }
         assert!(e.candidates().is_empty(), "member exited when suffix emptied: {:?}", e.candidates());
     }
 
     #[test]
     fn req_digit_extends_url_without_result_commits_with_result() {
         let (mut e, fake) = req_eng();
-        for c in "#req/news".chars() { e.predict(InputEvent::char(c)); }
+        for c in "#req/news".chars() { e.predict(KeyEvent::char(c)); }
         // No result yet → digit is a URL character
-        e.predict(InputEvent::char('2'));
-        e.predict(InputEvent::char('0'));
+        e.predict(KeyEvent::char('2'));
+        e.predict(KeyEvent::char('0'));
         let cands = e.candidates();
         assert!(cands.iter().any(|c| c.contains("/news20")), "digit appended to suffix: {cands:?}");
 
         // Fire → result lands → digit 1 commits the body
-        e.predict(InputEvent::enter());
+        e.predict(KeyEvent::enter());
         wait_req_tick(&e);
-        let v = e.predict(InputEvent::char('1'));
+        let v = e.predict(KeyEvent::char('1'));
         assert_eq!(ImeView::str_field(&v.commit_text), "这是本地服务返回的正文内容");
         assert!(fake.urls.lock().unwrap().iter().any(|u| u.ends_with("/news20")), "fired with digits in URL");
     }
@@ -1037,8 +1013,8 @@ mod tests {
     #[test]
     fn req_escape_cancels() {
         let mut e = eng();
-        for c in "#req".chars() { e.predict(InputEvent::char(c)); }
-        let v = e.predict(InputEvent::escape());
+        for c in "#req".chars() { e.predict(KeyEvent::char(c)); }
+        let v = e.predict(KeyEvent::escape());
         assert!(ImeView::str_field(&v.commit_text).is_empty(), "escape commits nothing");
         assert!(e.candidates().is_empty(), "cleared after escape");
     }
@@ -1070,8 +1046,8 @@ mod tests {
             crate::scoring::ScoringConfig::default(),
         );
         let mut e = e;
-        for c in "/sig".chars() { e.predict(InputEvent::char(c)); }
-        let v = e.predict(InputEvent::space());
+        for c in "/sig".chars() { e.predict(KeyEvent::char(c)); }
+        let v = e.predict(KeyEvent::space());
         assert_eq!(
             ImeView::str_field(&v.commit_text),
             "Best regards,\nAlice\n2026-08-05",
@@ -1089,25 +1065,25 @@ mod tests {
         let mut e = eng();
 
         // Case 1: no buffer attached at all (aura client never spawned).
-        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
         let v0 = e.view();
         let preedit = ImeView::str_field(&v0.preedit_text);
         assert!(preedit.contains("未连接"), "preedit explains unavailability: {preedit}");
         assert!(preedit.contains("语音不可用"), "preedit mentions voice unavailable: {preedit}");
-        let v = e.predict(InputEvent::space());
+        let v = e.predict(KeyEvent::space());
         assert_eq!(ImeView::str_field(&v.commit_text), "", "Space must not commit the explainer");
-        let v = e.predict(InputEvent::escape());
+        let v = e.predict(KeyEvent::escape());
         assert!(ImeView::str_field(&v.commit_text).is_empty(), "escape cancels");
 
         // Case 2: buffer attached but reported disconnected.
         let buf = Arc::new(AsrBuffer::new());
         buf.push_final("陈旧语音文本"); // stale data must not masquerade as live
         e.set_asr_buffer(Arc::clone(&buf));
-        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
         let v = e.view();
         let preedit = ImeView::str_field(&v.preedit_text);
         assert!(preedit.contains("未连接"), "disconnected buffer still explains: {preedit}");
-        let v = e.predict(InputEvent::space());
+        let v = e.predict(KeyEvent::space());
         assert_eq!(ImeView::str_field(&v.commit_text), "", "stale voice text never committed");
     }
 
@@ -1123,7 +1099,7 @@ mod tests {
         e.set_asr_buffer(Arc::clone(&buf));
 
         // Not connected → unavailable explainer.
-        for c in "#asr".chars() { e.predict(InputEvent::char(c)); }
+        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
         assert!(ImeView::str_field(&e.view().preedit_text).contains("未连接"));
 
         // Voice data arrives while still disconnected (version bumps) — tick
@@ -1157,7 +1133,7 @@ mod tests {
         std::fs::write(&path, "ganlan\t🥦\n").unwrap();
         let mut e = eng();
         e.load_emoji_dict(&path).unwrap();
-        for c in "ganlan".chars() { e.predict(InputEvent::char(c)); }
+        for c in "ganlan".chars() { e.predict(KeyEvent::char(c)); }
         assert!(e.candidates().contains(&"🥦".to_string()),
             "ganlan surfaces 🥦: {:?}", e.candidates());
         let _ = std::fs::remove_file(&path);
@@ -1168,14 +1144,14 @@ mod tests {
         // dicts.emoji: false → 整个家族退出统一打分,无任何 emoji 候选。
         let mut e = eng();
         e.set_family_enabled("emoji", false);
-        for c in "smile".chars() { e.predict(InputEvent::char(c)); }
+        for c in "smile".chars() { e.predict(KeyEvent::char(c)); }
         let cands = e.candidates_detailed();
         assert!(cands.iter().all(|d| d.family != "emoji"),
             "no emoji candidates when disabled: {cands:?}");
         // 恢复后候选回来(新引擎,避免上一段的 buffer 残留)。
         let mut e2 = eng();
         e2.set_family_enabled("emoji", true);
-        for c in "smile".chars() { e2.predict(InputEvent::char(c)); }
+        for c in "smile".chars() { e2.predict(KeyEvent::char(c)); }
         assert!(e2.candidates_detailed().iter().any(|d| d.family == "emoji"),
             "emoji candidates return when re-enabled");
     }
@@ -1185,13 +1161,13 @@ mod tests {
         // Emoji 是并列于中英文的第三家族:"smile" 输入时 😊 经统一打分
         // 出现在候选区(emoji priority 60 → exact 1.0 × 0.6 = 0.6)。
         let mut e = eng();
-        for c in "smile".chars() { e.predict(InputEvent::char(c)); }
+        for c in "smile".chars() { e.predict(KeyEvent::char(c)); }
         let cands = e.candidates();
         assert!(cands.contains(&"😊".to_string()), "smile surfaces 😊: {cands:?}");
 
         // 拼音关键词同样生效:"weixiao" → 😊。
         let mut e2 = eng();
-        for c in "weixiao".chars() { e2.predict(InputEvent::char(c)); }
+        for c in "weixiao".chars() { e2.predict(KeyEvent::char(c)); }
         assert!(e2.candidates().contains(&"😊".to_string()), "weixiao surfaces 😊: {:?}", e2.candidates());
     }
 
@@ -1200,7 +1176,7 @@ mod tests {
         // 调试模式开启时,候选槽的 meta 字段填充 [score family/source]。
         let mut e = eng();
         e.set_candidate_meta(true);
-        for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
+        for c in "nihao".chars() { e.predict(KeyEvent::char(c)); }
         let v = e.view();
         assert!(v.candidate_count > 0);
         let meta = ImeView::str_field(&v.candidates[0].meta);
@@ -1211,7 +1187,7 @@ mod tests {
         // 关闭后 meta 为空。
         let mut e2 = eng();
         e2.set_candidate_meta(false);
-        for c in "nihao".chars() { e2.predict(InputEvent::char(c)); }
+        for c in "nihao".chars() { e2.predict(KeyEvent::char(c)); }
         let v = e2.view();
         assert_eq!(ImeView::str_field(&v.candidates[0].meta), "",
             "debug off → no meta");
@@ -1225,9 +1201,9 @@ mod tests {
             let mut e = eng();
             e.set_context_aware(context_aware);
             // 先提交 你好(写入 recency),再查 nihao。
-            for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
-            e.predict(InputEvent::space());
-            for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
+            for c in "nihao".chars() { e.predict(KeyEvent::char(c)); }
+            e.predict(KeyEvent::space());
+            for c in "nihao".chars() { e.predict(KeyEvent::char(c)); }
             e.candidates_detailed().iter().find(|c| c.text == "你好")
                 .map(|c| c.score)
                 .unwrap_or(0.0)
@@ -1238,7 +1214,7 @@ mod tests {
         // 修复后词典词(你好)不进 phrase → 关闭时无短语/上下文记忆,分数
         // 与冷启动(从未提交)完全一致 —— recency 加成确实被跳过。
         let mut e = eng();
-        for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
+        for c in "nihao".chars() { e.predict(KeyEvent::char(c)); }
         let cold = e.candidates_detailed().iter().find(|c| c.text == "你好")
             .map(|c| c.score).unwrap_or(0.0);
         assert!((off - cold).abs() < 1e-9,
@@ -1252,17 +1228,17 @@ mod tests {
         // decomp 词下次输入时 Viterbi 重新组合出同样的候选,无需入本。
         let mut e = eng();
         // 多音节输入,候选含 decomp(Viterbi 造词)。
-        for c in "qingqiuti".chars() { e.predict(InputEvent::char(c)); }
+        for c in "qingqiuti".chars() { e.predict(KeyEvent::char(c)); }
         let cands = e.candidates();
         assert!(cands.iter().any(|c| c == "请求提"),
             "decomp 请求提 present: {cands:?}");
         // 直接空格提交 top(decomp)。
-        e.predict(InputEvent::space());
+        e.predict(KeyEvent::space());
 
         // 再次输入:仍是 decomp 来源。若被学进单词本,phrase(0.70)会盖过
         // decomp(0.32)且 source 变 "phrase"(即用户截图中的
         // `[0.708 pinyin/phrase]`)—— source 检测即 bug 的直接证据。
-        for c in "qingqiuti".chars() { e.predict(InputEvent::char(c)); }
+        for c in "qingqiuti".chars() { e.predict(KeyEvent::char(c)); }
         let detailed = e.candidates_detailed();
         let req = detailed.iter().find(|d| d.text == "请求提")
             .expect("请求提 still a candidate (via decomp)");
@@ -1276,7 +1252,7 @@ mod tests {
         // 加入单词本 —— 即使 你好 在词典里(与直接提交不同,直接提交时
         // 词典词不进 phrase,见 dictionary_words_are_not_learned)。
         let mut e = eng();
-        for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
+        for c in "nihao".chars() { e.predict(KeyEvent::char(c)); }
         // 数字键选 single 单字"你"(partial commit,进入自生词模式)
         let ni = e.candidates().iter().position(|c| *c == "你").expect("你 as single option");
         e.select_candidate(ni);
@@ -1286,7 +1262,7 @@ mod tests {
         assert_eq!(ImeView::str_field(&v.commit_text), "你好");
 
         // 再查 nihao → 你好 来自 phrase(自生词无条件加入生效)。
-        for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
+        for c in "nihao".chars() { e.predict(KeyEvent::char(c)); }
         let detailed = e.candidates_detailed();
         assert!(detailed.iter().any(|d| d.text == "你好" && d.source == "phrase"),
             "composed 你好 must be in the phrase book: {:?}",
@@ -1302,14 +1278,14 @@ mod tests {
         {
             let mut e = eng();
             e.init_store(&db);
-            for c in "cd".chars() { e.predict(InputEvent::char(c)); }
-            let v = e.predict(InputEvent::enter());
+            for c in "cd".chars() { e.predict(KeyEvent::char(c)); }
+            let v = e.predict(KeyEvent::enter());
             assert_eq!(ImeView::str_field(&v.commit_text), "cd", "Enter commits raw");
         }
         {
             let mut e = eng();
             e.init_store(&db);
-            for c in "cd".chars() { e.predict(InputEvent::char(c)); }
+            for c in "cd".chars() { e.predict(KeyEvent::char(c)); }
             let detailed = e.candidates_detailed();
             let cd = detailed.iter().find(|d| d.text == "cd")
                 .expect("learned cd is a candidate");
@@ -1321,8 +1297,8 @@ mod tests {
         {
             let mut e = eng();
             e.init_store(&db);
-            for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
-            e.predict(InputEvent::space());
+            for c in "nihao".chars() { e.predict(KeyEvent::char(c)); }
+            e.predict(KeyEvent::space());
             let store = crate::store::WeightStore::open(&db).unwrap();
             let en = store.load_all_en_user();
             assert_eq!(en, vec![("cd".to_string(), 1)], "chinese commit doesn't learn: {en:?}");
@@ -1344,7 +1320,7 @@ mod tests {
                 Vec::new(),
                 scoring,
             );
-            for c in "black".chars() { e.predict(InputEvent::char(c)); }
+            for c in "black".chars() { e.predict(KeyEvent::char(c)); }
             e.candidates_detailed().iter().find(|c| c.text == "black")
                 .map(|c| c.score)
                 .unwrap_or(0.0)
@@ -1389,51 +1365,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn special_keys_pass_through_when_no_candidate_panel() {
-        let e = eng();
-        // No input yet → panel closed. Navigation/paging keys AND Escape pass
-        // through to the app (typing "-" must reach the application; an idle Esc
-        // must reach the terminal — cancel a command, leave vi insert mode — not
-        // vanish into the IME).
-        for key in [
-            SpecialKey::Up, SpecialKey::Down, SpecialKey::Left, SpecialKey::Right,
-            SpecialKey::Tab, SpecialKey::PageUp, SpecialKey::PageDown,
-            SpecialKey::BracketLeft, SpecialKey::BracketRight,
-            SpecialKey::Plus, SpecialKey::Minus, SpecialKey::Escape,
-        ] {
-            let v = e.special_key_ctx(0, key);
-            assert_eq!(v.key_passthrough, 1, "{key:?} must pass through with no panel");
-        }
-    }
-
-    #[test]
-    fn special_keys_act_when_candidate_panel_open() {
-        let mut e = eng();
-        for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
-        assert!(!e.candidates().is_empty(), "panel open after typing pinyin");
-        // Panel open → Minus pages (no passthrough), Left moves highlight (no passthrough).
-        let v = e.special_key_ctx(0, SpecialKey::Minus);
-        assert_eq!(v.key_passthrough, 0, "Minus pages when panel open");
-        let v = e.special_key_ctx(0, SpecialKey::Left);
-        assert_eq!(v.key_passthrough, 0, "Left moves highlight when panel open");
-        // And the page actually moved (panel had >1 page? 20 candidates, page size 7).
-        let v2 = e.special_key_ctx(0, SpecialKey::Right);
-        assert_eq!(v2.key_passthrough, 0);
-    }
-
-    #[test]
-    fn escape_resets_when_panel_open() {
-        // Panel open (composition active) → Esc keeps its cancel/reset meaning:
-        // no passthrough, candidates cleared.
-        let mut e = eng();
-        for c in "nihao".chars() { e.predict(InputEvent::char(c)); }
-        assert!(!e.candidates().is_empty(), "panel open");
-        let v = e.special_key_ctx(0, SpecialKey::Escape);
-        assert_eq!(v.key_passthrough, 0, "Esc resets, not passthrough, while composing");
-        assert!(e.candidates().is_empty(), "composition cancelled");
-        // Idle again → Esc passes through to the app.
-        let v = e.special_key_ctx(0, SpecialKey::Escape);
-        assert_eq!(v.key_passthrough, 1, "idle Esc reaches the application");
-    }
+    // 特殊键路由(idle 透传 / 面板开时导航 / Esc 门控)的测试在
+    // router.rs —— 决策矩阵现在由状态机表统一持有。
 }

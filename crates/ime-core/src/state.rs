@@ -2,11 +2,15 @@
 //!
 //! ## State Transition Table
 //!
+//! **输入路由(哪个键进到这里、修饰键策略、透传判定)由
+//! [`crate::router`](crate::router) 的状态机表统一决定** —— 本模块只描述
+//! 字符进入组合后的内部迁移:
+//!
 //! | Current  | Input      | → Next   | View filled                |
 //! |----------|------------|----------|----------------------------|
 //! | Idle     | `/` `#`    | Snippet  | preedit_text               |
 //! | Idle     | a-z        | Pinyin   | candidates or preedit_text  |
-//! | Idle     | other      | Idle     | key_passthrough=1          |
+//! | Idle     | other      | Idle     | action=PASSTHROUGH        |
 //! | Snippet  | letter/dig | Snippet  | trie step → commit/preedit |
 //! | Snippet  | dead-end   | Idle     | commit_text                |
 //! | Pinyin   | a-z        | Pinyin   | extend + fill_view         |
@@ -62,13 +66,13 @@ pub struct StateMachine {
     /// Pending snippet/magic expansion text. When set, the expansion is
     /// shown as a candidate rather than auto-committed. Space/digit to
     /// commit, Enter to force raw text.
-    pending_expansion: Option<String>,
+    pub(crate) pending_expansion: Option<String>,
     /// Magic command prediction hints while typing `#…`: all commands whose trigger extends
     /// the buffer, as `(trigger, activation_token?)` — live members carry their token (Space
     /// on the hint COMPLETES into that command's Magic mode), static commands carry `None`
     /// (Space resolves their expansion). The raw buffer is the LAST rollback candidate.
     /// Only set in Snippet state; cleared on any other transition.
-    magic_hints: Vec<(String, Option<String>)>,
+    pub(crate) magic_hints: Vec<(String, Option<String>)>,
     /// Preview-state candidate tail. In Magic (preview) mode the candidate panel is assembled
     /// in three segments: [member candidates…] [`magic_tail`]…] + the final rollback (the raw
     /// trigger, e.g. `#asr`). `magic_member_cand_count` is where the member segment ends;
@@ -77,7 +81,7 @@ pub struct StateMachine {
     /// → the member; a tail continuation → switch into that command's preview; the rollback
     /// → commit the raw trigger text. Only set in Magic state.
     magic_member_cand_count: usize,
-    magic_tail: Vec<(String, Option<String>)>,
+    pub(crate) magic_tail: Vec<(String, Option<String>)>,
     /// The active live magic command (`#asr` voice anchor, `#req` HTTP request, …).
     /// `Some` only while in [`Magic`](ComposeState::Magic) state. Each activation
     /// spawns a fresh instance from the [`MagicFamily`] registry.
@@ -368,6 +372,7 @@ impl StateMachine {
     pub(crate) fn make_view(&self) -> ImeView {
         let mut v = ImeView::empty();
         self.fill_view(&mut v);
+        v.action = crate::platform::action::HANDLED;
         v
     }
 
@@ -376,6 +381,7 @@ impl StateMachine {
         let mut v = ImeView::empty();
         ImeView::set_str(&mut v.commit_text, text);
         v.commit_cursor = ImeView::str_field(&v.commit_text).len() as u32;
+        v.action = crate::platform::action::COMMIT | crate::platform::action::HANDLED;
         v
     }
 
@@ -387,13 +393,14 @@ impl StateMachine {
         ImeView::set_str(&mut v.commit_text, text);
         let len = ImeView::str_field(&v.commit_text).len();
         v.commit_cursor = cursor.min(len) as u32;
+        v.action = crate::platform::action::COMMIT | crate::platform::action::HANDLED;
         v
     }
 
     /// View that passes the current key through to the application untouched.
     pub(crate) fn passthrough_view() -> ImeView {
         let mut v = ImeView::empty();
-        v.key_passthrough = 1;
+        v.action = crate::platform::action::PASSTHROUGH;
         v
     }
 

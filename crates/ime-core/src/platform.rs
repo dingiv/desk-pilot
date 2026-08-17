@@ -19,6 +19,24 @@ pub trait PinyinEngine: Send + Sync {
     fn learn_phrase(&self, pinyin: &str, hanzi: &str);
 }
 
+// ── Action: 一次输入处理后引擎对调用者的指令 ────────────────────────────
+
+/// `ImeView::action` 的位标志(bitflags)。外界调用者(前端)**不再自行拦截
+/// 任何键** —— 所有键忠实传入引擎,再根据这些位做出反应:
+///
+/// - fcitx5:`HANDLED` 未置位 → 不 `filterAndAccept`,键自然到达应用;
+/// - TUI:`COMMIT` → 追加历史;`PASSTHROUGH` 的 Esc(idle)→ 退出。
+pub mod action {
+    /// 无动作(非键路径的空视图,如 magic_tick 无变化)。
+    pub const NONE: u32 = 0;
+    /// 键被输入法消费,不要透传给应用(前端 filterAndAccept)。
+    pub const HANDLED: u32 = 1 << 0;
+    /// 键必须原样透传给应用(idle 时的 Esc、`-`、方向键…)。
+    pub const PASSTHROUGH: u32 = 1 << 1;
+    /// 本次处理产生了上屏文本(`commit_text` 非空)。
+    pub const COMMIT: u32 = 1 << 2;
+}
+
 // ── ImeView: the cross-platform UI state snapshot ─────────────────────────
 
 pub const CANDIDATE_SLOTS: usize = 16;
@@ -66,7 +84,10 @@ pub struct ImeView {
     pub candidate_page_size: u32,
     /// Aux-up mirrors the preedit; same size so an expanded preedit is never cut here.
     pub aux_up: [u8; 512],
-    pub key_passthrough: u8,
+    /// 动作位标志(见 [`action`]):调用者按此反应,替代旧的单 bit
+    /// `key_passthrough`。键路径必为 `HANDLED` 或 `PASSTHROUGH` 之一;
+    /// 产生上屏时再或上 `COMMIT`。
+    pub action: u32,
 }
 
 impl ImeView {
@@ -83,7 +104,7 @@ impl ImeView {
             candidate_page: 0,
             candidate_page_size: 7,
             aux_up: [0u8; 512],
-            key_passthrough: 0,
+            action: action::NONE,
         }
     }
 

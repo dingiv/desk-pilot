@@ -1,7 +1,7 @@
 //! Smoke tests verifying rime-ice dictionary is loaded and effective.
 //! Run with: cargo test -p swift-ime --test rime_ice_smoke -- --nocapture
 
-use ime_core::engine::{ImeEngine, InputEvent};
+use ime_core::engine::{ImeEngine, KeyEvent};
 use std::path::Path;
 
 /// Find rime-ice.fst (the compiled dictionary — the repo no longer ships rime-ice.tsv).
@@ -29,7 +29,7 @@ fn engine_with_rime() -> ImeEngine {
 
 fn candidates_for(engine: &mut ImeEngine, input: &str) -> Vec<String> {
     for c in input.chars() {
-        engine.predict(InputEvent::char(c));
+        engine.predict(KeyEvent::char(c));
     }
     engine.candidates()
 }
@@ -89,7 +89,7 @@ fn common_word_shuoming() {
 #[test]
 fn specific_qianyiyuanze() {
     let mut e = engine_with_rime();
-    for c in "qianyiyuanze".chars() { e.predict(InputEvent::char(c)); }
+    for c in "qianyiyuanze".chars() { e.predict(KeyEvent::char(c)); }
     let cands = e.candidates();
     eprintln!("qianyiyuanze candidates (first 5): {:?}", &cands[..5.min(cands.len())]);
     assert!(!cands.is_empty(), "qianyiyuanze should have candidates");
@@ -152,11 +152,11 @@ fn context_prefix_association_boosts_tail_word() {
     // 提交 是(shi)后输入 de → "shide" → 是的(350380)→ 尾字"的"以整词
     // 权重提升(高于单字候选的词典分)。
     let mut e = engine_with_rime();
-    for c in "shi".chars() { e.predict(InputEvent::char(c)); }
+    for c in "shi".chars() { e.predict(KeyEvent::char(c)); }
     let idx = e.candidates().iter().position(|c| *c == "是").expect("是 present");
     e.select_candidate(idx);
 
-    for c in "de".chars() { e.predict(InputEvent::char(c)); }
+    for c in "de".chars() { e.predict(KeyEvent::char(c)); }
     let detailed = e.candidates_detailed();
     let di = detailed.iter().find(|d| d.text == "的").expect("的 present");
     assert_eq!(di.source, "context_comp",
@@ -226,16 +226,16 @@ fn learned_phrase_does_not_downgrade_dict_hit() {
     // jixu. A learned word that's already in the dict must keep its (higher)
     // dict ranking.
     let mut e = engine_with_rime();
-    for c in "jixu".chars() { e.predict(InputEvent::char(c)); }
+    for c in "jixu".chars() { e.predict(KeyEvent::char(c)); }
     let idx = e.candidates().iter().position(|c| *c == "继续").expect("继续 present");
     e.select_candidate(idx); // commits + learn_phrase("jixu", "继续")
 
     let mut e2 = engine_with_rime();
     // Simulate the same session state: select 继续 once, then re-type jixu.
-    for c in "jixu".chars() { e2.predict(InputEvent::char(c)); }
+    for c in "jixu".chars() { e2.predict(KeyEvent::char(c)); }
     let idx2 = e2.candidates().iter().position(|c| *c == "继续").expect("继续 present");
     e2.select_candidate(idx2);
-    for c in "jixu".chars() { e2.predict(InputEvent::char(c)); }
+    for c in "jixu".chars() { e2.predict(KeyEvent::char(c)); }
     let cands = e2.candidates();
     assert_eq!(cands.first().map(String::as_str), Some("继续"),
         "learned 继续 stays #1 after being picked: {cands:?}");

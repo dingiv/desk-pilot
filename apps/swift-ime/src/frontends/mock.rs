@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ime_core::asr_buffer::AsrBuffer;
-use ime_core::engine::{ImeEngine, InputEvent};
+use ime_core::engine::{ImeEngine, KeyEvent};
 use ime_core::ImeView;
 
 // ── Config ─────────────────────────────────────────────────────────────
@@ -192,7 +192,7 @@ fn show_candidates_with_async(
     engine: &mut ImeEngine, asr_buffer: &AsrBuffer, input: &str,
     top_n: usize, verbose: bool, async_wait_secs: u64,
 ) -> Vec<String> {
-    for c in input.chars() { engine.predict(InputEvent::char(c)); }
+    for c in input.chars() { engine.predict(KeyEvent::char(c)); }
 
     let cands = engine.candidates();
     let is_preview = cands.first().is_some_and(|c| c.ends_with("..."));
@@ -210,8 +210,8 @@ fn show_candidates_with_async(
         } else {
             eprintln!("📥 voice data arrived after {:.1}s", elapsed.as_secs_f64());
         }
-        engine.predict(InputEvent::enter());
-        for c in input.chars() { engine.predict(InputEvent::char(c)); }
+        engine.predict(KeyEvent::enter());
+        for c in input.chars() { engine.predict(KeyEvent::char(c)); }
     }
 
     let candidates = engine.candidates();
@@ -226,7 +226,7 @@ fn show_candidates_with_async(
         if candidates.is_empty() { println!("(no candidates)"); }
     }
 
-    engine.predict(InputEvent::enter());
+    engine.predict(KeyEvent::enter());
     candidates
 }
 
@@ -247,7 +247,7 @@ fn print_candidates_verbose(input: &str, detailed: &[ime_core::family::RankedCan
 
 fn show_commit(engine: &mut ImeEngine, input: &str, verbose: bool) {
     let mut last_view = ImeView::empty();
-    for c in input.chars() { last_view = engine.predict(InputEvent::char(c)); }
+    for c in input.chars() { last_view = engine.predict(KeyEvent::char(c)); }
 
     if verbose {
         let detailed = engine.candidates_detailed();
@@ -262,7 +262,7 @@ fn show_commit(engine: &mut ImeEngine, input: &str, verbose: bool) {
         if detailed.is_empty() { println!("  (no candidates before commit)"); }
     }
 
-    let commit_view = engine.predict(InputEvent::space());
+    let commit_view = engine.predict(KeyEvent::space());
     let committed = ImeView::str_field(&commit_view.commit_text);
     println!();
     if committed.is_empty() {
@@ -306,7 +306,7 @@ fn run_cases(engine: &mut ImeEngine, path: &str, verbose: bool) {
 
     for tc in &cases {
         total += 1;
-        for c in tc.pinyin.chars() { engine.predict(InputEvent::char(c)); }
+        for c in tc.pinyin.chars() { engine.predict(KeyEvent::char(c)); }
         let cands = engine.candidates();
         let pos = cands.iter().position(|c| c == &tc.expected);
         if pos == Some(0) { top1 += 1; }
@@ -321,7 +321,7 @@ fn run_cases(engine: &mut ImeEngine, path: &str, verbose: bool) {
                 println!("     got: {:?}", top);
             }
         }
-        engine.predict(InputEvent::enter());
+        engine.predict(KeyEvent::enter());
     }
 
     println!();
