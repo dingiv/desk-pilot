@@ -504,58 +504,69 @@ fn main() -> Result<()> {
                     // Recognition events → DATA plane only (broadcast the segment). The control
                     // plane (version/snapshot) is NOT bumped here — only settings changes bump it.
                     let segment = match ev {
-                        TurnEvent::Interim { seq, partial, at_s } => {
-                            // High-frequency (every ~0.5s while speaking, full accumulated text) —
-                            // debug; enable via aura.yaml `log_level: debug`.
-                            debug!(seq, at_s = (at_s * 10.0).round() / 10.0, partial = %partial, "流式");
-                            Some(AsrSegment::Interim { seq, partial: partial.to_string(), at_s })
-                        }
-                        TurnEvent::CalibratedInterim { seq, calibrated, route_ms } => {
-                            // Stage2 recalibrated an in-progress utterance (a fragment merged into
-                            // it). Also high-frequency (every fragment + the 1s diligent pass) —
-                            // debug.
-                            debug!(seq, route_ms = route_ms.round() as u64, calibrated = %calibrated, "纠偏(碎片)");
-                            Some(AsrSegment::CalibratedInterim { seq, calibrated })
-                        }
-                        TurnEvent::Final { utterance: u, decision: d, route_ms } => {
-                            // Log all three text layers — batch ASR (authoritative), streaming
-                            // ASR (hotword-biased), and the Stage2 rewrite — so ASR-level loss is
-                            // distinguishable from LLM rewriting when diagnosing "missing" words.
-                            info!(
-                                seq = u.seq,
-                                at_s = (u.at_s * 10.0).round() / 10.0,
-                                intent = %d.intent,
-                                route_ms = route_ms.round() as u64,
-                                batch = %u.raw_text,
-                                streaming = %u.streaming_text,
-                                calibrated = %d.calibrated_text,
-                                "final"
+                        TurnEvent::Interim { window_id, segment_id, partial, at_s } => {
+                            // High-frequency (every ~0.5s while speaking) — debug; enable via
+                            // aura.yaml `log_level: debug`.
+                            debug!(
+                                window_id,
+                                segment_id,
+                                at_s = (at_s * 10.0).round() / 10.0,
+                                partial = %partial,
+                                "流式"
                             );
-                            // Record PCM → audio archive, transcript+decision → day log + recent
-                            // ring (backs /api/audio + /api/recordings).
+                            Some(AsrSegment::Interim {
+                                window_id,
+                                segment_id,
+                                partial: partial.to_string(),
+                                at_s,
+                            })
+                        }
+                        TurnEvent::WindowCalibrated { window_id, calibrated, route_ms } => {
+                            // Stage2 jointly calibrated the current window (per VAD gap) —
+                            // high-frequency, debug.
+                            debug!(
+                                window_id,
+                                route_ms = route_ms.round() as u64,
+                                calibrated = %calibrated,
+                                "窗口整流(段)"
+                            );
+                            Some(AsrSegment::WindowCalibrated { window_id, calibrated })
+                        }
+                        TurnEvent::WindowFinal { window: w, calibrated, route_ms } => {
+                            // Log all three text layers — window-level batch (authoritative;
+                            // empty = re-run failed), the streaming concat, and the Stage2
+                            // rewrite — so ASR-level loss is distinguishable from LLM rewriting.
+                            info!(
+                                window_id = w.id,
+                                at_s = (w.start_s * 10.0).round() / 10.0,
+                                segs = w.segments.len(),
+                                route_ms = route_ms.round() as u64,
+                                batch = %w.batch_text.clone().unwrap_or_default(),
+                                streaming = %w.streaming_text,
+                                calibrated = %calibrated,
+                                "final(窗口)"
+                            );
+                            // Record the window's PCM → audio archive, transcript+calibration →
+                            // day log + recent ring (backs /api/audio + /api/recordings).
                             storage.record_final(FinalTurn {
-                                seq: u.seq,
-                                at_s: u.at_s,
-                                duration_ms: u.duration_ms,
-                                raw_text: u.raw_text.clone(),
-                                streaming_text: u.streaming_text.clone(),
-                                calibrated: d.calibrated_text.clone(),
-                                intent: d.intent.clone(),
-                                reply: d.reply.clone(),
+                                window_id: w.id,
+                                at_s: w.start_s,
+                                duration_ms: w.duration_ms(),
+                                raw_text: w.batch_text.clone().unwrap_or_default(),
+                                streaming_text: w.streaming_text.clone(),
+                                calibrated: calibrated.clone(),
                                 route_ms,
-                                pcm: u.pcm.clone(),
+                                pcm: (*w.pcm).clone(),
                             });
                             // Stage3 may add hotwords — that's a SETTINGS change → control plane.
-                            if stage3_on && stage3_rule_trigger(&tool, &d.calibrated_text) {
+                            if stage3_on && stage3_rule_trigger(&tool, &calibrated) {
                                 version.fetch_add(1, Ordering::Release);
                             }
-                            Some(AsrSegment::Final {
-                                seq: u.seq,
-                                raw_text: u.raw_text.clone(),
-                                streaming_text: u.streaming_text.clone(),
-                                calibrated: d.calibrated_text.clone(),
-                                intent: d.intent.clone(),
-                                reply: d.reply.clone(),
+                            Some(AsrSegment::WindowFinal {
+                                window_id: w.id,
+                                raw_text: w.batch_text.clone().unwrap_or_default(),
+                                streaming_text: w.streaming_text.clone(),
+                                calibrated,
                                 route_ms,
                             })
                         }
@@ -585,7 +596,7 @@ fn main() -> Result<()> {
         .thread_name("aura-socket")
         .build()?;
     info!(port, "socket: http://127.0.0.1:{port}  (/api/state /api/stream /api/control/scout /api/correct /api/audio)");
-    info!(scout = %scout_addr, stage3 = stage3_on, log_level, "pipeline running on bg thread — Ctrl-C 结束");
+    info!(scout = %scout_addr, stage3 = stage3_on, log_level = %log_level, "pipeline running on bg thread — Ctrl-C 结束");
     rt.block_on(serve_socket(state, port, web_dist));
     Ok(())
 }
@@ -739,13 +750,13 @@ async fn asr_stream(State(s): State<DaemonState>) -> Sse<impl tokio_stream::Stre
     Sse::new(hello.chain(live)).keep_alive(KeepAlive::default())
 }
 
-/// `GET /api/audio/:seq` — serve utterance `seq` as a WAV for playback. The archive resolves
-/// transparently: hot tier first, then the flushed file on disk.
+/// `GET /api/audio/:window_id` — serve the settled window's WAV for playback. The archive
+/// resolves transparently: hot tier first, then the flushed file on disk.
 async fn audio_handler(
     State(s): State<DaemonState>,
-    Path(seq): Path<u64>,
+    Path(window_id): Path<u64>,
 ) -> impl IntoResponse {
-    match s.storage.audio.wav(seq) {
+    match s.storage.audio.wav(window_id) {
         Some(wav) => {
             ([(axum::http::header::CONTENT_TYPE, "audio/wav")], wav).into_response()
         }
@@ -758,13 +769,13 @@ async fn recordings_handler(State(s): State<DaemonState>) -> Json<Value> {
     Json(json!({ "recordings": s.storage.recordings() }))
 }
 
-/// `POST /api/correct {seq, raw, corrected}` — record a user correction: push to the Stage2
-/// correction store, flag the timeline entry `corrected_by_user`, and bump `version` so clients
-/// re-fetch and see the badge.
+/// `POST /api/correct {window_id, raw, corrected}` — record a user correction for a settled
+/// window: push to the Stage2 correction store, flag the timeline entry `corrected_by_user`,
+/// and bump `version` so clients re-fetch and see the badge.
 async fn correction_handler(State(s): State<DaemonState>, body: Json<Value>) -> Json<Value> {
     let raw = body.get("raw").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let corrected = body.get("corrected").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let seq = body.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+    let window_id = body.get("window_id").and_then(|v| v.as_u64()).unwrap_or(0);
     if raw.is_empty() || corrected.is_empty() {
         return Json(json!({ "ok": false, "error": "raw and corrected required" }));
     }
@@ -776,8 +787,8 @@ async fn correction_handler(State(s): State<DaemonState>, body: Json<Value>) -> 
         } // evict oldest
         c.push((raw.clone(), corrected.clone()));
     }
-    // Data plane: tell subscribers to mark utterance `seq` corrected (the live list is client-side).
-    let _ = s.asr_events.send(AsrSegment::Correction { seq, raw, corrected });
+    // Data plane: tell subscribers to mark the window corrected (the live list is client-side).
+    let _ = s.asr_events.send(AsrSegment::Correction { window_id, raw, corrected });
     // Control plane: the corrections list changed → re-fetch snapshot.
     s.bump();
     info!("user correction added → Stage2");

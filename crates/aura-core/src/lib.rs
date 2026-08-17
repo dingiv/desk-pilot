@@ -13,7 +13,6 @@ pub mod archive;
 pub mod calibrator;
 #[cfg(feature = "asr")]
 pub mod composer;
-pub mod context;
 pub mod hub;
 pub mod prompt;
 pub mod wav;
@@ -21,13 +20,8 @@ pub mod wav;
 pub use calibrator::{Stage2Calibrator, Stage2CalibratorImpl};
 #[cfg(feature = "asr")]
 pub use composer::{Pipeline, TurnEvent};
-pub use context::ContextWindow;
 pub use prompt::PromptBuilder;
 pub use hub::{FinalTurn, Storage, TurnRecord};
-
-// Re-export from the former aura-dcl lib.rs (decision parsing kept here)
-mod decision;
-pub use decision::{parse_decision, Decision, TaskSpec};
 
 // ── Calibrator (mistral.rs Qwen3-1.7B GGUF loader) — from the former aura-dcl ──
 

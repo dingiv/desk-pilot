@@ -5,8 +5,8 @@
 ## 📍 现状（必读）
 
 - **[architecture.md](architecture.md)** — as-built：crate 拓扑（合并后）+ 三阶段 + dp-models + 双运行时。`🟢 当前`
-- **[stages.md](stages.md)** — Stage1（音频→文本，两遍识别+VAD 切段+碎片合并）与 Stage2（LLM 纠偏整流）的能力、流程与衔接契约。`🟢 2026-08-17 新`
-- **[vad-segment-model.md](vad-segment-model.md)** — 🔵 设计稿：VadSegment/VadWindow 状态机重构（AudioStore 按 id 持有录音、段级 batch、窗口边界事件、Stage2 联合整流）。尚未实现。
+- **[stages.md](stages.md)** — Stage1（段级流式+段级batch+窗口定稿，边界范式）与 Stage2（窗口联合整流）的能力、流程与衔接契约。`🟢 2026-08-17 边界范式重写`
+- **[vad-segment-model.md](vad-segment-model.md)** — VadSegment/VadWindow 状态机的设计动机与 D1-D4 裁决记录（已落地；前端迁移待做）。
 - **[roadmap.md](roadmap.md)** — 已完成/近期/中期/长期。`🟢 2026-08 更新`
 
 ## 🧭 设计参考

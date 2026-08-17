@@ -4,8 +4,8 @@
 //!   fetches the full [`AuraStateView`] and re-fetches on each throttled `state_changed` ping.
 //!   Right for low-frequency state (connection, config, hotwords, corrections).
 //! - **Data plane** ([`subscribe_segments`]): live recognition segments pushed directly
-//!   (low-latency, every event). Each [`AsrSegment`] is one Interim / CalibratedInterim / Final —
-//!   render the live streaming text off this, without the ping→fetch round-trip.
+//!   (low-latency, every event). Each [`AsrSegment`] is one Interim / WindowCalibrated /
+//!   WindowFinal — render the live text off this, without the ping→fetch round-trip.
 //!
 //! Both streams are resilient + infinite (they reconnect on drop). This crate is dependency-light
 //! on purpose (no mistralrs/asr) so an upper layer talks to aura without the GPU stack.
@@ -86,22 +86,23 @@ impl AuraClient {
         Ok(v.get("connected").and_then(|x| x.as_bool()).unwrap_or(enabled))
     }
 
-    /// `POST /api/correct {seq, raw, corrected}` — record a user correction (feeds Stage2).
-    pub async fn correct(&self, seq: u64, raw: &str, corrected: &str) -> Result<()> {
+    /// `POST /api/correct {window_id, raw, corrected}` — record a user correction for a
+    /// window (feeds Stage2).
+    pub async fn correct(&self, window_id: u64, raw: &str, corrected: &str) -> Result<()> {
         self.http
             .post(format!("{}/api/correct", self.base))
-            .json(&serde_json::json!({ "seq": seq, "raw": raw, "corrected": corrected }))
+            .json(&serde_json::json!({ "window_id": window_id, "raw": raw, "corrected": corrected }))
             .send()
             .await?
             .error_for_status()?;
         Ok(())
     }
 
-    /// `GET /api/audio/{seq}` — the utterance's WAV bytes (for playback).
-    pub async fn audio(&self, seq: u64) -> Result<Vec<u8>> {
+    /// `GET /api/audio/{window_id}` — the settled window's WAV bytes (for playback).
+    pub async fn audio(&self, window_id: u64) -> Result<Vec<u8>> {
         Ok(self
             .http
-            .get(format!("{}/api/audio/{}", self.base, seq))
+            .get(format!("{}/api/audio/{}", self.base, window_id))
             .send()
             .await?
             .error_for_status()?
@@ -110,7 +111,7 @@ impl AuraClient {
             .to_vec())
     }
 
-    /// `GET /api/recordings` — seq numbers of all known clips (hot + flushed), ascending.
+    /// `GET /api/recordings` — window ids of all known clips (hot + flushed), ascending.
     pub async fn recordings(&self) -> Result<Vec<u64>> {
         let v: serde_json::Value = self
             .http
@@ -176,7 +177,7 @@ impl AuraClient {
     }
 
     /// **Data plane** — live recognition segments pushed directly. Opens `GET /api/asr_stream` and
-    /// yields each [`AsrSegment`] (Interim / CalibratedInterim / Final) as it happens —
+    /// yields each [`AsrSegment`] (Interim / WindowCalibrated / WindowFinal) as it happens —
     /// low-latency, every event, no ping→fetch round-trip. Resilient + infinite (reconnects on
     /// drop). Render the live streaming text off this.
     pub fn subscribe_segments(&self) -> impl Stream<Item = AsrSegment> + '_ {

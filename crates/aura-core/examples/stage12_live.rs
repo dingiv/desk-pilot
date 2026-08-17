@@ -51,35 +51,35 @@ fn main() -> anyhow::Result<()> {
     let report = Arc::new(Mutex::new(fs::File::create(format!("{REPORT_DIR}/live-{epoch}.md"))?));
     writeln!(
         report.lock().unwrap(),
-        "# Stage1→Stage2 (Pipeline) · {epoch}\n\n\
+        "# Stage1→Stage2 (Pipeline · 边界范式) · {epoch}\n\n\
          - 源: omni-scout `{scout_addr}/audio`\n\n\
-         | # | 时刻(s) | 路由(ms) | 意图 | 流式(热词) | 批式原文 | Stage2整流 | 回应 |\n\
-         |---|---:|---:|---|---|---|---|---|"
+         | 窗口 | 时刻(s) | 路由(ms) | 段数 | 流式(热词拼接) | 窗口批式原文 | Stage2整流 |\n\
+         |---|---:|---:|---:|---|---|---|"
     )?;
 
     println!("\n● Pipeline 就绪 (scout {scout_addr}/audio). Ctrl-C 结束.\n");
     Pipeline::new(s1, Box::new(s2)).run(move |ev| match ev {
-        TurnEvent::Interim { seq: _, partial, at_s } => println!("  …流式 @{at_s:.1}s: {partial}"),
-        TurnEvent::CalibratedInterim { seq, calibrated, route_ms } => {
-            println!("  ≈ #{seq} 整流中 @{route_ms:.0}ms: {calibrated}");
-            let _ = writeln!(
-                report.lock().unwrap(),
-                "| {seq} | – | {route_ms:.0} | – | – | – | {} | – |",
-                cell(&calibrated)
-            );
+        TurnEvent::Interim { window_id, segment_id: _, partial, at_s } => {
+            println!("  …流式 w{window_id} @{at_s:.1}s: {partial}")
         }
-        TurnEvent::Final { utterance: u, decision: d, route_ms } => {
+        TurnEvent::WindowCalibrated { window_id, calibrated, route_ms } => {
+            println!("  ≈ w{window_id} 整流中 @{route_ms:.0}ms: {calibrated}");
+        }
+        TurnEvent::WindowFinal { window: w, calibrated, route_ms } => {
             println!(
-                "▶ #{} @{:.1}s ({}s) [{}] 路由 {:.0}ms\n   流式: {}\n   原文: {}\n   整流: {}\n   回应: {}\n",
-                u.seq, u.at_s, u.duration_ms / 1000.0, d.intent, route_ms,
-                u.streaming_text, u.raw_text, d.calibrated_text, d.reply
+                "▶ w{} @{:.1}s ({:.1}s, {} 段) 路由 {:.0}ms\n   流式: {}\n   原文: {}\n   整流: {}\n",
+                w.id, w.start_s, w.duration_ms() / 1000.0, w.segments.len(), route_ms,
+                w.streaming_text,
+                w.batch_text.as_deref().unwrap_or("(窗口批式失败,回退段级拼接)"),
+                calibrated
             );
             let _ = writeln!(
                 report.lock().unwrap(),
-                "| {} | {:.1} | {:.0} | {} | {} | {} | {} | {} |",
-                u.seq, u.at_s, route_ms, d.intent,
-                cell(&u.streaming_text), cell(&u.raw_text),
-                cell(&d.calibrated_text), cell(&d.reply)
+                "| {} | {:.1} | {:.0} | {} | {} | {} | {} |",
+                w.id, w.start_s, route_ms, w.segments.len(),
+                cell(&w.streaming_text),
+                cell(w.batch_text.as_deref().unwrap_or("")),
+                cell(&calibrated)
             );
         }
     });

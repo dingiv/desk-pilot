@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use audio_aura_asr::onnx::{OnlineAsr, StreamingAsrConfig};
+use dp_models::onnx::{OnlineAsr, StreamingAsrConfig};
 use audio_aura_core::wav;
 
 fn main() -> anyhow::Result<()> {

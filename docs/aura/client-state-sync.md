@@ -23,19 +23,18 @@
 
 ## 二、状态清单（盘点 + 分类 + 归属）
 
-### 数据面（`GET /api/asr_stream` → `AsrSegment` 流，每事件直推）
+### 数据面（`GET /api/asr_stream` → `AsrSegment` 流，每事件直推；边界范式 2026-08-17）
 
 | # | 状态 | 来源 | 频率 | 数据量 | 段类型 |
 |---|---|---|---|---|---|
-| 1 | 流式 partial（raw，前向纠错） | Stage1 Zipformer | **高**（~0.5s，说话中） | 小（~50–200 字） | `interim` |
-| 2 | Stage2 碎片纠偏（provisional calibrated） | Stage2 `calibrate_provisional` | 中（每 VAD 碎片 ~1–5s + 勤快 Stage2 每 1s 校准 partial） | 小 | `calibrated_interim` |
-| 3 | 定稿（raw / streaming / calibrated / intent / reply） | Stage2 `calibrate`（settle） | 低（每句 ~5–30s） | 小–中 | `final` |
-| 4 | 用户纠偏标记（per-utterance） | `POST /api/correct` | 极低（用户动作） | 极小 | `correction` |
+| 1 | 段级流式 partial（raw，前向纠错） | Stage1 段级 Zipformer 会话 | **高**（~0.5s，说话中） | 小（~50–200 字） | `interim {window_id, segment_id}` |
+| 2 | 窗口联合整流（provisional） | Stage2 `calibrate_window`（每 VAD 间隔） | 中（每段 ~1–5s） | 小 | `window_calibrated {window_id}` |
+| 3 | 窗口定稿（窗口 batch / streaming 拼接 / calibrated） | Stage2 `calibrate_final`（WindowEdge） | 低（每窗口） | 小–中 | `window_final {window_id}` |
+| 4 | 用户纠偏标记（per-window） | `POST /api/correct {window_id}` | 极低（用户动作） | 极小 | `correction {window_id}` |
 
-> **注意**：Stage1 的批式 provisional（`Stage1Action::Batch`，累积 PCM 重跑的 raw 文本，以及
-> 勤快 Stage2 每 1s 包装的 partial 文本）是**内部**的——它进 composer → Stage2，产出
-> `calibrated_interim`。客户端不需要 raw 批式文本（已有流式 raw + Stage2 纠偏），所以
-> **不单独暴露**在数据面。
+> **注意**：Stage1 的 `Stage1Event::Batch`（段级双路文本，含 batch 失败的 None）是
+> **内部**的——它进 composer → Stage2 联合整流，产出 `window_calibrated`。客户端不需要
+> 段级 raw 批式文本，不单独暴露在数据面（`window_final` 携带窗口级聚合文本）。
 
 ### 控制面（`GET /api/state` → `AuraStateView` 快照，节流 ping → 重拉）
 
@@ -58,21 +57,21 @@
 Stage2 产生两类东西，**归不同的面**，不能混：
 
 ```
-Stage2
+Stage2（无状态——窗口状态由事件载荷携带）
  ├─ 输出：纠偏后的文字 ──→ 数据面（识别结果，高频小数据，低延迟直推）
- │    · provisional（每碎片）→ AsrSegment::CalibratedInterim
- │    · final（定稿）       → AsrSegment::Final.calibrated
+ │    · provisional（每 VAD 间隔，窗口联合）→ AsrSegment::WindowCalibrated
+ │    · final（窗口定稿）                  → AsrSegment::WindowFinal.calibrated
  │
  └─ 输入配置：corrections 反馈 ──→ 控制面（一个 setting，低频小数据，Stage2 每轮读）
       · 用户教 Stage2 怎么纠的累积 → AuraStateView.corrections
 ```
 
-所以 Stage2 的**文字输出绝不进 settings 快照**（解耦后已是这样：utterances 不在 AuraStateView
+所以 Stage2 的**文字输出绝不进 settings 快照**（解耦后已是这样：windows 不在 AuraStateView
 里）。混进去的旧设计已经被纠正。
 
 **"用户纠偏"这一个动作会碰两面**，因为它的两个消费者不同：
 - 控制面 `corrections` 列表 → Stage2 读（配置反馈）。
-- 数据面 `correction` 段 → UI 把那句标 `corrected_by_user`（per-utterance 显示）。
+- 数据面 `correction` 段 → UI 把那个窗口标 `corrected_by_user`（per-window 显示）。
 
 这不是重复，是同一动作的两个视图。
 
@@ -99,7 +98,7 @@ Stage2
 |---|---|---|---|
 | `subscribe_segments()` | 数据面 | `Stream<AsrSegment>` | ✅ |
 | `subscribe(freq_ms)` | 控制面 | `Stream<AuraStateView>` | ✅ |
-| `state()` / `set_connected()` / `correct()` / `audio(seq)` / `recordings()` | 按需/动作 | — | ✅ |
+| `state()` / `set_connected()` / `correct(window_id,…)` / `audio(window_id)` / `recordings()` | 按需/动作 | — | ✅ |
 
 待 §四 决议后可能再加：
 - `subscribe_segments(filter)` —— 按 type 过滤（点 3）。

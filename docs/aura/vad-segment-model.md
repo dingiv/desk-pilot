@@ -1,7 +1,8 @@
-# VadSegment / VadWindow 状态机模型（设计稿 2026-08-17）
+# VadSegment / VadWindow 状态机模型（已落地 2026-08-17）
 
-> 状态：🔵 **设计中**——口述模型的结构化落稿，尚未实现。落地后 `stages.md` 以代码为准重写，
-> 本文转为 as-built 或并入。对照现状：`stages.md`（旧模型）。
+> 状态：✅ **as-built**——本设计已于 2026-08-17 实现并通过测试（Rust 侧全量切换；
+> 前端三处迁移待做，见 `stages.md` 迁移状态节）。流程细节以 `stages.md` 为准，
+> 本文保留设计动机与裁决记录。
 
 ## 动机（为什么推翻"就地修改"范式）
 
@@ -73,7 +74,7 @@ merge window（大中断 / 超时）
 | 事件范式 | Batch/MergeBatch + 同 seq 就地更新（修改范式） | Batch/WindowEdge + append-only（边界范式） |
 | Stage2 上下文 | ContextWindow（已禁用） | 窗口本身即上下文；WindowEdge 滑动左边界 |
 
-## 已决决策（2026-08-17 拍板）
+## 已决决策（2026-08-17 拍板，均已实现）
 
 - **D1 流式会话粒度 → 段级会话**：每个 VadSegment 独立开流式会话，EOS 定稿。
   接受段边界编码器上下文丢失（段首字可能略差）；每段有完整流式结果，拼接即窗口流式。
@@ -83,4 +84,12 @@ merge window（大中断 / 超时）
 - **D3 WindowEdge 产出 → 窗口级 Final**：一个窗口定稿一条（窗口内多句联合整流的
   完整文本）。UI 时间线：段实时生长 → 窗口关闭收拢为一条定稿。
 - **D4 迁移策略 → 直接替换**：一次性 breaking——executor / composer / calibrator /
-  daemon / aura-agent SDK（view+client）/ Web UI 同步改，不搞双范式并存。
+  daemon / aura-agent SDK 已同步切换；**前端三处（swift-ime / geek-familiar /
+  devtools）按用户指示暂缓**，作为后续独立迁移任务。
+
+实现补充裁决（落地时定）：
+- **Stage2 无状态**：Batch 事件每次携带当前窗口全部段（载荷即窗口），无内部缓冲。
+- **死代码清除**：`Decision`/`parse_decision`/`ContextWindow`/`AudioChunk` 删除，
+  Stage2 校准直接返回 `String`。
+- **窗口 PCM**：settle 拼接一次为 `Arc<Vec<i16>>` 挂在 VadWindow 上（窗口 batch 与
+  daemon 落盘共用），store 随即 evict。

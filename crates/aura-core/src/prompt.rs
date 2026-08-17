@@ -64,6 +64,7 @@ const OUTPUT: &str = r"
 + 修错字：按上下文纠正语音识别错误的同音词，谐音词。
 + 英文规范：英文单词前后加空格。
 + 专有名词: 语音识别容易会将专有名词识别错误, 你可以修正错误的专业名词.
++ 多句联合: 输入含多行时, 是同一人连续说的多段话; 结合上下文联合整流, 按原顺序输出, 不要加编号。
 ";
 // 2. 去口语：删掉「嗯」「那个」「呢」「对吧」等无意义的语气词和重复词。
 
@@ -87,6 +88,19 @@ pub struct PromptBuilder {
 }
 
 impl PromptBuilder {
+    /// 多段联合整流输入（边界范式）：一个窗口的多个 [`VadSegment`] 文本，每段一行
+    /// （行 = 段边界；多行让小模型知道这是同一人连续说的几段话，联合整流）。
+    /// 单段时等价于 [`PromptBuilder::new`]。空行被过滤。
+    pub fn new_multi(texts: &[&str]) -> Self {
+        let joined = texts
+            .iter()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self::new(&joined)
+    }
+
     /// 传入当前句的 ASR 原文。
     pub fn new(raw_text: &str) -> Self {
         Self {
@@ -236,9 +250,9 @@ mod tests {
         assert!(sys.contains("# 输出"));
         assert!(!sys.contains("- Bevy"), "no hotword entries when empty");
         assert!(!usr.contains("最近对话"), "no context in user when empty");
-        // 1.3 default few-shot is on
-        assert!(sys.contains("# 示例"), "default few-shot block present");
-        assert!(sys.contains("rost") && sys.contains("Rust"), "default examples present");
+        // 1.3 default few-shot 当前被注释停用(DEFAULT_FEW_SHOT 示例全部注释)——
+        // 恢复示例时改回 contains("# 示例") 断言。
+        assert!(!sys.contains("# 示例"), "default few-shot currently disabled");
         // 1.6 XML envelope
         assert!(usr.contains("<raw_transcript>"), "raw wrapped in XML envelope");
         assert!(usr.contains("你好"), "raw text present");
@@ -248,12 +262,25 @@ mod tests {
     fn with_hotwords_and_context() {
         let hw: Vec<String> = vec!["Bevy".into(), "Rust".into()];
         let (sys, usr) = PromptBuilder::new("B位引擎").hotwords(&hw).context("上句：开发贪吃蛇").build();
-        assert!(sys.contains("# 热词"));
-        assert!(sys.contains("Bevy"));
+        // 热词块当前被注释停用（小模型对长热词列表遵循不佳）——builder 仍接收热词,
+        // 但 system prompt 不渲染。恢复渲染时改回 contains 断言。
+        assert!(!sys.contains("# 热词"), "hotword block currently disabled in build_system");
+        assert!(!sys.contains("Bevy"), "hotword entries must not render while disabled");
         assert!(sys.contains("上下文"));
         assert!(usr.contains("最近对话"));
         assert!(usr.contains("上句：开发贪吃蛇"));
         assert!(usr.contains("<raw_transcript>"));
+    }
+
+    #[test]
+    fn multi_segment_input_one_line_per_segment() {
+        // 边界范式: new_multi 每段一行,全部包进同一个 <raw_transcript> 信封。
+        let (sys, usr) = PromptBuilder::new_multi(&["第一段说 Rust", "", "第二段说 Bevy"]).build();
+        assert!(usr.contains("<raw_transcript>\n第一段说 Rust\n第二段说 Bevy\n</raw_transcript>"));
+        assert!(sys.contains("多句联合"), "joint-calibration rule present");
+        // 单段时与 new 等价(无额外空行)。
+        let (_, single) = PromptBuilder::new_multi(&["只有一段"]).build();
+        assert!(single.contains("只有一段"));
     }
 
     #[test]
@@ -299,13 +326,15 @@ mod tests {
 
     #[test]
     fn output_lists_calibration_rules() {
-        // The simplified OUTPUT section enumerates 4 explicit calibration rules (the prompt was
-        // trimmed from long prose instructions to a 1-sentence role + these — small models follow
-        // enumerated rules better).
+        // The simplified OUTPUT section enumerates explicit calibration rules (the prompt was
+        // trimmed from long prose instructions to a 1-sentence role + these — small models
+        // follow enumerated rules better). "去口语"规则当前被注释停用。
         let (sys, _usr) = PromptBuilder::new("x").build();
         assert!(sys.contains("加标点"), "punctuation rule present");
-        assert!(sys.contains("去口语"), "filler-removal rule present");
         assert!(sys.contains("修错字"), "homophone rule present");
         assert!(sys.contains("英文规范"), "CJK/English formatting rule present");
+        assert!(sys.contains("专有名词"), "proper-noun rule present");
+        assert!(sys.contains("多句联合"), "joint-calibration rule present");
+        assert!(!sys.contains("去口语"), "filler-removal rule currently disabled");
     }
 }

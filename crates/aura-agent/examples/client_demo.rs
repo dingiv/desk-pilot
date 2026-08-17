@@ -38,20 +38,19 @@ async fn main() -> anyhow::Result<()> {
     while let Some(seg) = segments.next().await {
         let t = chrono::Local::now().format("%H:%M:%S%.3f");
         match seg {
-            AsrSegment::Interim { seq, partial, .. } => {
-                println!("[{t}] interim  #{seq} | {partial}")
+            AsrSegment::Interim { window_id, segment_id, partial, .. } => {
+                println!("[{t}] interim   w{window_id}/s{segment_id} | {partial}")
             }
-            AsrSegment::CalibratedInterim { seq, calibrated } => {
-                println!("[{t}] calibrated #{seq} | {calibrated}")
+            AsrSegment::WindowCalibrated { window_id, calibrated } => {
+                println!("[{t}] calibrated w{window_id} | {calibrated}")
             }
-            AsrSegment::Final { seq, raw_text, calibrated, intent, route_ms, .. } => {
+            AsrSegment::WindowFinal { window_id, raw_text, calibrated, route_ms, .. } => {
                 println!(
-                    "[{t}] FINAL    #{seq} ({}, {route_ms:.0}ms) | raw={raw_text:?} → {calibrated:?}",
-                    intent,
+                    "[{t}] FINAL     w{window_id} ({route_ms:.0}ms) | raw={raw_text:?} → {calibrated:?}"
                 );
             }
-            AsrSegment::Correction { seq, raw, corrected } => {
-                println!("[{t}] CORRECT  #{seq} | {raw:?} → {corrected:?}");
+            AsrSegment::Correction { window_id, raw, corrected } => {
+                println!("[{t}] CORRECT   w{window_id} | {raw:?} → {corrected:?}");
             }
         }
     }

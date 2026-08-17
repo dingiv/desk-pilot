@@ -48,18 +48,17 @@ consume loop）→ `aura-stage2`（LLM worker，mpsc 收 Stage1Action，partials
 
 | 阶段 | 职责 | crate | 抽象 |
 |---|---|---|---|
-| **Stage1** | 录音→VAD→两遍ASR（流式Zipformer partial + 批式ASR final）+ 碎片合并 | aura-asr | Stage1Executor（发 Interim + Action(Batch/MergeBatch)） |
-| **Stage2** | 口语纠偏（加标点/修同音字/英文规范/专有名词） | aura-core | Stage2Calibrator（calibrate / calibrate_provisional） |
+| **Stage1** | 录音→VAD→段级流式会话+段级batch→窗口定稿（边界范式：VadSegment/VadWindow） | aura-asr | Stage1Executor（发 Interim + Batch + WindowEdge） |
+| **Stage2** | 窗口内多句联合整流（加标点/修同音字/英文规范/专有名词），无状态 | aura-core | Stage2Calibrator（calibrate_window / calibrate_final） |
 | **Stage3** | 可选工具：热词 / 用户纠偏 | aura-agent | HotwordManager + CorrectionStore |
 
-两阶段的完整流程、事件契约（`Batch`=临时 / `MergeBatch`=权威定稿）、被禁用的通道
-（ContextWindow / prompt 热词块 / few-shot / streaming_ref）见 **`stages.md`**。
+两阶段的完整流程与事件契约见 **`stages.md`**，设计沿革与 D1-D4 裁决见
+`vad-segment-model.md`（2026-08-17 边界范式重构：PCM 由 AudioStore 按 id 持有、
+batch 失败显式 Option、事件 append-only、Stage2 联合整流替代被删的 ContextWindow）。
 
-**Stage2 简化**（2026-08）：去掉了 JSON 输出（intent/reply/task 字段仍在但恒空），
-**只输出纯文本纠偏**。PromptBuilder 精简（ROLE_TASK 1 句 + OUTPUT 四条规则 + 纠正段）。
-模型从 Qwen3-1.7B（thinking）换成 **Qwen2.5-3B-Instruct**（指令模型，~300ms，质量更好）。
-Stage2 收两类触发：`Batch`→`calibrate_provisional`（不写 ContextWindow），
-`MergeBatch`→`calibrate`（写入）——碎片增长期的中间态不污染上下文。
+**Stage2 简化**（2026-08）：只输出纯文本纠偏（`Decision`/`parse_decision`/`ContextWindow`
+已随边界范式重构删除，校准直接返回 String）。PromptBuilder 精简（ROLE_TASK 1 句 +
+OUTPUT 规则 + 多段联合输入 `new_multi`）。模型 **Qwen2.5-3B-Instruct**（~300ms）。
 
 ## dp-models Provider 抽象（2026-08 新增）
 

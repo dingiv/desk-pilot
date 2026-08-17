@@ -52,25 +52,34 @@ pub struct AuraStateView {
 /// One **data-plane** segment pushed by `GET /api/asr_stream` /
 /// [`crate::client::AuraClient::subscribe_segments`]. Serialized as `{type: "...", ...}` via the
 /// internally-tagged `type` field (snake_case variant names). The client builds + maintains its
-/// utterance list from this stream.
+/// window list from this stream (boundary paradigm — events are append-only; a window's
+/// calibration is REPLACED by the next `window_calibrated` for the same window, never mutated
+/// in place by unrelated events).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AsrSegment {
-    /// Live streaming partial (raw, evolving — forward correction as more audio arrives).
-    Interim { seq: u64, partial: String, at_s: f64 },
-    /// Stage2 provisional calibration of an in-progress utterance (per merged fragment).
-    CalibratedInterim { seq: u64, calibrated: String },
-    /// Settled utterance — authoritative batch ASR + Stage2 final calibration.
-    Final {
-        seq: u64,
+    /// Live streaming partial for the CURRENT segment (raw, evolving — forward correction as
+    /// more audio arrives). Keyed by the real `window_id` (assigned at the window's first SOS)
+    /// + `segment_id` (the per-segment streaming session's own id).
+    Interim { window_id: u64, segment_id: u64, partial: String, at_s: f64 },
+    /// Stage2 provisional JOINT calibration of the current window (one per `Batch` event —
+    /// i.e. per VAD gap): the calibrated text of ALL the window's segments so far, replacing
+    /// the window's previous calibration.
+    WindowCalibrated { window_id: u64, calibrated: String },
+    /// The settled window's authoritative result (per `WindowEdge`): window-level batch text +
+    /// Stage2 final calibration. Window-granularity final — one per closed window.
+    WindowFinal {
+        window_id: u64,
+        /// The window-level batch re-run (authoritative; may be empty when the re-run failed —
+        /// then it fell back to the per-segment concat).
         raw_text: String,
+        /// Concat of the segments' streaming finals (hotword-biased).
         streaming_text: String,
         calibrated: String,
-        intent: String,
-        reply: String,
         route_ms: f64,
     },
-    /// A user correction was submitted for utterance `seq` (POST /api/correct) — mark it corrected.
-    /// (The raw→corrected pair also enters the snapshot's `corrections` list as Stage2 feedback.)
-    Correction { seq: u64, raw: String, corrected: String },
+    /// A user correction was submitted for window `window_id` (POST /api/correct) — mark it
+    /// corrected. (The raw→corrected pair also enters the snapshot's `corrections` list as
+    /// Stage2 feedback.)
+    Correction { window_id: u64, raw: String, corrected: String },
 }

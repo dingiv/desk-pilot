@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use audio_aura_asr::onnx::{AsrBackend, AsrConfig, OnnxAsr};
+use dp_models::onnx::{AsrBackend, AsrConfig, OnnxAsr};
 use audio_aura_asr::Asr;
 use audio_aura_core::wav;
 

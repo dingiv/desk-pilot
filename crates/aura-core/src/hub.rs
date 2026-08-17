@@ -21,25 +21,24 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-/// One finalized turn's full Stage1+Stage2 result (what lands in the day log + `/results`).
+/// One finalized window's full Stage1+Stage2 result (what lands in the day log + `/results`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnRecord {
-    pub seq: u64,
+    /// The settled [`audio_aura_asr::VadWindow`]'s id (the archival unit is a WINDOW now).
+    pub window_id: u64,
     /// Wall-clock ms since unix epoch (absolute — day files must be self-contained).
     pub unix_ms: i64,
     /// Seconds since the pipeline started (matches the live log's `at_s`).
     pub at_s: f64,
     pub duration_ms: f32,
-    /// Stage1 batch final (authoritative).
+    /// Window-level batch text (authoritative; the concat re-run).
     pub raw_text: String,
-    /// Stage1 streaming final (hotword-biased).
+    /// Concat of the segments' streaming finals (hotword-biased).
     pub streaming_text: String,
     /// Stage2 calibrated text.
     pub calibrated: String,
-    pub intent: String,
-    pub reply: String,
     pub route_ms: f64,
-    /// The utterance's WAV path in the audio archive.
+    /// The window's WAV path in the audio archive.
     pub wav: String,
 }
 
@@ -116,17 +115,15 @@ pub struct Storage {
     recent_cap: usize,
 }
 
-/// What `record_final` needs from a finalized turn (everything but the wav path, which the
+/// What `record_final` needs from a finalized window (everything but the wav path, which the
 /// audio archive assigns).
 pub struct FinalTurn {
-    pub seq: u64,
+    pub window_id: u64,
     pub at_s: f64,
     pub duration_ms: f32,
     pub raw_text: String,
     pub streaming_text: String,
     pub calibrated: String,
-    pub intent: String,
-    pub reply: String,
     pub route_ms: f64,
     pub pcm: Vec<i16>,
 }
@@ -160,26 +157,24 @@ impl Storage {
         removed_audio + removed_turns
     }
 
-    /// Record one finalized utterance everywhere it belongs: PCM → audio archive,
-    /// transcript+decision → day log + the recent ring. Returns the built record.
+    /// Record one finalized window everywhere it belongs: PCM → audio archive,
+    /// transcript+calibration → day log + the recent ring. Returns the built record.
     pub fn record_final(&self, t: FinalTurn) -> TurnRecord {
-        let wav = self.audio.push(t.seq, t.at_s, t.pcm);
+        let wav = self.audio.push(t.window_id, t.at_s, t.pcm);
         let rec = TurnRecord {
-            seq: t.seq,
+            window_id: t.window_id,
             unix_ms: Local::now().timestamp_millis(),
             at_s: t.at_s,
             duration_ms: t.duration_ms,
             raw_text: t.raw_text,
             streaming_text: t.streaming_text,
             calibrated: t.calibrated,
-            intent: t.intent,
-            reply: t.reply,
             route_ms: t.route_ms,
             wav: wav.display().to_string(),
         };
         if let Err(e) = self.turns.append(&rec) {
             // Day-log failure must not break the live loop — the ring still serves /results.
-            warn!(error = %e, seq = rec.seq, "turn log append failed");
+            warn!(error = %e, window_id = rec.window_id, "turn log append failed");
         }
         let mut ring = self.recent.lock().unwrap();
         if ring.len() >= self.recent_cap {
@@ -220,18 +215,16 @@ mod tests {
         Storage::new(audio, root.join("turns"), 7)
     }
 
-    fn turn(seq: u64) -> FinalTurn {
+    fn turn(window_id: u64) -> FinalTurn {
         FinalTurn {
-            seq,
-            at_s: seq as f64,
+            window_id,
+            at_s: window_id as f64,
             duration_ms: 100.0,
-            raw_text: format!("原文{seq}"),
-            streaming_text: format!("流式{seq}"),
-            calibrated: format!("整流{seq}"),
-            intent: "chat".into(),
-            reply: "嗯".into(),
+            raw_text: format!("原文{window_id}"),
+            streaming_text: format!("流式{window_id}"),
+            calibrated: format!("整流{window_id}"),
             route_ms: 42.0,
-            pcm: vec![seq as i16; 1600],
+            pcm: vec![window_id as i16; 1600],
         }
     }
 
@@ -248,7 +241,7 @@ mod tests {
         let log = std::fs::read_to_string(root.join("turns").join(format!("{day}.jsonl")))
             .expect("day log written");
         let parsed: TurnRecord = serde_json::from_str(log.lines().next().unwrap()).unwrap();
-        assert_eq!(parsed.seq, 1);
+        assert_eq!(parsed.window_id, 1);
         assert_eq!(parsed.calibrated, "整流1");
         assert_eq!(parsed.wav, rec.wav, "transcript links to the audio file");
         // 3) recent ring.
@@ -262,12 +255,12 @@ mod tests {
         let log = TurnLog::new(root.join("turns"));
         let mut rec = mk_rec(1);
         log.append_to_day("2026-07-17", &rec).unwrap();
-        rec.seq = 2;
+        rec.window_id = 2;
         log.append_to_day("2026-07-17", &rec).unwrap();
         let s = std::fs::read_to_string(root.join("turns/2026-07-17.jsonl")).unwrap();
         let seqs: Vec<u64> = s
             .lines()
-            .map(|l| serde_json::from_str::<TurnRecord>(l).unwrap().seq)
+            .map(|l| serde_json::from_str::<TurnRecord>(l).unwrap().window_id)
             .collect();
         assert_eq!(seqs, vec![1, 2]);
         // A different day → a different file (date-named rollover).
@@ -308,22 +301,20 @@ mod tests {
         for i in 1..=5 {
             s.record_final(turn(i));
         }
-        let seqs: Vec<u64> = s.recent().iter().map(|r| r.seq).collect();
-        assert_eq!(seqs, vec![3, 4, 5], "oldest evicted, newest last");
+        let ids: Vec<u64> = s.recent().iter().map(|r| r.window_id).collect();
+        assert_eq!(ids, vec![3, 4, 5], "oldest evicted, newest last");
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    fn mk_rec(seq: u64) -> TurnRecord {
+    fn mk_rec(window_id: u64) -> TurnRecord {
         TurnRecord {
-            seq,
+            window_id,
             unix_ms: 0,
             at_s: 0.0,
             duration_ms: 0.0,
             raw_text: String::new(),
             streaming_text: String::new(),
             calibrated: String::new(),
-            intent: "chat".into(),
-            reply: String::new(),
             route_ms: 0.0,
             wav: String::new(),
         }

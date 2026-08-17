@@ -1,8 +1,9 @@
-//! audio-aura-asr — Stage1 pure logic (no I/O): audio frame type, an energy VAD with a hysteresis
-//! state machine (ported from livekit-agents Silero params), a VAD-gated segmenter (the
-//! `StreamAdapter` pattern: accumulate frames between speech start/end, then batch-recognize), a
-//! streaming/batch ASR trait, and the endpointing config. The daemon feeds 20ms frames in and gets
-//! `SpeechEvent`s out; the real ASR (sherpa-onnx) plugs into the `Asr` trait.
+//! audio-aura-asr — Stage1: audio ingest (scout→ring), the **boundary-paradigm data contract**
+//! ([`VadSegment`]/[`VadWindow`]/[`Stage1Event`], 2026-08-17 重构 — see
+//! docs/aura/vad-segment-model.md), the PCM [`audio_store::AudioStore`], and the ONNX executor
+//! (`executor`, feature-gated: Silero VAD + per-segment streaming sessions + per-segment batch +
+//! window settle). This crate also keeps the older pure-logic VAD pieces (energy VAD,
+//! `VadSegmenter`, `SpeechEvent` — livekit-port era) used by tests/examples.
 //!
 //! Design mirror: livekit `vad.py` (VADEvent SOS/EOS carrying accumulated frames),
 //! `stt/stream_adapter.py` (VAD-gated batch→streaming), `voice/endpointing.py` (min/max delay).
@@ -10,6 +11,7 @@
 
 use serde::Serialize;
 
+pub mod audio_store;
 pub mod buffer;
 pub mod scout;
 pub mod source;
@@ -26,86 +28,113 @@ pub mod executor;
 // 在 `dp_models::onnx`(feature `speech`)。本 crate 的 `onnx` feature 转发开启它:
 // audio-aura 不再直接依赖 sherpa-onnx。VAD 数据契约经 dp_models re-export。
 
-// ── Stage1 → Stage2 data contract (NOT onnx-gated; plain data) ─────────────────
-/// One finalized utterance from Stage1 (the batch final is authoritative; the streaming final
-/// is the hotword-biased hypothesis for comparison). Stage2 calibrates `raw_text` (falling back
-/// to `streaming_text` when the batch pass is empty).
+// ── Stage1 → Stage2 data contract · 边界范式（VadSegment / VadWindow）──────────────
+// 设计: docs/aura/vad-segment-model.md（2026-08-17 重构,替代旧的 Utterance/Stage1Action
+// "就地修改"契约）。两个时间参数切出两级实体:
+//   · VAD 间隔 (vad.min_silence)  → VadSegment  原子录音片段(段级流式会话 + 段级 batch)
+//   · merge 窗口 (vad.merge_gap)  → VadWindow   多段组合(定稿单位,拼接 PCM 重跑 batch)
+// PCM 由 [`audio_store::AudioStore`] 按 id 持有,实体只持 id——录音数据不随事件克隆。
+// 事件 append-only + 边界标记: Batch(每段)驱动 Stage2 联合整流当前窗口,WindowEdge
+// (窗口关闭)驱动定稿。batch 失败显式建模为 `Option`(远程网络可能出问题)。
+
+/// Audio clip id — assigned by [`audio_store::AudioStore`]. Entities hold ids, never PCM.
+pub type AudioId = u64;
+/// Segment id — monotonic within a pipeline run.
+pub type SegmentId = u64;
+/// Window id — monotonic within a run, assigned when the window OPENS (its first SOS), so
+/// live `Interim` partials can carry the real id (no prospective guessing).
+pub type WindowId = u64;
+
+/// One VAD-gap-delimited clip — the atomic Stage1 unit. A segment is complete the moment its
+/// EOS fires: streaming session finalized, PCM inserted into the AudioStore, one batch pass
+/// packed in. `batch_text: None` is LEGAL — batch depends on the remote network and may fail;
+/// consumers fall back to `streaming_text` via [`VadSegment::best_text`].
 #[derive(Debug, Clone)]
-pub struct Utterance {
-    /// Monotonic sequence number within the run.
-    pub seq: u64,
-    /// Batch SenseVoice final — the authoritative transcript Stage2 routes on.
-    pub raw_text: String,
-    /// Streaming Zipformer final (hotword-biased) — diagnostic / fallback when batch is empty.
+pub struct VadSegment {
+    pub id: SegmentId,
+    /// The clip's PCM, owned by the [`audio_store::AudioStore`] — never cloned into events.
+    pub audio_id: AudioId,
+    /// Wall-clock seconds since executor start (SOS).
+    pub start_s: f64,
+    /// Wall-clock seconds since executor start (EOS).
+    pub end_s: f64,
+    /// Per-segment streaming ASR final (hotword-biased; the session spans exactly this segment).
     pub streaming_text: String,
-    /// Utterance duration in milliseconds.
-    pub duration_ms: f32,
-    /// Wall-clock seconds since the executor started.
-    pub at_s: f64,
-    /// The segment's raw PCM (16 kHz mono S16LE) — for audio playback. Empty if not captured.
-    pub pcm: Vec<i16>,
+    /// Per-segment batch ASR result. `None` when the batch pass failed (network error) or
+    /// returned empty text — HttpAsr's `Err` and OnnxAsr's empty string map to the same None.
+    pub batch_text: Option<String>,
 }
 
-impl Utterance {
-    /// The text Stage2 should calibrate on: batch final if non-empty, else streaming final.
-    pub fn route_text(&self) -> &str {
-        if self.raw_text.trim().is_empty() {
-            &self.streaming_text
-        } else {
-            &self.raw_text
-        }
+impl VadSegment {
+    /// Best available text: `batch_text` when Some(non-empty), else `streaming_text`.
+    pub fn best_text(&self) -> &str {
+        self.batch_text
+            .as_deref()
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or(&self.streaming_text)
     }
 }
 
-/// The two trigger actions Stage1 emits for Stage2 to listen for and correct (纠偏).
-///
-/// The payload is a [`Utterance`], which carries at least the three essentials of a batch
-/// action: the audio data (`pcm`), the audio's production timestamp (`at_s`, wall-clock s
-/// since executor start), and the Stage1 recognition result (`raw_text`, with `streaming_text`
-/// as fallback when the batch pass is empty).
+/// A merge-window composition of [`VadSegment`]s — the settle/final unit. Built when a big
+/// gap (≥ `merge_gap_s`) or the settle-timeout closes the window; carries a snapshot of its
+/// segments plus the window-level aggregation:
+/// - `streaming_text` = concat of the segments' streaming finals (zero cost, no re-run);
+/// - `batch_text` = ONE re-run of the batch model over the concatenated PCM (cross-segment
+///   context; the authoritative text Stage2 finalizes on). `None` on a failed re-run.
 #[derive(Debug, Clone)]
-pub enum Stage1Action {
-    /// Normal Batch — fired when VAD silence ≥ `min_silence` (~1s): a quick batch pass over the
-    /// current accumulated PCM. Provisional — Stage2 recalibrates and updates the sentence in
-    /// place (same `seq`, `CalibratedInterim`), never committing to the ContextWindow.
-    Batch(Utterance),
-    /// Big MergeBatch — fired when silence ≥ `merge_gap` (~5s): a re-run of the batch model over
-    /// the merged paragraph (the SegmentMerger stitched medium-gap fragments back together).
-    /// Authoritative — Stage2 calibrates and commits to the ContextWindow (`TurnEvent::Final`),
-    /// feeding Stage3.
-    MergeBatch(Utterance),
+pub struct VadWindow {
+    pub id: WindowId,
+    /// Settle-time snapshot (ids/timestamps/texts only — no PCM per segment).
+    pub segments: Vec<VadSegment>,
+    /// SOS of the FIRST segment.
+    pub start_s: f64,
+    /// EOS of the LAST segment.
+    pub end_s: f64,
+    pub streaming_text: String,
+    pub batch_text: Option<String>,
+    /// The whole window's concatenated PCM — assembled once at settle, shared (Arc) between
+    /// the window-level batch pass and downstream archival. The AudioStore evicts the
+    /// per-segment clips right after; this Arc is the only remaining copy.
+    pub pcm: std::sync::Arc<Vec<i16>>,
 }
 
-/// Events emitted by [`executor::Stage1Executor`]. Defined here (ungated) so downstream crates
-/// can match on them without the `onnx` feature.
+impl VadWindow {
+    /// The authoritative text Stage2 finalizes on: the window-level batch re-run when present,
+    /// else the concat of the segments' own best texts (per-segment batches may have succeeded
+    /// even when the window re-run failed).
+    pub fn best_text(&self) -> std::borrow::Cow<'_, str> {
+        if let Some(t) = self.batch_text.as_deref().filter(|t| !t.trim().is_empty()) {
+            return std::borrow::Cow::Borrowed(t);
+        }
+        std::borrow::Cow::Owned(
+            self.segments.iter().map(|s| s.best_text()).collect::<Vec<_>>().join(""),
+        )
+    }
+
+    /// Window duration in milliseconds (from the PCM the batch actually heard).
+    pub fn duration_ms(&self) -> f32 {
+        self.pcm.len() as f32 / 16_000.0 * 1000.0
+    }
+}
+
+/// Events emitted by [`executor::Stage1Executor`]. Defined here (ungated) so downstream
+/// crates can match on them without the `onnx` feature. Append-only — consumers never mutate
+/// an earlier entity in place (the old paradigm's same-seq update is gone).
 #[derive(Debug, Clone)]
 pub enum Stage1Event {
-    /// A live streaming partial (the "phone input method" evolving text). `seq` is the
-    /// prospective sequence number of the in-progress utterance (= last Final's seq + 1), so
-    /// consumers can group partials with their utterance even when events from different
-    /// pipeline threads interleave. Passes straight through to the UI — NOT a Stage2 input.
-    Interim { seq: u64, partial: String, at_s: f64 },
-    /// A Stage1 action for Stage2 — the only events Stage2 listens for. Both [`Stage1Action`]
-    /// variants trigger its correction pass: `Batch` → provisional calibration, `MergeBatch`
-    /// → authoritative calibration.
-    Action(Stage1Action),
-}
-
-/// One audio buffer: 16 kHz mono S16LE by default (matches omni-scout `/audio`).
-#[derive(Debug, Clone)]
-pub struct AudioChunk {
-    pub sample_rate: u32,
-    pub channels: u16,
-    pub pcm: Vec<i16>,
-}
-
-impl AudioChunk {
-    pub fn duration_ms(&self) -> f32 {
-        if self.sample_rate == 0 {
-            return 0.0;
-        }
-        (self.pcm.len() as f32 / self.channels.max(1) as f32) / self.sample_rate as f32 * 1000.0
-    }
+    /// Live streaming partial for the CURRENT segment (per-segment session ⇒ the partial
+    /// belongs to exactly one segment). Carries the real `window_id` (assigned at the
+    /// window's first SOS) + `segment_id`. Passes straight through to the UI — NOT a Stage2
+    /// input (D2: no live-partial calibration).
+    Interim { window_id: WindowId, segment_id: SegmentId, partial: String, at_s: f64 },
+    /// A VAD gap closed a segment: its batch pass is packed in. `segments` is ALL segments
+    /// of the current window so far (Stage2 jointly calibrates them — the payload IS the
+    /// window, keeping Stage2 stateless). Provisional until the `WindowEdge`.
+    Batch { window_id: WindowId, segments: Vec<VadSegment> },
+    /// The merge window closed (big gap or settle-timeout): the window-level batch re-run is
+    /// done and packed. Authoritative — Stage2 finalizes on it; the AudioStore evicts the
+    /// segment clips right after this event.
+    WindowEdge { window: VadWindow },
 }
 
 /// Root-mean-square energy of a frame (proxy for loudness; the energy-VAD gate).

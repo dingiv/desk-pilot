@@ -5,8 +5,8 @@
 //! - **Control plane**: the latest [`AuraStateView`] snapshot (re-fetched on each `state_changed`
 //!   ping), readable synchronously via [`AuraAgent::state`].
 //! - **Data plane**: the live recognition text ([`AuraAgent::live`]) and the accumulated
-//!   utterance list ([`AuraAgent::utterances`], with corrected flags), built from the
-//!   `AsrSegment` stream.
+//!   window list ([`AuraAgent::windows`], with corrected flags), built from the
+//!   `AsrSegment` stream (boundary paradigm — windows settle one per merge gap).
 //! - **Connectivity**: a periodic `/health` probe ([`AuraAgent::conn`]).
 //!
 //! Every change also surfaces as an [`AgentEvent`] on [`AuraAgent::events`] for clients that want
@@ -16,8 +16,8 @@
 //! ```ignore
 //! use audio_aura_agent::agent::AuraAgent;
 //! let agent = AuraAgent::connect("http://127.0.0.1:9091")?;
-//! let utts = agent.utterances();        // sync read, never blocks
-//! agent.correct(3, "蛇声", "蛇身");      // fire-and-forget command
+//! let wins = agent.windows();          // sync read, never blocks
+//! agent.correct(3, "蛇声", "蛇身");      // fire-and-forget command (window_id 3)
 //! ```
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -66,44 +66,44 @@ impl AuraConn {
     }
 }
 
-/// One settled utterance, as the agent maintains it from the data plane (Final + Correction
-/// segments). The snapshot carries no utterances — this list is the client's transcript source.
+/// One settled window, as the agent maintains it from the data plane (WindowFinal +
+/// Correction segments). The snapshot carries no windows — this list is the client's
+/// transcript source.
 #[derive(Debug, Clone)]
-pub struct UtteranceView {
-    pub seq: u64,
+pub struct WindowView {
+    pub window_id: u64,
+    /// Window-level batch text (the concat re-run; authoritative pre-calibration).
     pub raw_text: String,
+    /// Concat of the segments' streaming finals (hotword-biased).
     pub streaming_text: String,
     pub calibrated: String,
-    pub intent: String,
-    pub reply: String,
     pub route_ms: f64,
-    /// True once a `Correction` segment for this seq arrived (the pair also enters Stage2).
+    /// True once a `Correction` segment for this window arrived (the pair also enters Stage2).
     pub corrected: bool,
 }
 
 /// Everything the agent surfaces to the client — read via [`AuraAgent::events`]. Three
-/// recognition events, one per stage, mirroring the daemon's `AsrSegment` variants:
-/// ① [`Interim`](AgentEvent::Interim) — a new Stage1 streaming fragment (raw partial); ②
-/// [`CalibratedInterim`](AgentEvent::CalibratedInterim) — Stage2 finished correcting a batch
-/// (small Batch or big MergeBatch — both land here while the utterance is still in progress);
-/// ③ [`TurnFinal`](AgentEvent::TurnFinal) — the merged paragraph settled (authoritative).
+/// recognition events mirroring the daemon's `AsrSegment` variants (boundary paradigm):
+/// ① [`Interim`](AgentEvent::Interim) — a segment's raw streaming partial; ②
+/// [`WindowCalibrated`](AgentEvent::WindowCalibrated) — Stage2's provisional JOINT calibration
+/// of the current window (one per VAD gap, replaces the window's previous calibration);
+/// ③ [`WindowFinal`](AgentEvent::WindowFinal) — the merge window closed (authoritative).
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     /// Connectivity changed (reconnecting / connected / lost).
     ConnChanged(AuraConn),
     /// The control-plane snapshot refreshed (initial fetch or a `state_changed` ping).
     StateChanged(AuraStateView),
-    /// ① A new Stage1 streaming fragment — the raw, evolving partial. Update the live UI fast.
-    /// `seq` is the in-progress utterance's prospective seq.
-    Interim { seq: u64, partial: String },
-    /// ② Stage2 finished correcting a batch (small Batch per merged fragment, or the big
-    /// MergeBatch's provisional) — the calibrated text so far, same seq, updates in place.
-    CalibratedInterim { seq: u64, calibrated: String },
-    /// ③ A settled utterance arrived (the big MergeBatch's authoritative Final) — appended to /
-    /// updated in [`AuraAgent::utterances`].
-    TurnFinal(UtteranceView),
-    /// A correction for seq was accepted (the list entry is marked `corrected`).
-    TurnCorrected(u64),
+    /// ① A segment's raw, evolving partial. Update the live UI fast.
+    Interim { window_id: u64, segment_id: u64, partial: String },
+    /// ② Stage2 jointly calibrated the current window's segments so far (per Batch) — the
+    /// calibrated text, same window, replaces the previous calibration.
+    WindowCalibrated { window_id: u64, calibrated: String },
+    /// ③ A window settled (WindowEdge's authoritative final) — appended to /
+    /// updated in [`AuraAgent::windows`].
+    WindowFinal(WindowView),
+    /// A correction for a window was accepted (the list entry is marked `corrected`).
+    WindowCorrected(u64),
 }
 
 /// Managed-state client facade. Cheap to clone (shares the driver + state).
@@ -130,7 +130,7 @@ struct AgentInner {
     client: AuraClient,
     rt: Runtime,
     state: RwLock<Option<AuraStateView>>,
-    utterances: RwLock<Vec<UtteranceView>>,
+    windows: RwLock<Vec<WindowView>>,
     live: RwLock<Option<(u64, String)>>,
     conn: AtomicU8,
     tx: tokio::sync::broadcast::Sender<AgentEvent>,
@@ -157,7 +157,7 @@ impl AuraAgent {
             client,
             rt,
             state: RwLock::new(None),
-            utterances: RwLock::new(Vec::new()),
+            windows: RwLock::new(Vec::new()),
             live: RwLock::new(None),
             conn: AtomicU8::new(AuraConn::Connecting as u8),
             tx,
@@ -180,12 +180,12 @@ impl AuraAgent {
         self.inner.state.read().unwrap().clone()
     }
 
-    /// Accumulated settled utterances (ascending seq). Clone — clients own a copy.
-    pub fn utterances(&self) -> Vec<UtteranceView> {
-        self.inner.utterances.read().unwrap().clone()
+    /// Accumulated settled windows (ascending window_id). Clone — clients own a copy.
+    pub fn windows(&self) -> Vec<WindowView> {
+        self.inner.windows.read().unwrap().clone()
     }
 
-    /// The in-progress utterance's live text `(seq, text)`, if any.
+    /// The live window's text `(window_id, text)`, if any.
     pub fn live(&self) -> Option<(u64, String)> {
         self.inner.live.read().unwrap().clone()
     }
@@ -237,20 +237,22 @@ impl AuraAgent {
         });
     }
 
-    /// `POST /api/correct` — record a user correction (feeds Stage2). Fire-and-forget.
-    pub fn correct(&self, seq: u64, raw: &str, corrected: &str) {
+    /// `POST /api/correct` — record a user correction for a window (feeds Stage2).
+    /// Fire-and-forget.
+    pub fn correct(&self, window_id: u64, raw: &str, corrected: &str) {
         let c = self.inner.client.clone();
         let raw = raw.to_string();
         let corrected = corrected.to_string();
         self.inner.rt.spawn(async move {
-            let _ = c.correct(seq, &raw, &corrected).await;
+            let _ = c.correct(window_id, &raw, &corrected).await;
         });
     }
 
-    /// `GET /api/audio/{seq}` — the utterance's WAV bytes (blocking; runs on the driver runtime).
-    pub fn audio(&self, seq: u64) -> Result<Vec<u8>> {
+    /// `GET /api/audio/{window_id}` — the window's WAV bytes (blocking; runs on the driver
+    /// runtime).
+    pub fn audio(&self, window_id: u64) -> Result<Vec<u8>> {
         let c = self.inner.client.clone();
-        self.inner.rt.block_on(c.audio(seq))
+        self.inner.rt.block_on(c.audio(window_id))
     }
 }
 
@@ -327,46 +329,48 @@ fn set_state(inner: &AgentInner, snap: AuraStateView) {
     let _ = inner.tx.send(AgentEvent::StateChanged(snap));
 }
 
-/// Fold one data-plane segment into the shared utterance list + live text. Pure enough to unit
+/// Fold one data-plane segment into the shared window list + live text. Pure enough to unit
 /// test (only touches the RwLocks + event queue).
 fn apply_segment(inner: &AgentInner, seg: AsrSegment) {
     match seg {
-        AsrSegment::Interim { seq, partial, .. } => {
-            *inner.live.write().unwrap() = Some((seq, partial.clone()));
-            let _ = inner.tx.send(AgentEvent::Interim { seq, partial });
+        AsrSegment::Interim { window_id, segment_id, partial, .. } => {
+            *inner.live.write().unwrap() = Some((window_id, partial.clone()));
+            let _ = inner.tx.send(AgentEvent::Interim { window_id, segment_id, partial });
         }
-        AsrSegment::CalibratedInterim { seq, calibrated } => {
-            *inner.live.write().unwrap() = Some((seq, calibrated.clone()));
-            let _ = inner.tx.send(AgentEvent::CalibratedInterim { seq, calibrated });
+        AsrSegment::WindowCalibrated { window_id, calibrated } => {
+            *inner.live.write().unwrap() = Some((window_id, calibrated.clone()));
+            let _ = inner.tx.send(AgentEvent::WindowCalibrated { window_id, calibrated });
         }
-        AsrSegment::Final { seq, raw_text, streaming_text, calibrated, intent, reply, route_ms } => {
+        AsrSegment::WindowFinal { window_id, raw_text, streaming_text, calibrated, route_ms } => {
             *inner.live.write().unwrap() = None;
-            let mut utts = inner.utterances.write().unwrap();
-            // Upsert by seq (defensive — Finals settle in ascending order, but a reconnect could
-            // replay an older one).
-            if let Some(existing) = utts.iter_mut().find(|u| u.seq == seq) {
-                *existing = UtteranceView {
-                    seq, raw_text, streaming_text, calibrated, intent, reply, route_ms,
+            let mut wins = inner.windows.write().unwrap();
+            // Upsert by window_id (defensive — windows settle in ascending order, but a
+            // reconnect could replay an older one).
+            if let Some(existing) = wins.iter_mut().find(|w| w.window_id == window_id) {
+                *existing = WindowView {
+                    window_id, raw_text, streaming_text, calibrated, route_ms,
                     corrected: existing.corrected,
                 };
             } else {
-                utts.push(UtteranceView {
-                    seq, raw_text, streaming_text, calibrated, intent, reply, route_ms,
+                wins.push(WindowView {
+                    window_id, raw_text, streaming_text, calibrated, route_ms,
                     corrected: false,
                 });
-                utts.sort_by_key(|u| u.seq);
+                wins.sort_by_key(|w| w.window_id);
             }
-            let view = utts.iter().find(|u| u.seq == seq).cloned();
-            drop(utts);
+            let view = wins.iter().find(|w| w.window_id == window_id).cloned();
+            drop(wins);
             if let Some(view) = view {
-                let _ = inner.tx.send(AgentEvent::TurnFinal(view));
+                let _ = inner.tx.send(AgentEvent::WindowFinal(view));
             }
         }
-        AsrSegment::Correction { seq, .. } => {
-            if let Some(u) = inner.utterances.write().unwrap().iter_mut().find(|u| u.seq == seq) {
-                u.corrected = true;
+        AsrSegment::Correction { window_id, .. } => {
+            if let Some(w) =
+                inner.windows.write().unwrap().iter_mut().find(|w| w.window_id == window_id)
+            {
+                w.corrected = true;
             }
-            let _ = inner.tx.send(AgentEvent::TurnCorrected(seq));
+            let _ = inner.tx.send(AgentEvent::WindowCorrected(window_id));
         }
     }
 }
@@ -382,7 +386,7 @@ mod tests {
             client,
             rt: Runtime::new().unwrap(),
             state: RwLock::new(None),
-            utterances: RwLock::new(Vec::new()),
+            windows: RwLock::new(Vec::new()),
             live: RwLock::new(None),
             conn: AtomicU8::new(AuraConn::Connecting as u8),
             tx,
@@ -392,67 +396,74 @@ mod tests {
     }
 
     #[test]
-    fn folds_final_into_utterances_and_clears_live() {
+    fn folds_window_final_into_windows_and_clears_live() {
         let i = inner();
-        apply_segment(&i, AsrSegment::CalibratedInterim { seq: 1, calibrated: "蛇声".into() });
+        apply_segment(&i, AsrSegment::WindowCalibrated { window_id: 1, calibrated: "蛇声".into() });
         assert_eq!(i.live.read().unwrap().as_ref().map(|(_, t)| t.as_str()), Some("蛇声"));
         apply_segment(
             &i,
-            AsrSegment::Final {
-                seq: 1,
+            AsrSegment::WindowFinal {
+                window_id: 1,
                 raw_text: "蛇声".into(),
                 streaming_text: "蛇声".into(),
                 calibrated: "蛇身".into(),
-                intent: "chat".into(),
-                reply: String::new(),
                 route_ms: 12.3,
             },
         );
-        assert!(i.live.read().unwrap().is_none(), "Final clears the live text");
-        let utts = i.utterances.read().unwrap();
-        assert_eq!(utts.len(), 1);
-        assert_eq!(utts[0].seq, 1);
-        assert_eq!(utts[0].calibrated, "蛇身");
-        assert!(!utts[0].corrected);
+        assert!(i.live.read().unwrap().is_none(), "WindowFinal clears the live text");
+        let wins = i.windows.read().unwrap();
+        assert_eq!(wins.len(), 1);
+        assert_eq!(wins[0].window_id, 1);
+        assert_eq!(wins[0].calibrated, "蛇身");
+        assert!(!wins[0].corrected);
     }
 
     #[test]
-    fn correction_marks_utterance() {
+    fn interim_keys_live_by_window() {
         let i = inner();
         apply_segment(
             &i,
-            AsrSegment::Final {
-                seq: 2,
-                raw_text: "蛇声".into(),
-                streaming_text: "蛇声".into(),
-                calibrated: "蛇声".into(),
-                intent: "chat".into(),
-                reply: String::new(),
-                route_ms: 0.0,
-            },
+            AsrSegment::Interim { window_id: 7, segment_id: 3, partial: "你好".into(), at_s: 1.0 },
         );
-        apply_segment(&i, AsrSegment::Correction { seq: 2, raw: "蛇声".into(), corrected: "蛇身".into() });
-        assert!(i.utterances.read().unwrap()[0].corrected);
+        assert_eq!(i.live.read().unwrap().as_ref().map(|(w, _)| *w), Some(7));
     }
 
     #[test]
-    fn finals_are_sorted_by_seq() {
+    fn correction_marks_window() {
         let i = inner();
-        for seq in [3u64, 1, 2] {
+        apply_segment(
+            &i,
+            AsrSegment::WindowFinal {
+                window_id: 2,
+                raw_text: "蛇声".into(),
+                streaming_text: "蛇声".into(),
+                calibrated: "蛇声".into(),
+                route_ms: 0.0,
+            },
+        );
+        apply_segment(
+            &i,
+            AsrSegment::Correction { window_id: 2, raw: "蛇声".into(), corrected: "蛇身".into() },
+        );
+        assert!(i.windows.read().unwrap()[0].corrected);
+    }
+
+    #[test]
+    fn windows_are_sorted_by_id() {
+        let i = inner();
+        for window_id in [3u64, 1, 2] {
             apply_segment(
                 &i,
-                AsrSegment::Final {
-                    seq,
+                AsrSegment::WindowFinal {
+                    window_id,
                     raw_text: "x".into(),
                     streaming_text: "x".into(),
                     calibrated: "x".into(),
-                    intent: "chat".into(),
-                    reply: String::new(),
                     route_ms: 0.0,
                 },
             );
         }
-        let seqs: Vec<u64> = i.utterances.read().unwrap().iter().map(|u| u.seq).collect();
-        assert_eq!(seqs, vec![1, 2, 3]);
+        let ids: Vec<u64> = i.windows.read().unwrap().iter().map(|w| w.window_id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 }
