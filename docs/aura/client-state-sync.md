@@ -28,13 +28,14 @@
 | # | 状态 | 来源 | 频率 | 数据量 | 段类型 |
 |---|---|---|---|---|---|
 | 1 | 流式 partial（raw，前向纠错） | Stage1 Zipformer | **高**（~0.5s，说话中） | 小（~50–200 字） | `interim` |
-| 2 | Stage2 碎片纠偏（provisional calibrated） | Stage2 `calibrate_provisional` | 中（每 VAD 碎片，~1–5s） | 小 | `calibrated_interim` |
+| 2 | Stage2 碎片纠偏（provisional calibrated） | Stage2 `calibrate_provisional` | 中（每 VAD 碎片 ~1–5s + 勤快 Stage2 每 1s 校准 partial） | 小 | `calibrated_interim` |
 | 3 | 定稿（raw / streaming / calibrated / intent / reply） | Stage2 `calibrate`（settle） | 低（每句 ~5–30s） | 小–中 | `final` |
 | 4 | 用户纠偏标记（per-utterance） | `POST /api/correct` | 极低（用户动作） | 极小 | `correction` |
 
-> **注意**：Stage1 的批式 provisional（`Revise`，累积 PCM 重跑的 raw 文本）是**内部**的——它
-> 进 composer → Stage2，产出 `calibrated_interim`。客户端不需要 raw 批式文本（已有流式 raw +
-> Stage2 纠偏），所以**不单独暴露**在数据面。
+> **注意**：Stage1 的批式 provisional（`Stage1Action::Batch`，累积 PCM 重跑的 raw 文本，以及
+> 勤快 Stage2 每 1s 包装的 partial 文本）是**内部**的——它进 composer → Stage2，产出
+> `calibrated_interim`。客户端不需要 raw 批式文本（已有流式 raw + Stage2 纠偏），所以
+> **不单独暴露**在数据面。
 
 ### 控制面（`GET /api/state` → `AuraStateView` 快照，节流 ping → 重拉）
 

@@ -1,6 +1,11 @@
 # 自适应学习：存疑提问 + 纠错闭环 + 动态微调
 
-> 2026-07-14 设计，**2026-08 更新**：用户纠偏已实现（POST /api/correct → CorrectionStore → Stage2 corrections 段）。存疑检测 + LoRA 仍待做。
+> 2026-07-14 设计，**2026-08-17 更新**：用户纠偏已实现（POST /api/correct →
+> CorrectionStore → Stage2 corrections 段）；热词偏置已在 **Stage1 流式 recognizer**
+> 落地（boot 烘焙 + Stage3 运行时加词走共享 store）。存疑检测 + LoRA 仍待做。
+> ⚠️ 现实约束变化：Stage2 已简化为**纯文本输出**（无 JSON）——下文的 uncertainties
+> 扩展需先恢复结构化输出（或改用独立轻量模型/正则通道），不能直接在现有
+> `calibrate` 上加字段。
 
 记录两环想法：Stage2 存疑检测 → 秘书主动提问 → 用户纠错 → 沉淀为用户专属能力（热词 / LoRA），随使用越来越准。这是"私人秘书 vs 通用转写器"的核心差异化护城河。
 
@@ -95,7 +100,8 @@ Stage2 整流 + 存疑检测：
 - 每次纠错(B位→Bevy)写入用户热词表
 - ASR 推理时把热词表作**上下文偏置**喂模型（sherpa-onnx 的 keyterms/keyword biasing）
 - 不用训练、即时生效、可增删
-- sherpa-rs 的 SenseVoice/Zipformer `STTCapabilities.keyterms` 待验证（**关键前置探查**）
+- sherpa-onnx（官方 crate）批式 SenseVoice 的 keyterms/上下文偏置待验证（**关键前置探查**；
+  流式 Zipformer 热词已实现，见 roadmap M5）
 
 **LoRA 留给"口癖/口音/句式"这类热词解决不了的深层模式。**
 
@@ -109,11 +115,13 @@ Stage2 整流 + 存疑检测：
 
 ## 五、演进路线（三层，由轻到重）
 
-### 第 1 层（现在能做）：热词偏置
-- ASR 接 keyterms，喂用户热词表
-- 纠错时即时写入热词表
+### 第 1 层（部分已落地）：热词偏置
+- ✅ **流式 ASR 热词已实现**：`StreamingAsrConfig.hotwords` boot 时烘进 Zipformer
+  （beam-search bias）；种子热词双层注入（recognizer + Stage2 共享 store）
+- ✅ Stage3 运行时加词 → 共享 store → Stage2 每轮读最新（LLM 层）
+- ⬜ 热词**运行时下沉** ASR recognizer（需重建 recognizer，M5）；批式 SenseVoice 的
+  keyterms 支持未验证（sherpa-onnx 官方 crate）
 - **覆盖**：专有名词、术语、人名（Bevy、项目名、同事名）
-- **前置**：验证 sherpa-rs SenseVoice 的 keyterms 支持
 
 ### 第 2 层（下一步）：纠错样本库 + 检索增强
 - 每次纠错存 `(音频片段, 正确文本, 上下文)` 三元组
@@ -137,9 +145,12 @@ Stage2 整流 + 存疑检测：
 - 第 3 层用它训 LoRA
 
 ### 落地下一步（建议顺序）
-1. **Stage2 加 uncertainties 输出**（存疑检测）—— 立刻可用
+1. **Stage2 加 uncertainties 输出**（存疑检测）—— 需先恢复结构化输出（当前纯文本）或
+   用独立通道；恢复 JSON 前先确认小模型不会被格式带偏
 2. **`corrections` 表**（SQLite：chunk_id / 音频片段引用 / 原文本 / 正确文本 / 上下文 / 时间戳）
-3. **ASR 接 keyterms** —— 验证热词偏置在 SenseVoice/sherpa 能否用（决定第 1 层可行性，**最该先探查**）
+   —— 现有 CorrectionStore（内存环形 20 条）与 recordings/turns 落盘是其前身
+3. **批式 ASR 接 keyterms** —— 验证热词偏置在 SenseVoice（sherpa-onnx）能否用；
+   流式 Zipformer 热词已实现
 
 ---
 

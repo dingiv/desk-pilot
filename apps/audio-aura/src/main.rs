@@ -16,7 +16,8 @@
 //!
 //! Run: cargo run -p aura-daemon --features asr,cuda -- 127.0.0.1:7879
 //! Config precedence: CLI (high-frequency knobs, see `Cli`) > `aura.yaml` (full surface, dev:
-//! this crate's dir, prod: ~/.desk-pilot/) > built-in defaults. No env vars.
+//! this crate's dir, prod: ~/.desk-pilot/) > built-in defaults. No env vars — except `RUST_LOG`,
+//! which overrides the `log_level` setting as the standard tracing escape hatch.
 
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -33,7 +34,7 @@ use axum::Router;
 use clap::Parser;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 use tokio_stream::StreamExt;
@@ -138,40 +139,63 @@ struct AuraConf {
     /// 录音 + turn 日志保留期(天,默认 7)——短期记录供复盘/Stage3;超过该
     /// 天数的日期目录/文件被过期清理(启动时 + 每 24h)。
     recordings_retention_days: Option<u32>,
+    /// Log filter (default "info"). Accepts a plain level (trace|debug|info|warn|error) or
+    /// full EnvFilter directives ("aura_daemon=debug,info"). RUST_LOG still wins (escape
+    /// hatch). High-frequency recognition logging (流式 partial / 纠偏碎片) is `debug` —
+    /// set this to debug to watch the live pipeline.
+    log_level: Option<String>,
     /// VAD / segmentation overrides (see [`VadConf`]). All-None by default.
     vad: Option<VadConf>,
 }
 
+/// Which config source [`AuraConf::load`] ended up on — reported by `main` AFTER tracing is
+/// up (the load itself runs pre-subscriber, so it can't log for itself).
+#[derive(Debug)]
+enum ConfOrigin {
+    Yaml,
+    Json,
+    /// Neither file found — all built-in defaults.
+    Defaults,
+    /// A file was found but didn't parse — carrying what went wrong (and which fallback won).
+    Malformed(String),
+}
+
 impl AuraConf {
-    /// Load `CONF::aura.json`. A missing file is fine (all defaults); a malformed one is
-    /// reported and ignored rather than killing the daemon.
-    fn load() -> Self {
+    /// Load `CONF::aura.yaml` (preferred — # comments, nesting-friendly), falling back to
+    /// `CONF::aura.json`. A missing file is fine (all defaults); a malformed one is reported
+    /// via the returned [`ConfOrigin`] (and skipped) rather than killing the daemon. Runs
+    /// PRE-subscriber (main needs `log_level` before tracing init), so it returns its origin
+    /// instead of logging.
+    fn load() -> (Self, ConfOrigin) {
         let fs = shared::loader!();
         // 优先 aura.yaml (支持 # 注释, 嵌套友好); fallback aura.json (向下兼容).
         if let Ok(s) = fs.read_str("CONF::aura.yaml") {
             match serde_yaml::from_str::<Self>(&s) {
-                Ok(conf) => {
-                    info!(path = %"aura.yaml", "conf loaded (yaml)");
-                    return conf;
+                Ok(conf) => return (conf, ConfOrigin::Yaml),
+                Err(e) => {
+                    let (conf, fallback) = Self::load_json_or_default(&fs);
+                    return (
+                        conf,
+                        ConfOrigin::Malformed(format!("aura.yaml parse error: {e} — {fallback:?}")),
+                    );
                 }
-                Err(e) => warn!(error = %e, "aura.yaml parse error — trying json fallback"),
             }
         }
+        Self::load_json_or_default(&fs)
+    }
+
+    /// `aura.json` fallback — `Self::default()` when absent or unparsable. Returns which of
+    /// the two won (for the [`ConfOrigin`] report).
+    fn load_json_or_default(fs: &shared::FileLoader) -> (Self, ConfOrigin) {
         match fs.read_str("CONF::aura.json") {
             Ok(s) => match serde_json::from_str(&s) {
-                Ok(conf) => {
-                    info!(path = %"aura.json", "conf loaded (json)");
-                    conf
-                }
-                Err(e) => {
-                    warn!(error = %e, "aura.json parse error — using defaults");
-                    Self::default()
-                }
+                Ok(conf) => (conf, ConfOrigin::Json),
+                Err(e) => (
+                    Self::default(),
+                    ConfOrigin::Malformed(format!("aura.json parse error: {e} — defaults")),
+                ),
             },
-            Err(_) => {
-                info!("no aura.yaml / aura.json — using built-in defaults");
-                Self::default()
-            }
+            Err(_) => (Self::default(), ConfOrigin::Defaults),
         }
     }
 }
@@ -227,6 +251,9 @@ struct Settings {
     web_dist: Option<String>,
     recordings_dir: Option<String>,
     recordings_retention_days: u32,
+    /// Log filter (RUST_LOG env still wins at subscriber init — see
+    /// `shared::init_tracing_with_filter`).
+    log_level: String,
     vad: VadResolved,
 }
 
@@ -268,6 +295,7 @@ fn resolve(cli: Cli, conf: AuraConf) -> Settings {
         web_dist: conf.web_dist,
         recordings_dir: conf.recordings_dir,
         recordings_retention_days: conf.recordings_retention_days.unwrap_or(7),
+        log_level: conf.log_level.unwrap_or_else(|| "info".to_string()),
         vad,
     }
 }
@@ -327,11 +355,27 @@ impl DaemonState {
 }
 
 fn main() -> Result<()> {
-    // Init-stage side effect, first thing in main: the process-wide tracing subscriber
-    // (dev: human-readable; release: JSON lines; RUST_LOG filter, default info).
-    shared::init_tracing();
-    let s = resolve(Cli::parse(), AuraConf::load());
-    let Settings { scout_addr, port, stage3_on, model, asr_backend, asr_language, asr_provider, asr_threads, asr_kind, asr_endpoint, llm_kind, llm_endpoint, llm_model, hotwords: seed_hotwords, web_dist, recordings_dir, recordings_retention_days, vad } = s;
+    // Config loads FIRST — tracing init needs the configured `log_level`. The load runs
+    // pre-subscriber, so it returns its origin instead of logging; we report it right after
+    // the subscriber is up (nothing is lost, just emitted post-init).
+    let (conf, origin) = AuraConf::load();
+    let s = resolve(Cli::parse(), conf);
+    // Init-stage side effect: the process-wide tracing subscriber (dev: human-readable;
+    // release: JSON lines). Filter precedence: RUST_LOG env (escape hatch) >
+    // aura.yaml `log_level` > "info". `effective_level` reports what actually took effect
+    // (differs from the configured value on RUST_LOG override or invalid-value fallback).
+    let effective_level = shared::init_tracing_with_filter(&s.log_level);
+    match &origin {
+        ConfOrigin::Yaml => info!(log_level = %effective_level, "conf loaded (aura.yaml)"),
+        ConfOrigin::Json => info!(log_level = %effective_level, "conf loaded (aura.json)"),
+        ConfOrigin::Defaults => {
+            info!(log_level = %effective_level, "no aura.yaml / aura.json — built-in defaults")
+        }
+        ConfOrigin::Malformed(what) => {
+            warn!(what, log_level = %effective_level, "conf parse error — fallback in effect")
+        }
+    }
+    let Settings { scout_addr, port, stage3_on, model, asr_backend, asr_language, asr_provider, asr_threads, asr_kind, asr_endpoint, llm_kind, llm_endpoint, llm_model, hotwords: seed_hotwords, web_dist, recordings_dir, recordings_retention_days, log_level, vad } = s;
 
     // Connection toggle + shared snapshot state, shared across the Pipeline thread + socket
     // handlers. (No event bus — SSE pings off the `version` counter; data lives in the snapshot.)
@@ -400,7 +444,7 @@ fn main() -> Result<()> {
         threshold = vad.threshold,
         min_silence_s = vad.min_silence,
         merge_gap_s = vad.merge_gap,
-        edge_margin_s = vad.edge_margin,
+        edge_margin_s = ((vad.edge_margin as f64) * 1000.0).round() / 1000.0, // f32 can't hold 0.3 — round in f64 for a clean display
         "VAD: min_silence 切段 + merge_gap 合并碎片 + edge_margin 补边界 (解耦)"
     );
     // Bake the seed hotwords into the streaming recognizer (beam-search biasing).
@@ -461,12 +505,16 @@ fn main() -> Result<()> {
                     // plane (version/snapshot) is NOT bumped here — only settings changes bump it.
                     let segment = match ev {
                         TurnEvent::Interim { seq, partial, at_s } => {
-                            info!(seq, at_s, partial = %partial, "流式");
+                            // High-frequency (every ~0.5s while speaking, full accumulated text) —
+                            // debug; enable via aura.yaml `log_level: debug`.
+                            debug!(seq, at_s = (at_s * 10.0).round() / 10.0, partial = %partial, "流式");
                             Some(AsrSegment::Interim { seq, partial: partial.to_string(), at_s })
                         }
                         TurnEvent::CalibratedInterim { seq, calibrated, route_ms } => {
-                            // Stage2 recalibrated an in-progress utterance (a fragment merged into it).
-                            info!(seq, route_ms, calibrated = %calibrated, "纠偏(碎片)");
+                            // Stage2 recalibrated an in-progress utterance (a fragment merged into
+                            // it). Also high-frequency (every fragment + the 1s diligent pass) —
+                            // debug.
+                            debug!(seq, route_ms = route_ms.round() as u64, calibrated = %calibrated, "纠偏(碎片)");
                             Some(AsrSegment::CalibratedInterim { seq, calibrated })
                         }
                         TurnEvent::Final { utterance: u, decision: d, route_ms } => {
@@ -475,9 +523,9 @@ fn main() -> Result<()> {
                             // distinguishable from LLM rewriting when diagnosing "missing" words.
                             info!(
                                 seq = u.seq,
-                                at_s = u.at_s,
+                                at_s = (u.at_s * 10.0).round() / 10.0,
                                 intent = %d.intent,
-                                route_ms,
+                                route_ms = route_ms.round() as u64,
                                 batch = %u.raw_text,
                                 streaming = %u.streaming_text,
                                 calibrated = %d.calibrated_text,
@@ -537,7 +585,7 @@ fn main() -> Result<()> {
         .thread_name("aura-socket")
         .build()?;
     info!(port, "socket: http://127.0.0.1:{port}  (/api/state /api/stream /api/control/scout /api/correct /api/audio)");
-    info!(scout = %scout_addr, stage3 = stage3_on, "pipeline running on bg thread — Ctrl-C 结束");
+    info!(scout = %scout_addr, stage3 = stage3_on, log_level, "pipeline running on bg thread — Ctrl-C 结束");
     rt.block_on(serve_socket(state, port, web_dist));
     Ok(())
 }
@@ -761,6 +809,7 @@ mod tests {
             .expect("apps/audio-aura/aura.yaml missing");
         let conf: AuraConf = serde_yaml::from_str(&s).expect("aura.yaml must parse");
         assert_eq!(conf.port, Some(9091));
+        assert_eq!(conf.log_level, Some("info".into()), "log_level documented in yaml");
         let vad = conf.vad.expect("aura.yaml must have a vad: section");
         assert_eq!(vad.merge_gap, Some(2.5), "merge_gap documented in yaml");
         assert_eq!(vad.threshold, Some(0.5));
@@ -783,6 +832,7 @@ mod tests {
             hotwords: None,
             web_dist: Some("/tmp/dist".into()),
             recordings_dir: None,
+            log_level: Some("debug".into()),
             ..Default::default()
         };
         let s = resolve(cli, conf);
@@ -792,12 +842,14 @@ mod tests {
         assert_eq!(s.model, "Qwen3-1.7B-Q8_0.gguf", "default model when unset");
         assert_eq!(s.hotwords.len(), super::SEED_HOTWORDS.len(), "seed fallback");
         assert_eq!(s.web_dist.as_deref(), Some("/tmp/dist"));
+        assert_eq!(s.log_level, "debug", "log_level from the config file");
 
         // All-empty → pure defaults.
         let d = resolve(Cli::default(), AuraConf::default());
         assert_eq!(d.scout_addr, "127.0.0.1:7878");
         assert_eq!(d.port, 9091);
         assert!(d.stage3_on);
+        assert_eq!(d.log_level, "info", "log_level default");
         // VAD defaults resolve to the built-ins (no vad: section ⇒ all-None ⇒ fallbacks).
         assert_eq!(d.vad.merge_gap, 5.0);
         assert_eq!(d.vad.threshold, 0.5);

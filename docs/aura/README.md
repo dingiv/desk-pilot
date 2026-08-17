@@ -5,6 +5,8 @@
 ## 📍 现状（必读）
 
 - **[architecture.md](architecture.md)** — as-built：crate 拓扑（合并后）+ 三阶段 + dp-models + 双运行时。`🟢 当前`
+- **[stages.md](stages.md)** — Stage1（音频→文本，两遍识别+VAD 切段+碎片合并）与 Stage2（LLM 纠偏整流）的能力、流程与衔接契约。`🟢 2026-08-17 新`
+- **[vad-segment-model.md](vad-segment-model.md)** — 🔵 设计稿：VadSegment/VadWindow 状态机重构（AudioStore 按 id 持有录音、段级 batch、窗口边界事件、Stage2 联合整流）。尚未实现。
 - **[roadmap.md](roadmap.md)** — 已完成/近期/中期/长期。`🟢 2026-08 更新`
 
 ## 🧭 设计参考
@@ -24,3 +26,4 @@
 
 aura = **语音助手前端 + 中间守护进程**：下接 omni-scout 录音，上接 geek-familiar 秘书。
 用三阶段提交（ASR → 纠偏 → 工具）把语音识别准确率榨到极致，是系统级 AI 秘书的"耳朵 + 整流"层。
+两阶段的权威梳理见 **[stages.md](stages.md)**。

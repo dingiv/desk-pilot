@@ -5,6 +5,13 @@ scout_addr: "127.0.0.1:7878"   # omni-scout /audio 地址
 port: 9091                      # daemon socket 端口
 stage3: true                    # 运行进程内 Stage3 规则触发器
 
+# ── 日志 ──────────────────────────────────────────────────────────────────────
+# 等级: trace | debug | info | warn | error; 也支持 EnvFilter 指令语法 (如
+# "aura_daemon=debug,info")。RUST_LOG 环境变量优先于此处 (逃生舱)。
+# 注意: 高频识别日志 (流式 partial ~0.5s/条、纠偏碎片 ~1s/条) 只在 debug 可见;
+# info 只出 final (每定稿一句一条, 含 batch/streaming/calibrated 三层文本)。
+log_level: "info"               # 调试语音管线时改 "debug"
+
 # ── Stage2 LLM (mistral.rs Qwen3-1.7B GGUF, local; 或 remote vLLM/sglang) ──
 model: "qwen2.5-3b-instruct-q4_k_m.gguf"
 llm_kind: "local"               # local | remote

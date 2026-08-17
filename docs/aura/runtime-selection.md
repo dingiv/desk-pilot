@@ -47,7 +47,7 @@ audio-aura 是语音秘书，需要两类模型：
 
 ### HF 侧：**mistral.rs (candle)**（已在用）
 - Stage2/3 的 Qwen LLM 走 `mistral.rs`（candle 后端，GGUF，GPU sm_120 已验证 ~400ms）。
-- `audio-aura-router` crate 的 `RouterEngine` 已是这条路径。
+- `aura-core` 的 `Calibrator`（原 aura-dcl，再原 audio-aura-router 的 `RouterEngine`）已是这条路径。
 
 ### 备选（若 sherpa-onnx 官方 crate 的 Silero 仍卡）
 - ASR 换 `qwen3-asr`（candle，纯 Rust，与 mistral.rs 同栈）—— 但放弃 SenseVoice，且不含 VAD/TTS。
@@ -69,8 +69,9 @@ audio-aura 是语音秘书，需要两类模型：
 │   │  (sherpa-onnx)          │   │  (mistral.rs / candle) │ │
 │   │                         │   │                        │ │
 │   │  · 单一 onnxruntime 实例 │   │  · 单一 candle 实例     │ │
-│   │  · VAD  (Silero)        │   │  · LLM  (Qwen3-1.7B)   │ │
-│   │  · ASR  (SenseVoice)   │   │  · (未来: Writer 大模型) │ │
+│   │  · VAD  (Silero)        │   │  · LLM  (Qwen2.5-3B)   │ │
+│   │  · ASR  (流式Zipformer  │   │  · (未来: Writer 大模型) │ │
+│   │    + 批式SV/Whisper/Q3) │   │                        │ │
 │   │  · TTS  (Kokoro, M3)   │   │                        │ │
 │   └────────────┬───────────┘   └────────────┬───────────┘ │
 │                │                            │              │
@@ -104,23 +105,24 @@ audio-aura 是语音秘书，需要两类模型：
 
 ---
 
-## 四、落地形态（Rust crate 规划）
+## 四、落地形态（2026-08-17 现状）
 
 ```
-audio-aura-asr (Stage1, ONNX 侧)
-  ├── OnnxRuntimeManager   ← sherpa-onnx 单实例，管 VAD/ASR/TTS 的加载与推理
-  ├── vad  (Silero via sherpa)
-  ├── asr  (SenseVoice via sherpa)
-  └── tts  (Kokoro via sherpa, M3)
+dp-models (跨子系统, ONNX 侧)
+  └── onnx  OnnxRuntimeManager ← sherpa-onnx 单实例，管 VAD/流式ASR/批式ASR 的加载与推理
+           (Silero VAD + Zipformer 流式 + SenseVoice/Whisper/Qwen3-ASR 批式)
 
-audio-aura-router (Stage2/3, HF 侧)
-  └── RouterEngine         ← mistral.rs/candle 单实例 (已在用)
-
-audio-aura-core (daemon, 编排)
-  └── 在两个管理器之间用"文本"串起 Stage1→2→3 管线
+aura-asr   (Stage1)  OnnxStage1Executor —— 消费 OnnxRuntimeManager, 批式可换 HttpAsr
+aura-core  (Stage2)  Calibrator ← mistral.rs/candle 单实例 (Qwen2.5-3B GGUF),
+                      亦可为 HttpLlm (vLLM/sglang remote)
+           (编排)    Pipeline: 两管理器之间用"文本"串起 Stage1→Stage2
 ```
 
-> 现状：audio-aura-asr 目前混用了 sherpa-rs(archive, 有bug) + ort(冲突源)。**动工第一步就是清理**：移除 sherpa-rs 与 ort，统一换成 sherpa-onnx 官方 crate，由 OnnxRuntimeManager 统一持有。
+> 迁移已完成（原"现状混用 sherpa-rs(archive) + ort(冲突源)"的清理早已落地）：sherpa-rs 与
+> ort 均已移除，ONNX 语音栈统一走 sherpa-onnx 官方 crate，且已下沉到 `dp-models::onnx`
+> 供跨子系统复用。`audio-aura-router` crate 已并入 aura-core（RouterEngine 时代结束，
+> Stage2 即 Calibrator）。TTS 仍在 aura-tts 占位（NoopTts），真后端接 sherpa 时落
+> dp-models::onnx 同一管理器。
 
 ---
 

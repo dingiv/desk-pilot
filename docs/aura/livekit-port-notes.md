@@ -1,5 +1,12 @@
 # LiveKit Agents → Rust 移植笔记（Stage1/2 施工蓝本）
 
+> **落地状态（2026-08-17）**：A 部分核心已落地——`AudioChunk`/`VadEvent`/`SpeechEvent`
+> 数据契约在 aura-asr；两遍识别（流式 Zipformer partial + VAD 门控批式 final）取代了纯
+> StreamAdapter；断句没照搬 min/max endpointing，而是 min_silence（切段）与 merge_gap
+> （合并窗口）解耦 + SegmentMerger（见 `stages.md`）。语义 turn-detector **未采纳**（中文
+> EOU 阈值那套），动态 endpointing 未做。B 部分（流式接力/barge-in/SpeechHandle）**未动工**，
+> 等 TTS 真后端（M2 Kokoro）接上再移植。
+
 来源：精读 `/workspaces/gui_agent/livekit-agents`（Python）。LiveKit ≈ 我们的 Stage1+Stage2（实时听+答）的成熟实现，**没有 Stage3（topic 长期记忆）**——那是我们的差异化。这里提炼其可移植设计。全部为**本地单用户**改写：去掉 WebRTC/房间/多参与者，音频源改为 omni-scout HTTP 或浏览器 PCM。
 
 关键源文件：`livekit/agents/vad.py`、`voice/audio_recognition.py`、`voice/endpointing.py`、`agents/inference/eot/`（turn-detector）、`stt/stt.py`、`stt/stream_adapter.py`、`voice/agent_activity.py`、`voice/generation.py`、`voice/speech_handle.py`。

@@ -33,23 +33,33 @@ aura-core       (Stage2+组装+存储) ← 2026-08 合并了原 aura-core/aura-d
   ├─ hub        Storage 总管: AudioArchive + TurnLog + recent ring
   ├─ archive    日期WAV落盘 + 热层回放
   └─ wav        WAV 读写
-aura-agent      (Stage3)      能力 trait + HotwordManager + AddHotwordTool
+aura-agent      (Stage3+SDK)    能力 trait + HotwordManager + AddHotwordTool
+                                + view(AuraStateView/AsrSegment 线协议) + AuraClient SDK
 aura-tts        (占位)        NoopTts (未来 Kokoro/Piper)
-apps/audio-aura (daemon)      Pipeline + socket(18 routes) + SSE + Stage3规则触发器
+apps/audio-aura (daemon)      Pipeline + socket(8 routes + SPA fallback) + SSE双面 + Stage3规则触发器
 crates/native                 napi shim (TS via VOICE_LOCAL_ROUTER)
 ```
+
+**线程模型**：`aura-stage1-ingest`（scout→ring）→ `aura-pipeline`（std 线程跑 Stage1
+consume loop）→ `aura-stage2`（LLM worker，mpsc 收 Stage1Action，partials 不被 LLM 卡住）
+→ `aura-socket`（主线程 tokio，axum SSE）。详见 `stages.md`。
 
 ## 三阶段提交
 
 | 阶段 | 职责 | crate | 抽象 |
 |---|---|---|---|
-| **Stage1** | 录音→VAD→两阶段ASR（流式Zipformer partial + 批式ASR final） | aura-asr | Stage1Executor（发 Interim/Final） |
-| **Stage2** | 口语纠偏（加标点/去语气词/修同音字） | aura-core | Stage2Calibrator（calibrate(Utterance)→Decision） |
+| **Stage1** | 录音→VAD→两遍ASR（流式Zipformer partial + 批式ASR final）+ 碎片合并 | aura-asr | Stage1Executor（发 Interim + Action(Batch/MergeBatch)） |
+| **Stage2** | 口语纠偏（加标点/修同音字/英文规范/专有名词） | aura-core | Stage2Calibrator（calibrate / calibrate_provisional） |
 | **Stage3** | 可选工具：热词 / 用户纠偏 | aura-agent | HotwordManager + CorrectionStore |
 
-**Stage2 简化**（2026-08）：去掉了 JSON 输出（intent/reply/task），**只输出纯文本纠偏**。
-PromptBuilder 精简（ROLE_TASK 1 句 + few-shot + 热词 + 纠正段 + OUTPUT）。
+两阶段的完整流程、事件契约（`Batch`=临时 / `MergeBatch`=权威定稿）、被禁用的通道
+（ContextWindow / prompt 热词块 / few-shot / streaming_ref）见 **`stages.md`**。
+
+**Stage2 简化**（2026-08）：去掉了 JSON 输出（intent/reply/task 字段仍在但恒空），
+**只输出纯文本纠偏**。PromptBuilder 精简（ROLE_TASK 1 句 + OUTPUT 四条规则 + 纠正段）。
 模型从 Qwen3-1.7B（thinking）换成 **Qwen2.5-3B-Instruct**（指令模型，~300ms，质量更好）。
+Stage2 收两类触发：`Batch`→`calibrate_provisional`（不写 ContextWindow），
+`MergeBatch`→`calibrate`（写入）——碎片增长期的中间态不污染上下文。
 
 ## dp-models Provider 抽象（2026-08 新增）
 
@@ -76,14 +86,28 @@ Pipeline `s2: Box<dyn Stage2Calibrator>`；daemon `asr_kind`/`llm_kind` 配置�
 
 ## 配置（aura.yaml，YAML 支持注释）
 
+当前实跑配置（2026-08-17）：
+
 ```yaml
 scout_addr: "127.0.0.1:7878"
 port: 9091
-model: "qwen2.5-3b-instruct-q4_k_m.gguf"  # Stage2 GGUF
+model: "qwen2.5-3b-instruct-q4_k_m.gguf"  # Stage2 GGUF (llm_kind: local)
 asr_backend: "qwen3-asr"        # sensevoice | whisper | qwen3-asr
-asr_kind: "local"               # local | remote
-hotwords: ["Rust", "Bevy"]
+asr_kind: "remote"              # local | remote（remote → qwen-asr-serve）
+asr_endpoint: "http://127.0.0.1:8000"
+hotwords: ["Rust", "Bevy", "贪吃蛇"]
+log_level: "info"               # trace|debug|info|warn|error | EnvFilter 指令; RUST_LOG 优先
+vad:
+  min_silence: 1.0   # 切段灵敏度（低保响应）
+  merge_gap: 2.5     # ★碎片合并窗口上界（"什么算一句话"的旋钮）
 ```
+
+日志分级：**info 只出 final**（每定稿一句一条，含 batch/streaming/calibrated 三层文本）；
+流式 partial（~0.5s/条）与纠偏碎片（~1s/条）为 **debug**——调管线时 `log_level: "debug"`。
+
+优先级：CLI > aura.yaml > 内置默认（aura.json 仅作 loader 向下兼容 fallback）。
+未来计划升级为 dp-models ModelSpec 结构化配置（`stage_asr:` / `stage_llm:` 嵌套段，
+见 docs/dp-models.md）。
 
 ## 运行
 
@@ -97,11 +121,23 @@ CARGO_MANIFEST_DIR=$(pwd) cargo run -p audio-aura-core --example stage12_live --
 
 ## 已验证
 
-- crate 合并后全编译绿（aura-core ~2000 行, 合并 dcl+store）。
-- Qwen2.5-3B 纠偏：~300ms/句，加标点+去语气词+纠偏有效。
+- crate 合并后全编译绿（aura-core ~1800 行，合并 dcl+store）。
+- Qwen2.5-3B 纠偏：~300ms/句，加标点+纠偏有效。
 - dp-models remote：qwen-asr-serve + sglang 端到端跑通。
 - 用户纠偏：POST /api/correct → CorrectionStore → Stage2 纠正段注入 → Web UI 编辑。
 - Qwen3-ASR：strip_qwen3_markers 修标记泄漏（language Chinese<asr_text>）。
+- 停顿碎片化：SegmentMerger（min_silence/merge_gap 解耦）+ edge_margin 边界扩展
+  已实现并有单测（详见 real-world-speech-design.md §1/§1a）。
+- 音频持久化：recordings/<日期>/*.wav + turns/<日期>.jsonl + 启动索引重建 +
+  保留期清理（recordings_retention_days，默认 7 天）。
+- 热词双层种子：boot 烘进流式 recognizer（beam bias）+ Stage2 共享 store；
+  Stage3 运行时加词只进 LLM 层（下沉 ASR 是 M5）。
+
+## 代码内遗留 TODO（整改时留意）
+
+- `Stage1Executor::run` 静默阻塞线程、睡眠轮询 → 待异步非阻塞化（executor.rs:426）。
+- `Stage1Config::new` 内嵌 IO（模型路径解析）→ 待拆出（executor.rs:75）。
+- daemon 硬编码静态文件路径 `BASE` → 改用 FileLoader 机制（main.rs:582）。
 
 ## 未完成
 

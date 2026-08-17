@@ -312,25 +312,74 @@ fn expand_tilde(path: &str) -> PathBuf {
 
 // ── shared's own build.rs (generates its own empty namespace table) ──────────
 
-/// Initialize the process-wide `tracing` subscriber. Call ONCE at the very top of a binary's
-/// `main` (init-stage side effect; lib crates only use the `tracing` facade macros).
+/// Initialize the process-wide `tracing` subscriber with the default filter `"info"`.
+/// See [`init_tracing_with_filter`] for the full contract. Call ONCE, at the very top of a
+/// binary's `main`.
+#[cfg(feature = "log")]
+pub fn init_tracing() {
+    let _ = init_tracing_with_filter("info");
+}
+
+/// Initialize the process-wide `tracing` subscriber with a caller-supplied default filter
+/// (typically from the app's config file, e.g. aura.yaml `log_level`). Call ONCE at the very
+/// top of a binary's `main` (init-stage side effect; lib crates only use the `tracing` facade
+/// macros). Returns the filter that actually took effect (e.g. `"info (fallback)"`,
+/// `"RUST_LOG env (…)"`) so the caller can log the truth, not the configured intent.
 ///
 /// - **Dev builds** (`debug_assertions`): human-readable colored output.
 /// - **Release builds**: one JSON object per line — machine-parseable for ELK/Loki.
-/// - **Level control**: the standard `RUST_LOG` env filter (e.g. `RUST_LOG=debug`,
-///   `RUST_LOG=aura_daemon=trace,info`); defaults to `info` when unset.
+/// - **Level control** precedence: `RUST_LOG` env filter (standard escape hatch, e.g.
+///   `RUST_LOG=aura_daemon=trace,info`) > `default_filter` > `"info"`. An invalid
+///   `default_filter` is reported to stderr (pre-subscriber, hence plain eprintln) and
+///   falls back to `"info"`. Accepts a bare level (`debug`) or per-target directives
+///   (`aura_daemon=trace,info`).
 /// - **Writer**: stderr, always. Log rotation/shipping is the HOST's job
 ///   (journald / logrotate / docker log-driver) — the process never writes log files itself.
 #[cfg(feature = "log")]
-pub fn init_tracing() {
+pub fn init_tracing_with_filter(default_filter: &str) -> String {
     use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let (filter, effective) = match EnvFilter::try_from_default_env() {
+        // RUST_LOG set — the standard escape hatch wins over the config file.
+        Ok(f) => {
+            let effective = format!("RUST_LOG env ({f})");
+            (f, effective)
+        }
+        Err(_) => match parse_config_filter(default_filter) {
+            Ok(f) => (f, default_filter.trim().to_string()),
+            Err(e) => {
+                // Must log pre-subscriber — plain stderr so the misconfiguration is visible.
+                eprintln!(
+                    "shared: invalid log filter {default_filter:?} ({e}) — falling back to info"
+                );
+                (EnvFilter::new("info"), "info (fallback)".to_string())
+            }
+        },
+    };
     let registry = tracing_subscriber::registry().with(filter);
     if cfg!(debug_assertions) {
         registry.with(fmt::layer().with_writer(std::io::stderr)).init();
     } else {
         registry.with(fmt::layer().json().with_writer(std::io::stderr)).init();
     }
+    effective
+}
+
+/// Validate a config-file filter value: either a bare level word (the common case) or a
+/// directive string (contains `=`/`,`, e.g. `"aura_daemon=debug,info"`), which
+/// `EnvFilter::try_new` then validates itself. A bare NON-level word must be rejected here:
+/// `EnvFilter` would silently treat it as a target name and mute the entire process.
+#[cfg(feature = "log")]
+fn parse_config_filter(s: &str) -> Result<tracing_subscriber::EnvFilter, String> {
+    use tracing_subscriber::EnvFilter;
+    const LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error", "off"];
+    let t = s.trim();
+    let bare_level = LEVELS.iter().any(|l| t.eq_ignore_ascii_case(l));
+    if !bare_level && !t.contains('=') && !t.contains(',') {
+        return Err(format!(
+            "{t:?} is not a log level (trace|debug|info|warn|error|off) nor a directive"
+        ));
+    }
+    EnvFilter::try_new(t).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -341,6 +390,22 @@ mod tests {
     fn bare_asset_resolves_in_source_tree() {
         let loader = FileLoader::new(env!("CARGO_MANIFEST_DIR"), "src");
         assert!(loader.exists("lib.rs"));
+    }
+
+    #[cfg(feature = "log")]
+    #[test]
+    fn config_filter_bare_words_and_directives_parse() {
+        // Bare level words (case-insensitive) and directive strings are accepted…
+        for ok in ["info", "DEBUG", " warn ", "trace", "error", "off", "aura_daemon=debug,info"] {
+            assert!(parse_config_filter(ok).is_ok(), "{ok:?} should parse");
+        }
+        // …but a bare NON-level word must be REJECTED — EnvFilter would treat it as a target
+        // name and silently mute the whole process (the "bogus!!" footgun).
+        for bad in ["bogus!!", "infos", ""] {
+            assert!(parse_config_filter(bad).is_err(), "{bad:?} should be rejected");
+        }
+        // Directives with a bad level still error via EnvFilter itself.
+        assert!(parse_config_filter("aura_daemon=bogus").is_err());
     }
 
     #[test]

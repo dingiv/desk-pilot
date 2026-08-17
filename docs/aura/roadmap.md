@@ -16,15 +16,25 @@
 - [x] ASR 后端：SenseVoice/Whisper/Qwen3-ASR（onnx）+ remote HttpAsr
 - [x] aura.json → aura.yaml（YAML 支持注释）
 - [x] assets/ 统一（models + sherpa + cudnn + lib）
+- [x] **段合并 SegmentMerger**（原 R2）——min_silence(1s 切段) 与 merge_gap(2.5s 合并上界)
+  解耦；碎片吸收后重跑批式、同一 seq 就地更新；≥merge_gap 定稿 MergeBatch。有单测。
+- [x] **edge_margin 段边界扩展**（0.3s）——修合并句"开头/结尾掉字"（Silero 段边界=
+  threshold 交叉而非语音边界）。
+- [x] **碎片焦虑消除**（原 R3"延迟显示"，以更优方案落地）——不做延迟，而是
+  CalibratedInterim 同 seq 就地更新 + 勤快 Stage2（说话中每 1s 校准一次流式 partial），
+  UI 看到一句持续生长的句子。
+- [x] 音频持久化：recordings WAV（按日期）+ turns jsonl 日志 + 热层 ring + 保留期清理
+  （retention_days，启动重建索引）。
 
 ## 🔴 近期
 
 | # | 事项 | 价值 | 说明 |
 |---|---|---|---|
-| R1 | **自适应 VAD**（min_silence 动态化） | 极高 | 短句 1.0s / 中长句 1.8s — 减少"停顿碎片化" |
-| R2 | **段合并**（EOS 后 pending 0.8s） | 极高 | 连续语音拼接为整句，消除碎片 |
-| R3 | **延迟显示**（合并+纠偏后一次性 final） | 高 | 消除"焦虑感"——流式 partial 正常，final 延迟到合并后 |
+| R1 | **自适应 merge_gap** | 中 | 碎片化主体已被 SegmentMerger 解决；剩余价值=按场景自适应"一句"的窗口（命令式调小快定稿 / 长句调大） |
 | R4 | **口误自纠检测**（正则 "X 不对 Y" → Y） | 中 | 零 LLM 开销的确定性预处理 |
+| R5 | **Stage1 run() 异步化** | 中 | 静默阻塞线程 + 睡眠轮询 → 异步非阻塞（executor.rs TODO） |
+| R6 | **Stage1Config::new IO 拆分** | 低 | 构造函数内嵌模型路径解析 IO，拆成独立函数（executor.rs TODO） |
+| R7 | **daemon 静态路径去硬编码** | 低 | `BASE` 常量 → FileLoader 机制（main.rs TODO） |
 
 ## 🟡 中期
 
