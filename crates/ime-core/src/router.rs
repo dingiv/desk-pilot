@@ -318,10 +318,12 @@ impl StateMachineTable {
             }
 
             // 5. Digit 1-9(Magic 模式已在上面 hoist 给 member):面板展开时
-            //    按序号选词;否则透传(idle 的裸数字属于应用)。
+            //    按**当前页内**序号选词(翻页后按 1 选的是新页的第一项,
+            //    不是全列表第一项);否则透传(idle 的裸数字属于应用)。
             KeyKind::Digit(n) => {
                 if flags.contains(StateFlags::PANEL_OPEN) {
-                    let idx = (n - 1) as usize;
+                    let base = sm.candidate_page.saturating_mul(sm.candidate_page_size);
+                    let idx = base + (n - 1) as usize;
                     if idx < sm.candidates.len() {
                         sm.select(idx, env)
                     } else {
@@ -622,6 +624,34 @@ mod tests {
         type_str(&mut e2, "nihao");
         let v = key(&mut e2, KeyEvent::char('1'));
         assert!(v.action & action::COMMIT != 0, "digit selects a candidate");
+    }
+
+    #[test]
+    fn digit_selects_within_current_page_after_paging() {
+        // 回归:翻页后数字键选的是**当前页内**的序号 —— 按 1 提交第 2 页的
+        // 第一项,而不是全列表第一项。
+        let mut e = ImeEngine::new();
+        type_str(&mut e, "shi");
+        let all = e.candidates();
+        let page_size = e.view().candidate_page_size as usize;
+        assert!(
+            all.len() > page_size,
+            "need >{page_size} candidates for a second page, got {}: {all:?}",
+            all.len(),
+        );
+
+        // 翻到第 2 页,再按数字 1。
+        let v = key(&mut e, KeyEvent { kind: KeyKind::PageDown, ctrl: false, shift: false, alt: false });
+        assert_eq!(v.candidate_page, 1, "paged to page 2");
+        let v = key(&mut e, KeyEvent::char('1'));
+
+        let committed = ImeView::str_field(&v.commit_text);
+        assert!(v.action & action::COMMIT != 0, "digit selects: {committed:?}");
+        assert_eq!(
+            committed, all[page_size],
+            "digit 1 on page 2 commits the FIRST item of page 2 (not {}/{:?})",
+            all[0], all[0],
+        );
     }
 
     // -- 状态标志位 ----------------------------------------------------------
