@@ -258,7 +258,14 @@ impl StateMachineTable {
         key: KeyEvent,
         env: &dyn StepEnv,
     ) -> ImeView {
-        let view = self.route_inner(sm, key, env);
+        let mut view = self.route_inner(sm, key, env);
+        // 不变式:键路径返回的视图必须带明确的 action 位。组合状态机里
+        // "消费了键但无可渲染"的路径(退格清空 buffer 后 reset、snippet
+        // 退空、magic 成员退出)返回的是空视图 —— action 为 NONE 时前端
+        // 会把键放行给应用(退格漏过去,应用里已输入的字被删掉)。
+        if view.action == action::NONE {
+            view.action = action::HANDLED;
+        }
         self.flags = sm.state_flags();
         view
     }
@@ -612,6 +619,36 @@ mod tests {
         let v = key(&mut e, KeyEvent::space());
         assert!(v.action & action::COMMIT != 0, "space commit sets COMMIT");
         assert!(v.action & action::HANDLED != 0);
+    }
+
+    #[test]
+    fn backspace_to_empty_is_consumed_not_passed_through() {
+        // 回归:删掉 preedit 最后一个字母时,组合状态机 reset 后返回空视图
+        // (action=NONE),前端会把这枚退格放行给应用 —— 应用里已输入的字
+        // 被删掉。空视图必须标 HANDLED。
+        let mut e = ImeEngine::new();
+        type_str(&mut e, "n");
+        let v = key(&mut e, KeyEvent::backspace());
+        assert!(v.action & action::HANDLED != 0, "final backspace is consumed: 0x{:x}", v.action);
+        assert_eq!(v.action & action::PASSTHROUGH, 0, "must NOT reach the application");
+        assert!(e.buffer().is_empty(), "buffer emptied");
+        assert_eq!(e.state_flags(), StateFlags::empty(), "back to idle");
+
+        // snippet 路径同理:'/' 后立刻退格。
+        let mut e2 = ImeEngine::new();
+        type_str(&mut e2, "/");
+        let v = key(&mut e2, KeyEvent::backspace());
+        assert!(v.action & action::HANDLED != 0, "snippet backspace consumed: 0x{:x}", v.action);
+        assert_eq!(e2.state_flags(), StateFlags::empty());
+    }
+
+    #[test]
+    fn idle_backspace_still_passes_through() {
+        // 无组合时的退格属于应用(删除应用里的文本)。
+        let mut e = ImeEngine::new();
+        let v = key(&mut e, KeyEvent::backspace());
+        assert_eq!(v.action & action::PASSTHROUGH, action::PASSTHROUGH);
+        assert_eq!(v.action & action::HANDLED, 0);
     }
 
     #[test]
