@@ -144,6 +144,10 @@ CARGO_MANIFEST_DIR=$(pwd) cargo run -p audio-aura-core --example stage12_live --
 - Qwen3-ASR：strip_qwen3_markers 修标记泄漏（language Chinese<asr_text>）。
 - 停顿碎片化：SegmentMerger（min_silence/merge_gap 解耦）+ edge_margin 边界扩展
   已实现并有单测（详见 real-world-speech-design.md §1/§1a）。
+- 流式引擎第二选项 **x-asr**（`asr.stream.model: x-asr`，2026-08-18 接入）：官方
+  chunk-480ms fp32 导出（Gilgamesh-J/X-ASR，~0.16B，100 万小时 zh-en 混说），
+  输出自带标点；实测可与 zipformer A/B（`--example streaming_asr -- <wav> <engine>`）。
+  注意其 tokens.txt 必须保持官方"token id"两列格式（sherpa 按索引列建映射）。
 - 音频持久化：recordings/<日期>/*.wav + turns/<日期>.jsonl + 启动索引重建 +
   保留期清理（recordings_retention_days，默认 7 天）。
 - 热词双层种子：boot 烘进流式 recognizer（beam bias）+ Stage2 共享 store；

@@ -25,7 +25,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use tracing::{debug, warn};
 
 use crate::audio_store::{AudioStore, DEFAULT_CAP_SAMPLES};
@@ -142,6 +142,38 @@ impl Stage1Config {
             merge_gap_s: 5.0,
             batch_enabled: true,
             active: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// Streaming engine selection (config `asr.stream.model`; streaming is ALWAYS local):
+    /// - "zipformer" — the default, 2023 bilingual zh-en (tens-of-thousands-hours training);
+    /// - "x-asr" — 2026, ~0.16B zipformer transducer trained on ~1M hours zh-en
+    ///   code-switch (repo: Gilgamesh-J/X-ASR; official chunk-480ms fp32 export, outputs
+    ///   PUNCTUATED text). Beats SenseVoice-small on published benchmarks despite 10×
+    ///   fewer params than Qwen3-ASR. 160/960/1920ms chunk variants exist in the repo.
+    pub fn with_stream_engine(mut self, engine: &str) -> Result<Self> {
+        match engine {
+            "zipformer" => Ok(self), // the default paths from with_models_dir
+            "x-asr" => {
+                let dir = self.models_dir.clone();
+                let p = |rel: &str| resolve_model(dir.as_deref(), rel);
+                self.streaming = StreamingAsrConfig {
+                    encoder: p("MODELS::x-asr/encoder-480ms.onnx"),
+                    decoder: p("MODELS::x-asr/decoder-480ms.onnx"),
+                    joiner: p("MODELS::x-asr/joiner-480ms.onnx"),
+                    // MUST be the official two-column "token id" format — sherpa builds its
+                    // token→id map from the index column (a single-column rewrite breaks it).
+                    tokens: p("MODELS::x-asr/tokens.txt"),
+                    // Exported from lang_5000/bpe.model via sentencepiece ("piece score"
+                    // lines) — sherpa needs it to tokenize raw-text hotwords (cjkchar+bpe).
+                    bpe_vocab: p("MODELS::x-asr/bpe.vocab"),
+                    ..Default::default()
+                };
+                Ok(self)
+            }
+            other => bail!(
+                "unsupported streaming engine {other:?} (supported: \"zipformer\" | \"x-asr\")"
+            ),
         }
     }
 
@@ -394,32 +426,32 @@ impl WindowTracker {
         Self { merge_gap_s, next_seg_id: 1, next_win_id: 1, open: None }
     }
 
-    /// VAD StartOfSpeech at wall-clock `at`: settle the open window FIRST when the gap since
-    /// its last segment ≥ `merge_gap_s` (returns the settled spans, if any), then start a new
-    /// in-progress segment — in the same window when the gap was short, else a fresh window.
-    fn on_sos(&mut self, at: f64) -> (Option<SettledSpans>, WindowId, SegmentId) {
-        let settled = self.settle_if_gap(at);
-        let window_id = match &self.open {
-            Some(w) => w.window_id, // short gap — same window continues
-            None => {
-                let id = self.next_win_id;
-                self.next_win_id += 1;
-                self.open = Some(OpenWindow { window_id: id, segments: Vec::new(), active: false });
-                id
-            }
-        };
+    /// VAD StartOfSpeech. NOTE: the SOS is RETROACTIVE — it fires at the segment's EOS instant
+    /// (its wall-clock IS the EOS time, NOT the speech onset), so the merge/split decision
+    /// CANNOT happen here (using the EOS instant as the onset would inflate every gap by the
+    /// segment's own duration and settle on EVERY segment — the "window never has >1 segment"
+    /// bug). This only allocates the segment id + marks the window active; the settle decision
+    /// moves to [`Self::on_eos`], which back-derives the true speech onset from the PCM.
+    fn on_sos(&mut self) -> SegmentId {
+        if self.open.is_none() {
+            let id = self.next_win_id;
+            self.next_win_id += 1;
+            self.open = Some(OpenWindow { window_id: id, segments: Vec::new(), active: false });
+        }
         let segment_id = self.next_seg_id;
         self.next_seg_id += 1;
         self.open.as_mut().expect("window just ensured").active = true;
-        (settled, window_id, segment_id)
+        segment_id
     }
 
-    /// Settle the open window iff the gap from `sos_at` back to its last segment ≥ merge_gap.
-    fn settle_if_gap(&mut self, sos_at: f64) -> Option<SettledSpans> {
+    /// Settle the open window iff the gap from `onset` (the NEXT segment's true speech start)
+    /// back to its last segment ≥ merge_gap. `onset` must be the back-derived start, not the
+    /// retroactive SOS instant.
+    fn settle_if_gap(&mut self, onset: f64) -> Option<SettledSpans> {
         let gap = {
             let w = self.open.as_ref()?;
             let last = w.segments.last()?;
-            sos_at - last.end_s
+            onset - last.end_s
         };
         if gap >= self.merge_gap_s {
             self.take_open()
@@ -428,14 +460,22 @@ impl WindowTracker {
         }
     }
 
-    /// Record a completed segment (already transcribed by the recognizer). Returns the Batch
-    /// payload: the window id + ALL its segments so far — the payload IS the window, so
-    /// Stage2 stays stateless (no separate left-boundary bookkeeping to desync).
-    fn on_eos(&mut self, seg: VadSegment) -> (WindowId, Vec<VadSegment>) {
-        let w = self.open.as_mut().expect("EOS without an open window");
+    /// Record a completed segment. Settles the open window FIRST when the gap since its last
+    /// segment ≥ merge_gap (using `seg.start_s`, the BACK-DERIVED true onset), then pushes this
+    /// segment into the (possibly fresh) window. Returns (settled spans, window id, ALL segments
+    /// so far) — the payload IS the window, so Stage2 stays stateless.
+    fn on_eos(&mut self, seg: VadSegment) -> (Option<SettledSpans>, WindowId, Vec<VadSegment>) {
+        let settled = self.settle_if_gap(seg.start_s);
+        if self.open.is_none() {
+            // First segment, or the previous window just settled.
+            let id = self.next_win_id;
+            self.next_win_id += 1;
+            self.open = Some(OpenWindow { window_id: id, segments: Vec::new(), active: false });
+        }
+        let w = self.open.as_mut().expect("window just ensured");
         w.active = false;
         w.segments.push(seg);
-        (w.window_id, w.segments.clone())
+        (settled, w.window_id, w.segments.clone())
     }
 
     /// Discard the in-progress segment (neither pass produced text — noise). Clears `active`
@@ -448,10 +488,14 @@ impl WindowTracker {
 
     /// Settle-timeout probe (call every loop tick with the current wall-clock). Closes the
     /// window when it has been silent (no active speech) for ≥ `merge_gap_s` — this is how the
-    /// TRAILING window finalizes. Suppressed while a segment is in progress.
-    fn check_settle(&mut self, now: f64) -> Option<SettledSpans> {
+    /// TRAILING window finalizes. Suppressed while a segment is in progress AND while `speaking`
+    /// is true — the streaming session still has a non-empty partial, i.e. someone is talking
+    /// right now but this VAD's SOS for that speech hasn't arrived yet (it's RETROACTIVE, comes
+    /// with EOS). Without this suppression the wall-clock timeout would fire mid-sentence and
+    /// split the next segment into a fresh window — the "window never has >1 segment" bug.
+    fn check_settle(&mut self, now: f64, speaking: bool) -> Option<SettledSpans> {
         let w = self.open.as_ref()?;
-        if w.active {
+        if w.active || speaking {
             return None;
         }
         let last = w.segments.last()?;
@@ -463,12 +507,12 @@ impl WindowTracker {
     }
 
     /// Seconds until [`Self::check_settle`] would close the open window (None = no pending
-    /// settle: nothing open, no segments yet, or speech in progress). Drives the consume
-    /// loop's condvar deadline — wake exactly when the trailing window is due, not on a
-    /// poll cadence.
-    fn settle_deadline(&self, now: f64) -> Option<f64> {
+    /// settle: nothing open, no segments yet, a segment in progress, or `speaking` — the next
+    /// segment's speech is ongoing but its SOS hasn't arrived yet). Drives the consume loop's
+    /// condvar deadline — wake exactly when the trailing window is due, not on a poll cadence.
+    fn settle_deadline(&self, now: f64, speaking: bool) -> Option<f64> {
         let w = self.open.as_ref()?;
-        if w.active {
+        if w.active || speaking {
             return None;
         }
         let last = w.segments.last()?;
@@ -595,7 +639,12 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
             // unavoidable — you must observe the gap to know it ended — but the per-segment
             // Batch results have been showing live text throughout, so it doesn't lag.
             let now_s = start.elapsed().as_secs_f64();
-            if let Some(settled) = tracker.check_settle(now_s) {
+            // 回溯式 VAD:下一段的 SOS 要等它 EOS 才到。此刻若流式 session 仍在产出
+            // partial(有人正在说话),绝不能按墙钟超时定稿——否则下一段(其 SOS 尚未到达)
+            // 会被错划进新窗口,导致窗口永远只有 1 个 segment。真正的 gap 判断由下一段
+            // EOS 到达时的 settle_if_gap 完成。
+            let speaking = sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
+            if let Some(settled) = tracker.check_settle(now_s, speaking) {
                 emit_window_edge(settled, &self.audio_store, &*self.batch_asr, sr, on_event);
                 // Window boundary ⇒ fresh streaming session (don't bleed encoder context
                 // across windows).
@@ -630,7 +679,7 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
             // pending → park indefinitely (wake only on incoming audio). This is what
             // replaces polling — no heartbeat, no idle wakeups.
             let mut wake_at: Option<Duration> = None;
-            if let Some(d) = tracker.settle_deadline(now_s) {
+            if let Some(d) = tracker.settle_deadline(now_s, speaking) {
                 let d = Duration::from_secs_f64(d.max(0.05));
                 wake_at = Some(wake_at.map_or(d, |w| w.min(d)));
             }
@@ -716,16 +765,9 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
             for ev in self.mgr.vad().unwrap().push_frame(&frame) {
                 match ev.kind {
                     VadEventKind::StartOfSpeech => {
-                        let now = start.elapsed().as_secs_f64();
-                        let (settled, window_id, segment_id) = tracker.on_sos(now);
-                        // A big gap settled the previous window FIRST — emit it before the
-                        // new segment lands in the next window.
-                        if let Some(s) = settled {
-                            emit_window_edge(s, &self.audio_store, &*self.batch_asr, sr, on_event);
-                            sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
-                        }
-                        cur_seg = segment_id;
-                        let _ = window_id; // authoritative windowing comes from on_eos
+                        // 回溯式 SOS:只分配段号 + 标记 active。merge/split 决策在 EOS
+                        // 臂(那里能回推真实语音起点)——见 on_eos。
+                        cur_seg = tracker.on_sos();
                     }
                     VadEventKind::EndOfSpeech => {
                         let end_s = start.elapsed().as_secs_f64();
@@ -763,7 +805,12 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                             streaming_text,
                             batch_text,
                         };
-                        let (window_id, segments) = tracker.on_eos(seg);
+                        let (settled, window_id, segments) = tracker.on_eos(seg);
+                        // A big gap settled the previous window FIRST — emit it before this
+                        // segment's Batch (its authoritative grouping).
+                        if let Some(s) = settled {
+                            emit_window_edge(s, &self.audio_store, &*self.batch_asr, sr, on_event);
+                        }
                         // 段级日志(debug):每个 VadSegment 定稿时打印——窗口/段 id、
                         // 时长、两路文本(batch 失败显式标出)、会话喂帧数(诊断)。
                         // 刚定稿的段就是 segments 的最后一个(字符串已 move,从这借)。
@@ -804,44 +851,45 @@ mod tests {
     #[test]
     fn short_gap_absorbs_into_same_window() {
         let mut t = WindowTracker::new(2.5);
-        let (settled, w1, s1) = t.on_sos(0.0);
+        let s1 = t.on_sos();
+        let (settled, w1, segs) = t.on_eos(seg(s1, 0.0, 0.5));
         assert!(settled.is_none());
-        let (w, segs) = t.on_eos(seg(s1, 0.0, 0.5));
-        assert_eq!((w, segs.len()), (w1, 1));
+        assert_eq!(segs.len(), 1);
 
-        // gap 1.0−0.5 = 0.5 < 2.5 → same window, second segment.
-        let (settled, w2, s2) = t.on_sos(1.0);
+        // gap 1.0−0.5 = 0.5 < 2.5 → same window, second segment (merge happens at EOS,
+        // where the true onset is back-derived).
+        let s2 = t.on_sos();
+        let (settled, w, segs) = t.on_eos(seg(s2, 1.0, 1.5));
         assert!(settled.is_none(), "short gap must NOT settle");
-        assert_eq!(w2, w1, "same window continues");
-        let (w, segs) = t.on_eos(seg(s2, 1.0, 1.5));
-        assert_eq!((w, segs.len()), (w1, 2), "both segments in one window");
+        assert_eq!(w, w1, "same window continues");
+        assert_eq!(segs.len(), 2, "both segments in one window");
     }
 
     #[test]
     fn big_gap_settles_previous_window_and_opens_new_one() {
         let mut t = WindowTracker::new(2.5);
-        let (_, w1, s1) = t.on_sos(0.0);
-        t.on_eos(seg(s1, 0.0, 0.5));
-        // gap 5.0−0.5 = 4.5 ≥ 2.5 → settle w1, open w2.
-        let (settled, w2, s2) = t.on_sos(5.0);
+        let s1 = t.on_sos();
+        let (_, w1, _) = t.on_eos(seg(s1, 0.0, 0.5));
+        // gap 5.0−0.5 = 4.5 ≥ 2.5 → settle w1 at the next segment's EOS, open w2.
+        let s2 = t.on_sos();
+        let (settled, w2, segs) = t.on_eos(seg(s2, 5.0, 5.5));
         let s = settled.expect("big gap settles the previous window");
         assert_eq!(s.window_id, w1);
         assert_eq!(s.segments.len(), 1);
         assert_ne!(w2, w1, "a fresh window opens");
         assert!(w2 > w1, "window ids are monotonic");
-        let (w, segs) = t.on_eos(seg(s2, 5.0, 5.5));
-        assert_eq!((w, segs.len()), (w2, 1));
+        assert_eq!(segs.len(), 1);
     }
 
     #[test]
     fn settle_timeout_closes_trailing_window() {
         let mut t = WindowTracker::new(2.5);
-        let (_, w1, s1) = t.on_sos(0.0);
-        t.on_eos(seg(s1, 0.0, 0.5));
-        assert!(t.check_settle(2.0).is_none(), "2.0 − 0.5 = 1.5 < 2.5, not yet");
-        let s = t.check_settle(3.0).expect("3.0 − 0.5 = 2.5 ≥ merge_gap → settle");
+        let s1 = t.on_sos();
+        let (_, w1, _) = t.on_eos(seg(s1, 0.0, 0.5));
+        assert!(t.check_settle(2.0, false).is_none(), "2.0 − 0.5 = 1.5 < 2.5, not yet");
+        let s = t.check_settle(3.0, false).expect("3.0 − 0.5 = 2.5 ≥ merge_gap → settle");
         assert_eq!(s.window_id, w1);
-        assert!(t.check_settle(10.0).is_none(), "nothing open anymore");
+        assert!(t.check_settle(10.0, false).is_none(), "nothing open anymore");
     }
 
     #[test]
@@ -850,13 +898,13 @@ mod tests {
         // parks on the ring condvar instead of polling — this is its only wake source for
         // the trailing window).
         let mut t = WindowTracker::new(2.5);
-        assert!(t.settle_deadline(0.0).is_none(), "nothing open yet");
-        let (_, _, s1) = t.on_sos(0.0);
+        assert!(t.settle_deadline(0.0, false).is_none(), "nothing open yet");
+        let s1 = t.on_sos();
         t.on_eos(seg(s1, 0.0, 0.5));
-        assert!((t.settle_deadline(1.0).unwrap() - 2.0).abs() < 1e-9, "2.5 − (1.0 − 0.5)");
-        assert!((t.settle_deadline(3.0).unwrap() - 0.0).abs() < 1e-9, "due now, clamped at 0");
-        let (_, _, _s2) = t.on_sos(1.0); // gap 0.5 < 2.5 → same window, speaking
-        assert!(t.settle_deadline(1.2).is_none(), "speaking ⇒ suppressed, no deadline");
+        assert!((t.settle_deadline(1.0, false).unwrap() - 2.0).abs() < 1e-9, "2.5 − (1.0 − 0.5)");
+        assert!((t.settle_deadline(3.0, false).unwrap() - 0.0).abs() < 1e-9, "due now, clamped at 0");
+        let _s2 = t.on_sos(); // segment in progress (active=true)
+        assert!(t.settle_deadline(1.2, false).is_none(), "active segment ⇒ suppressed, no deadline");
     }
 
     #[test]
@@ -864,25 +912,41 @@ mod tests {
         // Regression guard: a long following segment must not be mistaken for "no
         // continuation" and force-split the window mid-speech.
         let mut t = WindowTracker::new(2.5);
-        let (_, _, s1) = t.on_sos(0.0);
+        let s1 = t.on_sos();
         t.on_eos(seg(s1, 0.0, 0.5));
-        let (_, _, _s2) = t.on_sos(1.0); // gap 0.5 < 2.5 → same window, speaking again
-        assert!(t.check_settle(100.0).is_none(), "active segment ⇒ settle suppressed");
+        let _s2 = t.on_sos(); // segment in progress (active=true)
+        assert!(t.check_settle(100.0, false).is_none(), "active segment ⇒ settle suppressed");
+    }
+
+    #[test]
+    fn speaking_suppresses_settle_waiting_for_retroactive_sos() {
+        // 回溯式 VAD 的回归防护:下一段的 SOS 要等它的 EOS 才到——在它到达前,流式
+        // session 的 partial 非空(=speaking=true)必须抑制 settle 超时。否则墙钟超时
+        // 会在下一段说话时定稿,把它错划进新窗口(症状:窗口永远只有 1 个 segment)。
+        let mut t = WindowTracker::new(2.5);
+        let s1 = t.on_sos();
+        t.on_eos(seg(s1, 0.0, 0.5));
+        // 下一段正在说话(SOS 尚未到),墙钟已远超 merge_gap —— speaking=true 抑制。
+        assert!(t.check_settle(100.0, true).is_none(), "speaking ⇒ settle suppressed");
+        assert!(t.settle_deadline(100.0, true).is_none(), "speaking ⇒ no settle deadline");
+        // 说话停止(speaking=false)后,同一时刻立刻能定稿。
+        assert!(t.check_settle(100.0, false).is_some(), "not speaking ⇒ settle fires");
     }
 
     #[test]
     fn merge_gap_zero_makes_every_segment_its_own_window() {
         let mut t = WindowTracker::new(0.0);
-        let (_, w1, s1) = t.on_sos(0.0);
-        t.on_eos(seg(s1, 0.0, 0.5));
-        // Any gap ≥ 0 settles: at the next SOS…
-        let (settled, w2, _) = t.on_sos(0.6);
+        let s1 = t.on_sos();
+        let (_, w1, _) = t.on_eos(seg(s1, 0.0, 0.5));
+        // Any gap ≥ 0 settles at the next segment's EOS (gap 0.6 − 0.5 = 0.1 ≥ 0).
+        let s2 = t.on_sos();
+        let (settled, w2, _) = t.on_eos(seg(s2, 0.6, 0.7));
         assert_eq!(settled.expect("gap 0.1 ≥ 0 settles").window_id, w1);
         assert_ne!(w2, w1);
         // …and the settle timeout fires immediately after an EOS too.
-        let (_, _, s3) = t.on_sos(10.0);
+        let s3 = t.on_sos();
         t.on_eos(seg(s3, 10.0, 10.5));
-        assert!(t.check_settle(10.5).is_some(), "now − end = 0 ≥ 0 → settle");
+        assert!(t.check_settle(10.5, false).is_some(), "now − end = 0 ≥ 0 → settle");
     }
 
     /// Counting batch-ASR stub — proves the single-segment window skips the re-run.
@@ -952,11 +1016,13 @@ mod tests {
     #[test]
     fn drop_active_discards_without_recording() {
         let mut t = WindowTracker::new(2.5);
-        let (_, w1, _) = t.on_sos(0.0);
-        t.drop_active();
-        // Window stays open (same id), nothing recorded; settle timeout has nothing to close.
-        let (_, w2, _) = t.on_sos(1.0);
-        assert_eq!(w1, w2);
-        assert!(t.check_settle(100.0).is_none(), "no segments → nothing to settle");
+        let s1 = t.on_sos(); // opens empty window 0, allocates seg 0, active=true
+        t.drop_active(); // noise → active=false, window 0 stays open but empty
+        // Empty window → settle timeout has nothing to close.
+        assert!(t.check_settle(100.0, false).is_none(), "no segments → nothing to settle");
+        // The next segment reuses the still-open window.
+        let s2 = t.on_sos();
+        let (_, w, _) = t.on_eos(seg(s2, 1.0, 1.1));
+        assert_eq!(w, 1, "window reused (not re-opened) after drop_active");
     }
 }

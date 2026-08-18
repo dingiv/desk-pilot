@@ -25,7 +25,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use tracing::{debug, info};
 
 use crate::calibrator::{PassThroughCalibrator, Stage2Calibrator, Stage2CalibratorImpl};
@@ -218,7 +218,7 @@ impl Pipeline {
                                 let calibrated = s2.calibrate_window(window_id, &segments);
                                 let route_ms = t.elapsed().as_secs_f64() * 1000.0;
                                 // 联合整流当前窗口(每 VAD gap 一次)——高频,debug。
-                                debug!(
+                                info!(
                                     window_id,
                                     route_ms = route_ms.round() as u64,
                                     calibrated = %calibrated,
@@ -324,13 +324,6 @@ impl Pipeline {
 /// ASR 后端选择分支与全部模型选择日志都在这里;流式引擎/未知选型在这里报错。
 /// 单测直接盖这个函数。
 fn stage1_config(spec: &PipelineSpec, active: Arc<AtomicBool>) -> Result<Stage1Config> {
-    // 流式引擎(恒本地):zipformer 是当前唯一实现。
-    if spec.stream.model != "zipformer" {
-        bail!(
-            "unsupported asr.stream.model {:?} (supported: \"zipformer\")",
-            spec.stream.model
-        );
-    }
     // 自定义模型根目录:local 路径下 VAD/流式/批式全部改在其下解析。
     // (remote/disabled 批式时流式/VAD 仍走 MODELS 命名空间 —— model_dir 是 local 旋钮。)
     let model_dir = match &spec.asr {
@@ -354,7 +347,11 @@ fn stage1_config(spec: &PipelineSpec, active: Arc<AtomicBool>) -> Result<Stage1C
         edge_margin_s = ((v.edge_margin as f64) * 1000.0).round() / 1000.0, // f32 can't hold 0.3 — round in f64 for a clean display
         "VAD: min_silence 切段 + merge_gap 合并碎片 + edge_margin 补边界 (解耦)"
     );
-    // Bake the seed hotwords into the streaming recognizer (beam-search biasing).
+    // 流式引擎(恒本地):zipformer(默认) | x-asr。路径在 recognizer 侧解析,
+    // 未知引擎在那里报错(不静默回退)。
+    cfg = cfg.with_stream_engine(&spec.stream.model)?;
+    // Bake the seed hotwords into the streaming recognizer (beam-search biasing). MUST run
+    // after the engine selection — with_stream_engine replaces the whole streaming config.
     cfg.streaming.hotwords = spec.hotwords.clone();
     // Select batch ASR backend (default: SenseVoice).
     //   "whisper"   → large-v3-turbo
@@ -513,6 +510,21 @@ mod tests {
             pcm: std::sync::Arc::new(vec![0i16; 1600]),
         };
         assert_eq!(s2.finalize_window(&win), "窗口批式", "window batch 优先");
+    }
+
+    #[test]
+    fn stage1_config_selects_stream_engine() {
+        // x-asr → 指向 x-asr 模型目录;热词在引擎选择之后烘烤(整体替换不丢)。
+        let mut s = spec(local("sensevoice"));
+        s.stream.model = "x-asr".into();
+        let cfg = stage1_config(&s, Arc::new(AtomicBool::new(true))).unwrap();
+        assert!(cfg.streaming.encoder.ends_with("x-asr/encoder-480ms.onnx"));
+        assert!(cfg.streaming.bpe_vocab.ends_with("x-asr/bpe.vocab"));
+        assert_eq!(
+            cfg.streaming.hotwords,
+            vec!["Rust".to_string()],
+            "hotwords baked after the engine swap"
+        );
     }
 
     #[test]

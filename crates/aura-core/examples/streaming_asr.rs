@@ -1,7 +1,9 @@
-//! Test streaming ASR: feed zh.wav chunk-by-chunk, print partial results at intervals to see
+//! Test streaming ASR: feed a wav chunk-by-chunk, print partial results at intervals to see
 //! the "phone input method" correction effect (earlier text changes as more audio arrives).
+//! Doubles as the streaming-engine A/B tool (zipformer vs x-asr).
 //!
-//! Run: cargo run -p audio-aura-core --features asr --example streaming_asr -- [wav_path]
+//! Run: cargo run -p audio-aura-core --features asr --example streaming_asr -- [wav_path] [engine]
+//!   engine: "zipformer" (default) | "x-asr"
 
 use std::path::Path;
 use std::time::Instant;
@@ -10,17 +12,30 @@ use dp_models::onnx::{OnlineAsr, StreamingAsrConfig};
 use audio_aura_core::wav;
 
 fn main() -> anyhow::Result<()> {
+    let engine = std::env::args().nth(2).unwrap_or_else(|| "zipformer".to_string());
+    let (base, files) = match engine.as_str() {
+        "zipformer" => (
+            "MODELS::zipformer-streaming-zh-en",
+            ("encoder-epoch-99-avg-1.onnx", "decoder-epoch-99-avg-1.onnx", "joiner-epoch-99-avg-1.onnx"),
+        ),
+        "x-asr" => (
+            "MODELS::x-asr",
+            ("encoder-480ms.onnx", "decoder-480ms.onnx", "joiner-480ms.onnx"),
+        ),
+        other => anyhow::bail!("unknown engine {other:?} (zipformer | x-asr)"),
+    };
     let fs = shared::loader!();
     let p = |rel: &str| fs.resolve(rel).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-    let base = p("MODELS::zipformer-streaming-zh-en");
-    let wav_path = std::env::args().nth(1).unwrap_or_else(|| p("MODELS::sensevoice/test_wavs/zh.wav"));
+    let base = p(base);
+    let wav_path =
+        std::env::args().nth(1).unwrap_or_else(|| p("MODELS::sensevoice/test_wavs/zh.wav"));
 
-    eprintln!("[load] streaming Zipformer …");
+    eprintln!("[load] streaming {engine} …");
     let t = Instant::now();
     let asr = OnlineAsr::new(StreamingAsrConfig {
-        encoder: format!("{base}/encoder-epoch-99-avg-1.onnx"),
-        decoder: format!("{base}/decoder-epoch-99-avg-1.onnx"),
-        joiner: format!("{base}/joiner-epoch-99-avg-1.onnx"),
+        encoder: format!("{base}/{}", files.0),
+        decoder: format!("{base}/{}", files.1),
+        joiner: format!("{base}/{}", files.2),
         tokens: format!("{base}/tokens.txt"),
         bpe_vocab: format!("{base}/bpe.vocab"),
         ..Default::default()
