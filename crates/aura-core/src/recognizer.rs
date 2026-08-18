@@ -21,7 +21,7 @@
 //! ```
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -218,6 +218,8 @@ pub struct OnnxStage1Recognizer {
     /// stay in `mgr` (always local sherpa).
     batch_asr: Arc<dyn AsrProvider>,
     ring: Arc<Mutex<AudioRing>>,
+    /// Wakes the consume loop when the ingest thread pushes frames (no polling).
+    ring_cv: Arc<Condvar>,
     /// Merge-window gap (s) — see [`Stage1Config::merge_gap_s`].
     merge_gap_s: f64,
     active: Arc<AtomicBool>,
@@ -255,10 +257,12 @@ impl OnnxStage1Recognizer {
         };
         mgr.warm();
         let ring = Arc::new(Mutex::new(AudioRing::new(cfg.ring_cap_samples)));
-        spawn_ingest(Arc::clone(&ring), &cfg.scout_addr, Arc::clone(&cfg.active))?;
+        let ring_cv = Arc::new(Condvar::new());
+        spawn_ingest(Arc::clone(&ring), Arc::clone(&ring_cv), &cfg.scout_addr, Arc::clone(&cfg.active))?;
         Ok(Self {
             mgr,
             ring,
+            ring_cv,
             merge_gap_s: cfg.merge_gap_s,
             active: cfg.active,
             audio_store: Arc::new(AudioStore::new(DEFAULT_CAP_SAMPLES)),
@@ -277,10 +281,12 @@ impl OnnxStage1Recognizer {
             (ProviderKind::Remote { endpoint }, _) => Arc::new(HttpAsr::new(endpoint.clone())),
         };
         let ring = Arc::new(Mutex::new(AudioRing::new(cfg.ring_cap_samples)));
-        spawn_ingest(Arc::clone(&ring), &cfg.scout_addr, Arc::clone(&cfg.active))?;
+        let ring_cv = Arc::new(Condvar::new());
+        spawn_ingest(Arc::clone(&ring), Arc::clone(&ring_cv), &cfg.scout_addr, Arc::clone(&cfg.active))?;
         Ok(Self {
             mgr,
             ring,
+            ring_cv,
             merge_gap_s: cfg.merge_gap_s,
             active: cfg.active,
             audio_store: Arc::new(AudioStore::new(DEFAULT_CAP_SAMPLES)),
@@ -304,6 +310,7 @@ impl OnnxStage1Recognizer {
 /// `active` controls whether it connects (see [`ScoutAudioSource::with_active`]).
 fn spawn_ingest(
     ring: Arc<Mutex<AudioRing>>,
+    ring_cv: Arc<Condvar>,
     scout_addr: &str,
     active: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -312,11 +319,47 @@ fn spawn_ingest(
         .name("aura-stage1-ingest".into())
         .spawn(move || {
             src.stream(
-                move |win| ring.lock().unwrap().push(win),
+                move |win| {
+                    let mut g = ring.lock().unwrap();
+                    g.push(win);
+                    drop(g);
+                    // Wake the consume loop — it sleeps on the condvar between frames
+                    // (deadline-driven, no polling).
+                    ring_cv.notify_all();
+                },
                 Duration::from_secs(2),
             );
         })?;
     Ok(())
+}
+
+/// Block until a full Silero window is available in the ring (wakes on the ingest thread's
+/// condvar notify). `timeout: Some` additionally caps the wait — `None` return means the
+/// deadline fired (the caller re-runs its time-based checks); `timeout: None` parks until
+/// audio arrives (no timer at all — nothing time-based is pending).
+fn wait_frame(
+    ring: &Mutex<AudioRing>,
+    ring_cv: &Condvar,
+    frame_samples: usize,
+    timeout: Option<Duration>,
+) -> Option<Vec<i16>> {
+    let mut g = ring.lock().unwrap();
+    if g.has_frame(frame_samples) {
+        return Some(g.drain(frame_samples));
+    }
+    let mut g = match timeout {
+        Some(t) => {
+            let (g, _timed_out) =
+                ring_cv.wait_timeout_while(g, t, |r| !r.has_frame(frame_samples)).unwrap();
+            g
+        }
+        None => ring_cv.wait_while(g, |r| !r.has_frame(frame_samples)).unwrap(),
+    };
+    if g.has_frame(frame_samples) {
+        Some(g.drain(frame_samples))
+    } else {
+        None
+    }
 }
 
 // ── Window tracker: pure windowing decisions over wall-clock SOS/EOS (unit-testable, no I/O) ──
@@ -419,6 +462,19 @@ impl WindowTracker {
         }
     }
 
+    /// Seconds until [`Self::check_settle`] would close the open window (None = no pending
+    /// settle: nothing open, no segments yet, or speech in progress). Drives the consume
+    /// loop's condvar deadline — wake exactly when the trailing window is due, not on a
+    /// poll cadence.
+    fn settle_deadline(&self, now: f64) -> Option<f64> {
+        let w = self.open.as_ref()?;
+        if w.active {
+            return None;
+        }
+        let last = w.segments.last()?;
+        Some((self.merge_gap_s - (now - last.end_s)).max(0.0))
+    }
+
     fn take_open(&mut self) -> Option<SettledSpans> {
         self.open.take().map(|w| SettledSpans { window_id: w.window_id, segments: w.segments })
     }
@@ -507,7 +563,9 @@ impl ActiveSession {
 }
 
 impl Stage1Recognizer for OnnxStage1Recognizer {
-    // TODO: 该函数静默阻塞线程，使用睡眠轮询的方式；需要整改成异步非阻塞模式；
+    // TODO(R5 残余): 轮询已除(2026-08-18 —— ring 挂 Condvar,无帧时挂起等 ingest notify,
+    // 仅真实截止时间唤醒,空闲零唤醒);仍待整改:batch 调用还在消费线程内同步执行
+    // (远程 ~3.5s/次会暂停流式),以及 run 仍占用整线程的阻塞模型。
     fn run(&self, on_event: &mut dyn FnMut(Stage1Event)) -> ! {
         let sr = 16000u32;
         let start = Instant::now();
@@ -525,9 +583,11 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
 
         loop {
             // Connection toggle: when the scout connection is paused, skip VAD/ASR (the ingest
-            // thread also stops feeding the ring, so it drains to empty shortly).
+            // thread also stops feeding the ring, so it drains to empty shortly). Park on the
+            // condvar — the next pushed frame (or the resumed connection's first chunk) wakes
+            // us to re-check the toggle. No timer.
             if !self.active.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(50));
+                let _ = wait_frame(&self.ring, &self.ring_cv, WINDOW, None);
                 continue;
             }
             // Settle the trailing window: no follow-up segment came for merge_gap — it's done.
@@ -554,6 +614,41 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                     sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
                 }
             }
+            // Rate-limited liveness marker (3s), emitted only when the loop actually runs —
+            // i.e. on frames or deadline wakes. Fully idle ⇒ fully silent logs: a parked
+            // thread with nothing pending produces no output by design.
+            if last_diag.elapsed() >= Duration::from_secs(3) {
+                let rlen = self.ring.lock().unwrap().len();
+                // NOTE: `is_speaking()` is useless with this retroactive VAD (only true for
+                // the instant a segment pops) — the meaningful live signal is the partial.
+                let has_partial = sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
+                debug!(frames = frames_in, ring = rlen, has_partial, "stage1 diag");
+                last_diag = Instant::now();
+            }
+
+            // Next wake deadline: the earliest REAL timer, or None = nothing time-based is
+            // pending → park indefinitely (wake only on incoming audio). This is what
+            // replaces polling — no heartbeat, no idle wakeups.
+            let mut wake_at: Option<Duration> = None;
+            if let Some(d) = tracker.settle_deadline(now_s) {
+                let d = Duration::from_secs_f64(d.max(0.05));
+                wake_at = Some(wake_at.map_or(d, |w| w.min(d)));
+            }
+            if let Some(a) = sess.as_ref() {
+                if !a.last_partial.is_empty() {
+                    let d = STALE_SESSION_RESET.saturating_sub(a.last_change.elapsed());
+                    wake_at = Some(wake_at.map_or(d, |w| w.min(d)));
+                }
+            }
+            if let Some(since) = ring_empty_since {
+                let has_partial = sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
+                if has_partial {
+                    // Silence-feed deadline: force VAD EOS if the source dropped mid-utterance.
+                    let d = Duration::from_secs(2).saturating_sub(since.elapsed());
+                    wake_at = Some(wake_at.map_or(d, |w| w.min(d)));
+                }
+            }
+
             // drain one Silero window (512 samples = 32ms) when available
             let frame = {
                 let mut g = self.ring.lock().unwrap();
@@ -566,31 +661,26 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                     // feed silence to VAD so it fires EOS naturally — prevents the scenario
                     // where audio source drops mid-utterance and VAD never evaluates silence.
                     ring_empty_since.get_or_insert_with(Instant::now);
-                    if let Some(since) = ring_empty_since {
-                        let has_partial =
-                            sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
-                        if since.elapsed() > Duration::from_secs(2) && has_partial {
-                            debug!("ring empty > 2s during speech — feeding silence to force VAD EOS");
-                            vec![0i16; WINDOW] // synthetic silence frame → VAD will fire EOS
-                        } else {
-                            std::thread::sleep(Duration::from_millis(10));
-                            continue;
-                        }
+                    let since = ring_empty_since.unwrap();
+                    let has_partial =
+                        sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
+                    if since.elapsed() > Duration::from_secs(2) && has_partial {
+                        debug!("ring empty > 2s during speech — feeding silence to force VAD EOS");
+                        vec![0i16; WINDOW] // synthetic silence frame → VAD will fire EOS
                     } else {
-                        std::thread::sleep(Duration::from_millis(10));
-                        continue;
+                        // Park until the ingest thread pushes (condvar notify) or the next
+                        // deadline above fires — 无睡眠轮询,空闲时零唤醒.
+                        match wait_frame(&self.ring, &self.ring_cv, WINDOW, wake_at) {
+                            Some(f) => {
+                                ring_empty_since = None;
+                                f
+                            }
+                            None => continue, // deadline fired — re-run settle/watchdog checks
+                        }
                     }
                 }
             };
             frames_in += 1;
-            if last_diag.elapsed() >= Duration::from_secs(3) {
-                let rlen = self.ring.lock().unwrap().len();
-                // NOTE: `is_speaking()` is useless with this retroactive VAD (only true for
-                // the instant a segment pops) — the meaningful live signal is the partial.
-                let has_partial = sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
-                debug!(frames = frames_in, ring = rlen, has_partial, "stage1 diag");
-                last_diag = Instant::now();
-            }
 
             // (1) live streaming partial — the session is fed CONTINUOUSLY (D1 adaptation:
             //     this VAD's SOS is retroactive, so gating on speech-start is impossible);
@@ -752,6 +842,21 @@ mod tests {
         let s = t.check_settle(3.0).expect("3.0 − 0.5 = 2.5 ≥ merge_gap → settle");
         assert_eq!(s.window_id, w1);
         assert!(t.check_settle(10.0).is_none(), "nothing open anymore");
+    }
+
+    #[test]
+    fn settle_deadline_counts_down_to_merge_gap() {
+        // The condvar wake deadline: exactly when check_settle would fire (consumes loop
+        // parks on the ring condvar instead of polling — this is its only wake source for
+        // the trailing window).
+        let mut t = WindowTracker::new(2.5);
+        assert!(t.settle_deadline(0.0).is_none(), "nothing open yet");
+        let (_, _, s1) = t.on_sos(0.0);
+        t.on_eos(seg(s1, 0.0, 0.5));
+        assert!((t.settle_deadline(1.0).unwrap() - 2.0).abs() < 1e-9, "2.5 − (1.0 − 0.5)");
+        assert!((t.settle_deadline(3.0).unwrap() - 0.0).abs() < 1e-9, "due now, clamped at 0");
+        let (_, _, _s2) = t.on_sos(1.0); // gap 0.5 < 2.5 → same window, speaking
+        assert!(t.settle_deadline(1.2).is_none(), "speaking ⇒ suppressed, no deadline");
     }
 
     #[test]
