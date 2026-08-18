@@ -50,10 +50,12 @@ asr:
 
 # ── Stage2 LLM (llm) ──────────────────────────────────────────────────────────
 llm:
-  backend: local                # local (mistral.rs) | remote (vLLM/sglang, OpenAI 兼容)
+  backend: local                # local (mistral.rs) | remote (vLLM/sglang) | disable
   model: "qwen2.5-3b-instruct-q4_k_m.gguf"  # local: GGUF 文件名; remote: 服务端模型名
   # model_dir: "/path/to/models"            # local 时模型根目录覆盖 (默认 MODELS 命名空间)
   # endpoint: "http://127.0.0.1:3000"       # backend=remote 时服务地址
+  # backend=disable: 完全关闭第二阶段 —— 不加载 LLM, 校准=恒等 (calibrated 直接承载
+  # 原文, 零 LLM 延迟/开销; 纯 ASR 部署或对照 Stage2 贡献用)。
 
 # ── 种子热词 (流式 recognizer beam bias + Stage2 整流参考) ────────────────────
 hotwords: ["Rust", "Bevy", "贪吃蛇"]

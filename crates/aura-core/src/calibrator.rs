@@ -33,6 +33,23 @@ pub trait Stage2Calibrator: Send {
     fn finalize_window(&mut self, window: &VadWindow) -> String;
 }
 
+/// Stage2 turned off (`llm.backend: disable`): calibration is the identity — no LLM is
+/// loaded, `calibrate_window` concatenates the segments' best texts, `finalize_window`
+/// returns the window's best text. The `calibrated` field downstream (wire, archival)
+/// carries the raw best text unchanged, so consumers see the same shapes with zero LLM
+/// latency/cost. Useful for pure-ASR deployments and for A/B-ing Stage2's contribution.
+pub struct PassThroughCalibrator;
+
+impl Stage2Calibrator for PassThroughCalibrator {
+    fn calibrate_window(&mut self, _window_id: WindowId, segments: &[VadSegment]) -> String {
+        segments.iter().map(|s| s.best_text()).collect::<Vec<_>>().join("")
+    }
+
+    fn finalize_window(&mut self, window: &VadWindow) -> String {
+        window.best_text().into_owned()
+    }
+}
+
 /// Default Stage2 calibrator over an [`dp_models::LlmProvider`]. Reads the latest hotwords
 /// (shared with Stage3) and user corrections on every call.
 pub struct Stage2CalibratorImpl {

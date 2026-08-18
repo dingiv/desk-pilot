@@ -28,7 +28,7 @@ use std::time::Instant;
 use anyhow::{bail, Result};
 use tracing::{debug, info};
 
-use crate::calibrator::{Stage2Calibrator, Stage2CalibratorImpl};
+use crate::calibrator::{PassThroughCalibrator, Stage2Calibrator, Stage2CalibratorImpl};
 use crate::hub::{FinalTurn, Storage};
 use crate::recognizer::{OnnxStage1Recognizer, Stage1Config, Stage1Recognizer};
 use crate::{Calibrator, Stage1Event};
@@ -132,14 +132,18 @@ pub enum LlmSpec {
     Local { model: String, model_dir: Option<String> },
     /// 远程 HTTP(OpenAI 兼容 `/v1/chat/completions`,vLLM/SGLang)。`model` = 服务端模型名。
     Remote { endpoint: String, model: String },
+    /// Stage2 整体禁用:不加载任何 LLM,校准 = 恒等(`calibrated` 直接承载原文)。
+    /// 纯 ASR 部署 / 对照 Stage2 贡献用。
+    Disabled,
 }
 
 impl LlmSpec {
-    /// "local" | "remote" — 配置快照(ConfigView)的显示标签。
+    /// "local" | "remote" | "disabled" — 配置快照(ConfigView)的显示标签。
     pub fn kind(&self) -> &'static str {
         match self {
             LlmSpec::Local { .. } => "local",
             LlmSpec::Remote { .. } => "remote",
+            LlmSpec::Disabled => "disabled",
         }
     }
 }
@@ -399,6 +403,10 @@ fn stage2_calibrator(
     corrections: Arc<Mutex<Vec<(String, String)>>>,
 ) -> Result<Box<dyn Stage2Calibrator>> {
     let llm: Arc<dyn dp_models::LlmProvider> = match &spec.llm {
+        LlmSpec::Disabled => {
+            info!("Stage2 LLM: disabled — pass-through (calibrated = 原文, 零 LLM)");
+            return Ok(Box::new(PassThroughCalibrator));
+        }
         LlmSpec::Remote { endpoint, model } => {
             info!("Stage2 LLM: remote HTTP {endpoint} (model {model})");
             Arc::new(HttpLlm::new(endpoint.clone(), model.clone()))
@@ -419,6 +427,7 @@ fn stage2_calibrator(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{VadSegment, VadWindow};
     use dp_models::onnx::AsrBackend;
     use dp_models::ProviderKind;
     use std::sync::atomic::Ordering;
@@ -466,6 +475,44 @@ mod tests {
         assert!(matches!(cfg.asr.backend, AsrBackend::SenseVoice { .. }));
         assert_eq!(cfg.asr.provider, "cpu");
         assert_eq!(cfg.asr.num_threads, 8);
+    }
+
+    #[test]
+    fn stage2_disabled_is_pass_through_without_any_llm() {
+        // llm.backend: disable → PassThrough:校准 = 原文拼接,定稿 = 窗口 best_text,
+        // 不加载任何模型(route_ms ≈ 0,calibrated 字段承载原文,下游形状不变)。
+        let mut s = spec(local("sensevoice"));
+        s.llm = LlmSpec::Disabled;
+        let mut s2 = stage2_calibrator(&s, Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new()))).unwrap();
+        let segs = vec![
+            VadSegment {
+                id: 1,
+                audio_id: 1,
+                start_s: 0.0,
+                end_s: 1.0,
+                streaming_text: "流式一".into(),
+                batch_text: Some("批式一".into()),
+            },
+            VadSegment {
+                id: 2,
+                audio_id: 2,
+                start_s: 1.5,
+                end_s: 2.5,
+                streaming_text: "流式二".into(),
+                batch_text: None, // batch 失败 → 回退 streaming
+            },
+        ];
+        assert_eq!(s2.calibrate_window(1, &segs), "批式一流式二");
+        let win = VadWindow {
+            id: 1,
+            segments: segs,
+            start_s: 0.0,
+            end_s: 2.5,
+            streaming_text: "流式一流式二".into(),
+            batch_text: Some("窗口批式".into()),
+            pcm: std::sync::Arc::new(vec![0i16; 1600]),
+        };
+        assert_eq!(s2.finalize_window(&win), "窗口批式", "window batch 优先");
     }
 
     #[test]

@@ -314,12 +314,12 @@ fn resolve(cli: Cli, conf: AuraConf) -> Settings {
             model_dir: asr.local.model_dir.clone(),
         },
     };
-    // Stage2 LLM: local mistral.rs GGUF (可选 model_dir), or remote OpenAI-compatible。
+    // Stage2 LLM: local mistral.rs GGUF (可选 model_dir), remote OpenAI-compatible, 或禁用。
     let model = llm.model.clone().unwrap_or_else(|| "Qwen3-1.7B-Q8_0.gguf".to_string());
-    let llm_spec = if llm.backend.as_deref() == Some("remote") {
-        LlmSpec::Remote { endpoint: llm.endpoint.clone().unwrap_or_default(), model }
-    } else {
-        LlmSpec::Local { model, model_dir: llm.model_dir.clone() }
+    let llm_spec = match llm.backend.as_deref() {
+        Some("remote") => LlmSpec::Remote { endpoint: llm.endpoint.clone().unwrap_or_default(), model },
+        Some("disable") => LlmSpec::Disabled,
+        _ => LlmSpec::Local { model, model_dir: llm.model_dir.clone() },
     };
     Settings {
         bind_addr: bind_addr.unwrap_or_else(|| "127.0.0.1".to_string()),
@@ -441,6 +441,7 @@ fn main() -> Result<()> {
         llm_kind: spec.llm.kind().to_string(),
         model: match &spec.llm {
             LlmSpec::Local { model, .. } | LlmSpec::Remote { model, .. } => model.clone(),
+            LlmSpec::Disabled => String::new(),
         },
         vad: VadView {
             threshold: spec.vad.threshold,
@@ -836,5 +837,20 @@ mod tests {
         assert!(matches!(s.spec.asr, AsrSpec::Disabled));
         assert_eq!(s.spec.asr.kind(), "disabled");
         assert_eq!(s.spec.stream.model, "zipformer", "stream 默认引擎");
+    }
+
+    #[test]
+    fn resolve_selects_disabled_llm() {
+        // llm.backend: disable → Stage2 整体关闭(不加载 LLM,校准恒等)。
+        let conf = AuraConf {
+            llm: LlmConf {
+                backend: Some("disable".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let s = resolve(Cli::default(), conf);
+        assert!(matches!(s.spec.llm, LlmSpec::Disabled));
+        assert_eq!(s.spec.llm.kind(), "disabled");
     }
 }

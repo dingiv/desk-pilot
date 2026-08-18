@@ -105,7 +105,7 @@ asr:                            # Stage1 语音前端
   vad:    { min_silence: 1.0, merge_gap: 2.5 }   # 切段/窗口两级边界（+threshold 等）
 
 llm:                            # Stage2
-  backend: local                # local (mistral.rs) | remote (vLLM/sglang)
+  backend: local                # local (mistral.rs) | remote (vLLM/sglang) | disable
   model: "qwen2.5-3b-instruct-q4_k_m.gguf"       # local: GGUF 文件名; remote: 服务端模型名
 
 hotwords: ["Rust", "Bevy", "贪吃蛇"]
