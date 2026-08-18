@@ -17,7 +17,7 @@ mod voice;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-pub use member::{preview_text, CANDIDATE_PREVIEW_MAX, MagicMember, MemberAction};
+pub use member::{is_arg_char, preview_text, CANDIDATE_PREVIEW_MAX, CommandArgs, MagicMember, MemberAction};
 pub use req::{ReqFetcher, DEFAULT_REQ_BASE};
 pub use voice::{SubmitMember, VoiceMember};
 

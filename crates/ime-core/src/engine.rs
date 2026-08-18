@@ -723,6 +723,61 @@ mod tests {
     }
 
     #[test]
+    fn asr_path_en_enters_translate_mode_stub() {
+        // #asr/en → /en 传入家族内部,进入英文翻译模式(翻译实现留空,路径已就绪)。
+        use std::sync::Arc;
+        use crate::asr_buffer::AsrBuffer;
+        let mut e = eng();
+        let buf = Arc::new(AsrBuffer::new());
+        buf.set_connected(true);
+        e.set_asr_buffer(Arc::clone(&buf));
+
+        for c in "#asr/en".chars() { e.predict(KeyEvent::char(c)); }
+        let view = e.view();
+        let preedit = ImeView::str_field(&view.preedit_text);
+        assert!(preedit.contains("#asr/en"), "arg echoed in preedit: {preedit}");
+        assert!(preedit.contains("英文翻译"), "translate marker: {preedit}");
+    }
+
+    #[test]
+    fn asr_unknown_path_handled_by_family() {
+        // #asr/unknown → 家族内部自行处理(打未知参数标记,不崩溃)。
+        use std::sync::Arc;
+        use crate::asr_buffer::AsrBuffer;
+        let mut e = eng();
+        let buf = Arc::new(AsrBuffer::new());
+        buf.set_connected(true);
+        e.set_asr_buffer(Arc::clone(&buf));
+
+        for c in "#asr/unknown".chars() { e.predict(KeyEvent::char(c)); }
+        let view = e.view();
+        let preedit = ImeView::str_field(&view.preedit_text);
+        assert!(preedit.contains("#asr/unknown"), "arg echoed: {preedit}");
+        assert!(preedit.contains("未知参数"), "unknown marker: {preedit}");
+    }
+
+    #[test]
+    fn asr_query_num_commits_latest_n_finals() {
+        // #asr?num=2 → 提交语音队列最新两条定稿。
+        use std::sync::Arc;
+        use crate::asr_buffer::AsrBuffer;
+        let mut e = eng();
+        let buf = Arc::new(AsrBuffer::new());
+        buf.set_connected(true);
+        buf.push_final("第一句");
+        buf.push_final("第二句");
+        buf.push_final("第三句");
+        e.set_asr_buffer(Arc::clone(&buf));
+
+        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
+        let mut last = ImeView::empty();
+        for c in "?num=2".chars() { last = e.predict(KeyEvent::char(c)); }
+        let committed = ImeView::str_field(&last.commit_text);
+        assert_eq!(committed, "第三句\n第二句", "latest 2 finals: {committed:?}");
+        assert!(e.candidates().is_empty(), "session ended after commit");
+    }
+
+    #[test]
     fn magic_prefix_space_completes_into_command_not_raw() {
         // `#as` + Space → behaves like typing `#asr` (enters Magic mode), NOT committing "#as".
         use std::sync::Arc;

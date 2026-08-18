@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use super::member::{MagicMember, MemberAction};
+use super::member::{is_arg_char, CommandArgs, MagicMember, MemberAction};
 use super::MagicResources;
 use crate::platform::ImeView;
 use crate::state::{StateMachine, StepEnv};
@@ -31,6 +31,10 @@ pub struct VoiceMember {
     /// The preedit/candidate explain instead of pretending to recognize, and
     /// Space commits nothing.
     unavailable: bool,
+    /// 路径/查询参数的原始串(`/en`、`?num=2` …),命令触发后逐键积累。
+    arg: String,
+    /// `arg` 的解析结果,每次积累后重新解析 —— 家族内部据此路由。
+    args: CommandArgs,
 }
 
 impl VoiceMember {
@@ -41,7 +45,49 @@ impl VoiceMember {
             last_connected: false,
             full: Vec::new(),
             unavailable: false,
+            arg: String::new(),
+            args: CommandArgs::default(),
         }
+    }
+
+    /// 参数的可读标记(翻译模式 / 未知参数 / num 提交)。空参数字符串时为空。
+    fn arg_marker(&self) -> String {
+        if self.arg.is_empty() { return String::new(); }
+        let mut s = String::new();
+        if self.args.has_path("en") {
+            s.push_str(" · 英文翻译(待实现)");
+        } else if !self.args.path.is_empty() {
+            s.push_str(" · 未知参数");
+        }
+        if self.args.get("num").is_some() {
+            s.push_str(" · 提交最近 N 条");
+        }
+        s
+    }
+
+    /// 提交语音队列里最新的 `n` 条定稿(换行拼接)。不足 `n` 条提交现有。
+    fn commit_last_n(&self, n: usize) -> Option<String> {
+        let buf = self.resources.voice.get()?;
+        let (finals, _) = buf.voice_candidates();
+        if finals.is_empty() { return None; }
+        let take = n.min(finals.len());
+        Some(finals[..take].join("\n"))
+    }
+
+    /// 参数积累后的处理:重新解析并路由。`?num=N` 立即提交最新 N 条;
+    /// 其余参数只重建视图(翻译/未知参数等具体语义留待实现)。
+    fn apply_args(&mut self, sm: &mut StateMachine) -> MemberAction {
+        self.args = CommandArgs::parse(&self.arg);
+        if let Some(raw) = self.args.get("num") {
+            if let Ok(n) = raw.parse::<usize>() {
+                if n > 0 {
+                    if let Some(text) = self.commit_last_n(n) {
+                        return MemberAction::Commit(text);
+                    }
+                }
+            }
+        }
+        MemberAction::View(Box::new(self.refresh(sm)))
     }
 
     /// Rebuild the candidate view from the voice buffer: `[live, finals…]` — the
@@ -73,18 +119,19 @@ impl VoiceMember {
         sm.candidates_fresh = true;
         sm.candidate_highlight = 0;
         sm.candidate_page = 0;
+        let trigger = format!("#{}{}{}", self.name(), self.arg, self.arg_marker());
         match (connected, empty) {
             // Aura down / never connected: explain in the preedit, non-committable
             // candidate (Space commits nothing — the same guard as the placeholder).
             (false, _) => {
                 sm.candidates = vec!["aura 未连接，语音不可用".to_string()];
-                sm.preedit = "🎙 #asr — aura 未连接，语音不可用".into();
+                sm.preedit = format!("🎙 {trigger} — aura 未连接，语音不可用");
             }
             // Connected but no voice data yet — placeholder until it arrives.
             (true, true) => {
                 sm.candidates = vec!["语音识别中...".to_string()];
                 self.full.clear();
-                sm.preedit = "🎙 #asr …".into();
+                sm.preedit = format!("🎙 {trigger} …");
             }
             // Connected with data: full texts, un-truncated — each frontend renders
             // rows to its own space (the TUI has room and shows everything; the
@@ -96,7 +143,7 @@ impl VoiceMember {
             (true, false) => {
                 sm.candidates = self.full.clone();
                 let head = self.full.first().cloned().unwrap_or_default();
-                sm.preedit = format!("🎙 #asr {head}");
+                sm.preedit = format!("🎙 {trigger} {head}");
             }
         }
         sm.cursor = sm.preedit.len();
@@ -134,6 +181,19 @@ impl MagicMember for VoiceMember {
     }
 
     fn on_key(&mut self, sm: &mut StateMachine, ch: char, _env: &dyn StepEnv) -> MemberAction {
+        // ── 路径/查询参数积累 ──
+        // `/` 或 `?` 开启参数;开启后字母/数字/`=`/`&` 等都是参数字符,一路
+        // 积累到终止键(Space/Enter/Esc/Backspace)。`?num=N` 会立即提交
+        // 最新 N 条定稿。
+        if self.arg.is_empty() && (ch == '/' || ch == '?') {
+            self.arg.push(ch);
+            return MemberAction::View(Box::new(self.refresh(sm)));
+        }
+        if !self.arg.is_empty() && is_arg_char(ch) {
+            self.arg.push(ch);
+            return self.apply_args(sm);
+        }
+
         match ch {
             ' ' => {
                 // Aura unavailable: never commit the "语音不可用" explainer text.
@@ -161,7 +221,17 @@ impl MagicMember for VoiceMember {
             // Enter: force-commit the trigger text (`#asr`) and exit the session —
             // "回车强制 '#asr' 上屏". Esc/Backspace still cancel.
             '\n' | '\r' => MemberAction::Commit(format!("#{}", self.name())),
-            '\x1b' | '\x08' => MemberAction::Exit,
+            '\x1b' => MemberAction::Exit,
+            '\x08' => {
+                // Backspace: 先删参数,删空后退回取消整个会话。
+                if !self.arg.is_empty() {
+                    self.arg.pop();
+                    self.args = CommandArgs::parse(&self.arg);
+                    MemberAction::View(Box::new(self.refresh(sm)))
+                } else {
+                    MemberAction::Exit
+                }
+            }
             _ => MemberAction::View(Box::new(StateMachine::passthrough_view())),
         }
     }
