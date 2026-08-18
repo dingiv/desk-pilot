@@ -1,5 +1,5 @@
 //! stage12_live — thin Stage1→Stage2 bench built on `audio_aura_core::Pipeline`. (Moved here from
-//! aura-asr: the old "noodle" loop now lives inside `OnnxStage1Executor` + `Pipeline`.) Streams
+//! aura-asr: the old "noodle" loop now lives inside `OnnxStage1Recognizer` + `Pipeline`.) Streams
 //! omni-scout `/audio`, runs two-pass Stage1 + Qwen calibration, and writes bench/live-*.md.
 //!
 //! Stage3 is NOT exercised here (this is the S1→S2 behavior benchmark). The Stage3 feedback loop
@@ -12,7 +12,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use audio_aura_core::recognizer::{OnnxStage1Executor, Stage1Config};
+use audio_aura_core::recognizer::{OnnxStage1Recognizer, Stage1Config};
 use audio_aura_core::{Calibrator, Pipeline, Stage2CalibratorImpl, TurnEvent};
 
 // Repo-relative bench dir (crates/aura-core → desk-pilot/bench). Created on startup.
@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
     ]));
 
     eprintln!("[load] Stage1 (Silero VAD + 流式 Zipformer + SenseVoice) + Stage2 (Qwen3-1.7B) …");
-    let s1 = OnnxStage1Executor::new(Stage1Config::new(scout_addr.clone()))?;
+    let s1 = OnnxStage1Recognizer::new(Stage1Config::new(scout_addr.clone()))?;
     let calibrator = Calibrator::load_default("Qwen3-1.7B-Q8_0.gguf")?;
     let _ = calibrator.calibrate_blocking("你好", None, &[]); // HF warmup
     let corrections = Arc::new(Mutex::new(Vec::new()));

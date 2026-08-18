@@ -48,7 +48,7 @@ consume loop）→ `aura-stage2`（LLM worker，mpsc 收 Batch/WindowEdge，part
 
 | 阶段 | 职责 | crate | 抽象 |
 |---|---|---|---|
-| **Stage1** | 录音→VAD→段级流式会话+段级batch→窗口定稿（边界范式：VadSegment/VadWindow） | aura-core (`asr` feature) | Stage1Executor（发 Interim + Batch + WindowEdge） |
+| **Stage1** | 录音→VAD→段级流式会话+段级batch→窗口定稿（边界范式：VadSegment/VadWindow） | aura-core (`asr` feature) | Stage1Recognizer（发 Interim + Batch + WindowEdge） |
 | **Stage2** | 窗口内多句联合整流（加标点/修同音字/英文规范/专有名词），无状态 | aura-core | Stage2Calibrator（calibrate_window / calibrate_final） |
 | **Stage3** | 可选工具：热词 / 用户纠偏 | aura-agent | HotwordManager + CorrectionStore |
 
@@ -135,7 +135,7 @@ CARGO_MANIFEST_DIR=$(pwd) cargo run -p audio-aura-core --example stage12_live --
 
 ## 代码内遗留 TODO（整改时留意）
 
-- `Stage1Executor::run` 静默阻塞线程、睡眠轮询 → 待异步非阻塞化（recognizer.rs）。
+- `Stage1Recognizer::run` 静默阻塞线程、睡眠轮询 → 待异步非阻塞化（recognizer.rs）。
 - `Stage1Config::new` 内嵌 IO（模型路径解析）→ 待拆出（recognizer.rs）。
 - daemon 硬编码静态文件路径 `BASE` → 改用 FileLoader 机制（main.rs:582）。
 

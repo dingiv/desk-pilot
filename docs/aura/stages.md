@@ -41,7 +41,7 @@ daemon on_turn 回调 → SSE 数据面 /api/asr_stream → UI
 
 ## Stage1：音频 → 文本（ONNX 语音前端）
 
-**位置**：`crates/aura-core/src/recognizer.rs`（`OnnxStage1Executor`，原 aura-asr executor.rs）+ 纯窗口决策核心
+**位置**：`crates/aura-core/src/recognizer.rs`（`OnnxStage1Recognizer`，原 aura-asr executor.rs）+ 纯窗口决策核心
 `WindowTracker`（可单测，无 I/O）+ `audio_store.rs`（PCM 按 id 存管）。ONNX 语音栈在
 `dp-models::onnx`。
 

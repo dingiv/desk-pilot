@@ -50,7 +50,7 @@
 
 ### audio-aura —— 删除 sherpa-onnx 依赖
 
-- Stage1Executor 改造：VAD/流式从 dp-models 拿；batch ASR 改调 LocalAI（HttpAsr）。
+- OnnxStage1Recognizer 改造：VAD/流式从 dp-models 拿；batch ASR 改调 LocalAI（HttpAsr）。
 - `aura-asr` crate 变薄：OnnxAsr/OnlineAsr/OnnxVad 迁走后，保留 Asr trait re-export + 管线组装。
 - `aura-core` 的 `Calibrator`（mistral.rs）→ LocalAI（HttpLlm）；Stage2CalibratorImpl 保留
   （提示词/热词/上下文），内部 LLM 调用走 LocalAI。
@@ -68,7 +68,7 @@
    aura-asr 改为 re-export/委托；确认 Stage1 帧循环不受影响（回归测试）。
 2. **搭建 LocalAI**：安装 Go（✓）、LocalAI 可构建（✓ 已验证）、配置 batch ASR 模型
    （sherpa-onnx 后端 SenseVoice）+ LLM 模型（llama-cpp），业务侧 Http* 连通验证。
-3. **audio-aura 切换 batch ASR 到 LocalAI**：Stage1Executor 的 batch 路径改调服务；
+3. **audio-aura 切换 batch ASR 到 LocalAI**：OnnxStage1Recognizer 的 batch 路径改调服务；
    删除 aura-asr 的 OnnxAsr（或保留为 fallback）。
 4. **Stage2/3 切换 LLM 到 LocalAI**：Calibrator → HttpLlm；删除 mistral.rs 依赖。
 5. **audio-aura 删除 sherpa-onnx 依赖**：确认 VAD/流式走 dp-models 后清理。

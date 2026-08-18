@@ -1,4 +1,4 @@
-//! Stage1Executor — encapsulates the Stage1 "noodle": the audio ring + omni-scout ingest
+//! Stage1Recognizer — encapsulates the Stage1 "noodle": the audio ring + omni-scout ingest
 //! thread + Silero VAD + per-segment streaming sessions + per-segment batch passes + the
 //! window tracker. Owns ALL the loop state. It runs the consume loop internally and emits
 //! [`Stage1Event`]s — it does NOT touch files or run Stage2 (that's `pipeline`'s job,
@@ -12,7 +12,7 @@
 //! `Arc<Vec<i16>>` assembled once at settle.
 //!
 //! ```ignore
-//! let exec = OnnxStage1Executor::new(Stage1Config::new(scout_addr))?;
+//! let exec = OnnxStage1Recognizer::new(Stage1Config::new(scout_addr))?;
 //! exec.run(&mut |ev| match ev {
 //!     Stage1Event::Interim { window_id, segment_id, partial, .. } => println!("…{partial}"),
 //!     Stage1Event::Batch { window_id, segments } => stage2.calibrate_window(window_id, &segments),
@@ -51,7 +51,7 @@ const PARTIAL_EVERY_FRAMES: u32 = 15;
 /// which resets the session long before the partial could go stale.
 const STALE_SESSION_RESET: Duration = Duration::from_secs(8);
 
-/// Config for [`OnnxStage1Executor`] — paths + params for the VAD, batch ASR, and streaming ASR,
+/// Config for [`OnnxStage1Recognizer`] — paths + params for the VAD, batch ASR, and streaming ASR,
 /// plus the omni-scout address, ring capacity, and the connection `active` flag.
 #[derive(Clone)]
 pub struct Stage1Config {
@@ -170,14 +170,14 @@ impl Stage1Config {
 /// A Stage1 recognizer: audio in → [`Stage1Event`]s out. `run` blocks forever (drives the
 /// ingest+consume loop) and invokes `on_event` for each interim partial / settled segment /
 /// closed window.
-pub trait Stage1Executor {
+pub trait Stage1Recognizer {
     fn run(&self, on_event: &mut dyn FnMut(Stage1Event)) -> !;
 }
 
 /// ONNX-backed Stage1 recognizer (Silero VAD + streaming Zipformer + batch ASR via the single
 /// [`OnnxRuntimeManager`]). Thread-safe: the ring is shared with the ingest thread; the
 /// consume loop runs on the caller's thread.
-pub struct OnnxStage1Executor {
+pub struct OnnxStage1Recognizer {
     mgr: Arc<OnnxRuntimeManager>,
     /// Batch ASR as a trait object: local OnnxAsr (from `mgr`) or remote HttpAsr. Streaming/VAD
     /// stay in `mgr` (always local sherpa).
@@ -190,7 +190,7 @@ pub struct OnnxStage1Executor {
     audio_store: Arc<AudioStore>,
 }
 
-impl OnnxStage1Executor {
+impl OnnxStage1Recognizer {
     /// Build models from `cfg`, warm them, spawn the scout→ring ingest thread.
     pub fn new(cfg: Stage1Config) -> Result<Self> {
         // Batch ASR: Local → OnnxAsr lives in the mgr; Remote → HttpAsr (mgr skips .asr()).
@@ -467,7 +467,7 @@ impl ActiveSession {
     }
 }
 
-impl Stage1Executor for OnnxStage1Executor {
+impl Stage1Recognizer for OnnxStage1Recognizer {
     // TODO: 该函数静默阻塞线程，使用睡眠轮询的方式；需要整改成异步非阻塞模式；
     fn run(&self, on_event: &mut dyn FnMut(Stage1Event)) -> ! {
         let sr = 16000u32;

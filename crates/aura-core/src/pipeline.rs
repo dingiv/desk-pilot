@@ -1,4 +1,4 @@
-//! pipeline (原 composer) — the `Pipeline` (组装车间): wires Stage1Executor → Stage2Calibrator and emits
+//! pipeline (原 composer) — the `Pipeline` (组装车间): wires Stage1Recognizer → Stage2Calibrator and emits
 //! [`TurnEvent`]s to a caller-supplied callback. Pure orchestration — it does no printing, no
 //! file I/O, no Stage3 logic.
 //!
@@ -18,7 +18,7 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Instant;
 
-use crate::recognizer::{OnnxStage1Executor, Stage1Executor};
+use crate::recognizer::{OnnxStage1Recognizer, Stage1Recognizer};
 use crate::Stage1Event;
 
 use crate::calibrator::Stage2Calibrator;
@@ -38,12 +38,12 @@ pub enum TurnEvent<'a> {
 }
 
 pub struct Pipeline {
-    s1: OnnxStage1Executor,
+    s1: OnnxStage1Recognizer,
     s2: Box<dyn Stage2Calibrator>,
 }
 
 impl Pipeline {
-    pub fn new(s1: OnnxStage1Executor, s2: Box<dyn Stage2Calibrator>) -> Self {
+    pub fn new(s1: OnnxStage1Recognizer, s2: Box<dyn Stage2Calibrator>) -> Self {
         Self { s1, s2 }
     }
 

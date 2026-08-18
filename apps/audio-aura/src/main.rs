@@ -44,7 +44,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use audio_aura_agent::{AddHotwordTool, HotwordManager, SharedHotwordManager, Tool};
 use audio_aura_core::archive::{ArchiveConfig, AudioArchive};
 use audio_aura_core::hub::{FinalTurn, Storage};
-use audio_aura_core::recognizer::{OnnxStage1Executor, Stage1Config};
+use audio_aura_core::recognizer::{OnnxStage1Recognizer, Stage1Config};
 use audio_aura_core::{Pipeline, TurnEvent};
 use audio_aura_core::calibrator::Stage2CalibratorImpl;
 use audio_aura_core::Calibrator;
@@ -311,7 +311,7 @@ use audio_aura_agent::{AsrSegment, AuraStateView, ConfigView, CorrectionView, Va
 struct DaemonState {
     hotwords: Arc<Mutex<Vec<String>>>,
     corrections: Arc<Mutex<Vec<(String, String)>>>,
-    /// Scout-connection toggle (shared with Stage1Executor's ingest + run loop).
+    /// Scout-connection toggle (shared with the Stage1 recognizer's ingest + run loop).
     active: Arc<AtomicBool>,
     /// Bumped on ANY SETTINGS change (connected / hotword / correction). Recognition events do
     /// NOT bump — they're pushed via `asr_events` (the data plane). The SSE handler ticks at the
@@ -474,7 +474,7 @@ fn main() -> Result<()> {
         }
         info!("ASR provider: {} | threads: {} (batch ASR; VAD + streaming on CPU)", cfg.asr.provider, cfg.asr.num_threads);
     }
-    let s1 = OnnxStage1Executor::new(cfg)?;
+    let s1 = OnnxStage1Recognizer::new(cfg)?;
     // Stage2 LLM: local mistral.rs Calibrator, or remote HttpLlm (vLLM/SGLang, OpenAI-compatible).
     let llm: Arc<dyn dp_models::LlmProvider> = if llm_kind == "remote" {
         let ep = llm_endpoint.clone().unwrap_or_default();
