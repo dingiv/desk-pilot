@@ -62,10 +62,17 @@ pub fn spawn_aura_client(buffer: Arc<AsrBuffer>, aura_addr: Option<&str>) -> Aur
         .spawn(move || loop {
             // Push aura connectivity so `#asr` shows "语音不可用" while the daemon
             // is down / not yet connected (the member only surfaces voice data
-            // when Connected).
+            // when Connected). Initial read + `ConnChanged` events keep it reactive;
+            // the per-iteration `conn()` read is a cheap (atomic) safety net so a
+            // lagged broadcast consumer never stalls the flag.
             buffer.set_connected(matches!(drain_agent.conn(), AuraConn::Connected));
             for ev in drain_agent.poll_events() {
                 match ev {
+                    AgentEvent::ConnChanged(c) => {
+                        let connected = matches!(c, AuraConn::Connected);
+                        buffer.set_connected(connected);
+                        tracing::debug!(?c, "aura conn changed");
+                    }
                     // ① new Stage1 streaming fragment — raw live text.
                     AgentEvent::StreamFragment { text, .. } => {
                         if !text.is_empty() {
@@ -73,20 +80,24 @@ pub fn spawn_aura_client(buffer: Arc<AsrBuffer>, aura_addr: Option<&str>) -> Aur
                             tracing::debug!(text = %text, "asr live (stream)");
                         }
                     }
-                    // ② Stage2 jointly calibrated the window (per Batch) — live correction.
+                    // ④ Stage2 jointly calibrated the window (per Batch) — live correction.
                     AgentEvent::SegmentCalibration { calibrated, .. } => {
                         if !calibrated.is_empty() {
                             buffer.set_live(&calibrated);
                             tracing::debug!(text = %calibrated, "asr live (segment calibration)");
                         }
                     }
-                    // ③ the window settled — authoritative calibrated text.
+                    // ⑤ the window settled — authoritative calibrated text (also
+                    // clears the agent's live; push_final does the same here).
                     AgentEvent::WindowCalibration(u)
                         if !u.calibrated.is_empty() => {
                             buffer.push_final(&u.calibrated);
                             tracing::info!(text = %u.calibrated, "asr final → candidate #1");
                         }
-                    _ => {} // batch layers / snapshots / corrections / conn changes aren't voice-buffer input
+                    // ②③ 整窗 batch 重跑(BatchWindow 是权威 raw,但不作为 live ——
+                    // agent 语义,校准紧跟其后)、StateChanged 快照、WindowCorrected
+                    // 修正确认:都不是语音缓冲区输入,忽略。
+                    _ => {}
                 }
             }
             thread::sleep(DRAIN_INTERVAL);

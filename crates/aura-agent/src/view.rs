@@ -67,7 +67,7 @@ pub struct AuraStateView {
 pub enum AsrSegment {
     /// Live streaming output for the CURRENT segment (raw, evolving — forward correction as
     /// more audio arrives). Keyed by the real `window_id` (assigned at the window's first SOS)
-    /// + `segment_id` (the per-segment streaming session's own id). Emitted on every streaming
+    /// and `segment_id` (the per-segment streaming session's own id). Emitted on every streaming
     /// decode change, plus one FINAL fragment at EOS with the segment's definitive text.
     StreamFragment { window_id: u64, segment_id: u64, text: String, at_s: f64 },
     /// Stage1's per-segment batch pass for the just-closed segment (at its EOS).
