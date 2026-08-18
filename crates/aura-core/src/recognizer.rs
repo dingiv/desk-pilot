@@ -88,6 +88,11 @@ pub struct Stage1Config {
     /// first place, so the effective window is (min_silence, merge_gap) ≈ 1–2.5s. Decouples
     /// "VAD sensitivity" from "what's one utterance". 0 → every segment is its own window.
     pub merge_gap_s: f64,
+    /// Batch-ASR switch (config `asr.backend: disable`): false → the batch model is NOT
+    /// loaded and every batch pass returns empty (`batch_text` stays `None` — the legal
+    /// "batch unavailable" state; consumers fall back to streaming text by design).
+    /// Streaming + VAD unaffected. Defaults to true.
+    pub batch_enabled: bool,
     /// Shared connection toggle (see [`ScoutAudioSource::with_active`]). Flip to false to stop
     /// ingesting from scout (does NOT kill scout). Defaults to true.
     pub active: Arc<AtomicBool>,
@@ -135,6 +140,7 @@ impl Stage1Config {
             ring_cap_samples: DEFAULT_RING_CAP,
             asr_kind: ProviderKind::Local,
             merge_gap_s: 5.0,
+            batch_enabled: true,
             active: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -192,6 +198,17 @@ pub trait Stage1Recognizer {
     fn run(&self, on_event: &mut dyn FnMut(Stage1Event)) -> !;
 }
 
+/// Batch ASR turned off (`asr.backend: disable`): every pass yields empty text, which the
+/// executor maps to `batch_text: None` — the legal "batch unavailable" state consumers
+/// already handle by falling back to streaming text.
+struct DisabledAsr;
+
+impl AsrProvider for DisabledAsr {
+    fn recognize(&self, _pcm: &[i16], _sample_rate: u32) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
+}
+
 /// ONNX-backed Stage1 recognizer (Silero VAD + streaming Zipformer + batch ASR via the single
 /// [`OnnxRuntimeManager`]). Thread-safe: the ring is shared with the ingest thread; the
 /// consume loop runs on the caller's thread.
@@ -211,27 +228,30 @@ pub struct OnnxStage1Recognizer {
 impl OnnxStage1Recognizer {
     /// Build models from `cfg`, warm them, spawn the scout→ring ingest thread.
     pub fn new(cfg: Stage1Config) -> Result<Self> {
-        // Batch ASR: Local → OnnxAsr lives in the mgr; Remote → HttpAsr (mgr skips .asr()).
-        let mgr = match &cfg.asr_kind {
-            ProviderKind::Local => Arc::new(
+        // Batch ASR: Local → OnnxAsr lives in the mgr; Remote → HttpAsr (mgr skips .asr());
+        // batch disabled → no batch model loaded at all, DisabledAsr stands in (empty result
+        // ⇒ batch_text: None, the legal fallback state).
+        let mgr = match (&cfg.asr_kind, cfg.batch_enabled) {
+            (ProviderKind::Local, true) => Arc::new(
                 OnnxRuntimeManager::builder()
                     .vad(cfg.vad.clone())
                     .asr(cfg.asr.clone())
                     .streaming_asr(cfg.streaming.clone())
                     .build()?,
             ),
-            ProviderKind::Remote { .. } => Arc::new(
+            (ProviderKind::Local, false) | (ProviderKind::Remote { .. }, _) => Arc::new(
                 OnnxRuntimeManager::builder()
                     .vad(cfg.vad.clone())
                     .streaming_asr(cfg.streaming.clone())
-                    .build()?, // no local batch ASR — remote HttpAsr handles it
+                    .build()?, // no local batch ASR — remote HttpAsr or batch-off
             ),
         };
-        let batch_asr: Arc<dyn AsrProvider> = match &cfg.asr_kind {
-            ProviderKind::Local => {
+        let batch_asr: Arc<dyn AsrProvider> = match (&cfg.asr_kind, cfg.batch_enabled) {
+            (_, false) => Arc::new(DisabledAsr),
+            (ProviderKind::Local, _) => {
                 Arc::clone(mgr.asr().expect("local asr just loaded")) as Arc<dyn AsrProvider>
             }
-            ProviderKind::Remote { endpoint } => Arc::new(HttpAsr::new(endpoint.clone())),
+            (ProviderKind::Remote { endpoint }, _) => Arc::new(HttpAsr::new(endpoint.clone())),
         };
         mgr.warm();
         let ring = Arc::new(Mutex::new(AudioRing::new(cfg.ring_cap_samples)));
@@ -249,11 +269,12 @@ impl OnnxStage1Recognizer {
     /// Use an already-loaded [`OnnxRuntimeManager`] (e.g. shared with another stage); spawns the
     /// ingest thread against `cfg.scout_addr`.
     pub fn new_with_mgr(mgr: Arc<OnnxRuntimeManager>, cfg: Stage1Config) -> Result<Self> {
-        let batch_asr: Arc<dyn AsrProvider> = match &cfg.asr_kind {
-            ProviderKind::Local => {
+        let batch_asr: Arc<dyn AsrProvider> = match (&cfg.asr_kind, cfg.batch_enabled) {
+            (_, false) => Arc::new(DisabledAsr),
+            (ProviderKind::Local, _) => {
                 Arc::clone(mgr.asr().expect("local mgr must carry the batch ASR")) as Arc<dyn AsrProvider>
             }
-            ProviderKind::Remote { endpoint } => Arc::new(HttpAsr::new(endpoint.clone())),
+            (ProviderKind::Remote { endpoint }, _) => Arc::new(HttpAsr::new(endpoint.clone())),
         };
         let ring = Arc::new(Mutex::new(AudioRing::new(cfg.ring_cap_samples)));
         spawn_ingest(Arc::clone(&ring), &cfg.scout_addr, Arc::clone(&cfg.active))?;

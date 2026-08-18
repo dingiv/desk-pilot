@@ -44,7 +44,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use audio_aura_agent::{stage3_rule_trigger, AddHotwordTool, HotwordManager, SharedHotwordManager};
 use audio_aura_core::archive::{ArchiveConfig, AudioArchive};
 use audio_aura_core::hub::Storage;
-use audio_aura_core::{AsrSpec, LlmSpec, Pipeline, PipelineSpec, TurnEvent, VadSpec};
+use audio_aura_core::{AsrSpec, LlmSpec, Pipeline, PipelineSpec, StreamSpec, TurnEvent, VadSpec};
 
 const BASE: &str = "/workspaces/gui_agent/audio-aura/native";
 
@@ -89,12 +89,23 @@ struct VadConf {
     edge_margin: Option<f32>,
 }
 
-/// `asr:` — Stage1 语音前端:批式 ASR 部署选择 + VAD。`backend` 选边,未选中一侧的
-/// 字段被忽略(写了也不生效)。
+/// `asr.stream:` — 流式 ASR(恒本地,实时 partial 要低延迟)。
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct StreamConf {
+    /// 流式引擎: "zipformer" (默认,当前唯一;未知值 assemble 报错)。
+    model: Option<String>,
+}
+
+/// `asr:` — Stage1 语音前端:流式引擎 + 批式 ASR 部署选择 + VAD。`backend` 选边,
+/// 未选中一侧的字段被忽略(写了也不生效)。
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct AsrConf {
-    /// Batch-ASR deployment: "local" (默认, in-process sherpa) | "remote" (HTTP)。
+    /// 流式 ASR(恒本地)。
+    stream: StreamConf,
+    /// Batch-ASR deployment: "local" (默认, in-process sherpa) | "remote" (HTTP) |
+    /// "disable" (纯流式:不加载批式模型,batch_text 恒 None 回退流式文本)。
     backend: Option<String>,
     local: LocalAsrConf,
     remote: RemoteAsrConf,
@@ -288,17 +299,20 @@ fn resolve(cli: Cli, conf: AuraConf) -> Settings {
         merge_gap: v.merge_gap.unwrap_or(d.merge_gap),
         edge_margin: v.edge_margin.unwrap_or(d.edge_margin),
     };
-    // Stage1 batch ASR: remote HTTP, or local ONNX (model/hardware/threads/model_dir)。
-    let asr_spec = if asr.backend.as_deref() == Some("remote") {
-        AsrSpec::Remote { endpoint: asr.remote.endpoint.clone().unwrap_or_default() }
-    } else {
-        AsrSpec::Local {
+    // Stage1: 流式引擎(恒本地) + batch ASR (local / remote / disable)。
+    let stream = StreamSpec {
+        model: asr.stream.model.clone().unwrap_or_else(|| "zipformer".to_string()),
+    };
+    let asr_spec = match asr.backend.as_deref() {
+        Some("remote") => AsrSpec::Remote { endpoint: asr.remote.endpoint.clone().unwrap_or_default() },
+        Some("disable") => AsrSpec::Disabled,
+        _ => AsrSpec::Local {
             backend: asr.local.model.clone().unwrap_or_else(|| "sensevoice".to_string()),
             language: asr.local.language.clone().unwrap_or_else(|| "auto".to_string()),
             hardware: asr.local.hardware.clone().unwrap_or_else(|| "cpu".to_string()),
             threads: asr.local.threads.unwrap_or(8),
             model_dir: asr.local.model_dir.clone(),
-        }
+        },
     };
     // Stage2 LLM: local mistral.rs GGUF (可选 model_dir), or remote OpenAI-compatible。
     let model = llm.model.clone().unwrap_or_else(|| "Qwen3-1.7B-Q8_0.gguf".to_string());
@@ -323,6 +337,7 @@ fn resolve(cli: Cli, conf: AuraConf) -> Settings {
             hotwords: hotwords
                 .unwrap_or_else(|| SEED_HOTWORDS.iter().map(|s| s.to_string()).collect()),
             vad,
+            stream,
             asr: asr_spec,
             llm: llm_spec,
         },
@@ -416,11 +431,12 @@ fn main() -> Result<()> {
         asr_backend: match &spec.asr {
             AsrSpec::Local { backend, .. } => backend.clone(),
             AsrSpec::Remote { .. } => "remote-http".to_string(),
+            AsrSpec::Disabled => "streaming-only".to_string(),
         },
         asr_kind: spec.asr.kind().to_string(),
         asr_provider: match &spec.asr {
             AsrSpec::Local { hardware, .. } => hardware.clone(),
-            AsrSpec::Remote { .. } => String::new(),
+            AsrSpec::Remote { .. } | AsrSpec::Disabled => String::new(),
         },
         llm_kind: spec.llm.kind().to_string(),
         model: match &spec.llm {
@@ -741,6 +757,7 @@ mod tests {
         assert_eq!(vad.merge_gap, Some(2.5), "merge_gap documented in yaml");
         assert_eq!(vad.threshold, Some(0.5));
         assert_eq!(vad.min_silence, Some(1.0));
+        assert_eq!(conf.asr.stream.model, Some("zipformer".into()), "stream engine documented");
     }
 
     #[test]
@@ -803,5 +820,21 @@ mod tests {
         assert!(matches!(&s.spec.asr, AsrSpec::Remote { endpoint } if endpoint == "http://127.0.0.1:8000"));
         assert!(matches!(&s.spec.llm, LlmSpec::Remote { endpoint, model }
             if endpoint == "http://127.0.0.1:3000" && model == "m.gguf"));
+    }
+
+    #[test]
+    fn resolve_selects_disabled_batch() {
+        // asr.backend: disable → 纯流式(不加载批式模型)。
+        let conf = AuraConf {
+            asr: AsrConf {
+                backend: Some("disable".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let s = resolve(Cli::default(), conf);
+        assert!(matches!(s.spec.asr, AsrSpec::Disabled));
+        assert_eq!(s.spec.asr.kind(), "disabled");
+        assert_eq!(s.spec.stream.model, "zipformer", "stream 默认引擎");
     }
 }

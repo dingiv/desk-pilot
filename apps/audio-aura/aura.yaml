@@ -17,13 +17,10 @@ stage3: true                    # 运行进程内 Stage3 规则触发器
 log_level: "info"               # 调试语音管线时改 "debug"
 
 # ── Stage1 语音前端 (asr) ─────────────────────────────────────────────────────
-# backend 选批式 ASR 部署位置; 流式 ASR + VAD 恒为本地 (实时 partial 要低延迟)。
+# stream = 流式 ASR (恒本地, 实时 partial 要低延迟); backend 选批式 ASR 部署。
 asr:
-  # stream 流式 asr 模型
-  stream:
-    model: zipformer
-    # ...
-  # batch 批处理 asr 模型, 可以禁用
+  stream:                       # 流式引擎 (未知值启动报错, 不静默回退)
+    model: zipformer            # zipformer (当前唯一)
   backend: remote               # local | remote | disable
   local:                        # backend=local 时生效
     model: qwen3-asr            # 批式引擎: sensevoice | whisper | qwen3-asr
@@ -34,6 +31,8 @@ asr:
   remote:                       # backend=remote 时生效
     endpoint: "http://127.0.0.1:8000"  # OpenAI 兼容服务地址 (qwen-asr-serve 等)
     # api_key: ...              # 未来: HttpAsr 尚未支持鉴权, 落键无行为故先不开
+  # backend=disable: 纯流式模式 —— 不加载批式模型, batch_text 恒 None (回退流式文本),
+  # 省掉段级/窗口级 batch 调用 (远程 ~3.5s/次)。
   # ── VAD / 分段 (Silero; 全部可选, 不写用内置默认) ──
   #   min_silence 和 merge_gap 解耦, 分别切出段与窗口两级边界:
   #     · min_silence = VAD 静音达此秒数 → EOS 切段 (切段灵敏度) —— 保持小 (1s),

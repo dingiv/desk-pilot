@@ -28,7 +28,7 @@ pub mod wav;
 
 pub use calibrator::{Stage2Calibrator, Stage2CalibratorImpl};
 #[cfg(feature = "asr")]
-pub use pipeline::{AsrSpec, LlmSpec, Pipeline, PipelineSpec, TurnEvent, VadSpec};
+pub use pipeline::{AsrSpec, LlmSpec, Pipeline, PipelineSpec, StreamSpec, TurnEvent, VadSpec};
 pub use prompt::PromptBuilder;
 pub use hub::{FinalTurn, Storage, TurnRecord};
 

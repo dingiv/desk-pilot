@@ -25,7 +25,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use tracing::{debug, info};
 
 use crate::calibrator::{Stage2Calibrator, Stage2CalibratorImpl};
@@ -40,8 +40,8 @@ use dp_models::http::HttpLlm;
 // 具体值 —— 线协议/文件格式不进 core。VadSpec::default 与 Stage1Config::new 的内置
 // 默认一致(单测钉死,防两处漂移)。
 
-/// Fully-resolved pipeline 选型:音频源、种子热词、VAD/分段参数、Stage1 batch ASR、
-/// Stage2 LLM。[`Pipeline::assemble`] 的唯一输入(运行时共享句柄除外)。
+/// Fully-resolved pipeline 选型:音频源、种子热词、VAD/分段参数、流式 ASR、Stage1 batch
+/// ASR、Stage2 LLM。[`Pipeline::assemble`] 的唯一输入(运行时共享句柄除外)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct PipelineSpec {
     /// omni-scout `/audio` 地址。
@@ -49,8 +49,17 @@ pub struct PipelineSpec {
     /// 种子热词:烘烤进流式 recognizer(beam bias),并预载 Stage2 共享 store。
     pub hotwords: Vec<String>,
     pub vad: VadSpec,
+    pub stream: StreamSpec,
     pub asr: AsrSpec,
     pub llm: LlmSpec,
+}
+
+/// 流式 ASR 选型(**恒本地** —— 实时 partial 要低延迟,不走 remote)。当前唯一引擎
+/// zipformer;新引擎落地时在 [`stage1_config`] 的 match 里扩臂。
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamSpec {
+    /// "zipformer" (当前唯一;未知值 assemble 直接报错)。
+    pub model: String,
 }
 
 /// VAD/分段参数(具体值)。[`Default`] 与 [`Stage1Config::new`] 的内置默认逐字段一致。
@@ -99,14 +108,18 @@ pub enum AsrSpec {
     },
     /// 远程 HTTP(OpenAI 兼容 `/v1/audio/transcriptions`)。流式/VAD 仍走 MODELS 命名空间。
     Remote { endpoint: String },
+    /// 批式整体禁用(纯流式模式):不加载批式模型,`batch_text` 恒 `None` —— 消费方
+    /// 按设计回退流式文本。省掉段级/窗口级 batch 调用(远程 ~3.5s/次)。
+    Disabled,
 }
 
 impl AsrSpec {
-    /// "local" | "remote" — 配置快照(ConfigView)的显示标签。
+    /// "local" | "remote" | "disabled" — 配置快照(ConfigView)的显示标签。
     pub fn kind(&self) -> &'static str {
         match self {
             AsrSpec::Local { .. } => "local",
             AsrSpec::Remote { .. } => "remote",
+            AsrSpec::Disabled => "disabled",
         }
     }
 }
@@ -171,7 +184,7 @@ impl Pipeline {
         storage: Option<Arc<Storage>>,
     ) -> Result<Self> {
         info!("loading Stage1 (ONNX) + Stage2 (Qwen calibrator) …");
-        let s1 = OnnxStage1Recognizer::new(stage1_config(spec, active))?;
+        let s1 = OnnxStage1Recognizer::new(stage1_config(spec, active)?)?;
         let s2 = stage2_calibrator(spec, hotwords, corrections)?;
         Ok(Self { s1, s2, storage })
     }
@@ -304,13 +317,21 @@ impl Pipeline {
 }
 
 /// 纯映射(除 Stage1Config::new 的路径解析 R6 TODO 外无重 IO):spec → Stage1Config。
-/// ASR 后端选择分支与全部模型选择日志都在这里。单测直接盖这个函数。
-fn stage1_config(spec: &PipelineSpec, active: Arc<AtomicBool>) -> Stage1Config {
+/// ASR 后端选择分支与全部模型选择日志都在这里;流式引擎/未知选型在这里报错。
+/// 单测直接盖这个函数。
+fn stage1_config(spec: &PipelineSpec, active: Arc<AtomicBool>) -> Result<Stage1Config> {
+    // 流式引擎(恒本地):zipformer 是当前唯一实现。
+    if spec.stream.model != "zipformer" {
+        bail!(
+            "unsupported asr.stream.model {:?} (supported: \"zipformer\")",
+            spec.stream.model
+        );
+    }
     // 自定义模型根目录:local 路径下 VAD/流式/批式全部改在其下解析。
-    // (remote 批式时流式/VAD 仍走 MODELS 命名空间 —— model_dir 是 local 旋钮。)
+    // (remote/disabled 批式时流式/VAD 仍走 MODELS 命名空间 —— model_dir 是 local 旋钮。)
     let model_dir = match &spec.asr {
         AsrSpec::Local { model_dir, .. } => model_dir.clone(),
-        AsrSpec::Remote { .. } => None,
+        AsrSpec::Remote { .. } | AsrSpec::Disabled => None,
     };
     let mut cfg = Stage1Config::with_models_dir(spec.scout_addr.clone(), model_dir);
     cfg.active = active;
@@ -334,10 +355,15 @@ fn stage1_config(spec: &PipelineSpec, active: Arc<AtomicBool>) -> Stage1Config {
     // Select batch ASR backend (default: SenseVoice).
     //   "whisper"   → large-v3-turbo
     //   "qwen3-asr" → Qwen3-Audio ASR 1.7B int8 (high accuracy, slow on CPU)
-    match &spec.asr {
+    Ok(match &spec.asr {
         AsrSpec::Remote { endpoint } => {
             info!("ASR: remote HTTP {endpoint}");
             cfg.with_remote_asr(endpoint.clone())
+        }
+        AsrSpec::Disabled => {
+            info!("ASR batch: disabled — streaming-only (batch_text 恒 None,回退流式文本)");
+            cfg.batch_enabled = false;
+            cfg
         }
         AsrSpec::Local { backend, language, hardware: provider, threads, .. } => {
             if backend == "whisper" {
@@ -362,7 +388,7 @@ fn stage1_config(spec: &PipelineSpec, active: Arc<AtomicBool>) -> Stage1Config {
             );
             cfg
         }
-    }
+    })
 }
 
 /// Stage2 组装:local mistral.rs Calibrator(加载 + "你好"预热)或 remote HttpLlm,
@@ -402,6 +428,7 @@ mod tests {
             scout_addr: "127.0.0.1:7878".into(),
             hotwords: vec!["Rust".into()],
             vad: VadSpec::default(),
+            stream: StreamSpec { model: "zipformer".into() },
             asr,
             llm: LlmSpec::Local { model: "m.gguf".into(), model_dir: None },
         }
@@ -423,20 +450,35 @@ mod tests {
         let cfg = stage1_config(
             &spec(AsrSpec::Remote { endpoint: "http://127.0.0.1:8000".into() }),
             Arc::new(AtomicBool::new(true)),
-        );
+        )
+        .unwrap();
         assert!(matches!(cfg.asr_kind, ProviderKind::Remote { .. }));
+        assert!(cfg.batch_enabled, "remote batch stays on");
 
         // whisper / qwen3-asr → 对应 ONNX 后端。
-        let cfg = stage1_config(&spec(local("whisper")), Arc::new(AtomicBool::new(true)));
+        let cfg = stage1_config(&spec(local("whisper")), Arc::new(AtomicBool::new(true))).unwrap();
         assert!(matches!(cfg.asr.backend, AsrBackend::Whisper { .. }));
-        let cfg = stage1_config(&spec(local("qwen3-asr")), Arc::new(AtomicBool::new(true)));
+        let cfg = stage1_config(&spec(local("qwen3-asr")), Arc::new(AtomicBool::new(true))).unwrap();
         assert!(matches!(cfg.asr.backend, AsrBackend::Qwen3Asr { .. }));
 
         // 未知/默认 → SenseVoice;provider/threads 落位。
-        let cfg = stage1_config(&spec(local("sensevoice")), Arc::new(AtomicBool::new(true)));
+        let cfg = stage1_config(&spec(local("sensevoice")), Arc::new(AtomicBool::new(true))).unwrap();
         assert!(matches!(cfg.asr.backend, AsrBackend::SenseVoice { .. }));
         assert_eq!(cfg.asr.provider, "cpu");
         assert_eq!(cfg.asr.num_threads, 8);
+    }
+
+    #[test]
+    fn stage1_config_disabled_batch_and_unknown_stream_rejected() {
+        // disable → 纯流式:batch_enabled=false(不加载批式模型,DisabledAsr 顶位)。
+        let cfg = stage1_config(&spec(AsrSpec::Disabled), Arc::new(AtomicBool::new(true))).unwrap();
+        assert!(!cfg.batch_enabled);
+        assert!(matches!(cfg.asr_kind, ProviderKind::Local { .. }), "不影响 streaming/VAD 的本地路径");
+
+        // 未知流式引擎 → 显式报错(不静默回退默认)。
+        let mut s = spec(local("sensevoice"));
+        s.stream.model = "bogus".into();
+        assert!(stage1_config(&s, Arc::new(AtomicBool::new(true))).is_err());
     }
 
     #[test]
@@ -445,7 +487,7 @@ mod tests {
         s.vad.threshold = 0.6;
         s.vad.merge_gap = 2.5;
         let active = Arc::new(AtomicBool::new(false));
-        let cfg = stage1_config(&s, Arc::clone(&active));
+        let cfg = stage1_config(&s, Arc::clone(&active)).unwrap();
         assert!((cfg.vad.threshold - 0.6).abs() < 1e-6);
         assert_eq!(cfg.merge_gap_s, 2.5);
         assert_eq!(cfg.streaming.hotwords, vec!["Rust".to_string()], "seed baked into streaming");
@@ -459,7 +501,7 @@ mod tests {
         if let AsrSpec::Local { model_dir, .. } = &mut s.asr {
             *model_dir = Some("/custom/models".into());
         }
-        let cfg = stage1_config(&s, Arc::new(AtomicBool::new(true)));
+        let cfg = stage1_config(&s, Arc::new(AtomicBool::new(true))).unwrap();
         assert!(cfg.vad.model.starts_with("/custom/models/silero-vad/"));
         assert!(matches!(&cfg.asr.backend, AsrBackend::SenseVoice { model, .. }
             if model.starts_with("/custom/models/sensevoice/")));
@@ -468,7 +510,7 @@ mod tests {
         if let AsrSpec::Local { model_dir, .. } = &mut s.asr {
             *model_dir = Some("/m".into());
         }
-        let cfg = stage1_config(&s, Arc::new(AtomicBool::new(true)));
+        let cfg = stage1_config(&s, Arc::new(AtomicBool::new(true))).unwrap();
         assert!(matches!(&cfg.asr.backend, AsrBackend::Whisper { encoder, .. }
             if encoder.starts_with("/m/whisper/")), "builder 走同一根目录");
     }
