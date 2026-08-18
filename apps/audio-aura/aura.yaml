@@ -4,6 +4,10 @@
 
 # ── daemon 服务 ───────────────────────────────────────────────────────────────
 scout_addr: "127.0.0.1:7878"   # omni-scout /audio 地址 (音频源; local/remote ASR 都吃它)
+scout_chunk_ms: 64            # 请求 scout 按 ~N-ms 聚合推流 (HTTP chunk; 不能快过 scout
+                              #   node.quantum, 默认 quantum=1024@16kHz=64ms; 实测 pipewire 实际
+                              #   ~42.7ms/块)。None=不传, scout 按自身 quantum 速率推。纯网络层
+                              #   优化——消费侧照样重切 32ms 窗喂 VAD, 只省上游网络读取/唤醒。
 bind_addr: "127.0.0.1"          # daemon socket 监听地址
 port: 9091                      # daemon socket 端口
 stage3: true                    # 运行进程内 Stage3 规则触发器

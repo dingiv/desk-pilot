@@ -77,6 +77,10 @@ pub struct Stage1Config {
     pub asr: AsrConfig,
     pub streaming: StreamingAsrConfig,
     pub ring_cap_samples: usize,
+    /// 客户端请求 scout 的推流 cadence(ms):`?chunk_ms=N` 让 scout 把源 buffer 聚合成
+    /// N-ms 的 HTTP chunk 再推(不能快过 scout 的 node.quantum)。None = 不传参,scout
+    /// 按自身 quantum 速率推。纯网络层优化——消费循环照样重切成 32ms 窗喂 VAD。
+    pub scout_chunk_ms: Option<u64>,
     /// Batch ASR backend: `Local` (lib sherpa OnnxAsr) or `Remote` (HTTP, OpenAI-compatible).
     /// Streaming ASR + VAD stay local sherpa regardless (real-time partials need low latency).
     pub asr_kind: ProviderKind,
@@ -138,6 +142,7 @@ impl Stage1Config {
                 ..Default::default()
             },
             ring_cap_samples: DEFAULT_RING_CAP,
+            scout_chunk_ms: None,
             asr_kind: ProviderKind::Local,
             merge_gap_s: 5.0,
             batch_enabled: true,
@@ -290,7 +295,13 @@ impl OnnxStage1Recognizer {
         mgr.warm();
         let ring = Arc::new(Mutex::new(AudioRing::new(cfg.ring_cap_samples)));
         let ring_cv = Arc::new(Condvar::new());
-        spawn_ingest(Arc::clone(&ring), Arc::clone(&ring_cv), &cfg.scout_addr, Arc::clone(&cfg.active))?;
+        spawn_ingest(
+            Arc::clone(&ring),
+            Arc::clone(&ring_cv),
+            &cfg.scout_addr,
+            Arc::clone(&cfg.active),
+            cfg.scout_chunk_ms,
+        )?;
         Ok(Self {
             mgr,
             ring,
@@ -314,7 +325,13 @@ impl OnnxStage1Recognizer {
         };
         let ring = Arc::new(Mutex::new(AudioRing::new(cfg.ring_cap_samples)));
         let ring_cv = Arc::new(Condvar::new());
-        spawn_ingest(Arc::clone(&ring), Arc::clone(&ring_cv), &cfg.scout_addr, Arc::clone(&cfg.active))?;
+        spawn_ingest(
+            Arc::clone(&ring),
+            Arc::clone(&ring_cv),
+            &cfg.scout_addr,
+            Arc::clone(&cfg.active),
+            cfg.scout_chunk_ms,
+        )?;
         Ok(Self {
             mgr,
             ring,
@@ -339,14 +356,17 @@ impl OnnxStage1Recognizer {
 }
 
 /// Spawn the scout→ring ingest thread (never blocks, never drops; reconnects on 2s backoff).
-/// `active` controls whether it connects (see [`ScoutAudioSource::with_active`]).
+/// `active` controls whether it connects (see [`ScoutAudioSource::with_active`]); `chunk_ms`
+/// (Some) asks scout to aggregate source buffers into ~N-ms HTTP chunks (`/audio?chunk_ms=N`).
 fn spawn_ingest(
     ring: Arc<Mutex<AudioRing>>,
     ring_cv: Arc<Condvar>,
     scout_addr: &str,
     active: Arc<AtomicBool>,
+    chunk_ms: Option<u64>,
 ) -> Result<()> {
-    let src = ScoutAudioSource::with_active(scout_addr.to_string(), WINDOW, active);
+    let src = ScoutAudioSource::with_active(scout_addr.to_string(), WINDOW, active)
+        .with_chunk_ms(chunk_ms);
     thread::Builder::new()
         .name("aura-stage1-ingest".into())
         .spawn(move || {

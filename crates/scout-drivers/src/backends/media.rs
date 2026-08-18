@@ -363,6 +363,11 @@ impl AudioSource for MediaAudioSource {
     fn subscriber_count(&self) -> usize {
         self.active_count.load(Ordering::Relaxed)
     }
+
+    /// 20 ms @ 16 kHz mono = 320 samples per replayed chunk (see `replay_from_start`).
+    fn buffer_samples(&self) -> Option<u32> {
+        Some(320)
+    }
 }
 
 /// Replay the in-memory PCM from the beginning at realtime pace, one-shot. Sends
@@ -487,6 +492,11 @@ impl AudioSource for MockAudioDirSource {
 
     fn subscriber_count(&self) -> usize {
         0 // we don't track global count (each subscriber is independent)
+    }
+
+    /// 20 ms @ 16 kHz mono = 320 samples per replayed chunk (same mechanism as `MediaAudioSource`).
+    fn buffer_samples(&self) -> Option<u32> {
+        Some(320)
     }
 }
 

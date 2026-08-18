@@ -177,6 +177,10 @@ struct AuraConf {
     /// omni-scout `/audio` 地址 (default `127.0.0.1:7878`)。音频源,与 ASR 部署无关
     /// (local/remote 批式都吃它)。
     scout_addr: Option<String>,
+    /// 客户端请求 scout 的推流 cadence (ms):`?chunk_ms=N` 让 scout 把源 buffer 聚合成
+    /// N-ms 的 HTTP chunk 再推(不能快过 scout 的 node.quantum)。None = 不传,scout
+    /// 按自身 quantum 速率推。纯网络层优化——消费侧照样重切 32ms 窗喂 VAD。
+    scout_chunk_ms: Option<u64>,
     /// Daemon socket 监听地址 (default `127.0.0.1`)。
     bind_addr: Option<String>,
     /// Daemon socket port (default 9091)。
@@ -287,7 +291,7 @@ struct Settings {
 /// Pure merge: CLI > `aura.yaml` > built-in default. (`--no-stage3` wins over the file;
 /// model / hotwords / web_dist / vad are config-file-only — low-frequency knobs.)
 fn resolve(cli: Cli, conf: AuraConf) -> Settings {
-    let AuraConf { scout_addr, bind_addr, port, stage3, log_level, web_dist, hotwords, asr, llm, storage } = conf;
+    let AuraConf { scout_addr, scout_chunk_ms, bind_addr, port, stage3, log_level, web_dist, hotwords, asr, llm, storage } = conf;
     // VAD: each field is the config value or the pipeline's built-in default
     // (`VadSpec::default` — pinned equal to Stage1Config's defaults by a core unit test,
     // so this can't drift from what the recognizer would use anyway).
@@ -336,6 +340,7 @@ fn resolve(cli: Cli, conf: AuraConf) -> Settings {
                 .scout_addr
                 .or(scout_addr)
                 .unwrap_or_else(|| "127.0.0.1:7878".to_string()),
+            scout_chunk_ms,
             hotwords: hotwords
                 .unwrap_or_else(|| SEED_HOTWORDS.iter().map(|s| s.to_string()).collect()),
             vad,

@@ -156,17 +156,28 @@ fn handle(
         return Ok(());
     }
     let req = std::str::from_utf8(&buf[..n]).unwrap_or("");
-    let path = req
+    let raw = req
         .lines()
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .unwrap_or("/");
-    let path = path.split('?').next().unwrap_or(path);
+    let (path, query) = match raw.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (raw, None),
+    };
 
     // /audio is a chunked streaming response — handle it out-of-band (it can't
     // return a fixed Content-Length body like the other routes).
     if path == "/audio" {
-        return serve_audio(stream, audio, demand);
+        // Client-requested push cadence: `?chunk_ms=N` aggregates source buffers into
+        // N-ms HTTP chunks. Absent → one chunk per source buffer (the base quantum rate).
+        let chunk_ms = query.and_then(|q| {
+            q.split('&').find_map(|kv| {
+                let (k, v) = kv.split_once('=')?;
+                (k == "chunk_ms").then(|| v.parse().ok()).flatten()
+            })
+        });
+        return serve_audio(stream, audio, demand, chunk_ms);
     }
 
     let (status, ctype, body) = route(path, src, audio, demand);
@@ -186,10 +197,17 @@ fn handle(
 /// are directly consumable by a streaming ASR client. The source is resumed on
 /// connect and paused again by the idle ticker once the subscription (and all
 /// others) drops.
+///
+/// `chunk_ms` (from `?chunk_ms=N`) lets the client request a SLOWER push cadence:
+/// source buffers are aggregated into ~N-ms HTTP chunks. The floor is the source's
+/// own buffer size (`buffer_samples`) — a client can't ask for chunks SMALLER than
+/// the capture quantum (optimization-1 frequency). `None` → one chunk per source
+/// buffer (the base quantum rate).
 fn serve_audio(
     mut stream: TcpStream,
     audio: &Option<Audio>,
     demand: &Arc<Mutex<Demand>>,
+    chunk_ms: Option<u64>,
 ) -> std::io::Result<()> {
     let Some(a) = audio else {
         return write_text(&mut stream, 503, "no audio source (init failed)");
@@ -206,6 +224,7 @@ fn serve_audio(
 
     // Report the format so the client can decode (mock = always 16k/1/S16LE).
     let (rate, ch) = a.format().map(|f| (f.rate, f.channels)).unwrap_or((16000, 1));
+    let aggregate_to = aggregation_bytes(rate, a.buffer_samples().unwrap_or(0), chunk_ms);
     let head = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: audio/pcm\r\n\
@@ -221,24 +240,102 @@ fn serve_audio(
     stream.write_all(head.as_bytes())?;
 
     // subscription drops at end of scope → unsubscribed → ticker pauses the source.
+    let mut acc: Vec<u8> = Vec::new();
     loop {
         let bytes = match sub.recv_timeout(AUDIO_RECV_TIMEOUT) {
             Ok(b) => b,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue, // keep connection alive
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Source quiet (or ended): flush any partial aggregation, keep the conn alive.
+                if !acc.is_empty() {
+                    if write_chunk(&mut stream, &acc).is_err() {
+                        break; // client gone
+                    }
+                    acc.clear();
+                }
+                continue;
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        // HTTP/1.1 chunk: hex size CRLF, payload, CRLF.
-        let line = format!("{:x}\r\n", bytes.len());
-        if stream.write_all(line.as_bytes()).is_err()
-            || stream.write_all(&bytes).is_err()
-            || stream.write_all(b"\r\n").is_err()
-            || stream.flush().is_err()
-        {
-            break; // client gone
+        match aggregate_to {
+            Some(target) => {
+                acc.extend_from_slice(&bytes);
+                if acc.len() >= target {
+                    if write_chunk(&mut stream, &acc).is_err() {
+                        break; // client gone
+                    }
+                    acc.clear();
+                }
+            }
+            None => {
+                // No client cadence request → forward each source buffer as one chunk.
+                if write_chunk(&mut stream, &bytes).is_err() {
+                    break; // client gone
+                }
+            }
         }
     }
     let _ = stream.write_all(b"0\r\n\r\n"); // terminator (best-effort)
     Ok(())
+}
+
+/// Write one HTTP/1.1 chunked-encoding frame: `{hex-size}\r\n{payload}\r\n`.
+fn write_chunk(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+    let line = format!("{:x}\r\n", bytes.len());
+    stream.write_all(line.as_bytes())?;
+    stream.write_all(bytes)?;
+    stream.write_all(b"\r\n")?;
+    stream.flush()
+}
+
+/// Bytes per aggregated HTTP chunk for a client-requested cadence (mono S16LE: samples × 2).
+/// `None` chunk_ms → `None` (forward each source chunk as-is). The result is clamped UP to the
+/// source's own buffer size and rounded to a whole multiple of it — a client can't push faster
+/// than the capture quantum, so `chunk_ms` below the quantum becomes one source chunk.
+fn aggregation_bytes(rate: u32, floor_samples: u32, chunk_ms: Option<u64>) -> Option<usize> {
+    chunk_ms.map(|ms| {
+        let per_ms = (rate as usize) * 2 / 1000; // mono S16LE bytes per ms
+        let floor_bytes = floor_samples as usize * 2;
+        let want = if floor_bytes > 0 {
+            (per_ms * ms as usize).max(floor_bytes)
+        } else {
+            per_ms * ms as usize
+        };
+        if floor_bytes > 0 {
+            want.div_ceil(floor_bytes) * floor_bytes
+        } else {
+            want
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aggregation_bytes;
+
+    #[test]
+    fn no_client_cadence_forwards_source_chunks() {
+        // chunk_ms None → None → forward each source buffer as-is.
+        assert_eq!(aggregation_bytes(16000, 1024, None), None);
+    }
+
+    #[test]
+    fn requested_cadence_aggregates_and_clamps_to_floor() {
+        // quantum 1024 @ 16kHz = 64ms → 64ms = 1024 samples = 2048 bytes floor.
+        // Request 128ms → 128ms = 2048 samples = 4096 bytes (2 source chunks).
+        assert_eq!(aggregation_bytes(16000, 1024, Some(128)), Some(4096));
+        // Request 256ms → 4096 samples = 8192 bytes (4 source chunks).
+        assert_eq!(aggregation_bytes(16000, 1024, Some(256)), Some(8192));
+        // Request 32ms → BELOW the 64ms floor → clamped to one source chunk (64ms).
+        assert_eq!(aggregation_bytes(16000, 1024, Some(32)), Some(2048));
+    }
+
+    #[test]
+    fn rounding_up_to_source_multiple() {
+        // 100ms @ 16kHz = 1600 samples; floor 1024 → round up to 2048 samples = 4096 bytes.
+        assert_eq!(aggregation_bytes(16000, 1024, Some(100)), Some(4096));
+        // Unknown source (floor 0): exact ms→bytes, no rounding.
+        assert_eq!(aggregation_bytes(16000, 0, Some(100)), Some(3200));
+    }
 }
 
 fn route(

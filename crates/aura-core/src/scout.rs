@@ -29,6 +29,11 @@ pub struct ScoutAudioSource {
     /// connection behavior" switch — it does NOT kill the scout process. Shared with the daemon's
     /// POST /api/control/scout handler.
     active: Arc<AtomicBool>,
+    /// Client-requested push cadence (ms): asks scout to aggregate source buffers into ~N-ms
+    /// HTTP chunks (`/audio?chunk_ms=N`; scout clamps up to its capture quantum). `None` =
+    /// one chunk per scout buffer. Fewer, larger network reads upstream — the consume loop
+    /// re-frames into 32ms windows regardless.
+    chunk_ms: Option<u64>,
 }
 
 impl ScoutAudioSource {
@@ -39,7 +44,13 @@ impl ScoutAudioSource {
     /// Like [`new`](Self::new) but with a shared `active` flag the caller can flip at runtime to
     /// pause/resume the scout connection (takes effect at the reconnect boundary).
     pub fn with_active(addr: impl Into<String>, window: usize, active: Arc<AtomicBool>) -> Self {
-        ScoutAudioSource { addr: addr.into(), window, active }
+        ScoutAudioSource { addr: addr.into(), window, active, chunk_ms: None }
+    }
+
+    /// Request a per-connection push cadence from scout (ms per HTTP chunk).
+    pub fn with_chunk_ms(mut self, chunk_ms: Option<u64>) -> Self {
+        self.chunk_ms = chunk_ms;
+        self
     }
 
     /// Connect to `/audio` and call `on_window` for each fixed-size i16 window. Blocks the calling
@@ -72,10 +83,13 @@ impl ScoutAudioSource {
     fn stream_once<F: FnMut(&[i16])>(&self, on_window: &mut F) -> anyhow::Result<()> {
         let mut sock = TcpStream::connect(&self.addr)?;
         sock.set_nodelay(true)?; // minimise latency on small chunks
-        let req = format!(
-            "GET /audio HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-            self.addr
-        );
+        // Optional client-requested push cadence: scout aggregates source buffers into ~N-ms
+        // HTTP chunks (clamped to ≥ the capture quantum — it can't push faster than the source).
+        let path = match self.chunk_ms {
+            Some(ms) => format!("/audio?chunk_ms={ms}"),
+            None => "/audio".to_string(),
+        };
+        let req = format!("GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", self.addr);
         sock.write_all(req.as_bytes())?;
 
         // ── read everything into one growable buffer, scan for headers end ──

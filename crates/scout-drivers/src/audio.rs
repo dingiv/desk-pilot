@@ -53,6 +53,12 @@ pub trait AudioSource {
     /// How many clients are currently subscribed (for idle detection: pause the
     /// source when this hits 0).
     fn subscriber_count(&self) -> usize;
+
+    /// Samples per captured chunk — the source's native buffer granularity.
+    /// The server uses this as the FLOOR for a client's requested push cadence:
+    /// a client cannot ask for chunks SMALLER than the source produces (you can't
+    /// push faster than the capture quantum). `None` = unknown (no floor).
+    fn buffer_samples(&self) -> Option<u32>;
 }
 
 /// A live subscription to an [`AudioSource`]'s chunk fan-out. Owns its receiver;

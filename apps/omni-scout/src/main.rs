@@ -48,6 +48,8 @@ use scout_drivers::mock::MockCaptureSource;
 mod server;
 
 const LOCK_PATH: &str = "/run/omni-scout.lock";
+/// Default PipeWire capture quantum (samples per buffer): 1024 @ 16 kHz = 64 ms.
+const DEFAULT_AUDIO_QUANTUM: u32 = 1024;
 
 /// Screen source type held by the server (see `server::Screen`).
 type ScreenBox = Box<dyn CaptureSource + Send>;
@@ -95,7 +97,7 @@ fn main() {
         };
         build_mock_audio_dir(&resolved_dir)
     } else {
-        build_real(args.audio_only)
+        build_real(args.audio_only, args.audio_quantum)
     };
 
     let mode = if args.mock_audio.is_some() && args.mock.is_none() {
@@ -142,16 +144,26 @@ fn build_mock_audio_dir(dir: &str) -> (Arc<Mutex<ScreenBox>>, Option<AudioArc>) 
 
 /// Real PipeWire sources: ScreenCast portal (may prompt to pick a screen) + mic.
 /// Mic is best-effort: a missing/broken mic degrades to screen-only.
-fn build_real(audio_only: bool) -> (Arc<Mutex<ScreenBox>>, Option<AudioArc>) {
-    if audio_only {
-        info!("audio-only mode — skipping ScreenCast portal");
-        let audio = match PipeWireAudioSource::new() {
+/// `audio_quantum` = samples per captured buffer (`node.quantum`); default 1024 @ 16 kHz = 64 ms.
+fn build_real(audio_only: bool, audio_quantum: u32) -> (Arc<Mutex<ScreenBox>>, Option<AudioArc>) {
+    let new_mic = || -> Option<AudioArc> {
+        match PipeWireAudioSource::new(audio_quantum) {
             Ok(a) => {
-                info!("mic source ready (16 kHz mono S16LE requested)");
+                info!(quantum = audio_quantum, "mic source ready (16 kHz mono S16LE, node.quantum = {audio_quantum} samples)");
                 Some(Arc::new(a) as AudioArc)
             }
             Err(e) => {
-                error!(error = %e, "mic source unavailable");
+                warn!(error = %e, "mic source unavailable");
+                None
+            }
+        }
+    };
+    if audio_only {
+        info!("audio-only mode — skipping ScreenCast portal");
+        let audio = match new_mic() {
+            Some(a) => Some(a),
+            None => {
+                error!("mic source unavailable (audio-only mode)");
                 std::process::exit(2);
             }
         };
@@ -171,17 +183,7 @@ fn build_real(audio_only: bool) -> (Arc<Mutex<ScreenBox>>, Option<AudioArc>) {
     }
     let src: Arc<Mutex<ScreenBox>> = Arc::new(Mutex::new(Box::new(pw)));
 
-    let audio = match PipeWireAudioSource::new() {
-        Ok(a) => {
-            info!("mic source ready (16 kHz mono S16LE requested)");
-            Some(Arc::new(a) as AudioArc)
-        }
-        Err(e) => {
-            warn!(error = %e, "mic source unavailable: screen-only mode");
-            None
-        }
-    };
-    (src, audio)
+    (src, new_mic())
 }
 
 /// File-backed mock sources (no portal, no mic): decode a media file to BGRA
@@ -269,6 +271,9 @@ struct ScoutConf {
     host: Option<String>,
     port: Option<u16>,
     audio_only: Option<bool>,
+    /// PipeWire capture quantum (samples per buffer, `node.quantum`). Larger = fewer, bigger
+    /// `process` callbacks → lower push frequency upstream. Default 1024 @ 16 kHz = 64 ms.
+    audio_quantum: Option<u32>,
     /// Default mock media file (CLI `--mock` overrides). Bare filenames resolve in ASSETS.
     mock: Option<String>,
     mock_video: Option<String>,
@@ -330,6 +335,9 @@ struct Cli {
     /// Only capture mic audio — skip the ScreenCast portal (zero GPU)
     #[arg(long)]
     audio_only: bool,
+    /// PipeWire capture quantum (samples per buffer). Default 1024 @ 16 kHz = 64 ms.
+    #[arg(long, value_name = "SAMPLES")]
+    audio_quantum: Option<u32>,
 }
 
 /// Fully-resolved runtime settings (what `main` actually runs on).
@@ -343,6 +351,8 @@ struct Args {
     /// Override the mock audio file (defaults to `mock`).
     mock_audio: Option<String>,
     audio_only: bool,
+    /// PipeWire capture quantum (samples per buffer). Default 1024 @ 16 kHz = 64 ms.
+    audio_quantum: u32,
 }
 
 /// Pure merge: CLI > `scout.json` > built-in default.
@@ -354,6 +364,7 @@ fn resolve(cli: Cli, conf: ScoutConf) -> Args {
         mock_video: cli.mock_video.or(conf.mock_video),
         mock_audio: cli.mock_audio.or(conf.mock_audio),
         audio_only: cli.audio_only || conf.audio_only.unwrap_or(false),
+        audio_quantum: cli.audio_quantum.or(conf.audio_quantum).unwrap_or(DEFAULT_AUDIO_QUANTUM),
     }
 }
 
@@ -365,7 +376,7 @@ impl Args {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve, Cli, ScoutConf};
+    use super::{resolve, Cli, ScoutConf, DEFAULT_AUDIO_QUANTUM};
 
     #[test]
     fn checked_in_scout_json_parses() {
@@ -392,8 +403,18 @@ mod tests {
         assert_eq!(a.port, 9000, "CLI wins over file");
         assert_eq!(a.mock.as_deref(), Some("cli.m4a"));
         assert!(a.audio_only, "file flag applies when CLI flag absent");
+        assert_eq!(a.audio_quantum, DEFAULT_AUDIO_QUANTUM, "unset quantum falls to default");
+
+        // CLI quantum wins over config.
+        let cli = Cli { audio_quantum: Some(2048), ..Cli::default() };
+        let conf = ScoutConf { audio_quantum: Some(512), ..ScoutConf::default() };
+        assert_eq!(resolve(cli, conf).audio_quantum, 2048, "CLI wins over file");
+        // Config wins over built-in default.
+        let conf = ScoutConf { audio_quantum: Some(512), ..ScoutConf::default() };
+        assert_eq!(resolve(Cli::default(), conf).audio_quantum, 512, "file wins over default");
 
         let d = resolve(Cli::default(), ScoutConf::default());
         assert_eq!((d.host.as_str(), d.port, d.audio_only), ("127.0.0.1", 7878, false));
+        assert_eq!(d.audio_quantum, DEFAULT_AUDIO_QUANTUM);
     }
 }

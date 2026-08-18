@@ -60,15 +60,24 @@ struct Shared {
     subscribers: Vec<(u64, SyncSender<Arc<[u8]>>)>,
     /// Negotiated format, learned from the first `Format` `param_changed`.
     fmt: Option<AudioFormat>,
+    /// Samples per captured chunk, learned from the first `process` buffer (mono S16LE →
+    /// samples = bytes/2). This is the source's native granularity — the server's floor
+    /// for a client-requested push cadence. Falls back to the requested quantum before
+    /// the first buffer arrives.
+    chunk_samples: Option<u32>,
+    /// The quantum we requested via `node.quantum` (samples/buffer). Default 1024 @ 16 kHz = 64 ms.
+    quantum: u32,
     /// Any fatal worker error (connection failure, …).
     error: Option<String>,
 }
 
-impl Default for Shared {
-    fn default() -> Self {
+impl Shared {
+    fn with_quantum(quantum: u32) -> Self {
         Self {
             subscribers: Vec::new(),
             fmt: None,
+            chunk_samples: None,
+            quantum,
             error: None,
         }
     }
@@ -94,11 +103,13 @@ pub struct PipeWireAudioSource {
 
 impl PipeWireAudioSource {
     /// Connect to the local PipeWire daemon and start capturing the default
-    /// microphone at 16 kHz mono S16LE. The stream starts *active*; call
-    /// [`AudioSource::set_active`]`(false)` to pause.
-    pub fn new() -> Result<Self> {
-        let shared = Arc::new(Mutex::new(Shared::default()));
-        let (worker, ctl) = spawn(Arc::clone(&shared));
+    /// microphone at 16 kHz mono S16LE. `quantum` = samples per captured buffer —
+    /// passed as `node.quantum` so the `process` callback (and thus the push rate to
+    /// subscribers) fires on bigger, fewer chunks. Default 1024 @ 16 kHz = 64 ms.
+    /// The stream starts *active*; call [`AudioSource::set_active`]`(false)` to pause.
+    pub fn new(quantum: u32) -> Result<Self> {
+        let shared = Arc::new(Mutex::new(Shared::with_quantum(quantum)));
+        let (worker, ctl) = spawn(Arc::clone(&shared), quantum);
         if worker.is_none() {
             // Connect failed synchronously; surface the recorded error.
             let msg = shared
@@ -156,6 +167,12 @@ impl AudioSource for PipeWireAudioSource {
     fn subscriber_count(&self) -> usize {
         self.shared.lock().map(|g| g.subscribers.len()).unwrap_or(0)
     }
+
+    /// Samples per captured chunk: the ACTUAL buffer size (from the first process
+    /// callback), falling back to the requested `node.quantum` before the first buffer.
+    fn buffer_samples(&self) -> Option<u32> {
+        self.shared.lock().ok().map(|g| g.chunk_samples.unwrap_or(g.quantum))
+    }
 }
 
 impl Drop for PipeWireAudioSource {
@@ -171,13 +188,13 @@ impl Drop for PipeWireAudioSource {
 
 /// Owns the PipeWire `ThreadLoop` + audio stream and fans buffers out to
 /// subscribers. Returns `(None, ..)` if the connection failed synchronously.
-fn spawn(shared: Arc<Mutex<Shared>>) -> (Option<JoinHandle<()>>, mpsc::Sender<Cmd>) {
+fn spawn(shared: Arc<Mutex<Shared>>, quantum: u32) -> (Option<JoinHandle<()>>, mpsc::Sender<Cmd>) {
     let (tx, rx) = mpsc::channel::<Cmd>();
     // Clone for the thread so `shared` stays usable in the spawn-failure branch below.
     let shared_for_thread = Arc::clone(&shared);
     let worker = thread::Builder::new()
         .name("vrover-audio".into())
-        .spawn(move || run_worker(&rx, &shared_for_thread));
+        .spawn(move || run_worker(&rx, &shared_for_thread, quantum));
     match worker {
         Ok(h) => (Some(h), tx),
         Err(e) => {
@@ -187,7 +204,7 @@ fn spawn(shared: Arc<Mutex<Shared>>) -> (Option<JoinHandle<()>>, mpsc::Sender<Cm
     }
 }
 
-fn run_worker(rx: &mpsc::Receiver<Cmd>, shared: &Arc<Mutex<Shared>>) {
+fn run_worker(rx: &mpsc::Receiver<Cmd>, shared: &Arc<Mutex<Shared>>, quantum: u32) {
     // SAFETY: pw_thread_loop_new; pipewire is initialized internally by the crate.
     let tl = match unsafe { ThreadLoop::new(Some("vrover-audio"), None) } {
         Ok(t) => t,
@@ -211,6 +228,12 @@ fn run_worker(rx: &mpsc::Receiver<Cmd>, shared: &Arc<Mutex<Shared>>) {
     props.insert("media.category", "Capture");
     // role + AUTOCONNECT lets PipeWire route to + link the default audio source.
     props.insert("media.role", "Communication");
+    // ★Per-stream buffer-size control. 实测:仅 `node.quantum` 会被 graph 忽略(2026-08-18,
+    // 恒 341 smp @ ~21.4ms = graph 全局 1024@48k)。正确机制是 `node.latency` (PW_KEY_NODE_LATENCY,
+    // 格式 "<samples>/<rate>")——graph 调度器按节点的延迟请求调整 quantum, 而非只当 hint。
+    // `node.quantum` 保留作直接提示。默认 1024 @ 16 kHz = 64 ms。
+    props.insert("node.quantum", quantum.to_string());
+    props.insert("node.latency", format!("{quantum}/{TARGET_RATE}"));
     let stream = match Stream::new(&_core, "vrover-audio", props) {
         Ok(s) => s,
         Err(e) => return fail(shared, format!("Stream::new: {e}")),
@@ -321,6 +344,9 @@ fn on_process(stream: &pipewire::stream::StreamRef, shared: &Arc<Mutex<Shared>>)
     let Ok(mut g) = shared.lock() else {
         return;
     };
+    // Record the ACTUAL buffer size (mono S16LE → samples = bytes/2) — the source's
+    // native granularity the server clamps client push-frequency against.
+    g.chunk_samples = Some((n / 2) as u32);
     // Fan out. try_send is non-blocking: a full (slow) client skips this chunk;
     // a client whose receiver was dropped is pruned (swap_remove, O(1)).
     let mut i = 0;

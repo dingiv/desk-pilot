@@ -49,6 +49,10 @@ use dp_models::http::HttpLlm;
 pub struct PipelineSpec {
     /// omni-scout `/audio` 地址。
     pub scout_addr: String,
+    /// 客户端请求 scout 的推流 cadence(ms):`?chunk_ms=N` 让 scout 把源 buffer 聚合成
+    /// N-ms 的 HTTP chunk 再推(不能快过 scout 的 node.quantum)。None = 不传参,scout
+    /// 按自身 quantum 速率推。纯网络层优化——daemon 侧照样重切成 32ms 窗。
+    pub scout_chunk_ms: Option<u64>,
     /// 种子热词:烘烤进流式 recognizer(beam bias),并预载 Stage2 共享 store。
     pub hotwords: Vec<String>,
     pub vad: VadSpec,
@@ -365,6 +369,8 @@ fn stage1_config(spec: &PipelineSpec, active: Arc<AtomicBool>) -> Result<Stage1C
     };
     let mut cfg = Stage1Config::with_models_dir(spec.scout_addr.clone(), model_dir);
     cfg.active = active;
+    // 客户端请求的 scout 推流 cadence(ms):None = scout 按自身 quantum 速率推。
+    cfg.scout_chunk_ms = spec.scout_chunk_ms;
     // VAD / 分段(默认 = VadSpec::default,与 Stage1Config 内置默认一致)。
     let v = &spec.vad;
     cfg.vad.threshold = v.threshold;
@@ -465,6 +471,7 @@ mod tests {
     fn spec(asr: AsrSpec) -> PipelineSpec {
         PipelineSpec {
             scout_addr: "127.0.0.1:7878".into(),
+            scout_chunk_ms: None,
             hotwords: vec!["Rust".into()],
             vad: VadSpec::default(),
             stream: StreamSpec { model: "zipformer".into() },
