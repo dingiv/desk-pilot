@@ -21,6 +21,7 @@
 //! agent.correct(3, "蛇声", "蛇身");      // fire-and-forget command (window_id 3)
 //! ```
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -110,6 +111,72 @@ pub enum AgentEvent {
     WindowCorrected(u64),
 }
 
+// ── Per-window / per-segment recognition state ────────────────────────────
+//
+// `get_window_preview` 需要知道窗口里每个 Segment 当前是什么:
+// 是还在流式(StreamFragment)还是已出 batch(BatchSegment)、整窗是否已关
+// 闭(BatchWindow/WindowCalibration)、Stage2 校准到了哪一层。这里用
+// `windows_state` 在事件流入时折叠出这个视图。
+
+/// 一个 Segment 的识别状态。
+#[derive(Debug, Clone, Default)]
+struct SegmentState {
+    /// 最新的 StreamFragment 文本(正在识别)。
+    stream: String,
+    /// BatchSegment 结果(该 Segment EOS 出 batch 后才有)。
+    batch: Option<String>,
+}
+
+/// 一个窗口的识别状态,由数据面事件折叠而来。
+#[derive(Debug, Clone, Default)]
+struct WindowState {
+    /// 整窗已关闭(BatchWindow / WindowCalibration 到达)。
+    closed: bool,
+    /// 整窗 batch 重跑文本(BatchWindow,权威 raw)。
+    batch_window: Option<String>,
+    /// 定稿校准文本(WindowCalibration)。
+    calibrated: Option<String>,
+    /// Stage2 对当前窗口所有已到 Segment 的临时联合校准(SegmentCalibration)。
+    segment_calibration: Option<String>,
+    /// 各 Segment,按首见顺序。
+    segments: Vec<(u64, SegmentState)>,
+}
+
+impl WindowState {
+    /// 逐段拼接:每段有 BatchSegment 用 BatchSegment,否则用 StreamFragment。
+    fn concat_segments(&self) -> String {
+        let mut out = String::new();
+        for (_, seg) in &self.segments {
+            let text = seg.batch.clone().unwrap_or_else(|| seg.stream.clone());
+            out.push_str(&text);
+        }
+        out
+    }
+
+    /// 基本预览(plain):窗口已关闭 → BatchWindow;未关闭 → 逐段拼接。
+    fn plain_preview(&self) -> String {
+        if self.closed {
+            self.batch_window.clone().unwrap_or_default()
+        } else {
+            self.concat_segments()
+        }
+    }
+
+    /// 校准优先预览(calc):窗口已关闭 → WindowCalibration 优先于 BatchWindow;
+    /// 未关闭 → SegmentCalibration 优先于逐段拼接,识别中段用 StreamFragment。
+    fn calc_preview(&self) -> String {
+        if self.closed {
+            return self.calibrated.clone()
+                .or_else(|| self.batch_window.clone())
+                .unwrap_or_default();
+        }
+        match &self.segment_calibration {
+            Some(sc) if !sc.is_empty() => sc.clone(),
+            _ => self.concat_segments(),
+        }
+    }
+}
+
 /// Managed-state client facade. Cheap to clone (shares the driver + state).
 #[derive(Clone)]
 pub struct AuraAgent {
@@ -135,6 +202,8 @@ struct AgentInner {
     rt: Runtime,
     state: RwLock<Option<AuraStateView>>,
     windows: RwLock<Vec<WindowView>>,
+    /// 每窗口识别状态(折叠数据面事件)—— `get_window_preview` 的源。
+    windows_state: RwLock<HashMap<u64, WindowState>>,
     live: RwLock<Option<(u64, String)>>,
     conn: AtomicU8,
     tx: tokio::sync::broadcast::Sender<AgentEvent>,
@@ -162,6 +231,7 @@ impl AuraAgent {
             rt,
             state: RwLock::new(None),
             windows: RwLock::new(Vec::new()),
+            windows_state: RwLock::new(HashMap::new()),
             live: RwLock::new(None),
             conn: AtomicU8::new(AuraConn::Connecting as u8),
             tx,
@@ -192,6 +262,25 @@ impl AuraAgent {
     /// The live window's text `(window_id, text)`, if any.
     pub fn live(&self) -> Option<(u64, String)> {
         self.inner.live.read().unwrap().clone()
+    }
+
+    /// 一个窗口的**基本预览**:窗口已关闭 → 显示该窗口的 `BatchWindow` 结果;
+    /// 未关闭 → 逐段拼接,每段优先 `BatchSegment`,仍在识别则用 `StreamFragment`。
+    ///
+    /// 未知窗口返回 `None`。
+    pub fn get_window_preview(&self, window_id: u64) -> Option<String> {
+        let map = self.inner.windows_state.read().unwrap();
+        map.get(&window_id).map(|w| w.plain_preview())
+    }
+
+    /// 一个窗口的**校准优先预览**(`#asr/calc` 集成):
+    /// - 已关闭:`WindowCalibration` 优先于 `BatchWindow`;
+    /// - 未关闭:`SegmentCalibration` 优先于逐段拼接,识别中段用 `StreamFragment`。
+    ///
+    /// 未知窗口返回 `None`。
+    pub fn get_window_calc_preview(&self, window_id: u64) -> Option<String> {
+        let map = self.inner.windows_state.read().unwrap();
+        map.get(&window_id).map(|w| w.calc_preview())
     }
 
     /// Current connectivity (best-effort, last known).
@@ -333,26 +422,68 @@ fn set_state(inner: &AgentInner, snap: AuraStateView) {
     let _ = inner.tx.send(AgentEvent::StateChanged(snap));
 }
 
+/// 取(或建)一个窗口的识别状态,就地更新。
+fn with_window_state(
+    ws: &RwLock<HashMap<u64, WindowState>>,
+    window_id: u64,
+    f: impl FnOnce(&mut WindowState),
+) {
+    let mut map = ws.write().unwrap();
+    let win = map.entry(window_id).or_default();
+    f(win);
+}
+
+/// 取(或建)窗口里的一个 Segment 状态,就地更新(按 segment_id upsert)。
+fn with_segment_state(
+    ws: &RwLock<HashMap<u64, WindowState>>,
+    window_id: u64,
+    segment_id: u64,
+    f: impl FnOnce(&mut SegmentState),
+) {
+    with_window_state(ws, window_id, |win| {
+        match win.segments.iter_mut().find(|(id, _)| *id == segment_id) {
+            Some((_, seg)) => f(seg),
+            None => {
+                win.segments.push((segment_id, SegmentState::default()));
+                f(&mut win.segments.last_mut().unwrap().1);
+            }
+        }
+    });
+}
+
 /// Fold one data-plane segment into the shared window list + live text. Pure enough to unit
 /// test (only touches the RwLocks + event queue).
 fn apply_segment(inner: &AgentInner, seg: AsrSegment) {
     match seg {
         AsrSegment::StreamFragment { window_id, segment_id, text, .. } => {
             *inner.live.write().unwrap() = Some((window_id, text.clone()));
+            with_segment_state(&inner.windows_state, window_id, segment_id, |s| s.stream = text.clone());
             let _ = inner.tx.send(AgentEvent::StreamFragment { window_id, segment_id, text });
         }
         AsrSegment::BatchSegment { window_id, segment_id, text } => {
+            with_segment_state(&inner.windows_state, window_id, segment_id, |s| s.batch = Some(text.clone()));
             let _ = inner.tx.send(AgentEvent::BatchSegment { window_id, segment_id, text });
         }
         AsrSegment::BatchWindow { window_id, text } => {
+            with_window_state(&inner.windows_state, window_id, |w| {
+                w.closed = true;
+                w.batch_window = Some(text.clone());
+            });
             let _ = inner.tx.send(AgentEvent::BatchWindow { window_id, text });
         }
         AsrSegment::SegmentCalibration { window_id, calibrated } => {
             *inner.live.write().unwrap() = Some((window_id, calibrated.clone()));
+            with_window_state(&inner.windows_state, window_id, |w| {
+                w.segment_calibration = Some(calibrated.clone());
+            });
             let _ = inner.tx.send(AgentEvent::SegmentCalibration { window_id, calibrated });
         }
         AsrSegment::WindowCalibration { window_id, calibrated } => {
             *inner.live.write().unwrap() = None;
+            with_window_state(&inner.windows_state, window_id, |w| {
+                w.closed = true;
+                w.calibrated = Some(calibrated.clone());
+            });
             let mut wins = inner.windows.write().unwrap();
             // Upsert by window_id (defensive — windows settle in ascending order, but a
             // reconnect could replay an older one). Preserve the corrected flag.
@@ -391,6 +522,7 @@ mod tests {
             rt: Runtime::new().unwrap(),
             state: RwLock::new(None),
             windows: RwLock::new(Vec::new()),
+            windows_state: RwLock::new(HashMap::new()),
             live: RwLock::new(None),
             conn: AtomicU8::new(AuraConn::Connecting as u8),
             tx,
@@ -451,5 +583,102 @@ mod tests {
         }
         let ids: Vec<u64> = i.windows.read().unwrap().iter().map(|w| w.window_id).collect();
         assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    // ── get_window_preview ──────────────────────────────────────────────
+
+    /// 喂一段流式 + 对应 batch(模拟一个已出 batch 的 Segment)。
+    fn stream_then_batch(i: &Arc<AgentInner>, wid: u64, sid: u64, text: &str) {
+        apply_segment(
+            &i,
+            AsrSegment::StreamFragment { window_id: wid, segment_id: sid, text: text.into(), at_s: 0.0 },
+        );
+        apply_segment(&i, AsrSegment::BatchSegment { window_id: wid, segment_id: sid, text: text.into() });
+    }
+
+    fn preview(i: &Arc<AgentInner>, wid: u64) -> (Option<String>, Option<String>) {
+        let a = AuraAgent { inner: Arc::clone(i) };
+        (a.get_window_preview(wid), a.get_window_calc_preview(wid))
+    }
+
+    #[test]
+    fn open_window_preview_uses_stream_fragment_while_recognizing() {
+        let i = inner();
+        apply_segment(
+            &i,
+            AsrSegment::StreamFragment { window_id: 5, segment_id: 1, text: "你好".into(), at_s: 0.0 },
+        );
+        // 未关闭,只有 StreamFragment → 拼接取它。
+        let (plain, calc) = preview(&i, 5);
+        assert_eq!(plain.as_deref(), Some("你好"));
+        assert_eq!(calc.as_deref(), Some("你好"), "无 SegmentCalibration 时 calc 同样取流式");
+    }
+
+    #[test]
+    fn open_window_preview_prefers_batch_segment_over_stream() {
+        let i = inner();
+        apply_segment(
+            &i,
+            AsrSegment::StreamFragment { window_id: 5, segment_id: 1, text: "你好".into(), at_s: 0.0 },
+        );
+        apply_segment(&i, AsrSegment::BatchSegment { window_id: 5, segment_id: 1, text: "你好".into() });
+        // 已出 batch → 用 BatchSegment。
+        assert_eq!(preview(&i, 5).0.as_deref(), Some("你好"));
+    }
+
+    #[test]
+    fn open_window_preview_concats_segments_in_order() {
+        let i = inner();
+        stream_then_batch(&i, 9, 1, "第一段");
+        // 第二段还在识别。
+        apply_segment(
+            &i,
+            AsrSegment::StreamFragment { window_id: 9, segment_id: 2, text: "第二段".into(), at_s: 0.0 },
+        );
+        // 未关闭 → 逐段拼接:第一段取 BatchSegment,第二段取 StreamFragment。
+        assert_eq!(preview(&i, 9).0.as_deref(), Some("第一段第二段"));
+    }
+
+    #[test]
+    fn closed_window_preview_uses_batch_window() {
+        let i = inner();
+        stream_then_batch(&i, 4, 1, "内容");
+        apply_segment(&i, AsrSegment::BatchWindow { window_id: 4, text: "整窗batch".into() });
+        // 已关闭 → plain 显示 BatchWindow。
+        assert_eq!(preview(&i, 4).0.as_deref(), Some("整窗batch"));
+        // calc:无 WindowCalibration 时回退 BatchWindow。
+        assert_eq!(preview(&i, 4).1.as_deref(), Some("整窗batch"));
+    }
+
+    #[test]
+    fn calc_closed_prefers_window_calibration_over_batch_window() {
+        let i = inner();
+        stream_then_batch(&i, 4, 1, "内容");
+        apply_segment(&i, AsrSegment::BatchWindow { window_id: 4, text: "整窗batch".into() });
+        apply_segment(&i, AsrSegment::WindowCalibration { window_id: 4, calibrated: "定稿".into() });
+        // plain 仍显示 BatchWindow(未集成校准)。
+        assert_eq!(preview(&i, 4).0.as_deref(), Some("整窗batch"));
+        // calc 优先 WindowCalibration。
+        assert_eq!(preview(&i, 4).1.as_deref(), Some("定稿"));
+    }
+
+    #[test]
+    fn calc_open_prefers_segment_calibration_over_concat() {
+        let i = inner();
+        stream_then_batch(&i, 7, 1, "第一段");
+        apply_segment(&i, AsrSegment::StreamFragment { window_id: 7, segment_id: 2, text: "第二段".into(), at_s: 0.0 });
+        assert_eq!(preview(&i, 7).1.as_deref(), Some("第一段第二段"), "无校准 → 逐段拼接");
+        // Stage2 联合校准到达 → calc 用它。
+        apply_segment(&i, AsrSegment::SegmentCalibration { window_id: 7, calibrated: "联合整流".into() });
+        assert_eq!(preview(&i, 7).1.as_deref(), Some("联合整流"));
+        // plain 不受影响(仍拼接)。
+        assert_eq!(preview(&i, 7).0.as_deref(), Some("第一段第二段"));
+    }
+
+    #[test]
+    fn unknown_window_preview_is_none() {
+        let i = inner();
+        assert_eq!(preview(&i, 42).0, None);
+        assert_eq!(preview(&i, 42).1, None);
     }
 }

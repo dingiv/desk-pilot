@@ -37,6 +37,19 @@ struct VoiceState {
     /// Settled utterances, most-recent-first. Each WindowCalibration `push_final` inserts at the
     /// head — so `finals[0]` is the latest, which the engine surfaces as candidate #1.
     finals: Vec<String>,
+    /// 当前窗口的组装预览(由 aura-agent 的 `get_window_preview` 经 bridge 喂入)。
+    /// `plain` = BatchWindow/逐段拼接;`calc` = 校准优先(WindowCalibration/SegmentCalibration)。
+    preview: Option<AsrPreview>,
+}
+
+/// 一个窗口的组装预览,`#asr` 显示用。`plain` 是基本预览,`calc` 是
+/// `#asr/calc` 的校准优先版本(WindowCalibration > BatchWindow,
+/// SegmentCalibration > BatchSegment,识别中用 StreamFragment)。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AsrPreview {
+    pub window_id: u64,
+    pub plain: String,
+    pub calc: String,
 }
 
 /// Shared voice-session state. Written by the aura data-plane client, read by the IME engine.
@@ -119,6 +132,34 @@ impl AsrBuffer {
     /// Seed a final (used by the mock frontend's `--asr-text`). Equivalent to `push_final`.
     pub fn update(&self, text: &str) {
         self.push_final(text);
+    }
+
+    /// 写入当前窗口的组装预览(bridge 每轮 drain 后喂)。内容有变化才 bump
+    /// 版本,让 `#asr` 的 tick 重建候选。
+    pub fn set_preview(&self, preview: AsrPreview) {
+        let mut g = self.state.lock().unwrap();
+        let changed = g.preview.as_ref() != Some(&preview);
+        g.preview = Some(preview);
+        drop(g);
+        if changed {
+            self.bump();
+        }
+    }
+
+    /// 清除预览(当前窗口关闭 / 无活动窗口时)。有预览才 bump。
+    pub fn clear_preview(&self) {
+        let mut g = self.state.lock().unwrap();
+        let had = g.preview.is_some();
+        g.preview = None;
+        drop(g);
+        if had {
+            self.bump();
+        }
+    }
+
+    /// 当前窗口的组装预览(若无则 `None` —— `#asr` 回退到 live/finals)。
+    pub fn preview(&self) -> Option<AsrPreview> {
+        self.state.lock().unwrap().preview.clone()
     }
 }
 

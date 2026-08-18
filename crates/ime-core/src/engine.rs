@@ -797,6 +797,57 @@ mod tests {
     }
 
     #[test]
+    fn asr_calc_uses_calibration_preview() {
+        // #asr/calc → 集成校准:候选 #1 用 calc 预览(WindowCalibration/SegmentCalibration),
+        // 而非 plain 预览。
+        use std::sync::Arc;
+        use crate::asr_buffer::{AsrBuffer, AsrPreview};
+        let mut e = eng();
+        let buf = Arc::new(AsrBuffer::new());
+        buf.set_connected(true);
+        buf.set_preview(AsrPreview { window_id: 3, plain: "plain文本".into(), calc: "校准文本".into() });
+        e.set_asr_buffer(Arc::clone(&buf));
+
+        for c in "#asr/calc".chars() { e.predict(KeyEvent::char(c)); }
+        let cands = e.candidates();
+        assert_eq!(cands.first().map(|s| s.as_str()), Some("校准文本"), "{cands:?}");
+        let view = e.view();
+        assert!(ImeView::str_field(&view.preedit_text).contains("校准预览"), "marker: {:?}", view.preedit_text);
+    }
+
+    #[test]
+    fn asr_plain_uses_basic_preview_when_available() {
+        // 无 /calc → 用 plain 预览(批处理/逐段拼接);无预览时回退原始 live。
+        use std::sync::Arc;
+        use crate::asr_buffer::{AsrBuffer, AsrPreview};
+        let mut e = eng();
+        let buf = Arc::new(AsrBuffer::new());
+        buf.set_connected(true);
+        buf.set_preview(AsrPreview { window_id: 3, plain: "plain文本".into(), calc: "校准文本".into() });
+        e.set_asr_buffer(Arc::clone(&buf));
+
+        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
+        let cands = e.candidates();
+        assert_eq!(cands.first().map(|s| s.as_str()), Some("plain文本"), "{cands:?}");
+    }
+
+    #[test]
+    fn asr_preview_falls_back_to_live_without_preview() {
+        // bridge 未喂预览(如纯 live/finals 环境)→ 回退原始 live。
+        use std::sync::Arc;
+        use crate::asr_buffer::AsrBuffer;
+        let mut e = eng();
+        let buf = Arc::new(AsrBuffer::new());
+        buf.set_connected(true);
+        buf.set_live("流式原文");
+        e.set_asr_buffer(Arc::clone(&buf));
+
+        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
+        let cands = e.candidates();
+        assert_eq!(cands.first().map(|s| s.as_str()), Some("流式原文"), "{cands:?}");
+    }
+
+    #[test]
     fn asr_query_num_commits_latest_n_finals() {
         // #asr?num=2 → 提交语音队列最新两条定稿。
         use std::sync::Arc;

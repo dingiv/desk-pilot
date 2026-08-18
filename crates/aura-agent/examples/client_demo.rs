@@ -38,16 +38,20 @@ async fn main() -> anyhow::Result<()> {
     while let Some(seg) = segments.next().await {
         let t = chrono::Local::now().format("%H:%M:%S%.3f");
         match seg {
-            AsrSegment::Interim { window_id, segment_id, partial, .. } => {
-                println!("[{t}] interim   w{window_id}/s{segment_id} | {partial}")
+            AsrSegment::StreamFragment { window_id, segment_id, text, .. } => {
+                println!("[{t}] stream    w{window_id}/s{segment_id} | {text}")
             }
-            AsrSegment::WindowCalibrated { window_id, calibrated } => {
-                println!("[{t}] calibrated w{window_id} | {calibrated}")
+            AsrSegment::BatchSegment { window_id, segment_id, text } => {
+                println!("[{t}] batch-seg w{window_id}/s{segment_id} | {text}")
             }
-            AsrSegment::WindowFinal { window_id, raw_text, calibrated, route_ms, .. } => {
-                println!(
-                    "[{t}] FINAL     w{window_id} ({route_ms:.0}ms) | raw={raw_text:?} → {calibrated:?}"
-                );
+            AsrSegment::BatchWindow { window_id, text } => {
+                println!("[{t}] batch-win w{window_id} | {text}")
+            }
+            AsrSegment::SegmentCalibration { window_id, calibrated } => {
+                println!("[{t}] seg-calib w{window_id} | {calibrated}")
+            }
+            AsrSegment::WindowCalibration { window_id, calibrated } => {
+                println!("[{t}] FINAL     w{window_id} | {calibrated}")
             }
             AsrSegment::Correction { window_id, raw, corrected } => {
                 println!("[{t}] CORRECT   w{window_id} | {raw:?} → {corrected:?}");

@@ -100,6 +100,18 @@ pub fn spawn_aura_client(buffer: Arc<AsrBuffer>, aura_addr: Option<&str>) -> Aur
                     _ => {}
                 }
             }
+            // 组装预览:当前活动窗口(live 存在)→ 用 aura-agent 的
+            // `get_window_preview`(plain)+ `get_window_calc_preview`(calc)喂给
+            // `#asr`/`#asr/calc`。窗口关闭后 live 清空 → 清预览,定稿已由
+            // WindowCalibration 作为候选提供。
+            match drain_agent.live() {
+                Some((window_id, _)) => {
+                    let plain = drain_agent.get_window_preview(window_id).unwrap_or_default();
+                    let calc = drain_agent.get_window_calc_preview(window_id).unwrap_or_default();
+                    buffer.set_preview(ime_core::asr_buffer::AsrPreview { window_id, plain, calc });
+                }
+                None => buffer.clear_preview(),
+            }
             thread::sleep(DRAIN_INTERVAL);
         })
         .expect("spawn aura drain thread");

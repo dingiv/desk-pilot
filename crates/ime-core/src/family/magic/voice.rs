@@ -50,13 +50,16 @@ impl VoiceMember {
         }
     }
 
-    /// 参数的可读标记(翻译模式 / 未知参数 / num 提交)。空参数字符串时为空。
+    /// 参数的可读标记(翻译模式 / 校准预览 / 未知参数 / num 提交)。空参数字符串时为空。
     fn arg_marker(&self) -> String {
         if self.arg.is_empty() { return String::new(); }
         let mut s = String::new();
+        if self.args.has_path("calc") {
+            s.push_str(" · 校准预览");
+        }
         if self.args.has_path("en") {
             s.push_str(" · 英文翻译(待实现)");
-        } else if !self.args.path.is_empty() {
+        } else if !self.args.path.is_empty() && !self.args.has_path("calc") {
             s.push_str(" · 未知参数");
         }
         if self.args.get("num").is_some() {
@@ -90,9 +93,17 @@ impl VoiceMember {
         MemberAction::View(Box::new(self.refresh(sm)))
     }
 
-    /// Rebuild the candidate view from the voice buffer: `[live, finals…]` — the
-    /// active utterance is #1, then settled finals newest→oldest. `sm.candidates`
-    /// holds previews; `self.full` holds the full texts for commit.
+    /// 是否启用校准优先预览(`#asr/calc`)。
+    fn use_calc_preview(&self) -> bool {
+        self.args.has_path("calc")
+    }
+
+    /// Rebuild the candidate view from the voice buffer: `[window-preview, finals…]`
+    /// — the current window's composed preview is #1, then settled finals
+    /// newest→oldest. The preview comes from aura-agent's `get_window_preview`
+    /// (plain) / `get_window_calc_preview`(`/calc`,校准优先)经 bridge 喂入
+    /// `AsrBuffer`;无预览时回退到原始 `live`(StreamFragment/SegmentCalibration)。
+    /// `sm.candidates` holds previews; `self.full` holds the full texts for commit.
     ///
     /// When aura is NOT connected (or no buffer is attached at all), the preedit
     /// says so explicitly instead of the normal "🎙 #asr …" — the user learns the
@@ -106,8 +117,21 @@ impl VoiceMember {
         if connected {
             if let Some(buf) = buf.as_ref() {
                 let (finals, live) = buf.voice_candidates();
-                if !live.is_empty() {
-                    full.push(live); // active streaming → #1
+                // 组装预览优先(bridge 喂入的当前窗口组装文本);无预览则回退
+                // 原始流式 live。
+                let preview = buf.preview();
+                let composed = match &preview {
+                    Some(p) if self.use_calc_preview() && !p.calc.is_empty() => Some(p.calc.clone()),
+                    Some(p) if !self.use_calc_preview() && !p.plain.is_empty() => Some(p.plain.clone()),
+                    _ => None,
+                };
+                match composed {
+                    Some(text) => full.push(text),
+                    None => {
+                        if !live.is_empty() {
+                            full.push(live); // active streaming → #1
+                        }
+                    }
                 }
                 full.extend(finals); // then settled, newest→oldest
             }
