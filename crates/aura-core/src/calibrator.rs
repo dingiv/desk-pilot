@@ -12,6 +12,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{VadSegment, VadWindow, WindowId};
 
 use crate::prompt::PromptBuilder;
@@ -50,6 +52,22 @@ impl Stage2Calibrator for PassThroughCalibrator {
     }
 }
 
+/// Stage2 纠偏的输入源（配置 `llm.input`）——选择把哪些识别文本喂给 LLM。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LlmInput {
+    /// 只用 batch 结果（`VadSegment::best_text()`：batch 优先，流式回退）。默认——batch 是权威。
+    #[default]
+    #[serde(rename = "batch")]
+    Batch,
+    /// 只用流式结果（`streaming_text`）——热词偏置更强、句首更全，但同音字更多。
+    #[serde(rename = "stream")]
+    Stream,
+    /// batch + 流式双通道对照（`<primary_transcript>` + `<secondary_transcript>`）——批式丢句首
+    /// 时由流式补回（见 [`crate::prompt::DUAL_TRANSCRIPT_INSTRUCTION`]）。
+    #[serde(rename = "both")]
+    Both,
+}
+
 /// Default Stage2 calibrator over an [`dp_models::LlmProvider`]. Reads the latest hotwords
 /// (shared with Stage3) and user corrections on every call.
 pub struct Stage2CalibratorImpl {
@@ -59,6 +77,8 @@ pub struct Stage2CalibratorImpl {
     /// User corrections (raw→corrected pairs), shared with daemon's POST /api/correct handler.
     /// Read fresh on every calibrate — the correction feedback channel.
     corrections: Arc<Mutex<Vec<(String, String)>>>,
+    /// 纠偏输入源（`llm.input`）。
+    input: LlmInput,
     /// 窗口状态机的全部状态:当前窗口 id + 其最后一次联合整流结果(每个 Batch 覆盖,
     /// WindowEdge 消费并清空 = 移动左边界)。
     current: Option<(WindowId, String)>,
@@ -66,21 +86,40 @@ pub struct Stage2CalibratorImpl {
 
 impl Stage2CalibratorImpl {
     /// `hotwords` is shared (clone the Arc from wherever Stage3 holds it); `llm` is the local
-    /// `Calibrator` or a remote `HttpLlm` (as `Arc<dyn LlmProvider>`).
+    /// `Calibrator` or a remote `HttpLlm` (as `Arc<dyn LlmProvider>`). `input` selects the
+    /// calibration source text (batch / stream / both).
     pub fn new(
         llm: Arc<dyn dp_models::LlmProvider>,
         hotwords: Arc<Mutex<Vec<String>>>,
         corrections: Arc<Mutex<Vec<(String, String)>>>,
+        input: LlmInput,
     ) -> Self {
-        Self { llm, hotwords, corrections, current: None }
+        Self { llm, hotwords, corrections, input, current: None }
     }
 }
 
 impl Stage2Calibrator for Stage2CalibratorImpl {
     fn calibrate_window(&mut self, window_id: WindowId, segments: &[VadSegment]) -> String {
-        // One line per segment — the joint input IS the cross-sentence context.
-        let texts: Vec<&str> = segments.iter().map(|s| s.best_text()).collect();
-        let calibrated = self.joint_calibrate(&texts);
+        let calibrated = match self.input {
+            LlmInput::Batch => {
+                // One line per segment — the joint input IS the cross-sentence context.
+                let texts: Vec<&str> = segments.iter().map(|s| s.best_text()).collect();
+                self.joint_calibrate(&texts, None)
+            }
+            LlmInput::Stream => {
+                let texts: Vec<&str> = segments.iter().map(|s| s.streaming_text.as_str()).collect();
+                self.joint_calibrate(&texts, None)
+            }
+            LlmInput::Both => {
+                let texts: Vec<&str> = segments.iter().map(|s| s.best_text()).collect();
+                let streaming = segments
+                    .iter()
+                    .map(|s| s.streaming_text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.joint_calibrate(&texts, Some(&streaming))
+            }
+        };
         // 识别一次之后,覆盖当前窗口的整流结果(WindowEdge 时它就是 VadWindow 的纠偏字段)。
         self.current = Some((window_id, calibrated.clone()));
         calibrated
@@ -103,12 +142,18 @@ impl Stage2Calibrator for Stage2CalibratorImpl {
 
 impl Stage2CalibratorImpl {
     /// The shared core: build the prompt (corrections → hotwords → joint text in the XML
-    /// envelope), run the LLM, fall back to the raw text on failure.
-    fn joint_calibrate(&mut self, texts: &[&str]) -> String {
+    /// envelope), run the LLM, fall back to the raw text on failure. `streaming_ref` (Some for
+    /// [`LlmInput::Both`]) adds the dual-transcript envelope so the LLM can补回 batch 丢的句首.
+    fn joint_calibrate(&mut self, texts: &[&str], streaming_ref: Option<&str>) -> String {
         let hotwords = self.hotwords.lock().unwrap().clone();
         let corrections = self.corrections.lock().unwrap().clone();
 
         let mut pb = PromptBuilder::new_multi(texts).hotwords(&hotwords);
+        // Dual-transcript (llm.input: both): streaming head/tail is fuller — the instruction
+        // tells the LLM to补回 real words batch dropped at the segment head.
+        if let Some(sref) = streaming_ref {
+            pb = pb.streaming_ref(sref);
+        }
         // User corrections (raw→corrected) — authoritative examples, highest priority.
         if !corrections.is_empty() {
             pb = pb.corrections(&corrections);
@@ -165,8 +210,58 @@ mod tests {
             Arc::new(CountingLlm(Arc::clone(&calls))),
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(Mutex::new(Vec::new())),
+            LlmInput::Batch,
         );
         (s, calls)
+    }
+
+    /// Capturing LLM stub — records the USER prompt so the test can assert which source text
+    /// (batch / stream / both) was fed.
+    struct CapturingLlm(Arc<Mutex<Option<String>>>);
+    impl dp_models::LlmProvider for CapturingLlm {
+        fn complete(&self, _system: &str, user: &str) -> anyhow::Result<String> {
+            *self.0.lock().unwrap() = Some(user.to_string());
+            Ok("整流OK".into())
+        }
+    }
+
+    fn s2_with_input(input: LlmInput) -> (Stage2CalibratorImpl, Arc<Mutex<Option<String>>>) {
+        let user = Arc::new(Mutex::new(None));
+        let s = Stage2CalibratorImpl::new(
+            Arc::new(CapturingLlm(Arc::clone(&user))),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            input,
+        );
+        (s, user)
+    }
+
+    #[test]
+    fn llm_input_selects_source_text() {
+        let segs = vec![seg(1), seg(2)]; // batch "段1/段2", streaming "流式1/流式2"
+
+        // batch（默认）：只喂 batch 文本，无 streaming 信封。
+        let (mut s, user) = s2_with_input(LlmInput::Batch);
+        s.calibrate_window(1, &segs);
+        let u = user.lock().unwrap().clone().unwrap();
+        assert!(u.contains("段1") && u.contains("段2"), "batch 文本进 prompt: {u}");
+        assert!(!u.contains("流式1"), "batch 模式不喂流式");
+        assert!(!u.contains("secondary_transcript"), "无双通道信封");
+
+        // stream：只喂流式文本。
+        let (mut s, user) = s2_with_input(LlmInput::Stream);
+        s.calibrate_window(1, &segs);
+        let u = user.lock().unwrap().clone().unwrap();
+        assert!(u.contains("流式1") && u.contains("流式2"), "流式文本进 prompt: {u}");
+        assert!(!u.contains("段1"), "stream 模式不喂 batch");
+
+        // both：batch 进 primary_transcript + 流式进 secondary_transcript。
+        let (mut s, user) = s2_with_input(LlmInput::Both);
+        s.calibrate_window(1, &segs);
+        let u = user.lock().unwrap().clone().unwrap();
+        assert!(u.contains("段1") && u.contains("段2"), "both 模式 batch 进 primary_transcript");
+        assert!(u.contains("流式1") && u.contains("流式2"), "both 模式流式进 secondary_transcript");
+        assert!(u.contains("secondary_transcript"), "双通道信封存在");
     }
 
     #[test]

@@ -26,7 +26,7 @@ pub mod tts;
 pub mod vad;
 pub mod wav;
 
-pub use calibrator::{PassThroughCalibrator, Stage2Calibrator, Stage2CalibratorImpl};
+pub use calibrator::{LlmInput, PassThroughCalibrator, Stage2Calibrator, Stage2CalibratorImpl};
 #[cfg(feature = "asr")]
 pub use pipeline::{AsrSpec, LlmSpec, Pipeline, PipelineSpec, StreamSpec, TurnEvent, VadSpec};
 pub use prompt::PromptBuilder;

@@ -28,7 +28,7 @@ use std::time::Instant;
 use anyhow::Result;
 use tracing::{debug, info};
 
-use crate::calibrator::{PassThroughCalibrator, Stage2Calibrator, Stage2CalibratorImpl};
+use crate::calibrator::{LlmInput, PassThroughCalibrator, Stage2Calibrator, Stage2CalibratorImpl};
 use crate::hub::{FinalTurn, Storage};
 use crate::recognizer::{OnnxStage1Recognizer, Stage1Config, Stage1Recognizer};
 use crate::{Calibrator, Stage1Event};
@@ -52,6 +52,8 @@ pub struct PipelineSpec {
     pub stream: StreamSpec,
     pub asr: AsrSpec,
     pub llm: LlmSpec,
+    /// Stage2 纠偏的输入源（`llm.input`）：batch（默认）| stream | both。
+    pub llm_input: LlmInput,
 }
 
 /// 流式 ASR 选型(**恒本地** —— 实时 partial 要低延迟,不走 remote)。当前唯一引擎
@@ -418,7 +420,7 @@ fn stage2_calibrator(
             Arc::new(calibrator)
         }
     };
-    Ok(Box::new(Stage2CalibratorImpl::new(llm, hotwords, corrections)))
+    Ok(Box::new(Stage2CalibratorImpl::new(llm, hotwords, corrections, spec.llm_input)))
 }
 
 #[cfg(test)]
@@ -437,6 +439,7 @@ mod tests {
             stream: StreamSpec { model: "zipformer".into() },
             asr,
             llm: LlmSpec::Local { model: "m.gguf".into(), model_dir: None },
+            llm_input: LlmInput::Batch,
         }
     }
 

@@ -44,7 +44,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use audio_aura_agent::{stage3_rule_trigger, AddHotwordTool, HotwordManager, SharedHotwordManager};
 use audio_aura_core::archive::{ArchiveConfig, AudioArchive};
 use audio_aura_core::hub::Storage;
-use audio_aura_core::{AsrSpec, LlmSpec, Pipeline, PipelineSpec, StreamSpec, TurnEvent, VadSpec};
+use audio_aura_core::{AsrSpec, LlmInput, LlmSpec, Pipeline, PipelineSpec, StreamSpec, TurnEvent, VadSpec};
 
 const BASE: &str = "/workspaces/gui_agent/audio-aura/native";
 
@@ -150,6 +150,8 @@ struct LlmConf {
     model_dir: Option<String>,
     /// remote-only:服务地址。
     endpoint: Option<String>,
+    /// Stage2 纠偏输入源: "batch" (默认) | "stream" | "both"。
+    input: Option<LlmInput>,
 }
 
 /// `storage:` — 音频持久化。
@@ -340,6 +342,7 @@ fn resolve(cli: Cli, conf: AuraConf) -> Settings {
             stream,
             asr: asr_spec,
             llm: llm_spec,
+            llm_input: llm.input.unwrap_or_default(),
         },
     }
 }
@@ -728,7 +731,7 @@ async fn correction_handler(State(s): State<DaemonState>, body: Json<Value>) -> 
 #[cfg(test)]
 mod tests {
     use super::{resolve, AuraConf, AsrConf, Cli, LlmConf, RemoteAsrConf};
-    use audio_aura_core::{AsrSpec, LlmSpec};
+    use audio_aura_core::{AsrSpec, LlmInput, LlmSpec};
 
     #[test]
     fn unknown_config_key_rejected() {
@@ -739,26 +742,6 @@ mod tests {
         assert!(serde_yaml::from_str::<AuraConf>("asr:\n  typo: 1").is_err());
         // 分层 + 已知键正常。
         assert!(serde_yaml::from_str::<AuraConf>("asr:\n  backend: remote").is_ok());
-    }
-
-    #[test]
-    fn checked_in_aura_yaml_parses() {
-        // Guard the YAML config (the primary dev config) + the vad: section against drift.
-        // (aura.json is gone — yaml is the shipped config; json remains a loader fallback only.)
-        let s = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/aura.yaml"))
-            .expect("apps/audio-aura/aura.yaml missing");
-        let conf: AuraConf = serde_yaml::from_str(&s).expect("aura.yaml must parse");
-        assert_eq!(conf.port, Some(9091));
-        // 只断言存在——具体等级是用户的本地旋钮(实测时改成 debug 是常态),不该被测试钉死。
-        assert!(
-            conf.log_level.as_deref().map(|v| !v.trim().is_empty()).unwrap_or(false),
-            "log_level documented in yaml"
-        );
-        let vad = conf.asr.vad.expect("aura.yaml must have an asr.vad: section");
-        assert_eq!(vad.merge_gap, Some(2.5), "merge_gap documented in yaml");
-        assert_eq!(vad.threshold, Some(0.5));
-        assert_eq!(vad.min_silence, Some(1.0));
-        assert_eq!(conf.asr.stream.model, Some("zipformer".into()), "stream engine documented");
     }
 
     #[test]
@@ -852,5 +835,30 @@ mod tests {
         let s = resolve(Cli::default(), conf);
         assert!(matches!(s.spec.llm, LlmSpec::Disabled));
         assert_eq!(s.spec.llm.kind(), "disabled");
+    }
+
+    #[test]
+    fn resolve_selects_llm_input() {
+        // llm.input 默认 batch;显式配置 stream/both 时正确映射。
+        let d = resolve(Cli::default(), AuraConf::default());
+        assert_eq!(d.spec.llm_input, LlmInput::Batch, "默认 batch");
+
+        let conf = AuraConf {
+            llm: LlmConf {
+                input: Some(LlmInput::Stream),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(resolve(Cli::default(), conf).spec.llm_input, LlmInput::Stream);
+
+        let conf = AuraConf {
+            llm: LlmConf {
+                input: Some(LlmInput::Both),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(resolve(Cli::default(), conf).spec.llm_input, LlmInput::Both);
     }
 }

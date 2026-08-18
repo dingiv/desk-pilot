@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use audio_aura_core::recognizer::{OnnxStage1Recognizer, Stage1Config};
-use audio_aura_core::{Calibrator, Pipeline, Stage2CalibratorImpl, TurnEvent};
+use audio_aura_core::{Calibrator, LlmInput, Pipeline, Stage2CalibratorImpl, TurnEvent};
 
 // Repo-relative bench dir (crates/aura-core → desk-pilot/bench). Created on startup.
 const REPORT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench");
@@ -44,7 +44,7 @@ fn main() -> anyhow::Result<()> {
     let calibrator = Calibrator::load_default("Qwen3-1.7B-Q8_0.gguf")?;
     let _ = calibrator.calibrate_blocking("你好", None, &[]); // HF warmup
     let corrections = Arc::new(Mutex::new(Vec::new()));
-    let s2 = Stage2CalibratorImpl::new(Arc::new(calibrator), Arc::clone(&hotwords), corrections);
+    let s2 = Stage2CalibratorImpl::new(Arc::new(calibrator), Arc::clone(&hotwords), corrections, LlmInput::Batch);
 
     fs::create_dir_all(REPORT_DIR).ok();
     let epoch = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);

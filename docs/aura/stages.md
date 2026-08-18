@@ -96,7 +96,7 @@ worker 线程有序到达（Batch×N → WindowEdge），状态不可能失步�
 worker（pipeline.rs），LLM 耗时不卡 partial。
 
 - `calibrate_window(window_id, segments)`：全部段 `best_text()` 逐行（`PromptBuilder::
-  new_multi`，`<raw_transcript>` 信封内一行一段）联合整流 → `WindowCalibrated`（每 VAD
+  new_multi`，`<primary_transcript>` 信封内一行一段）联合整流 → `WindowCalibrated`（每 VAD
   间隔一次，替换同窗口上次结果）并**覆盖窗口存档**。
 - `finalize_window(window)`：返回存档（= 最后一次 `WindowCalibrated` 的文本）→
   `WindowFinal`（窗口粒度定稿，D3；route_ms ≈ 0）。防御路径：无存档时回退窗口
