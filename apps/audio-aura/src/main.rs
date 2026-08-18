@@ -4,7 +4,7 @@
 //! - `GET /api/state` — the complete [`AuraStateView`] snapshot (one source of truth).
 //! - `GET /api/stream?state_changed_frequency=<ms>` — SSE: `hello`, then `state_changed` pings
 //!   (throttled ≥250ms) whenever `version` advances. The client re-GETs /api/state on a ping.
-//! - `POST /api/control/scout` (toggle), `POST /api/correct` (user correction), `GET /api/audio/:seq`.
+//! - `POST /api/control/scout` (toggle), `POST /api/correct` (user correction), `GET /api/audio/:window_id`.
 //!
 //! Threading: the Pipeline runs Stage1 on a dedicated **std thread** (it blocks forever) and
 //! Stage2 on its own internal `aura-stage2` worker (so partials never freeze behind a 1-2s LLM
@@ -820,7 +820,11 @@ mod tests {
             .expect("apps/audio-aura/aura.yaml missing");
         let conf: AuraConf = serde_yaml::from_str(&s).expect("aura.yaml must parse");
         assert_eq!(conf.port, Some(9091));
-        assert_eq!(conf.log_level, Some("info".into()), "log_level documented in yaml");
+        // 只断言存在——具体等级是用户的本地旋钮(实测时改成 debug 是常态),不该被测试钉死。
+        assert!(
+            conf.log_level.as_deref().map(|v| !v.trim().is_empty()).unwrap_or(false),
+            "log_level documented in yaml"
+        );
         let vad = conf.vad.expect("aura.yaml must have a vad: section");
         assert_eq!(vad.merge_gap, Some(2.5), "merge_gap documented in yaml");
         assert_eq!(vad.threshold, Some(0.5));

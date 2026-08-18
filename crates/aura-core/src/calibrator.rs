@@ -3,12 +3,12 @@
 //! [`dp_models::LlmProvider`] (local mistral.rs or remote) + the LLM-layer hotword store
 //! (shared with Stage3) + the user-correction ring (shared with POST /api/correct).
 //!
-//! STATELESS by design (2026-08-17 边界范式): the two trigger events carry the window
-//! themselves — `Stage1Event::Batch { segments }` brings ALL segments of the current window
-//! so far, `Stage1Event::WindowEdge { window }` brings the settled snapshot. No internal
-//! left-boundary bookkeeping exists to desync; "移动左边界" is simply the next event's
-//! payload being the new window. The old ContextWindow (disabled — 3B 复读) is deleted:
-//! cross-sentence context now enters through the joint input itself.
+//! 窗口状态机 (2026-08-17 边界范式,规格修订):内部只维护**当前窗口的最后一次联合整流
+//! 结果**——每个 `Batch` 事件(每段一次)整体覆盖它;`WindowEdge` 到来时**不再调用 LLM**
+//! (最后一个段的 Batch 已把全窗口整流完),直接取存档作为该 VadWindow 的纠偏字段并
+//! 移动左边界(清空状态)。事件在单一 worker 线程上有序到达(Batch×N → WindowEdge),
+//! 状态不可能失步。The old ContextWindow (disabled — 3B 复读) is deleted: cross-sentence
+//! context enters through the joint input itself.
 
 use std::sync::{Arc, Mutex};
 
@@ -17,16 +17,20 @@ use audio_aura_asr::{VadSegment, VadWindow, WindowId};
 use crate::prompt::PromptBuilder;
 
 /// Stage2's correction pass (纠偏/整流), driven by the two Stage1 events:
-/// - `Stage1Event::Batch` → [`calibrate_window`](Self::calibrate_window) — provisional joint
-///   calibration of every segment in the current window (multi-sentence);
-/// - `Stage1Event::WindowEdge` → [`calibrate_final`](Self::calibrate_final) — the settled
-///   window's authoritative calibration.
+/// - `Stage1Event::Batch` → [`calibrate_window`](Self::calibrate_window) — joint calibration
+///   of EVERY segment in the current window (multi-sentence); the result **overwrites** the
+///   window's stored calibration;
+/// - `Stage1Event::WindowEdge` → [`finalize_window`](Self::finalize_window) — move the left
+///   boundary. **No LLM call**: the last Batch already calibrated the whole window; the
+///   stored result simply becomes the VadWindow's calibrated field.
 pub trait Stage2Calibrator: Send {
-    /// Provisional joint calibration (per Batch). Input = ALL segments so far.
+    /// Joint calibration (per Batch). Input = ALL segments so far; overwrites the current
+    /// window's stored result.
     fn calibrate_window(&mut self, window_id: WindowId, segments: &[VadSegment]) -> String;
-    /// Authoritative calibration (per WindowEdge). Runs on the window-level batch text
-    /// (falling back to the concat of per-segment best texts when the re-run failed).
-    fn calibrate_final(&mut self, window: &VadWindow) -> String;
+    /// Finalize (per WindowEdge): return the window's LAST joint calibration — no LLM run —
+    /// and clear the window state (left boundary moves). Falls back to the window's
+    /// best_text only in the impossible no-Batch case (defensive).
+    fn finalize_window(&mut self, window: &VadWindow) -> String;
 }
 
 /// Default Stage2 calibrator over an [`dp_models::LlmProvider`]. Reads the latest hotwords
@@ -38,6 +42,9 @@ pub struct Stage2CalibratorImpl {
     /// User corrections (raw→corrected pairs), shared with daemon's POST /api/correct handler.
     /// Read fresh on every calibrate — the correction feedback channel.
     corrections: Arc<Mutex<Vec<(String, String)>>>,
+    /// 窗口状态机的全部状态:当前窗口 id + 其最后一次联合整流结果(每个 Batch 覆盖,
+    /// WindowEdge 消费并清空 = 移动左边界)。
+    current: Option<(WindowId, String)>,
 }
 
 impl Stage2CalibratorImpl {
@@ -48,22 +55,32 @@ impl Stage2CalibratorImpl {
         hotwords: Arc<Mutex<Vec<String>>>,
         corrections: Arc<Mutex<Vec<(String, String)>>>,
     ) -> Self {
-        Self { llm, hotwords, corrections }
+        Self { llm, hotwords, corrections, current: None }
     }
 }
 
 impl Stage2Calibrator for Stage2CalibratorImpl {
-    fn calibrate_window(&mut self, _window_id: WindowId, segments: &[VadSegment]) -> String {
+    fn calibrate_window(&mut self, window_id: WindowId, segments: &[VadSegment]) -> String {
         // One line per segment — the joint input IS the cross-sentence context.
         let texts: Vec<&str> = segments.iter().map(|s| s.best_text()).collect();
-        self.joint_calibrate(&texts)
+        let calibrated = self.joint_calibrate(&texts);
+        // 识别一次之后,覆盖当前窗口的整流结果(WindowEdge 时它就是 VadWindow 的纠偏字段)。
+        self.current = Some((window_id, calibrated.clone()));
+        calibrated
     }
 
-    fn calibrate_final(&mut self, window: &VadWindow) -> String {
-        // The window-level batch re-run heard the whole paragraph in one pass — strictly
-        // better context than any per-segment text. Fall back to the segments' best concat.
-        let best = window.best_text().into_owned();
-        self.joint_calibrate(&[best.as_str()])
+    fn finalize_window(&mut self, window: &VadWindow) -> String {
+        // 移动左边界:取走存档(不匹配/无存档 = 防御路径,理论不可达——窗口必有 Batch)。
+        match self.current.take() {
+            Some((id, calibrated)) if id == window.id => calibrated,
+            _ => {
+                tracing::warn!(
+                    window = window.id,
+                    "WindowEdge 无匹配整流存档——回退窗口 best_text(理论不可达)"
+                );
+                window.best_text().into_owned()
+            }
+        }
     }
 }
 
@@ -89,6 +106,68 @@ impl Stage2CalibratorImpl {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use audio_aura_asr::SegmentId;
+
+    /// Counting LLM stub — the shared handle lets the test READ the call count, proving
+    /// finalize_window makes NO LLM call.
+    struct CountingLlm(Arc<Mutex<usize>>);
+    impl dp_models::LlmProvider for CountingLlm {
+        fn complete(&self, _system: &str, _user: &str) -> anyhow::Result<String> {
+            *self.0.lock().unwrap() += 1;
+            Ok("整流OK".into())
+        }
+    }
+
+    fn seg(id: SegmentId) -> VadSegment {
+        VadSegment {
+            id,
+            audio_id: id,
+            start_s: 0.0,
+            end_s: 0.1,
+            streaming_text: format!("流式{id}"),
+            batch_text: Some(format!("段{id}")),
+        }
+    }
+
+    fn window(id: WindowId) -> VadWindow {
+        VadWindow {
+            id,
+            segments: vec![seg(1), seg(2)],
+            start_s: 0.0,
+            end_s: 1.0,
+            streaming_text: "拼接".into(),
+            batch_text: Some("窗口批式".into()),
+            pcm: std::sync::Arc::new(Vec::new()),
+        }
+    }
+
+    fn s2() -> (Stage2CalibratorImpl, Arc<Mutex<usize>>) {
+        let calls = Arc::new(Mutex::new(0));
+        let s = Stage2CalibratorImpl::new(
+            Arc::new(CountingLlm(Arc::clone(&calls))),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        (s, calls)
+    }
+
+    #[test]
+    fn window_state_machine_overwrites_and_finalizes_without_llm() {
+        let (mut s, calls) = s2();
+        // 两个 Batch(同窗口):每次联合整流跑一次 LLM,结果覆盖窗口存档。
+        assert_eq!(s.calibrate_window(7, &[seg(1)]), "整流OK");
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(s.calibrate_window(7, &[seg(1), seg(2)]), "整流OK");
+        assert_eq!(*calls.lock().unwrap(), 2, "每个 Batch 一次 LLM");
+        // WindowEdge:不跑 LLM,直接返回存档(= 最后一次联合整流)。
+        assert_eq!(s.finalize_window(&window(7)), "整流OK", "final = 最后一次 Batch 的整流结果");
+        assert_eq!(*calls.lock().unwrap(), 2, "finalize 零 LLM 调用");
+        // finalize 后状态清空(左边界已移):再 finalize 走防御回退 best_text,依然零 LLM。
+        assert_eq!(s.finalize_window(&window(9)), "窗口批式", "无存档回退窗口 best_text");
+        assert_eq!(*calls.lock().unwrap(), 2);
+    }
+
     #[test]
     fn shared_hotword_store_visible_to_both() {
         // The Stage3→Stage2 feedback channel: the same Arc<Mutex<Vec<String>>> is mutated by

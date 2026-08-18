@@ -22,6 +22,7 @@ fn main() -> anyhow::Result<()> {
         decoder: format!("{base}/decoder-epoch-99-avg-1.onnx"),
         joiner: format!("{base}/joiner-epoch-99-avg-1.onnx"),
         tokens: format!("{base}/tokens.txt"),
+        bpe_vocab: format!("{base}/bpe.vocab"),
         ..Default::default()
     })?;
     eprintln!("[load] ready in {:.2}s", t.elapsed().as_secs_f64());

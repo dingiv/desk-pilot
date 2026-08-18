@@ -54,12 +54,13 @@ merge window（大中断 / 超时）
           emit WindowEdge(window) ──────► Stage2
 ```
 
-## Stage2 行为
+## Stage2 行为（2026-08-17 规格修订：定稿零 LLM）
 
 - **收到 Batch**：把**当前窗口内所有 VadSegment** 的文本（batch_text 优先，
-  streaming_text 兜底）喂给文本模型**联合整流**——多个句子一起整。
-- **收到 WindowEdge**：**移动左边界**——该窗口定稿（联合整流结果即最终文本），
-  后续整流不再包含其片段。
+  streaming_text 兜底）喂给文本模型**联合整流**——多个句子一起整；结果**覆盖**当前
+  窗口的整流存档。
+- **收到 WindowEdge**：**移动左边界，无需再纠偏**——最后一个 VadSegment 的 Batch
+  到来时整流已完成；取存档作为该 VadWindow 的纠偏字段即可（零 LLM 调用）。
 
 ## 与现状的差异
 
@@ -78,6 +79,9 @@ merge window（大中断 / 超时）
 
 - **D1 流式会话粒度 → 段级会话**：每个 VadSegment 独立开流式会话，EOS 定稿。
   接受段边界编码器上下文丢失（段首字可能略差）；每段有完整流式结果，拼接即窗口流式。
+  **实施修正（2026-08-17 实测）**：sherpa VAD 的 SOS 是与 EOS 成对**回溯**发出的
+  （段结束才吐 segment），"SOS 建会话"没有时机——落地为**持续喂帧 + 每段 EOS / 窗口
+  settle 后重置会话**，效果等价于段级会话（每会话恰好覆盖一个段）。
 - **D2 说话中实时纠偏 → 砍掉**：Batch 只在 VAD 间隔触发；说话中 UI 只显示 raw
   partial，纠偏文本在首个 VAD 间隔后出现（~1s 滞后）。省掉每秒一次的 LLM 调用。
   （勤快 Stage2 的 `STREAM_CALIBRATE_INTERVAL` 路径删除。）
@@ -88,7 +92,8 @@ merge window（大中断 / 超时）
   devtools）按用户指示暂缓**，作为后续独立迁移任务。
 
 实现补充裁决（落地时定）：
-- **Stage2 无状态**：Batch 事件每次携带当前窗口全部段（载荷即窗口），无内部缓冲。
+- **Stage2 窗口状态机**：Batch 事件每次携带当前窗口全部段（载荷即窗口）；内部仅存
+  `(当前窗口 id, 最后一次整流结果)`，WindowEdge 消费并清空（规格修订:定稿不跑 LLM）。
 - **死代码清除**：`Decision`/`parse_decision`/`ContextWindow`/`AudioChunk` 删除，
   Stage2 校准直接返回 `String`。
 - **窗口 PCM**：settle 拼接一次为 `Arc<Vec<i16>>` 挂在 VadWindow 上（窗口 batch 与

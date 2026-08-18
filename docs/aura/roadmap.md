@@ -32,7 +32,7 @@
 |---|---|---|---|
 | R1 | **自适应 merge_gap** | 中 | 碎片化主体已被 SegmentMerger 解决；剩余价值=按场景自适应"一句"的窗口（命令式调小快定稿 / 长句调大） |
 | R4 | **口误自纠检测**（正则 "X 不对 Y" → Y） | 中 | 零 LLM 开销的确定性预处理 |
-| R5 | **Stage1 run() 异步化** | 中 | 静默阻塞线程 + 睡眠轮询 → 异步非阻塞（executor.rs TODO） |
+| R5 | **Stage1 run() 异步化** | 中 | 静默阻塞线程 + 睡眠轮询 → 异步非阻塞（executor.rs TODO）。含：**batch 调用移出消费线程**——EOS/窗口定稿时的段级+窗口级 batch 是消费循环内同步调用，远程 ASR（mloader qwen3-asr）实测 ~3.5s/次，期间流式 partial 与 VAD 全停；真实语速下 EOS 间隔 >1s 尚可接受，但批量重放/长窗口时有感知延迟（2026-08-17 e2e 实测记录，见 stages.md）。副作用实证：batch 阻塞期间 ring 积压，解除后追赶音频被压缩处理——**墙钟 gap 被压扁导致过度并窗**（10x 重放下 4s 间隔压成 0.4s 实测复现） |
 | R6 | **Stage1Config::new IO 拆分** | 低 | 构造函数内嵌模型路径解析 IO，拆成独立函数（executor.rs TODO） |
 | R7 | **daemon 静态路径去硬编码** | 低 | `BASE` 常量 → FileLoader 机制（main.rs TODO） |
 

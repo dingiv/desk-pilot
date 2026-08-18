@@ -26,7 +26,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::audio_store::{AudioStore, DEFAULT_CAP_SAMPLES};
 use crate::buffer::AudioRing;
@@ -43,6 +43,13 @@ use dp_models::{http::HttpAsr, AsrProvider, ProviderKind};
 const DEFAULT_RING_CAP: usize = 16_000 * 600;
 /// Streaming-partial decode cadence: every N windows (~0.5s @ 32ms Silero windows).
 const PARTIAL_EVERY_FRAMES: u32 = 15;
+/// Stale-session watchdog: reset the streaming session when its partial has been UNCHANGED
+/// this long AND no EOS came — that means VAD never latched (audio below `threshold` =
+/// discard-by-design), and its residue (hallucinated repetitions included) must NOT leak
+/// into whatever segment closes next (2026-08-17 实测:35s 悬置会话把上一段幻觉文本卷进
+/// 下一句). Real speech never trips this: a ≥min_silence pause closes the segment via EOS,
+/// which resets the session long before the partial could go stale.
+const STALE_SESSION_RESET: Duration = Duration::from_secs(8);
 
 /// Config for [`OnnxStage1Executor`] — paths + params for the VAD, batch ASR, and streaming ASR,
 /// plus the omni-scout address, ring capacity, and the connection `active` flag.
@@ -376,6 +383,15 @@ impl WindowTracker {
     fn take_open(&mut self) -> Option<SettledSpans> {
         self.open.take().map(|w| SettledSpans { window_id: w.window_id, segments: w.segments })
     }
+
+    /// The ids the segment currently being spoken WILL get: the open window's id (or the next
+    /// one when nothing is open) + the next segment id. Used to key live `Interim` partials —
+    /// this VAD emits SOS RETROACTIVELY (with EOS), so the real assignment only exists at EOS.
+    /// Authoritative grouping arrives with the `Batch`/`WindowEdge` events.
+    fn prospective(&self) -> (WindowId, SegmentId) {
+        let w = self.open.as_ref().map(|w| w.window_id).unwrap_or(self.next_win_id);
+        (w, self.next_seg_id)
+    }
 }
 
 /// Turn settled spans into a [`VadWindow`] and emit `WindowEdge`: concat the clips from the
@@ -394,7 +410,16 @@ fn emit_window_edge(
     }
     let ids: Vec<AudioId> = settled.segments.iter().map(|s| s.audio_id).collect();
     let pcm = Arc::new(store.concat(&ids));
-    let batch_text = batch_asr.recognize(&pcm, sr).ok().filter(|t| !t.trim().is_empty());
+    // ★单段窗口免重跑:窗口 batch 的意义是"跨段上下文重新整听"——只有一个段时拼接
+    // PCM 与该段 PCM 完全相同,段级 batch 刚刚跑过同一音频,直接复用其结果(含 None:
+    // 远程失败后立刻重试大概率仍失败,徒增 settle 延迟)。单段是常态(merge 仅发生在
+    // <merge_gap 的停顿后),此优化省掉大多数窗口的一整次 batch 调用。
+    let batch_text = if settled.segments.len() == 1 {
+        debug!("单段窗口——复用段级 batch 结果,跳过整窗重跑");
+        settled.segments[0].batch_text.clone()
+    } else {
+        batch_asr.recognize(&pcm, sr).ok().filter(|t| !t.trim().is_empty())
+    };
     let streaming_text =
         settled.segments.iter().map(|s| s.streaming_text.as_str()).collect::<String>();
     let start_s = settled.segments.first().map(|s| s.start_s).unwrap_or(0.0);
@@ -414,15 +439,32 @@ fn emit_window_edge(
     store.evict(&ids);
 }
 
-/// Executor-side mirror of the tracker's active segment: the per-segment streaming session
-/// (D1 — created at SOS, finalized and dropped at EOS) + its partial-throttle state.
+/// The live streaming session + its partial-throttle state. D1 adaptation: sherpa's VAD
+/// emits SOS RETROACTIVELY (together with EOS — the segment only pops complete), so the
+/// session CANNOT be created at speech onset. Instead it is fed CONTINUOUSLY and RESET at
+/// every segment boundary (EOS) and window settle — each session therefore covers exactly
+/// [previous boundary, this EOS] ≈ this one segment (+ surrounding silence, which decodes
+/// to nothing). Per-segment attribution is preserved; live partials keep flowing.
 struct ActiveSession {
-    segment_id: SegmentId,
-    window_id: WindowId,
-    start_s: f64,
     stream: StreamingSession,
     frames_since_partial: u32,
     last_partial: String,
+    /// When `last_partial` last CHANGED (decayed text ⇒ stale ⇒ watchdog reset).
+    last_change: Instant,
+    /// Diagnostic: frames fed since the last reset.
+    fed: u32,
+}
+
+impl ActiveSession {
+    fn new(stream: StreamingSession) -> Self {
+        Self {
+            stream,
+            frames_since_partial: 0,
+            last_partial: String::new(),
+            last_change: Instant::now(),
+            fed: 0,
+        }
+    }
 }
 
 impl Stage1Executor for OnnxStage1Executor {
@@ -434,9 +476,13 @@ impl Stage1Executor for OnnxStage1Executor {
         let mut frames_in = 0u64;
 
         let sasr = self.mgr.streaming_asr();
-        let mut sess: Option<ActiveSession> = None;
+        // Continuously-fed streaming session (reset at every segment/window boundary — see
+        // [`ActiveSession`]). `cur_seg`/`cur_win` carry the retroactive SOS's ids to the EOS
+        // arm within the SAME push_frame batch (SOS+EOS always arrive together).
+        let mut sess: Option<ActiveSession> = sasr.map(|asr| ActiveSession::new(asr.create_session()));
         let mut ring_empty_since: Option<Instant> = None;
         let mut tracker = WindowTracker::new(self.merge_gap_s);
+        let mut cur_seg: SegmentId = 0;
 
         loop {
             // Connection toggle: when the scout connection is paused, skip VAD/ASR (the ingest
@@ -452,6 +498,22 @@ impl Stage1Executor for OnnxStage1Executor {
             let now_s = start.elapsed().as_secs_f64();
             if let Some(settled) = tracker.check_settle(now_s) {
                 emit_window_edge(settled, &self.audio_store, &*self.batch_asr, sr, on_event);
+                // Window boundary ⇒ fresh streaming session (don't bleed encoder context
+                // across windows).
+                sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
+            }
+            // Stale-session watchdog: VAD-unlatched audio is discard-by-design — its residue
+            // must not linger in the session until the next (loud) utterance swallows it.
+            // See [`STALE_SESSION_RESET`].
+            if let Some(a) = sess.as_ref() {
+                if !a.last_partial.is_empty() && a.last_change.elapsed() >= STALE_SESSION_RESET {
+                    warn!(
+                        stale_s = a.last_change.elapsed().as_secs(),
+                        partial = %a.last_partial,
+                        "流式会话停滞重置——VAD 未定段的微弱音频不残留到下一句"
+                    );
+                    sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
+                }
             }
             // drain one Silero window (512 samples = 32ms) when available
             let frame = {
@@ -484,65 +546,70 @@ impl Stage1Executor for OnnxStage1Executor {
             frames_in += 1;
             if last_diag.elapsed() >= Duration::from_secs(3) {
                 let rlen = self.ring.lock().unwrap().len();
-                let speaking = self.mgr.vad().map(|v| v.is_speaking()).unwrap_or(false);
-                debug!(frames = frames_in, ring = rlen, speaking, "stage1 diag");
+                // NOTE: `is_speaking()` is useless with this retroactive VAD (only true for
+                // the instant a segment pops) — the meaningful live signal is the partial.
+                let has_partial = sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
+                debug!(frames = frames_in, ring = rlen, has_partial, "stage1 diag");
                 last_diag = Instant::now();
             }
 
-            // (1) per-segment streaming partial (D1: the session exists only while a segment
-            //     is in progress — SOS..EOS). Throttle to ~0.5s, only on change.
-            //     `decode_and_result` drains ALL pending chunks (is_ready loop), so the
-            //     hypothesis stays caught-up with real-time. NOT a Stage2 input (D2).
+            // (1) live streaming partial — the session is fed CONTINUOUSLY (D1 adaptation:
+            //     this VAD's SOS is retroactive, so gating on speech-start is impossible);
+            //     see [`ActiveSession`]. Throttle to ~0.5s, only on change. Keyed by the
+            //     tracker's prospective ids (authoritative grouping comes with Batch).
+            //     NOT a Stage2 input (D2).
             if let (Some(asr), Some(a)) = (sasr, sess.as_mut()) {
                 a.stream.accept_waveform(sr as i32, &frame);
+                a.fed += 1;
                 a.frames_since_partial += 1;
                 if a.frames_since_partial >= PARTIAL_EVERY_FRAMES {
                     let partial = asr.decode_and_result(&a.stream);
                     if !partial.is_empty() && partial != a.last_partial {
+                        let (window_id, segment_id) = tracker.prospective();
                         on_event(Stage1Event::Interim {
-                            window_id: a.window_id,
-                            segment_id: a.segment_id,
+                            window_id,
+                            segment_id,
                             partial: partial.clone(),
                             at_s: start.elapsed().as_secs_f64(),
                         });
                         a.last_partial = partial;
+                        a.last_change = Instant::now();
                     }
                     a.frames_since_partial = 0;
                 }
             }
 
             // (2) VAD boundaries → WindowTracker → Batch (per segment) / WindowEdge (settle).
+            //     NOTE: this VAD emits SOS RETROACTIVELY — SOS+EOS arrive together in one
+            //     push_frame batch when the finished segment pops. The SOS arm records the
+            //     ids (for the segment the EOS arm in the same batch builds); the streaming
+            //     session lifecycle is boundary-driven instead (see [`ActiveSession`]).
             for ev in self.mgr.vad().unwrap().push_frame(&frame) {
                 match ev.kind {
                     VadEventKind::StartOfSpeech => {
                         let now = start.elapsed().as_secs_f64();
-                        if sess.is_some() {
-                            debug!("SOS while a segment is active — replacing the session");
-                        }
                         let (settled, window_id, segment_id) = tracker.on_sos(now);
                         // A big gap settled the previous window FIRST — emit it before the
-                        // new segment's partials start flowing.
+                        // new segment lands in the next window.
                         if let Some(s) = settled {
                             emit_window_edge(s, &self.audio_store, &*self.batch_asr, sr, on_event);
+                            sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
                         }
-                        // Fresh per-segment session (D1): create at SOS, finalize at EOS.
-                        sess = sasr.map(|asr| ActiveSession {
-                            segment_id,
-                            window_id,
-                            start_s: now,
-                            stream: asr.create_session(),
-                            frames_since_partial: 0,
-                            last_partial: String::new(),
-                        });
+                        cur_seg = segment_id;
+                        let _ = window_id; // authoritative windowing comes from on_eos
                     }
                     VadEventKind::EndOfSpeech => {
                         let end_s = start.elapsed().as_secs_f64();
-                        // Finalize the segment's streaming session → its streaming_text.
+                        // Finalize the CURRENT streaming session → this segment's
+                        // streaming_text, then reset it (the next session covers exactly the
+                        // next segment). `fed` is diagnostic.
                         let a = sess.take();
+                        let fed = a.as_ref().map(|a| a.fed).unwrap_or(0);
                         let streaming_text = match (sasr, a.as_ref()) {
                             (Some(asr), Some(a)) => asr.finalize_and_result(&a.stream),
                             _ => String::new(),
                         };
+                        sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
                         // One batch pass over exactly this segment's PCM (edge-extended by
                         // the VAD). Err (remote network) and empty text both map to None.
                         let batch_text = self
@@ -556,15 +623,32 @@ impl Stage1Executor for OnnxStage1Executor {
                             tracker.drop_active();
                             continue;
                         }
+                        // Speech onset back-derived from the PCM duration (SOS was
+                        // retroactive, so its wall-clock IS the EOS instant).
+                        let start_s = (end_s - ev.pcm.len() as f64 / sr as f64).max(0.0);
                         let seg = VadSegment {
-                            id: a.as_ref().map(|a| a.segment_id).unwrap_or_default(),
+                            id: cur_seg,
                             audio_id: self.audio_store.insert(ev.pcm),
-                            start_s: a.as_ref().map(|a| a.start_s).unwrap_or(end_s),
+                            start_s,
                             end_s,
                             streaming_text,
                             batch_text,
                         };
                         let (window_id, segments) = tracker.on_eos(seg);
+                        // 段级日志(debug):每个 VadSegment 定稿时打印——窗口/段 id、
+                        // 时长、两路文本(batch 失败显式标出)、会话喂帧数(诊断)。
+                        // 刚定稿的段就是 segments 的最后一个(字符串已 move,从这借)。
+                        if let Some(s) = segments.last() {
+                            debug!(
+                                window = window_id,
+                                segment = s.id,
+                                dur_ms = ((s.end_s - s.start_s) * 1000.0).round() as u64,
+                                fed,
+                                batch = s.batch_text.as_deref().unwrap_or("(none)"),
+                                streaming = %s.streaming_text,
+                                "段定稿(VadSegment)"
+                            );
+                        }
                         on_event(Stage1Event::Batch { window_id, segments });
                     }
                 }
@@ -655,6 +739,70 @@ mod tests {
         let (_, _, s3) = t.on_sos(10.0);
         t.on_eos(seg(s3, 10.0, 10.5));
         assert!(t.check_settle(10.5).is_some(), "now − end = 0 ≥ 0 → settle");
+    }
+
+    /// Counting batch-ASR stub — proves the single-segment window skips the re-run.
+    struct CountingAsr(std::sync::Mutex<usize>);
+    impl AsrProvider for CountingAsr {
+        fn recognize(&self, _pcm: &[i16], _sr: u32) -> anyhow::Result<String> {
+            *self.0.lock().unwrap() += 1;
+            Ok("窗口重跑".into())
+        }
+    }
+
+    fn seg_into(store: &AudioStore, id: SegmentId, batch: Option<&str>) -> VadSegment {
+        VadSegment {
+            id,
+            audio_id: store.insert(vec![1i16; 1600]),
+            start_s: id as f64,
+            end_s: id as f64 + 0.1,
+            streaming_text: format!("流式{id}"),
+            batch_text: batch.map(|b| b.to_string()),
+        }
+    }
+
+    #[test]
+    fn single_segment_window_reuses_segment_batch_no_rerun() {
+        let store = AudioStore::new(1_000_000);
+        let asr = CountingAsr(std::sync::Mutex::new(0));
+        let mut events = Vec::new();
+        // batch Some → propagated verbatim; None → propagates as None (no retry either).
+        for batch in [Some("段级结果"), None] {
+            events.clear();
+            let settled = SettledSpans {
+                window_id: 1,
+                segments: vec![seg_into(&store, 1, batch)],
+            };
+            emit_window_edge(settled, &store, &asr, 16000, &mut |ev| events.push(ev));
+            assert_eq!(*asr.0.lock().unwrap(), 0, "单段窗口绝不重跑 batch");
+            match &events[0] {
+                Stage1Event::WindowEdge { window } => assert_eq!(
+                    window.batch_text.as_deref(),
+                    batch,
+                    "窗口 batch_text = 段级结果原样复用(含 None)"
+                ),
+                other => panic!("expected WindowEdge, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn multi_segment_window_reruns_batch_once() {
+        let store = AudioStore::new(1_000_000);
+        let asr = CountingAsr(std::sync::Mutex::new(0));
+        let settled = SettledSpans {
+            window_id: 1,
+            segments: vec![seg_into(&store, 1, Some("段1")), seg_into(&store, 2, Some("段2"))],
+        };
+        let mut events = Vec::new();
+        emit_window_edge(settled, &store, &asr, 16000, &mut |ev| events.push(ev));
+        assert_eq!(*asr.0.lock().unwrap(), 1, "多段窗口恰好重跑一次");
+        match &events[0] {
+            Stage1Event::WindowEdge { window } => {
+                assert_eq!(window.batch_text.as_deref(), Some("窗口重跑"));
+            }
+            other => panic!("expected WindowEdge, got {other:?}"),
+        }
     }
 
     #[test]

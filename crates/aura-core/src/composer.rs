@@ -8,9 +8,11 @@
 //!
 //! The worker drains the two Stage1 triggers off an mpsc channel (Interim never crosses the
 //! channel — it passes straight through on the Stage1 thread): `Batch` →
-//! [`Stage2Calibrator::calibrate_window`] (provisional joint calibration of the current
-//! window) → [`TurnEvent::WindowCalibrated`]; `WindowEdge` →
-//! [`Stage2Calibrator::calibrate_final`] (authoritative) → [`TurnEvent::WindowFinal`].
+//! [`Stage2Calibrator::calibrate_window`] (joint calibration of the current window, result
+//! overwrites the window's stored calibration) → [`TurnEvent::WindowCalibrated`];
+//! `WindowEdge` → [`Stage2Calibrator::finalize_window`] (NO LLM — attach the stored
+//! calibration as the window's final field, move the left boundary) →
+//! [`TurnEvent::WindowFinal`].
 
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -30,8 +32,8 @@ pub enum TurnEvent<'a> {
     /// Stage2's provisional JOINT calibration of the current window (per Batch) — the
     /// calibrated text so far, replacing the previous calibration of the same window.
     WindowCalibrated { window_id: u64, calibrated: String, route_ms: f64 },
-    /// The settled window's authoritative calibration (per WindowEdge). Window-granularity
-    /// final (D3): one per closed window.
+    /// The settled window's final calibration (per WindowEdge) — the window's LAST joint
+    /// calibration attached as its field (no extra LLM run). Window-granularity final (D3).
     WindowFinal { window: &'a audio_aura_asr::VadWindow, calibrated: String, route_ms: f64 },
 }
 
@@ -54,7 +56,8 @@ impl Pipeline {
         let on_turn = Arc::new(on_turn);
 
         // Stage2 worker on its own thread — drains the two Stage1 triggers off-channel.
-        // The event payloads carry the window (all its segments), so Stage2 stays stateless.
+        // Events arrive in order on this single thread (Batch×N → WindowEdge), so Stage2's
+        // tiny window state (last calibration per window) can never desync.
         let (tx, rx) = mpsc::channel::<Stage1Event>();
         {
             let on_turn = Arc::clone(&on_turn);
@@ -76,7 +79,9 @@ impl Pipeline {
                             }
                             Stage1Event::WindowEdge { window } => {
                                 let t = Instant::now();
-                                let calibrated = s2.calibrate_final(&window);
+                                // 定稿不跑 LLM:取该窗口最后一次 Batch 联合整流的存档
+                                // (最后一个段到来时整流已完成),移动左边界。
+                                let calibrated = s2.finalize_window(&window);
                                 let route_ms = t.elapsed().as_secs_f64() * 1000.0;
                                 on_turn(TurnEvent::WindowFinal {
                                     window: &window,

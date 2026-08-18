@@ -67,7 +67,7 @@ pub enum AsrSegment {
     /// the window's previous calibration.
     WindowCalibrated { window_id: u64, calibrated: String },
     /// The settled window's authoritative result (per `WindowEdge`): window-level batch text +
-    /// Stage2 final calibration. Window-granularity final — one per closed window.
+    /// Stage2 calibration. Window-granularity final — one per closed window.
     WindowFinal {
         window_id: u64,
         /// The window-level batch re-run (authoritative; may be empty when the re-run failed —
@@ -75,6 +75,9 @@ pub enum AsrSegment {
         raw_text: String,
         /// Concat of the segments' streaming finals (hotword-biased).
         streaming_text: String,
+        /// The window's LAST joint calibration (attached at the boundary; NO extra LLM run —
+        /// the final Batch already calibrated the whole window). Equals the last
+        /// `window_calibrated` for this window.
         calibrated: String,
         route_ms: f64,
     },
