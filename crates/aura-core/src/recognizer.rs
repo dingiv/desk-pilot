@@ -592,6 +592,12 @@ struct ActiveSession {
     last_change: Instant,
     /// Diagnostic: frames fed since the last reset.
     fed: u32,
+    /// Every fed frame, accumulated — the EXACT audio this streaming session heard. At EOS this
+    /// becomes the segment's PCM (shared with the batch ASR), so streaming and batch see the
+    /// same audio — including the soft onset BEFORE VAD's threshold crossing, which the VAD's
+    /// own segment cuts off (the "batch drops the first 2-3 chars" bug). Bounded by the segment
+    /// length (+ boundary silence), reset at every EOS / window settle.
+    pcm: Vec<i16>,
 }
 
 impl ActiveSession {
@@ -602,6 +608,7 @@ impl ActiveSession {
             last_partial: String::new(),
             last_change: Instant::now(),
             fed: 0,
+            pcm: Vec::new(),
         }
     }
 }
@@ -738,6 +745,7 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
             //     NOT a Stage2 input (D2).
             if let (Some(asr), Some(a)) = (sasr, sess.as_mut()) {
                 a.stream.accept_waveform(sr as i32, &frame);
+                a.pcm.extend_from_slice(&frame); // 流式与 batch 共用同一段音频
                 a.fed += 1;
                 a.frames_since_partial += 1;
                 if a.frames_since_partial >= PARTIAL_EVERY_FRAMES {
@@ -781,11 +789,15 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                             _ => String::new(),
                         };
                         sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
-                        // One batch pass over exactly this segment's PCM (edge-extended by
-                        // the VAD). Err (remote network) and empty text both map to None.
+                        // 段 PCM = 流式 session 累积的完整音频(含段首 soft onset)——与流式
+                        // 听到的完全一致,区别只在 batch 一次整段听(大块)vs 流式逐帧听(小块)。
+                        // 流式未配置(sess 为 None)时 fallback VAD 的 edge-extended 段。
+                        let seg_pcm = a.map(|a| a.pcm).unwrap_or_else(|| ev.pcm.clone());
+                        // One batch pass over the segment's PCM. Err (remote network) and
+                        // empty text both map to None.
                         let batch_text = self
                             .batch_asr
-                            .recognize(&ev.pcm, sr)
+                            .recognize(&seg_pcm, sr)
                             .ok()
                             .filter(|t| !t.trim().is_empty());
                         // Neither pass produced text → noise segment: discard entirely.
@@ -796,10 +808,10 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                         }
                         // Speech onset back-derived from the PCM duration (SOS was
                         // retroactive, so its wall-clock IS the EOS instant).
-                        let start_s = (end_s - ev.pcm.len() as f64 / sr as f64).max(0.0);
+                        let start_s = (end_s - seg_pcm.len() as f64 / sr as f64).max(0.0);
                         let seg = VadSegment {
                             id: cur_seg,
-                            audio_id: self.audio_store.insert(ev.pcm),
+                            audio_id: self.audio_store.insert(seg_pcm),
                             start_s,
                             end_s,
                             streaming_text,
@@ -1016,7 +1028,7 @@ mod tests {
     #[test]
     fn drop_active_discards_without_recording() {
         let mut t = WindowTracker::new(2.5);
-        let s1 = t.on_sos(); // opens empty window 0, allocates seg 0, active=true
+        let _ = t.on_sos(); // opens empty window 0, allocates seg 0, active=true
         t.drop_active(); // noise → active=false, window 0 stays open but empty
         // Empty window → settle timeout has nothing to close.
         assert!(t.check_settle(100.0, false).is_none(), "no segments → nothing to settle");
