@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# dev-up.sh — 本地开发一键启动:omni-scout + aura-daemon + dp-models(模型服务)。
+# dev-up.sh — 本地开发一键启动:omni-scout + aura-daemon + batch-ASR(mloader qwen3-asr)。
 #
 # 用法:
-#   ./scripts/dev-up.sh [start|stop|status] [scout|aura|models|all]
+#   ./scripts/dev-up.sh [start|stop|status] [scout|aura|asr|all]
 #   ./scripts/dev-up.sh                  # 等价 start all
 #   ./scripts/dev-up.sh start aura       # 只起 aura
 #   ./scripts/dev-up.sh stop             # 全部停止
@@ -10,9 +10,13 @@
 # 环境变量(可选):
 #   SCOUT_MOCK=路径    scout 用 mock 模式(容器/无 PipeWire 环境必用;默认
 #                      assets/models/testwavs/zh-standard-1.wav)
-#   MODELS_PORT=8080   dp-models 监听端口
+#   ASR_MODEL=路径     batch ASR 模型目录(默认 assets/models/qwen3-asr-1.7b-hf)
+#   ASR_PORT=8000      mloader ASR 监听端口(默认对齐 aura.yaml asr_endpoint)
 #   AURA_PORT=9091     aura-daemon 端口
 #   SCOUT_PORT=7878    omni-scout 端口
+#
+# 注:dp-models(LocalAI)未完成——batch ASR 暂用 scripts/mloader 的 qwen-asr
+# PyTorch 服务(OpenAI 兼容 /v1/audio/transcriptions),完成后再切回。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -22,10 +26,11 @@ mkdir -p "$LOG_DIR"
 
 SCOUT_PORT="${SCOUT_PORT:-7878}"
 AURA_PORT="${AURA_PORT:-9091}"
-MODELS_PORT="${MODELS_PORT:-8080}"
+ASR_PORT="${ASR_PORT:-8000}"
+ASR_MODEL="${ASR_MODEL:-$ROOT/assets/models/qwen3-asr-1.7b-hf}"
 # --mock-audio 期望音频**目录**(循环播放);scout 自带 apps/omni-scout/assets/mock-audio。
 SCOUT_MOCK="${SCOUT_MOCK:-$ROOT/apps/omni-scout/assets/mock-audio}"
-MODELS_DIR="${MODELS_DIR:-$ROOT/apps/dp-models/models}"
+
 
 pid_file() { echo "$PID_DIR/$1.pid"; }
 log_file()  { echo "$LOG_DIR/$1.log"; }
@@ -45,8 +50,8 @@ start_one() {
         scout)
             # 纯音频 mock(--mock-audio,容器/无 PipeWire 环境);真实环境
             # 去掉 SCOUT_MOCK 或改用 --mock <video>。
-            echo "  scout  (omni-scout :$SCOUT_PORT, mock-audio=$SCOUT_MOCK)"
-            (cd "$ROOT" && cargo run -p omni-scout -- --port "$SCOUT_PORT" --mock-audio "$SCOUT_MOCK" \
+            echo "  scout  (omni-scout :$SCOUT_PORT, 真实麦克风)"
+            (cd "$ROOT" && cargo run -p omni-scout -- --port "$SCOUT_PORT"\
                 >"$(log_file scout)" 2>&1 & echo $! >"$(pid_file scout)")
             ;;
         aura)
@@ -57,12 +62,14 @@ start_one() {
                 --port "$AURA_PORT" "127.0.0.1:$SCOUT_PORT" \
                 >"$(log_file aura)" 2>&1 & echo $! >"$(pid_file aura)")
             ;;
-        models)
-            echo "  models (dp-models LocalAI :$MODELS_PORT, models=$MODELS_DIR)"
-            (cd "$ROOT/apps/dp-models" && go run . --models "$MODELS_DIR" --addr ":$MODELS_PORT" \
-                >"$(log_file models)" 2>&1 & echo $! >"$(pid_file models)")
+        asr)
+            # mloader qwen3-asr (PyTorch + FastAPI, OpenAI 兼容)。在 scripts/mloader 里
+            # uv run(用它的 pyproject 环境);模型路径用绝对路径不受 cwd 影响。
+            echo "  asr    (mloader qwen3-asr :$ASR_PORT, model=$ASR_MODEL)"
+            (cd "$ROOT/scripts/mloader" && uv run --extra server mloader-serve asr --model "$ASR_MODEL" --port "$ASR_PORT" \
+                >"$(log_file asr)" 2>&1 & echo $! >"$(pid_file asr)")
             ;;
-        *) echo "  未知服务: $name (scout|aura|models)"; exit 1 ;;
+        *) echo "  未知服务: $name (scout|aura|asr)"; exit 1 ;;
     esac
 }
 
@@ -77,7 +84,7 @@ stop_one() {
     case "$name" in
         scout)  pkill -f "target/debug/omni-scout --port" 2>/dev/null || true ;;
         aura)   pkill -f "target/debug/aura-daemon" 2>/dev/null || true ;;
-        models) pkill -f "dp-models --models" 2>/dev/null || true ;;
+        asr)    pkill -f "mloader-serve asr" 2>/dev/null || true ;;
     esac
     rm -f "$(pid_file "$name")"
     echo "  $name 已停止"
@@ -94,7 +101,7 @@ status_one() {
 
 run_all() {
     local action="$1"
-    for svc in scout aura models; do
+    for svc in scout asr aura; do
         case "$action" in
             start) start_one "$svc" ;;
             stop)  stop_one "$svc" ;;
@@ -128,6 +135,6 @@ if [ "$action" = "start" ]; then
     echo "  探活:"
     [ "$target" = "all" ] || [ "$target" = "scout" ]  && echo "    scout  → http://127.0.0.1:$SCOUT_PORT"
     [ "$target" = "all" ] || [ "$target" = "aura" ]   && echo "    aura   → http://127.0.0.1:$AURA_PORT"
-    [ "$target" = "all" ] || [ "$target" = "models" ] && echo "    models → http://127.0.0.1:$MODELS_PORT"
+    [ "$target" = "all" ] || [ "$target" = "asr" ]    && echo "    asr    → http://127.0.0.1:$ASR_PORT/health (模型加载 ~30s)"
     echo "  日志: $LOG_DIR/*.log (tail -f 查看)"
 fi
