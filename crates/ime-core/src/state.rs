@@ -195,6 +195,11 @@ impl StateMachine {
                 self.reset();
                 Self::commit_view(&text)
             }
+            MemberAction::CommitAt(text, cursor) => {
+                member.deactivate();
+                self.reset();
+                Self::commit_view_at(&text, cursor)
+            }
             MemberAction::Exit => {
                 member.deactivate();
                 self.reset();
@@ -222,6 +227,12 @@ impl StateMachine {
             return;
         }
         self.magic_member_cand_count = self.candidates.len();
+        // 片段命令(空名)全权管理候选列表:无 `#command` 续写 tail,Space 直接
+        // 路由到成员(否则候选高亮会落到 tail/rollback 段,提交成原始 `#`)。
+        if self.magic_member.as_ref().map(|m| m.name().is_empty()).unwrap_or(false) {
+            self.magic_tail.clear();
+            return;
+        }
         // Continuations: all commands whose trigger strictly extends the current one.
         self.magic_tail = env.magic()
             .hints(&self.buffer)
@@ -516,6 +527,21 @@ impl StateMachine {
             let raw = std::mem::take(&mut self.buffer);
             self.reset();
             return Self::commit_view(&raw);
+        }
+
+        // 片段命令(空名魔法命令):`#` 紧跟 `/` → 进入 SnippetMember,`/` 之后
+        // 的 `/hello?name=Mike` 由成员自身逐键积累。这是 `#command` trie 匹配
+        // 之外的特判路由(命令名为空,不进 trie)。
+        if self.buffer == "#" && ch == '/' {
+            if let Some(mut member) = env.magic().spawn("__SNIPPET__") {
+                self.state = ComposeState::Magic;
+                self.pending_expansion = None;
+                let _ = member.activate(self, env);
+                self.magic_member = Some(member);
+                self.assemble_magic_tail(env);
+                return self.handle_magic(ch, env);
+            }
+            // 片段命令未注册(不应发生)—— 退回普通 matcher 流程。
         }
 
         match env.matcher().step(&self.buffer, ch) {

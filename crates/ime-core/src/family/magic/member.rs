@@ -23,6 +23,8 @@ pub enum MemberAction {
     View(Box<ImeView>),
     /// The member is done — commit this text and return to Idle.
     Commit(String),
+    /// Commit with the application caret at a byte offset (snippet `$CURSOR`).
+    CommitAt(String, usize),
     /// The member is done — exit without committing (cancel).
     Exit,
 }

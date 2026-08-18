@@ -47,7 +47,7 @@ fn incremental_composition_full_flow() {
 #[test]
 fn snippet_slash_greet() {
     let mut eng = ImeEngine::new();
-    for c in "/greet".chars() {
+    for c in "#/greet".chars() {
         eng.predict(KeyEvent::char(c));
     }
     // Completing the trigger shows a candidate; space commits it.
@@ -58,12 +58,12 @@ fn snippet_slash_greet() {
 #[test]
 fn snippet_enter_commits_raw_trigger() {
     let mut eng = ImeEngine::new();
-    for c in "/greet".chars() {
+    for c in "#/greet".chars() {
         eng.predict(KeyEvent::char(c));
     }
     // Enter should commit the raw trigger text, not expand.
     let v = eng.predict(KeyEvent::enter());
-    assert_eq!(commit(&v), "/greet");
+    assert_eq!(commit(&v), "#/greet");
 }
 
 #[test]

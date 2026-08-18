@@ -634,12 +634,12 @@ mod tests {
         assert!(e.buffer().is_empty(), "buffer emptied");
         assert_eq!(e.state_flags(), StateFlags::empty(), "back to idle");
 
-        // snippet 路径同理:'/' 后立刻退格。
+        // 片段命令路径同理:'#/' 后立刻退格 → 删参数(消费,不透传)。
         let mut e2 = ImeEngine::new();
-        type_str(&mut e2, "/");
+        type_str(&mut e2, "#/");
         let v = key(&mut e2, KeyEvent::backspace());
         assert!(v.action & action::HANDLED != 0, "snippet backspace consumed: 0x{:x}", v.action);
-        assert_eq!(e2.state_flags(), StateFlags::empty());
+        assert_eq!(v.action & action::PASSTHROUGH, 0);
     }
 
     #[test]

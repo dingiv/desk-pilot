@@ -120,6 +120,27 @@ impl Expander {
         &self,
         template: &str,
     ) -> Result<(String, Option<usize>), ExpandError> {
+        self.expand_impl(template, None)
+    }
+
+    /// Expand a template with extra `$var` values (`vars`) taking precedence
+    /// over the provider. Used by the snippet magic command — `?name=Mike`
+    /// query params inject `$name` into the template. Returns `(text, cursor)`
+    /// like [`expand_with_cursor`].
+    pub fn expand_with_vars(
+        &self,
+        template: &str,
+        vars: &[(String, String)],
+    ) -> Result<(String, Option<usize>), ExpandError> {
+        self.expand_impl(template, Some(vars))
+    }
+
+    /// Shared expansion loop. `vars` (query params) shadow the provider when set.
+    fn expand_impl(
+        &self,
+        template: &str,
+        vars: Option<&[(String, String)]>,
+    ) -> Result<(String, Option<usize>), ExpandError> {
         let mut result = String::with_capacity(template.len());
         let mut cursor: Option<usize> = None;
         let mut chars = template.chars().peekable();
@@ -168,8 +189,15 @@ impl Expander {
                     // record where it lands in the expanded text, contribute nothing.
                     cursor = Some(result.len());
                 } else {
-                    match self.provider.resolve(&name) {
+                    // Query params shadow the provider; then fall back to it.
+                    let value = vars
+                        .and_then(|v| v.iter().find(|(k, _)| *k == name).map(|(_, val)| val.clone()))
+                        .or_else(|| self.provider.resolve(&name));
+                    match value {
                         Some(value) => result.push_str(&value),
+                        // 查询参数作用域下,未提供的 `$var` 渲染为空(片段命令
+                        // 的 `?name=` 是逐键注入的,键入中途不报错)。
+                        None if vars.is_some() => {}
                         None => return Err(ExpandError::UnknownVariable(name)),
                     }
                 }

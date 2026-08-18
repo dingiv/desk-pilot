@@ -242,8 +242,15 @@ mod tests {
     }
 
     fn d() -> Dispatcher {
-        let entries = vec![("/greet".into(), "你好,我是 AI 秘书".into()), ("#date".into(), "2026-07-23".into())];
-        Dispatcher::new_for_test(Matcher::new(entries), Expander::new(std::sync::Arc::new(StaticProvider { date: "2026-07-23".into(), clipboard: String::new() })), Box::new(StubPinyin))
+        let entries = vec![("#date".into(), "2026-07-23".into())];
+        let d = Dispatcher::new_for_test(
+            Matcher::new(entries),
+            Expander::new(std::sync::Arc::new(StaticProvider { date: "2026-07-23".into(), clipboard: String::new() })),
+            Box::new(StubPinyin),
+        );
+        // 片段经 magic 注册表(`#/greet`),而非 matcher trie。
+        d.magic().set_snippets(vec![("greet".into(), "你好,我是 AI 秘书".into())]);
+        d
     }
 
     fn sm() -> StateMachine { StateMachine::new() }
@@ -263,9 +270,9 @@ mod tests {
     #[test]
     fn snippet_expansion() {
         let d = d(); let mut s = sm();
-        // Type /greet — shows expansion as candidate, doesn't auto-expand.
-        d.process_key('/', &mut s); d.process_key('g', &mut s); d.process_key('r', &mut s); d.process_key('e', &mut s); d.process_key('e', &mut s);
-        let view = d.process_key('t', &mut s);
+        // Type #/greet — shows expansion as candidate, doesn't auto-expand.
+        let mut view = ImeView::empty();
+        for c in "#/greet".chars() { view = d.process_key(c, &mut s); }
         assert!(view.candidate_count > 0, "should show expansion as candidate, got {view:?}");
         // Space commits the expansion.
         assert_eq!(ImeView::str_field(&d.process_key(' ', &mut s).commit_text), "你好,我是 AI 秘书");
@@ -326,17 +333,17 @@ mod tests {
             }
         }
 
-        let entries = vec![("/note".into(), "$DATE 完成: $CURSOR 记得检查".into())];
         let provider: std::sync::Arc<dyn VariableProvider> = std::sync::Arc::new(MutableDate {
             date: Mutex::new("2026-08-05".into()),
         });
         let d = Dispatcher::new_for_test(
-            Matcher::new(entries),
+            Matcher::new(Vec::new()),
             Expander::new(provider),
             Box::new(StubPinyin),
         );
+        d.magic().set_snippets(vec![("note".into(), "$DATE 完成: $CURSOR 记得检查".into())]);
         let mut s = sm();
-        for c in "/note".chars() { d.process_key(c, &mut s); }
+        for c in "#/note".chars() { d.process_key(c, &mut s); }
         let v = d.process_key(' ', &mut s);
         let text = ImeView::str_field(&v.commit_text);
         // "$DATE" = 10 bytes + " 完成: " = 9 → marker lands at byte 19.

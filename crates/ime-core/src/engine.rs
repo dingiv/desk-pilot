@@ -128,17 +128,23 @@ impl ImeEngine {
     ) -> Self {
         // Magic command entries are generated from the member registry (#asr, #flush,
         // #submit, #req, #date, #password …) — adding a command = one member, nothing
-        // here. `/`-snippets and the `#wait` async demo stay plain matcher entries.
+        // here. `/`-snippets are now the empty-name snippet magic command (`#/sig`);
+        // the `#wait` async demo stays a plain matcher entry.
         let magic = Arc::new(MagicFamily::new());
         let mut entries = magic.matcher_entries();
-        entries.extend(vec![
-            ("/greet".into(), "你好，我是 AI 秘书，请问有什么可以帮你的？".into()),
-            ("/sig".into(), "Best regards,\nAlice".into()),
-            ("#wait".into(), "__WAIT_DEMO__".into()),
-        ]);
-        // Config snippets override built-ins (later entries overwrite trie nodes).
-        entries.extend(extra_snippets);
+        entries.push(("#wait".into(), "__WAIT_DEMO__".into()));
         let matcher = crate::Matcher::new(entries);
+        // 片段注册表:内置 + 配置片段;名字去掉前导 `/`(触发名 `/sig` → `sig`,
+        // 调用 `#/sig`)。
+        let mut snippets: Vec<(String, String)> = vec![
+            ("greet".into(), "你好，我是 AI 秘书，请问有什么可以帮你的？".into()),
+            ("sig".into(), "Best regards,\nAlice".into()),
+        ];
+        for (trigger, expand) in extra_snippets {
+            let name = trigger.strip_prefix('/').unwrap_or(&trigger).to_string();
+            snippets.push((name, expand));
+        }
+        magic.set_snippets(snippets);
         // Shared with the dispatcher's expander — `set_variable` writes through the same Arc.
         let provider: Arc<dyn crate::expander::VariableProvider> = Arc::from(provider);
         let expander = crate::Expander::new(Arc::clone(&provider));
@@ -649,13 +655,47 @@ mod tests {
 
     #[test]
     fn snippet_expansion() {
+        // 内置片段 greet 经 `#/greet` 展开。
         let mut e = eng();
-        for c in "/greet".chars() {
-            let v = e.predict(KeyEvent::char(c));
-            if ImeView::str_field(&v.commit_text) == "你好，我是 AI 秘书" { return; }
+        for c in "#/greet".chars() { e.predict(KeyEvent::char(c)); }
+        let v = e.predict(KeyEvent::space());
+        assert_eq!(
+            ImeView::str_field(&v.commit_text),
+            "你好，我是 AI 秘书，请问有什么可以帮你的？"
+        );
+    }
+
+    #[test]
+    fn snippet_query_params_inject_template_variables() {
+        // #/hello?name=Mike → 查询参数注入模板变量 $name。
+        use crate::expander::VariableProvider;
+        #[derive(Clone)]
+        struct NoVars;
+        impl VariableProvider for NoVars {
+            fn resolve(&self, _name: &str) -> Option<String> { None }
         }
-        // Default engine has empty Matcher, so snippet won't expand.
-        // Just check that it doesn't crash.
+        let e = ImeEngine::with_config(
+            crate::family::pinyin::PinyinWeights::default(),
+            crate::family::english::EnglishWeights::default(),
+            Box::new(NoVars),
+            vec![("/hello".into(), "Hello, my name is $name.".into())],
+            crate::scoring::ScoringConfig::default(),
+        );
+        let mut e = e;
+        for c in "#/hello?name=Mike".chars() { e.predict(KeyEvent::char(c)); }
+        let v = e.predict(KeyEvent::space());
+        assert_eq!(ImeView::str_field(&v.commit_text), "Hello, my name is Mike.");
+    }
+
+    #[test]
+    fn snippet_unknown_name_shows_hint_and_commits_empty() {
+        // 未知片段名 → 候选"未知片段 /nope",Space 空提交。
+        let mut e = eng();
+        for c in "#/nope".chars() { e.predict(KeyEvent::char(c)); }
+        let cands = e.candidates();
+        assert!(cands.iter().any(|c| c.contains("未知片段")), "{cands:?}");
+        let v = e.predict(KeyEvent::space());
+        assert!(ImeView::str_field(&v.commit_text).is_empty(), "unknown snippet commits nothing");
     }
 
     #[test]
@@ -833,27 +873,6 @@ mod tests {
         let v = e.predict(KeyEvent::space());
         assert_eq!(ImeView::str_field(&v.commit_text), "#asr", "rollback commits #asr");
         assert!(e.candidates().is_empty(), "exited preview");
-    }
-
-    #[test]
-    fn unknown_snippet_space_commits_raw() {
-        // `/unknown` (no trie match) → the raw text is a fallback candidate;
-        // Space commits it — the trie never swallows unknown `/` input.
-        let mut e = eng();
-        for c in "/unknown".chars() { e.predict(KeyEvent::char(c)); }
-        let cands = e.candidates();
-        assert_eq!(cands, vec!["/unknown".to_string()], "raw fallback: {cands:?}");
-
-        let v = e.predict(KeyEvent::space());
-        assert_eq!(ImeView::str_field(&v.commit_text), "/unknown", "space commits raw");
-        assert!(e.candidates().is_empty(), "cleared after commit");
-
-        // Escape cancels instead of committing.
-        let mut e2 = eng();
-        for c in "/unknown".chars() { e2.predict(KeyEvent::char(c)); }
-        let v = e2.predict(KeyEvent::escape());
-        assert!(ImeView::str_field(&v.commit_text).is_empty(), "escape cancels");
-        assert!(e2.candidates().is_empty(), "cleared after escape");
     }
 
     #[test]
@@ -1162,7 +1181,7 @@ mod tests {
             crate::scoring::ScoringConfig::default(),
         );
         let mut e = e;
-        for c in "/sig".chars() { e.predict(KeyEvent::char(c)); }
+        for c in "#/sig".chars() { e.predict(KeyEvent::char(c)); }
         let v = e.predict(KeyEvent::space());
         assert_eq!(
             ImeView::str_field(&v.commit_text),

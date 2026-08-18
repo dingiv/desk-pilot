@@ -12,6 +12,7 @@
 
 mod member;
 mod req;
+mod snippet;
 mod voice;
 
 use std::collections::HashMap;
@@ -19,6 +20,7 @@ use std::sync::{Arc, Mutex};
 
 pub use member::{is_arg_char, preview_text, CANDIDATE_PREVIEW_MAX, CommandArgs, MagicMember, MemberAction};
 pub use req::{ReqFetcher, DEFAULT_REQ_BASE};
+pub use snippet::SnippetMember;
 pub use voice::{SubmitMember, VoiceMember};
 
 use req::ReqMember;
@@ -49,6 +51,9 @@ pub struct MagicResources {
     pub voice: Arc<VoiceSlot>,
     pub req_base: Mutex<String>,
     pub req_fetcher: Mutex<Arc<dyn ReqFetcher>>,
+    /// 片段注册表:名字(无前导 `/`)→ 模板。`#/hello?name=Mike` 的 `hello`
+    /// 在此查表;`?name=Mike` 作为模板变量注入。
+    pub snippets: Mutex<HashMap<String, String>>,
 }
 
 fn default_fetcher() -> Arc<dyn ReqFetcher> {
@@ -68,6 +73,7 @@ impl Default for MagicResources {
             voice: Arc::new(VoiceSlot::default()),
             req_base: Mutex::new(DEFAULT_REQ_BASE.to_string()),
             req_fetcher: Mutex::new(default_fetcher()),
+            snippets: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -120,6 +126,8 @@ impl MagicFamily {
             Arc::new(VoiceMember::new(Arc::clone(&resources))),
             Arc::new(SubmitMember::new(Arc::clone(&resources))),
             Arc::new(ReqMember::new(Arc::clone(&resources))),
+            // 片段命令:空名魔法命令(`#/hello?name=Mike`),经 `#` + `/` 路由。
+            Arc::new(SnippetMember::new(Arc::clone(&resources))),
         ];
         let mut token_map = HashMap::new();
         for (i, m) in members.iter().enumerate() {
@@ -156,6 +164,8 @@ impl MagicFamily {
             out.push((s.trigger.to_string(), s.trigger.to_string()));
         }
         for m in &self.members {
+            // 空名成员(片段命令)不进 matcher trie —— 它经 `#` + `/` 特判路由。
+            if m.name().is_empty() { continue; }
             let token = m.activation_token().expect("live member needs an activation token");
             out.push((format!("#{}", m.name()), token.to_string()));
             for alias in m.aliases() {
@@ -188,6 +198,7 @@ impl MagicFamily {
         }
         for m in &self.members {
             if let Some(token) = m.activation_token() {
+                if m.name().is_empty() { continue; } // 片段命令不作为 `#…` 提示
                 let t = format!("#{}", m.name());
                 if t.starts_with(prefix) && t != prefix {
                     out.push((t.clone(), Some(token)));
@@ -222,6 +233,16 @@ impl MagicFamily {
     /// behind the `http` feature).
     pub fn set_req_fetcher(&self, fetcher: Arc<dyn ReqFetcher>) {
         *self.resources.req_fetcher.lock().unwrap() = fetcher;
+    }
+
+    /// 填充片段注册表(名字 → 模板)。名字不应带前导 `/`(`#/hello` 的 `hello`)。
+    /// 供 SnippetMember 在 `#/name?params` 时查表展开。
+    pub fn set_snippets(&self, snippets: Vec<(String, String)>) {
+        let mut map = self.resources.snippets.lock().unwrap();
+        map.clear();
+        for (name, tpl) in snippets {
+            map.insert(name, tpl);
+        }
     }
 
     /// Shared resources — member instances and the engine talk through these.
