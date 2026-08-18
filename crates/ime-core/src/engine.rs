@@ -293,8 +293,10 @@ impl ImeEngine {
     pub fn commit_pending_ctx(&self, ctx: usize) -> ImeView {
         let map = self.contexts.lock().unwrap();
         let Some(pc) = map.get(&ctx) else { return ImeView::empty() };
-        let text = pc.sm.candidates.first().cloned()
-            .unwrap_or_else(|| pc.sm.buffer.clone());
+        // 候选(英文按键入大小写回填)优先,否则提交原始输入 raw_buffer。
+        let text = pc.sm.candidates.first()
+            .map(|c| crate::state::apply_input_casing(c, &pc.sm.raw_buffer))
+            .unwrap_or_else(|| pc.sm.raw_buffer.clone());
         let mut v = ImeView::empty();
         if !text.is_empty() {
             ImeView::set_str(&mut v.commit_text, &text);
@@ -571,6 +573,65 @@ mod tests {
         assert!(e.candidates().iter().any(|c| c.contains("你好")));
         let v = e.predict(KeyEvent::space());
         assert!(ImeView::str_field(&v.commit_text).contains("你"));
+    }
+
+    #[test]
+    fn uppercase_english_predicts_as_lowercase_and_commits_cased() {
+        // 大写 E 视作小写 e 预测(词典候选 english 出现),提交保留 English。
+        let mut e = eng();
+        for c in "English".chars() { e.predict(KeyEvent::char(c)); }
+        let cands = e.candidates();
+        assert!(
+            cands.iter().any(|c| c == "english"),
+            "uppercase should predict as lowercase: {cands:?}"
+        );
+        // preedit 保留原始大小写。
+        assert_eq!(ImeView::str_field(&e.view().preedit_text), "English");
+        // 选 english 候选 → 提交 English。
+        let idx = cands.iter().position(|c| c == "english").unwrap();
+        let v = e.select_candidate(idx);
+        assert_eq!(ImeView::str_field(&v.commit_text), "English");
+    }
+
+    #[test]
+    fn uppercase_english_enter_commits_raw_cased() {
+        // Enter 强选 raw 文本:提交原始大小写,非小写 buffer。
+        let mut e = eng();
+        for c in "English".chars() { e.predict(KeyEvent::char(c)); }
+        let v = e.predict(KeyEvent::enter());
+        assert_eq!(ImeView::str_field(&v.commit_text), "English");
+    }
+
+    #[test]
+    fn prefix_case_applied_to_completion() {
+        // "Engli" → 补全 english:前缀回填大小写,补全段( sh )保持小写。
+        let mut e = eng();
+        for c in "Engli".chars() { e.predict(KeyEvent::char(c)); }
+        let cands = e.candidates();
+        assert!(cands.iter().any(|c| c == "english"), "{cands:?}");
+        let idx = cands.iter().position(|c| c == "english").unwrap();
+        let v = e.select_candidate(idx);
+        assert_eq!(ImeView::str_field(&v.commit_text), "English");
+    }
+
+    #[test]
+    fn all_caps_english_commits_all_caps() {
+        let mut e = eng();
+        for c in "ENGLISH".chars() { e.predict(KeyEvent::char(c)); }
+        let cands = e.candidates();
+        let idx = cands.iter().position(|c| c == "english").expect("english candidate");
+        let v = e.select_candidate(idx);
+        assert_eq!(ImeView::str_field(&v.commit_text), "ENGLISH");
+    }
+
+    #[test]
+    fn lowercase_english_unchanged() {
+        let mut e = eng();
+        for c in "english".chars() { e.predict(KeyEvent::char(c)); }
+        let cands = e.candidates();
+        let idx = cands.iter().position(|c| c == "english").expect("english candidate");
+        let v = e.select_candidate(idx);
+        assert_eq!(ImeView::str_field(&v.commit_text), "english");
     }
 
     #[test]

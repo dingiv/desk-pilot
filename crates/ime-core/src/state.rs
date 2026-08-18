@@ -43,6 +43,10 @@ pub struct StateMachine {
     pub state: ComposeState,
     /// Raw pinyin buffer — remaining uncommitted pinyin syllables.
     pub buffer: String,
+    /// 键入的原始文本(保留大小写)。预测用 [`buffer`](小写);展示与提交
+    /// 用这里。英文候选提交时按它回填大小写(English 而非 english)。
+    /// 不变式:`buffer` 是 `raw_buffer` 的 ASCII 小写,二者等长。
+    pub raw_buffer: String,
     /// Visual preedit: committed hanzi + remaining pinyin.
     pub preedit: String,
     /// Cursor byte offset within preedit.
@@ -249,11 +253,13 @@ impl StateMachine {
 
         let is_partial = self.partial_commit_indices.get(index).copied().unwrap_or(false);
         if !is_partial {
-            // Full commit: combine committed_text + selected text.
+            // Full commit: combine committed_text + selected text. 英文候选按
+            // 键入的原始大小写回填(raw_buffer),汉字候选天然 no-op。
+            let picked_cased = apply_input_casing(&picked, &self.raw_buffer);
             let final_text = if self.committed_text.is_empty() {
-                picked.clone()
+                picked_cased.clone()
             } else {
-                format!("{}{}", self.committed_text, picked)
+                format!("{}{}", self.committed_text, picked_cased)
             };
             // Boost this word in inputx-pinyin's L0 user model.
             let full_pinyin = if self.committed_text.is_empty() {
@@ -284,8 +290,10 @@ impl StateMachine {
                 env.record_pick(&consumed, &picked);
                 self.committed_pinyin_buf.push_str(&consumed);
                 self.buffer = self.buffer[first_len..].to_string();
+                // 同步收缩 raw_buffer(consumed 是小写音节,等字节长)。
+                self.raw_buffer = self.raw_buffer[first_len..].to_string();
             }
-            self.preedit = format!("{}{}", self.committed_text, self.buffer);
+            self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
             self.cursor = self.preedit.len();
             self.candidates_fresh = false;
             self.candidate_highlight = 0;
@@ -301,6 +309,7 @@ impl StateMachine {
         }
         self.state = ComposeState::Idle;
         self.buffer.clear();
+        self.raw_buffer.clear();
         self.preedit.clear();
         self.cursor = 0;
         self.candidates.clear();
@@ -414,10 +423,13 @@ impl StateMachine {
             self.cursor = 1;
             return self.make_view();
         }
-        if ch.is_ascii_lowercase() {
+        if ch.is_ascii_alphabetic() {
+            // 大写字母视作小写进行预测(English → english),展示与提交
+            // 保留原始大小写(raw_buffer)。
             self.state = ComposeState::Pinyin;
-            self.buffer.push(ch);
-            self.preedit = self.buffer.clone();
+            self.buffer.push(ch.to_ascii_lowercase());
+            self.raw_buffer.push(ch);
+            self.preedit = self.raw_buffer.clone();
             self.cursor = self.preedit.len();
             self.candidates_fresh = false;
             return self.query_pinyin(env);
@@ -603,9 +615,10 @@ impl StateMachine {
             '\x08' => self.pinyin_backspace(env),
             '\n' | '\r' => self.pinyin_enter(),
             ' ' => self.pinyin_space(env),
-            c if c.is_ascii_lowercase() => {
-                self.buffer.push(c);
-                self.preedit = format!("{}{}", self.committed_text, self.buffer);
+            c if c.is_ascii_alphabetic() => {
+                self.buffer.push(c.to_ascii_lowercase());
+                self.raw_buffer.push(c);
+                self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
                 self.cursor = self.preedit.len();
                 self.candidates_fresh = false;
                 self.query_pinyin(env)
@@ -710,15 +723,17 @@ impl StateMachine {
                 self.committed_pinyin_buf.truncate(trim);
                 // Prepend the syllable back to buffer.
                 self.buffer = format!("{syl}{}", self.buffer);
+                self.raw_buffer = format!("{syl}{}", self.raw_buffer);
             }
-            self.preedit = format!("{}{}", self.committed_text, self.buffer);
+            self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
             self.cursor = self.preedit.len();
             self.candidates_fresh = false;
             return self.query_pinyin(env);
         }
 
         self.buffer.pop();
-        self.preedit = format!("{}{}", self.committed_text, self.buffer);
+        self.raw_buffer.pop();
+        self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
         self.cursor = self.preedit.len();
         self.candidates_fresh = false;
         if self.buffer.is_empty() {
@@ -730,7 +745,8 @@ impl StateMachine {
     }
 
     fn pinyin_enter(&mut self) -> ImeView {
-        let raw = std::mem::take(&mut self.buffer);
+        // Enter 强选 raw 文本:提交原始大小写(raw_buffer),非小写 buffer。
+        let raw = std::mem::take(&mut self.raw_buffer);
         let committed = std::mem::take(&mut self.committed_text);
         let text = if committed.is_empty() { raw } else { format!("{committed}{raw}") };
         self.reset();
@@ -739,9 +755,10 @@ impl StateMachine {
 
     fn pinyin_space(&mut self, env: &dyn StepEnv) -> ImeView {
         if !self.candidates_fresh {
-            // No candidates — commit raw (committed_text + buffer).
+            // No candidates — commit raw (committed_text + raw_buffer)。
             let committed = std::mem::take(&mut self.committed_text);
-            let raw = std::mem::take(&mut self.buffer);
+            let raw = std::mem::take(&mut self.raw_buffer);
+            let _ = std::mem::take(&mut self.buffer);
             self.candidates.clear();
             self.state = ComposeState::Idle;
             let text = if committed.is_empty() { raw } else { format!("{committed}{raw}") };
@@ -760,7 +777,8 @@ impl StateMachine {
         let fresh = self.candidates_fresh;
         let top = self.candidates.first().cloned();
         let committed = std::mem::take(&mut self.committed_text);
-        let raw = std::mem::take(&mut self.buffer);
+        let raw = std::mem::take(&mut self.raw_buffer);
+        let _ = std::mem::take(&mut self.buffer);
         self.candidates_fresh = false;
         self.state = ComposeState::Idle;
         self.candidates.clear();
@@ -770,12 +788,54 @@ impl StateMachine {
             return Self::commit_view(&format!("{prefix}{raw}{ch}"));
         }
         let text = match top {
-            Some(t) => format!("{prefix}{t}{ch}"),
+            Some(t) => format!("{prefix}{}{ch}", apply_input_casing(&t, &raw)),
             None => format!("{prefix}{raw}{ch}"),
         };
         Self::commit_view(&text)
     }
 
+}
+
+/// 提交英文候选时,把用户键入的大小写回填到词典(小写)单词上。
+///
+/// `word` 是候选文本(词典小写,如 "english"),`raw_input` 是当前未提交
+/// 输入的原始大小写([`StateMachine::raw_buffer`])。仅当 `word` 的小写形式
+/// 以 `raw_input` 的小写形式为前缀时,逐字符回填前缀的大小写;余下部分
+/// (用户没打完、由词典补全的段)保持词典小写。汉字等非 ASCII 候选天然
+/// no-op("好".starts_with("hao") 为 false)。
+///
+/// ```text
+/// "Engli" + "english" → "English"   (前缀回填 + 补全段小写)
+/// "ENGLISH" + "english" → "ENGLISH"
+/// "english" + "english" → "english"
+/// "hao" + "好" → "好"               (no-op)
+/// ```
+pub(crate) fn apply_input_casing(word: &str, raw_input: &str) -> String {
+    if raw_input.is_empty() || word.is_empty() {
+        return word.to_string();
+    }
+    // 仅 ASCII 字母参与大小写回填(拼音/英文输入);含非字母(raw 里混入
+    // 符号)时保守不处理。
+    if !raw_input.chars().all(|c| c.is_ascii_alphabetic()) {
+        return word.to_string();
+    }
+    let word_lower = word.to_ascii_lowercase();
+    let raw_lower = raw_input.to_ascii_lowercase();
+    if !word_lower.starts_with(&raw_lower) {
+        return word.to_string();
+    }
+
+    let mut out = String::with_capacity(word.len());
+    let mut word_chars = word.chars();
+    for rc in raw_input.chars() {
+        match word_chars.next() {
+            Some(wc) if wc.is_ascii_alphabetic() => out.push(rc),
+            Some(wc) => out.push(wc),
+            None => break,
+        }
+    }
+    out.extend(word_chars);
+    out
 }
 
 /// Borrowed engine components needed by the FSM to evaluate transitions.

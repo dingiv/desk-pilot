@@ -212,9 +212,14 @@ impl EnglishFamily {
         if word.is_empty() || !word.chars().all(|c| c.is_ascii_alphanumeric()) {
             return;
         }
-        self.merge_into_user(&[(word.to_string(), 10_000)]);
+        // 匹配是大小写不敏感的(predict 里 input 小写、词典全小写),所以
+        // 学入的英文自生词也要归一小写 —— 否则提交 "English" 会学到
+        // "English",下次输入 english 却匹配不到。提交时的大小写由
+        // 输入路由层按 raw_buffer 回填,不靠词典。
+        let word = word.to_ascii_lowercase();
+        self.merge_into_user(&[(word.clone(), 10_000)]);
         if let Some(ref store) = *self.store.lock().unwrap() {
-            store.record_en_user(word);
+            store.record_en_user(&word);
         }
     }
 
