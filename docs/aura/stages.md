@@ -18,7 +18,7 @@ AudioRing（10min @16kHz mono）
    ▼
 ┌──────────────────── Stage1（音频 → 文本，边界范式）────────────────────┐
 │ 流式会话持续喂帧、段/窗口边界重置（D1 适配，见流程细节）                │
-│   → ~0.5s 节流出 Interim（前瞻 id 键；只进 UI，不是 Stage2 输入）        │
+│   → ~0.5s 节流出 StreamFragment（前瞻 id 键；只进 UI，不是 Stage2 输入）│
 │ VAD 间隔 (min_silence 1s) → EOS：                                     │
 │   finalize 会话 → streaming_text                                      │
 │   段 PCM 入 AudioStore（id） → 段级 batch（失败=None）                 │
@@ -27,7 +27,7 @@ AudioRing（10min @16kHz mono）
 │   → store.concat 拼接 PCM → 窗口级 batch 重跑（权威）                  │
 │   → emit WindowEdge { window }（pcm: Arc）→ store.evict               │
 └──────────────────────────────────────────────────────────────────────┘
-   │  mpsc（Stage2 独立 worker 线程 aura-stage2；Interim 不走通道）
+   │  mpsc（Stage2 独立 worker 线程 aura-stage2；StreamFragment 不走通道）
    ▼
 ┌──────────────────── Stage2（文本 → 纠偏文本，窗口状态机）──────────────┐
 │ Batch      → calibrate_window：当前窗口全部段文本逐行联合整流，          │
@@ -39,7 +39,7 @@ AudioRing（10min @16kHz mono）
 Pipeline run()（WindowEdge 臂）→ 识别日志 + record_final 落盘（recordings WAV +
    turns jsonl，按 window_id；storage 由 daemon 传入）
    ▼
-daemon on_turn 回调 → SSE 数据面 /api/asr_stream → UI（WindowFinal 时另触发 Stage3 规则加词）
+daemon on_turn 回调 → SSE 数据面 /api/asr_stream → UI（WindowCalibration 时另触发 Stage3 规则加词）
 ```
 
 ## Stage1：音频 → 文本（ONNX 语音前端）
@@ -63,7 +63,7 @@ daemon on_turn 回调 → SSE 数据面 /api/asr_stream → UI（WindowFinal 时
    "语音起点建会话"的时机（实测 fed=0 教训）。因此会话改为持续喂帧，在每次 EOS 终结
    （产出该段 streaming_text）和窗口 settle 后立即重置——每个会话恰好覆盖
    [上一边界, 本次 EOS] ≈ 单个段（含边界静音，静音不解码出字），段级归属保留。
-   partial 每 ~15 窗（≈0.5s）解码、变化才发 `Interim`，键用 tracker 的前瞻
+   partial 每 ~15 窗（≈0.5s）解码、变化才发 `StreamFragment`，键用 tracker 的前瞻
    (window_id, segment_id)（权威分组随 Batch 到达）。段的 `start_s` 由 PCM 时长回推。
    **停滞看门狗**：partial 非空但 ≥8s 无变化且无 EOS ⇒ VAD 从未锁定（音频低于
    threshold = 按设计应抛弃）⇒ 重置会话——微弱音频的残留（含流式幻觉复读）不得
@@ -96,10 +96,10 @@ worker 线程有序到达（Batch×N → WindowEdge），状态不可能失步�
 worker（pipeline.rs），LLM 耗时不卡 partial。
 
 - `calibrate_window(window_id, segments)`：全部段 `best_text()` 逐行（`PromptBuilder::
-  new_multi`，`<primary_transcript>` 信封内一行一段）联合整流 → `WindowCalibrated`（每 VAD
+  new_multi`，`<primary_transcript>` 信封内一行一段）联合整流 → `SegmentCalibration`（每 VAD
   间隔一次，替换同窗口上次结果）并**覆盖窗口存档**。
-- `finalize_window(window)`：返回存档（= 最后一次 `WindowCalibrated` 的文本）→
-  `WindowFinal`（窗口粒度定稿，D3；route_ms ≈ 0）。防御路径：无存档时回退窗口
+- `finalize_window(window)`：返回存档（= 最后一次 `SegmentCalibration` 的文本）→
+  `WindowCalibration`（窗口粒度定稿，D3；route_ms ≈ 0）。防御路径：无存档时回退窗口
   best_text（理论不可达——窗口必有 Batch）。
 - LLM 失败回退原文；用户纠正对（环形 20 条，POST /api/correct）优先级最高注入；
   热词 store 每次读最新（prompt 热词块仍处停用状态——小模型遵循不佳，见 prompt.rs）。
@@ -115,9 +115,11 @@ worker（pipeline.rs），LLM 耗时不卡 partial。
 
 | SSE 段类型（`AsrSegment`，aura-agent/view.rs） | 键 | 语义 |
 |---|---|---|
-| `interim` | window_id + segment_id | 段内流式 partial |
-| `window_calibrated` | window_id | 窗口联合整流（临时，同窗替换） |
-| `window_final` | window_id | 窗口定稿（raw=窗口batch 可空 / streaming 拼接 / calibrated） |
+| `stream_fragment` | window_id + segment_id | 流式模型每次产出的当前段文本（live partial + EOS 定稿） |
+| `batch_segment` | window_id + segment_id | batch 识别完单个段（EOS）——该段 batch 文本 |
+| `batch_window` | window_id | batch 识别完整个窗口（settle）——整窗重跑权威 raw_text |
+| `segment_calibration` | window_id | 每次 Batch 联合纠偏完成——整窗已校准文本（同窗替换） |
+| `window_calibration` | window_id | 窗口纠偏定稿（window 关闭）——最后一次联合整流结果 |
 | `correction` | window_id | 用户纠正标记 |
 
 识别事件走数据面（直推不节流）；设置变更走控制面（version ping → 重拉快照）。
@@ -126,11 +128,13 @@ worker（pipeline.rs），LLM 耗时不卡 partial。
 `/api/audio/{window_id}`、`/api/recordings` 返回窗口 id。Stage3 规则触发器不变（吃定稿
 calibrated 文本加词）。
 
-## 迁移状态（2026-08-17）
+## 迁移状态（2026-08-18）
 
-- ✅ aura-core（含并入的原 aura-asr/aura-tts，2026-08-18）/ aura-agent / aura-daemon 已切换新契约（定向构建+测试绿）。
-- ⬜ **前端三处未迁移**（后续独立任务）：`apps/swift-ime`（bridge 的
-  `CalibratedInterim`→`WindowCalibrated`、mock 测试 JSON 换 `window_calibrated`/
-  `window_final` 标签）、`apps/geek-familiar`（app.rs 事件改挂）、
-  `apps/audio-aura-devtools`（types.ts/App.tsx/UtteranceList 按 window_id 重键）。
-  过渡期 `cargo build --workspace` 会在 swift-ime / geek-familiar 处失败，验证用 `-p` 定向。
+- ✅ aura-core（含并入的原 aura-asr/aura-tts，2026-08-18）/ aura-agent / aura-daemon 已切换
+  5 事件协议（`stream_fragment`/`batch_segment`/`batch_window`/`segment_calibration`/
+  `window_calibration` + `correction`；定向构建+测试绿）。
+- ✅ `apps/swift-ime`（bridge 挂 `StreamFragment`/`SegmentCalibration`/`WindowCalibration`，
+  mock 测试 JSON 已换新标签）、`apps/geek-familiar`（app.rs 事件改挂 + ConversationTurn 按
+  window_id 重键）。
+- ⬜ **`apps/audio-aura-devtools` 未迁移**（后续独立任务）：types.ts/App.tsx/UtteranceList
+  换 5 事件协议并按 window_id 重键。

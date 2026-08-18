@@ -1,10 +1,10 @@
 //! AsrBuffer — thread-safe **voice session** state shared between the background aura data-plane
 //! client (producer) and the IME engine / frontend (consumer).
 //!
-//! Holds the current streaming text (`live`, updated by Interim/CalibratedInterim) + a stack of
-//! settled utterances (`finals`, most-recent-first, appended by Final). A `version` counter lets
-//! a poll-loop frontend (the TUI) detect changes and refresh the candidate view without a
-//! keypress.
+//! Holds the current streaming text (`live`, updated by StreamFragment / SegmentCalibration) +
+//! a stack of settled utterances (`finals`, most-recent-first, appended by WindowCalibration).
+//! A `version` counter lets a poll-loop frontend (the TUI) detect changes and refresh the
+//! candidate view without a keypress.
 //!
 //! ## Thread safety
 //! The aura client writes from a background tokio thread; the IME key-event / TUI render path
@@ -15,8 +15,8 @@
 //! ```ignore
 //! let buf = AsrBuffer::new();
 //! // Producer (aura data-plane thread):
-//! buf.set_live("今天天气");        // Interim / CalibratedInterim
-//! buf.push_final("今天天气不错");   // Final → becomes candidate #1
+//! buf.set_live("今天天气");        // StreamFragment / SegmentCalibration
+//! buf.push_final("今天天气不错");   // WindowCalibration → becomes candidate #1
 //! // Consumer (engine / TUI):
 //! let (finals, live) = buf.voice_candidates(); // (["今天天气不错"], "今天天气")
 //! let v = buf.version();                        // bumps on every write
@@ -31,11 +31,11 @@ const MAX_FINALS: usize = 8;
 
 #[derive(Default)]
 struct VoiceState {
-    /// Current streaming text (Interim raw / CalibratedInterim). Updated continuously; cleared
-    /// implicitly when a Final graduates it (the next utterance overwrites it).
+    /// Current streaming text (StreamFragment raw / SegmentCalibration). Updated continuously;
+    /// cleared implicitly when a WindowCalibration graduates it (the next window overwrites it).
     live: String,
-    /// Settled utterances, most-recent-first. Each Final `push_final` inserts at the head — so
-    /// `finals[0]` is the latest, which the engine surfaces as candidate #1.
+    /// Settled utterances, most-recent-first. Each WindowCalibration `push_final` inserts at the
+    /// head — so `finals[0]` is the latest, which the engine surfaces as candidate #1.
     finals: Vec<String>,
 }
 
@@ -74,7 +74,7 @@ impl AsrBuffer {
         self.version.fetch_add(1, Ordering::Release);
     }
 
-    /// Update the live streaming text (Interim / CalibratedInterim from aura).
+    /// Update the live streaming text (StreamFragment / SegmentCalibration from aura).
     pub fn set_live(&self, text: &str) {
         let mut g = self.state.lock().unwrap();
         g.live = text.to_string();

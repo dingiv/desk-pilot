@@ -498,7 +498,7 @@ fn main() -> Result<()> {
         Arc::clone(&active),
         Arc::clone(&hotwords),
         Arc::clone(&corrections),
-        Some(Arc::clone(&storage)), // WindowFinal 时自动 record_final(archive+day log+ring)
+        Some(Arc::clone(&storage)), // WindowCalibration 时自动 record_final(archive+day log+ring)
     )?;
 
     // ── Pipeline on its core-owned thread ── recognition segments → DATA plane; Stage3 on
@@ -512,29 +512,30 @@ fn main() -> Result<()> {
             // plane (version/snapshot) is NOT bumped here — only settings changes bump it.
             // (识别日志与窗口归档在 core 的 run() 内部——这里只做线协议映射。)
             let segment = match ev {
-                TurnEvent::Interim { window_id, segment_id, partial, at_s } => {
-                    Some(AsrSegment::Interim {
+                TurnEvent::StreamFragment { window_id, segment_id, text, at_s } => {
+                    Some(AsrSegment::StreamFragment {
                         window_id,
                         segment_id,
-                        partial: partial.to_string(),
+                        text: text.to_string(),
                         at_s,
                     })
                 }
-                TurnEvent::WindowCalibrated { window_id, calibrated, .. } => {
-                    Some(AsrSegment::WindowCalibrated { window_id, calibrated })
+                TurnEvent::BatchSegment { window_id, segment_id, text } => {
+                    Some(AsrSegment::BatchSegment { window_id, segment_id, text })
                 }
-                TurnEvent::WindowFinal { window: w, calibrated, route_ms } => {
+                TurnEvent::BatchWindow { window_id, text } => {
+                    Some(AsrSegment::BatchWindow { window_id, text })
+                }
+                TurnEvent::SegmentCalibration { window_id, calibrated, .. } => {
+                    Some(AsrSegment::SegmentCalibration { window_id, calibrated })
+                }
+                TurnEvent::WindowCalibration { window_id, calibrated, route_ms } => {
                     // Stage3 may add hotwords — that's a SETTINGS change → control plane.
                     if stage3_on && stage3_rule_trigger(&tool, &calibrated) {
                         version.fetch_add(1, Ordering::Release);
                     }
-                    Some(AsrSegment::WindowFinal {
-                        window_id: w.id,
-                        raw_text: w.batch_text.clone().unwrap_or_default(),
-                        streaming_text: w.streaming_text.clone(),
-                        calibrated,
-                        route_ms,
-                    })
+                    let _ = route_ms;
+                    Some(AsrSegment::WindowCalibration { window_id, calibrated })
                 }
             };
             // Data plane: push the recognition segment directly to /api/asr_stream
@@ -667,8 +668,9 @@ async fn stream_asr(
 
 /// `GET /api/asr_stream` — the DATA plane: pushes each recognition segment directly to the
 /// subscriber (low-latency, every event — not throttled, unlike the control-plane `/api/stream`).
-/// One `data: <AsrSegment json>\n\n` frame per Interim / CalibratedInterim / Final. Late/lagged
-/// subscribers get a `lagged` comment (broadcast backlog overflowed) and keep going.
+/// One `data: <AsrSegment json>\n\n` frame per recognition event (StreamFragment / BatchSegment
+/// / BatchWindow / SegmentCalibration / WindowCalibration). Late/lagged subscribers get a
+/// `lagged` comment (broadcast backlog overflowed) and keep going.
 async fn asr_stream(State(s): State<DaemonState>) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let rx = s.asr_events.subscribe();
     let hello = tokio_stream::once(Ok::<_, Infallible>(

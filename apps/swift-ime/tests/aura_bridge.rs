@@ -3,7 +3,8 @@
 //! Verifies the 联调 seam end-to-end (no mic): the `AuraAgent` SDK drives the connection
 //! (health probe + snapshot fetch + `/api/asr_stream` SSE), the bridge drains its events into
 //! the AsrBuffer (live → live, final → #1), which the `#asr` Voice flow reads. The mock speaks
-//! the daemon's HTTP contract per path; `/api/asr_stream` scripts interim → calibrated → final.
+//! the daemon's HTTP contract per path; `/api/asr_stream` scripts stream_fragment →
+//! batch_segment → segment_calibration → window_calibration.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -35,9 +36,10 @@ fn mock_aura_server() -> String {
             if path.starts_with("/api/asr_stream") {
                 let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
                 stream.write_all(resp).unwrap();
-                stream.write_all(b"data: {\"type\":\"interim\",\"seq\":1,\"partial\":\"ni\",\"at_s\":0}\n\n").unwrap();
-                stream.write_all("data: {\"type\":\"calibrated_interim\",\"seq\":1,\"calibrated\":\"你好\"}\n\n".as_bytes()).unwrap();
-                stream.write_all("data: {\"type\":\"final\",\"seq\":1,\"raw_text\":\"你好\",\"streaming_text\":\"\",\"calibrated\":\"你好世界\",\"intent\":\"chat\",\"reply\":\"\",\"route_ms\":12}\n\n".as_bytes()).unwrap();
+                stream.write_all(b"data: {\"type\":\"stream_fragment\",\"window_id\":1,\"segment_id\":1,\"text\":\"ni\",\"at_s\":0}\n\n").unwrap();
+                stream.write_all("data: {\"type\":\"batch_segment\",\"window_id\":1,\"segment_id\":1,\"text\":\"你好\"}\n\n".as_bytes()).unwrap();
+                stream.write_all("data: {\"type\":\"segment_calibration\",\"window_id\":1,\"calibrated\":\"你好\"}\n\n".as_bytes()).unwrap();
+                stream.write_all("data: {\"type\":\"window_calibration\",\"window_id\":1,\"calibrated\":\"你好世界\"}\n\n".as_bytes()).unwrap();
                 stream.flush().unwrap();
                 thread::sleep(Duration::from_secs(2)); // keep open so bytes are flushed before close
             } else if path.starts_with("/api/state") {

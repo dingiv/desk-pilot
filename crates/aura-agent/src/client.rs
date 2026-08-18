@@ -4,8 +4,9 @@
 //!   fetches the full [`AuraStateView`] and re-fetches on each throttled `state_changed` ping.
 //!   Right for low-frequency state (connection, config, hotwords, corrections).
 //! - **Data plane** ([`subscribe_segments`]): live recognition segments pushed directly
-//!   (low-latency, every event). Each [`AsrSegment`] is one Interim / WindowCalibrated /
-//!   WindowFinal — render the live text off this, without the ping→fetch round-trip.
+//!   (low-latency, every event). Each [`AsrSegment`] is one of the five recognition events
+//!   (StreamFragment / BatchSegment / BatchWindow / SegmentCalibration / WindowCalibration) —
+//!   render the live text off this, without the ping→fetch round-trip.
 //!
 //! Both streams are resilient + infinite (they reconnect on drop). This crate is dependency-light
 //! on purpose (no mistralrs/asr) so an upper layer talks to aura without the GPU stack.
@@ -177,9 +178,10 @@ impl AuraClient {
     }
 
     /// **Data plane** — live recognition segments pushed directly. Opens `GET /api/asr_stream` and
-    /// yields each [`AsrSegment`] (Interim / WindowCalibrated / WindowFinal) as it happens —
-    /// low-latency, every event, no ping→fetch round-trip. Resilient + infinite (reconnects on
-    /// drop). Render the live streaming text off this.
+    /// yields each [`AsrSegment`] (StreamFragment / BatchSegment / BatchWindow /
+    /// SegmentCalibration / WindowCalibration) as it happens — low-latency, every event, no
+    /// ping→fetch round-trip. Resilient + infinite (reconnects on drop). Render the live
+    /// streaming text off this.
     pub fn subscribe_segments(&self) -> impl Stream<Item = AsrSegment> + '_ {
         let url = format!("{}/api/asr_stream", self.base);
         async_stream::stream! {

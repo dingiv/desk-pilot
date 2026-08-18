@@ -46,7 +46,7 @@ pub type AudioId = u64;
 /// Segment id — monotonic within a pipeline run.
 pub type SegmentId = u64;
 /// Window id — monotonic within a run, assigned when the window OPENS (its first SOS), so
-/// live `Interim` partials can carry the real id (no prospective guessing).
+/// live `StreamFragment` partials can carry the real id (no prospective guessing).
 pub type WindowId = u64;
 
 /// One VAD-gap-delimited clip — the atomic Stage1 unit. A segment is complete the moment its
@@ -126,11 +126,12 @@ impl VadWindow {
 /// an earlier entity in place (the old paradigm's same-seq update is gone).
 #[derive(Debug, Clone)]
 pub enum Stage1Event {
-    /// Live streaming partial for the CURRENT segment (per-segment session ⇒ the partial
+    /// Live streaming output for the CURRENT segment (per-segment session ⇒ the fragment
     /// belongs to exactly one segment). Carries the real `window_id` (assigned at the
     /// window's first SOS) + `segment_id`. Passes straight through to the UI — NOT a Stage2
-    /// input (D2: no live-partial calibration).
-    Interim { window_id: WindowId, segment_id: SegmentId, partial: String, at_s: f64 },
+    /// input (D2: no live-partial calibration). Emitted on every streaming decode change, plus
+    /// one FINAL fragment at EOS carrying the segment's definitive `streaming_text`.
+    StreamFragment { window_id: WindowId, segment_id: SegmentId, text: String, at_s: f64 },
     /// A VAD gap closed a segment: its batch pass is packed in. `segments` is ALL segments
     /// of the current window so far (Stage2 jointly calibrates them — the payload IS the
     /// window, keeping Stage2 stateless). Provisional until the `WindowEdge`.

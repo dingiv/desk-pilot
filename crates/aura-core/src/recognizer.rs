@@ -14,7 +14,7 @@
 //! ```ignore
 //! let exec = OnnxStage1Recognizer::new(Stage1Config::new(scout_addr))?;
 //! exec.run(&mut |ev| match ev {
-//!     Stage1Event::Interim { window_id, segment_id, partial, .. } => println!("…{partial}"),
+//!     Stage1Event::StreamFragment { window_id, segment_id, text, .. } => println!("…{text}"),
 //!     Stage1Event::Batch { window_id, segments } => stage2.calibrate_window(window_id, &segments),
 //!     Stage1Event::WindowEdge { window } => stage2.calibrate_final(&window),
 //! });
@@ -524,7 +524,8 @@ impl WindowTracker {
     }
 
     /// The ids the segment currently being spoken WILL get: the open window's id (or the next
-    /// one when nothing is open) + the next segment id. Used to key live `Interim` partials —
+    /// one when nothing is open) + the next segment id. Used to key live `StreamFragment`
+    /// partials —
     /// this VAD emits SOS RETROACTIVELY (with EOS), so the real assignment only exists at EOS.
     /// Authoritative grouping arrives with the `Batch`/`WindowEdge` events.
     fn prospective(&self) -> (WindowId, SegmentId) {
@@ -631,6 +632,8 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
         let mut ring_empty_since: Option<Instant> = None;
         let mut tracker = WindowTracker::new(self.merge_gap_s);
         let mut cur_seg: SegmentId = 0;
+        // silence-feed 的节流计时器:喂送静音逼 VAD EOS 时,每 100ms 至多喂一帧(避免 CPU 空转)。
+        let mut last_silence_feed = Instant::now();
 
         loop {
             // Connection toggle: when the scout connection is paused, skip VAD/ASR (the ingest
@@ -670,9 +673,6 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                     sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
                 }
             }
-            // Rate-limited liveness marker (3s), emitted only when the loop actually runs —
-            // i.e. on frames or deadline wakes. Fully idle ⇒ fully silent logs: a parked
-            // thread with nothing pending produces no output by design.
             if last_diag.elapsed() >= Duration::from_secs(3) {
                 let rlen = self.ring.lock().unwrap().len();
                 // NOTE: `is_speaking()` is useless with this retroactive VAD (only true for
@@ -721,8 +721,23 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                     let has_partial =
                         sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
                     if since.elapsed() > Duration::from_secs(2) && has_partial {
-                        debug!("ring empty > 2s during speech — feeding silence to force VAD EOS");
-                        vec![0i16; WINDOW] // synthetic silence frame → VAD will fire EOS
+                        // Feed synthetic silence so VAD fires EOS when the source dropped
+                        // mid-utterance — but at a 100ms cadence, NOT a CPU burn: each feed is
+                        // one 32ms silence window, so ~1s of silence accumulates over ~3s wall.
+                        if last_silence_feed.elapsed() >= Duration::from_millis(100) {
+                            last_silence_feed = Instant::now();
+                            debug!("ring empty > 2s during speech — feeding silence to force VAD EOS");
+                            vec![0i16; WINDOW] // synthetic silence frame → VAD will fire EOS
+                        } else {
+                            // Park until the next feed tick (a real frame still wakes us early).
+                            match wait_frame(&self.ring, &self.ring_cv, WINDOW, Some(Duration::from_millis(100))) {
+                                Some(f) => {
+                                    ring_empty_since = None;
+                                    f
+                                }
+                                None => continue, // not a feed tick yet — re-run checks
+                            }
+                        }
                     } else {
                         // Park until the ingest thread pushes (condvar notify) or the next
                         // deadline above fires — 无睡眠轮询,空闲时零唤醒.
@@ -752,10 +767,10 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                     let partial = asr.decode_and_result(&a.stream);
                     if !partial.is_empty() && partial != a.last_partial {
                         let (window_id, segment_id) = tracker.prospective();
-                        on_event(Stage1Event::Interim {
+                        on_event(Stage1Event::StreamFragment {
                             window_id,
                             segment_id,
-                            partial: partial.clone(),
+                            text: partial.clone(),
                             at_s: start.elapsed().as_secs_f64(),
                         });
                         a.last_partial = partial;
@@ -836,6 +851,18 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                                 streaming = %s.streaming_text,
                                 "段定稿(VadSegment)"
                             );
+                        }
+                        // Final stream fragment: the segment's DEFINITIVE streaming text
+                        // (live partials only decode up to the last throttle frame; finalize
+                        // is authoritative). Real ids now assigned by on_eos. Skipped when
+                        // streaming produced nothing (batch-only segment).
+                        if let Some(s) = segments.last().filter(|s| !s.streaming_text.is_empty()) {
+                            on_event(Stage1Event::StreamFragment {
+                                window_id,
+                                segment_id: s.id,
+                                text: s.streaming_text.clone(),
+                                at_s: end_s,
+                            });
                         }
                         on_event(Stage1Event::Batch { window_id, segments });
                     }

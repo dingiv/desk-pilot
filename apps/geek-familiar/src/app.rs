@@ -139,35 +139,34 @@ impl PetApp {
                         self.status_messages.insert(0, format!("🔤 hotwords: {}", view.hotwords.join(", ")));
                         if self.status_messages.len() > 30 { self.status_messages.truncate(30); }
                     }
-                    // Data plane: settled utterance → history + transcript.
-                    TurnFinal(u) => {
+                    // Data plane: settled window → history + transcript.
+                    WindowCalibration(u) => {
                         let turn = crate::model::ConversationTurn {
-                            seq: u.seq,
+                            window_id: u.window_id,
                             user_text: u.calibrated.clone(),
-                            intent: u.intent.clone(),
-                            reply: u.reply.clone(),
                         };
-                        let existing = self.asr.history.iter_mut().find(|t| t.seq == u.seq);
+                        let existing = self.asr.history.iter_mut().find(|t| t.window_id == u.window_id);
                         if let Some(t) = existing { *t = turn; } else { self.asr.history.push(turn); }
                         if self.asr.history.len() > 20 {
                             self.asr.history.drain(0..self.asr.history.len() - 20);
                         }
-                        let mut line = u.calibrated.clone();
-                        if !u.reply.is_empty() {
-                            line.push_str(&format!("\n   ◀ {}", u.reply));
-                        }
                         let mut content = self.transcript.clone();
-                        if !content.text().is_empty() { content = text_editor::Content::with_text(&format!("{}\n{}", content.text(), line)); }
-                        else { content = text_editor::Content::with_text(&line); }
+                        if !content.text().is_empty() {
+                            content = text_editor::Content::with_text(&format!("{}\n{}", content.text(), u.calibrated));
+                        } else {
+                            content = text_editor::Content::with_text(&u.calibrated);
+                        }
                         self.transcript = content;
                     }
-                    // ① new Stage1 streaming fragment — raw partial (fast UI follow).
-                    Interim { partial, .. } => self.asr.interim = partial,
-                    // ② Stage2 corrected a batch — calibrated text wins over the raw partial.
-                    CalibratedInterim { calibrated, .. } => self.asr.interim = calibrated,
+                    // ① new Stage1 streaming fragment — raw live text (fast UI follow).
+                    StreamFragment { text, .. } => self.asr.interim = text,
+                    // ② Stage2 jointly calibrated the window (per Batch) — wins over the raw.
+                    SegmentCalibration { calibrated, .. } => self.asr.interim = calibrated,
                     // Connectivity changed (the agent probes /health itself).
                     ConnChanged(c) => self.asr.sse_connected = c == audio_aura_agent::AuraConn::Connected,
-                    TurnCorrected(_) => {} // the pair already entered Stage2; UI shows via corrections
+                    WindowCorrected(_) => {} // the pair already entered Stage2; UI shows via corrections
+                    // Batch layers aren't UI input — the calibrated text is the source of truth.
+                    BatchSegment { .. } | BatchWindow { .. } => {}
                 }
             }
             // Placeholder for SSE connection status from the stream itself
@@ -268,8 +267,10 @@ impl PetApp {
                 }
             }
             Message::PlayAudio(idx) => {
-                eprintln!("[geek-familiar] play audio seq={idx}");
-                play_audio(self.agent.clone(), idx);
+                if let Some(turn) = self.asr.history.get(idx as usize) {
+                    eprintln!("[geek-familiar] play audio window={}", turn.window_id);
+                    play_audio(self.agent.clone(), turn.window_id);
+                }
             }
             Message::AudioPlayed(seq, ok) => {
                 let msg = if ok { format!("🔊 audio seq={seq} played") } else { format!("⚠ audio seq={seq} failed") };
@@ -279,12 +280,12 @@ impl PetApp {
             Message::CorrectionEdit(s) => self.correction_text = s,
             Message::SubmitCorrection(idx) => {
                 if let Some(turn) = self.asr.history.get(idx as usize) {
-                    let seq = turn.seq;
+                    let window_id = turn.window_id;
                     let raw = turn.user_text.clone();
                     let corrected = self.correction_text.clone();
                     self.corrections.insert(0, (raw.clone(), corrected.clone()));
                     if self.corrections.len() > 50 { self.corrections.truncate(50); }
-                    self.agent.correct(seq, &raw, &corrected);
+                    self.agent.correct(window_id, &raw, &corrected);
                     self.editing_turn = None;
                     self.correction_text.clear();
                 }

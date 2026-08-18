@@ -10,15 +10,18 @@
 //!
 //! Stage2 calibration runs on its own `aura-stage2` worker thread so the Stage1 consume loop
 //! never blocks on the LLM — streaming partials keep flowing while a window is being
-//! calibrated. An `Interim` for segment N+1 can arrive BEFORE the `WindowFinal` for window N.
+//! calibrated. A `StreamFragment` for segment N+1 can arrive BEFORE the `WindowCalibration`
+//! for window N.
 //!
-//! The worker drains the two Stage1 triggers off an mpsc channel (Interim never crosses the
-//! channel — it passes straight through on the Stage1 thread): `Batch` →
+//! The worker drains the two Stage1 triggers off an mpsc channel (`StreamFragment` never
+//! crosses the channel — it passes straight through on the Stage1 thread): `Batch` →
 //! [`Stage2Calibrator::calibrate_window`] (joint calibration of the current window, result
-//! overwrites the window's stored calibration) → [`TurnEvent::WindowCalibrated`];
+//! overwrites the window's stored calibration) → [`TurnEvent::SegmentCalibration`];
 //! `WindowEdge` → [`Stage2Calibrator::finalize_window`] (NO LLM — attach the stored
 //! calibration as the window's final field, move the left boundary) →
-//! [`TurnEvent::WindowFinal`].
+//! [`TurnEvent::WindowCalibration`]. The worker also surfaces the two batch layers as
+//! [`TurnEvent::BatchSegment`] (the just-closed segment's batch) and [`TurnEvent::BatchWindow`]
+//! (the whole-window re-run).
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc, Mutex};
@@ -150,18 +153,25 @@ impl LlmSpec {
     }
 }
 
-/// One turn surfaced to the caller.
+/// One turn surfaced to the caller. Data-plane event vocabulary (mirrors `AsrSegment`):
+/// [`StreamFragment`](TurnEvent::StreamFragment) + [`BatchSegment`](TurnEvent::BatchSegment) +
+/// [`BatchWindow`](TurnEvent::BatchWindow) from Stage1; [`SegmentCalibration`](TurnEvent::SegmentCalibration)
+/// + [`WindowCalibration`](TurnEvent::WindowCalibration) from Stage2.
 #[derive(Debug)]
 pub enum TurnEvent<'a> {
-    /// Live streaming partial for the CURRENT segment (raw, uncalibrated). Straight from the
+    /// Live streaming output for the CURRENT segment (raw, uncalibrated). Straight from the
     /// Stage1 thread — NOT a Stage2 input (D2: no live-partial calibration).
-    Interim { window_id: u64, segment_id: u64, partial: &'a str, at_s: f64 },
+    StreamFragment { window_id: u64, segment_id: u64, text: &'a str, at_s: f64 },
+    /// The just-closed segment's batch pass (per-segment batch, at EOS).
+    BatchSegment { window_id: u64, segment_id: u64, text: String },
+    /// The whole-window batch re-run (per WindowEdge) — authoritative raw_text.
+    BatchWindow { window_id: u64, text: String },
     /// Stage2's provisional JOINT calibration of the current window (per Batch) — the
     /// calibrated text so far, replacing the previous calibration of the same window.
-    WindowCalibrated { window_id: u64, calibrated: String, route_ms: f64 },
+    SegmentCalibration { window_id: u64, calibrated: String, route_ms: f64 },
     /// The settled window's final calibration (per WindowEdge) — the window's LAST joint
     /// calibration attached as its field (no extra LLM run). Window-granularity final (D3).
-    WindowFinal { window: &'a crate::VadWindow, calibrated: String, route_ms: f64 },
+    WindowCalibration { window_id: u64, calibrated: String, route_ms: f64 },
 }
 
 pub struct Pipeline {
@@ -216,6 +226,18 @@ impl Pipeline {
                     for ev in rx {
                         match ev {
                             Stage1Event::Batch { window_id, segments } => {
+                                // BatchSegment: the just-closed segment's batch text (per-segment
+                                // batch ran synchronously at EOS). `segments.last()` IS that
+                                // segment. Skipped when batch produced nothing (None).
+                                if let Some(seg) = segments.last() {
+                                    if let Some(text) = seg.batch_text.clone() {
+                                        on_turn(TurnEvent::BatchSegment {
+                                            window_id,
+                                            segment_id: seg.id,
+                                            text,
+                                        });
+                                    }
+                                }
                                 let t = Instant::now();
                                 let calibrated = s2.calibrate_window(window_id, &segments);
                                 let route_ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -226,13 +248,22 @@ impl Pipeline {
                                     calibrated = %calibrated,
                                     "纠偏[segment]"
                                 );
-                                on_turn(TurnEvent::WindowCalibrated {
+                                on_turn(TurnEvent::SegmentCalibration {
                                     window_id,
                                     calibrated,
                                     route_ms,
                                 });
                             }
                             Stage1Event::WindowEdge { window } => {
+                                // BatchWindow: the whole-window batch re-run (authoritative
+                                // raw_text). Skipped when the re-run produced nothing (None —
+                                // single-segment windows reuse the segment's own None too).
+                                if let Some(text) = window.batch_text.clone() {
+                                    on_turn(TurnEvent::BatchWindow {
+                                        window_id: window.id,
+                                        text,
+                                    });
+                                }
                                 let t = Instant::now();
                                 // 定稿不跑 LLM:取该窗口最后一次 Batch 联合整流的存档
                                 // (最后一个段到来时整流已完成),移动左边界。
@@ -265,15 +296,15 @@ impl Pipeline {
                                         pcm: (*window.pcm).clone(),
                                     });
                                 }
-                                on_turn(TurnEvent::WindowFinal {
-                                    window: &window,
+                                on_turn(TurnEvent::WindowCalibration {
+                                    window_id: window.id,
                                     calibrated,
                                     route_ms,
                                 });
                             }
-                            Stage1Event::Interim { .. } => {
-                                // Never sent down the channel (the Stage1 loop handles Interim
-                                // inline) — defensive no-op if that ever changes.
+                            Stage1Event::StreamFragment { .. } => {
+                                // Never sent down the channel (the Stage1 loop handles
+                                // StreamFragment inline) — defensive no-op if that ever changes.
                             }
                         }
                     }
@@ -281,22 +312,22 @@ impl Pipeline {
                 .expect("spawn aura-stage2 worker");
         }
 
-        // Stage1 consume loop (this thread) — Interim partials pass straight through; the two
+        // Stage1 consume loop (this thread) — StreamFragment partials pass straight through; the two
         // Stage2 triggers are handed to the worker so this loop never blocks on the LLM.
         s1.run(&mut move |ev| match ev {
-            Stage1Event::Interim { window_id, segment_id, partial, at_s } => {
+            Stage1Event::StreamFragment { window_id, segment_id, text, at_s } => {
                 // 高频(说话中 ~0.5s/条)——debug;aura.yaml `log_level: debug` 打开。
                 debug!(
                     window_id,
                     segment_id,
                     at_s = (at_s * 10.0).round() / 10.0,
-                    partial = %partial,
+                    text = %text,
                     "流式"
                 );
-                on_turn(TurnEvent::Interim {
+                on_turn(TurnEvent::StreamFragment {
                     window_id,
                     segment_id,
-                    partial: &partial,
+                    text: &text,
                     at_s,
                 });
             }

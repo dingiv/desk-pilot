@@ -167,13 +167,11 @@ pub enum Message {
 
 // ── ASR state ────────────────────────────────────────────────────────────────
 
-/// One conversation turn (synced from aura's FinalView).
+/// One conversation turn (synced from aura's `WindowView` — a settled window's calibrated text).
 #[derive(Debug, Clone)]
 pub struct ConversationTurn {
-    pub seq: u64,
+    pub window_id: u64,
     pub user_text: String,
-    pub intent: String,
-    pub reply: String,
 }
 
 #[derive(Default)]

@@ -10,8 +10,9 @@
 //! - **Connectivity**: a periodic `/health` probe ([`AuraAgent::conn`]).
 //!
 //! Every change also surfaces as an [`AgentEvent`] on [`AuraAgent::events`] for clients that want
-//! push semantics (e.g. a UI that updates on each Interim/Final). Commands (`set_connected`,
-//! `correct`, `audio`) are one-liners. No client-side connection or state-management code needed.
+//! push semantics (e.g. a UI that updates on each StreamFragment / WindowCalibration). Commands
+//! (`set_connected`, `correct`, `audio`) are one-liners. No client-side connection or
+//! state-management code needed.
 //!
 //! ```ignore
 //! use audio_aura_agent::agent::AuraAgent;
@@ -66,42 +67,45 @@ impl AuraConn {
     }
 }
 
-/// One settled window, as the agent maintains it from the data plane (WindowFinal +
-/// Correction segments). The snapshot carries no windows — this list is the client's
-/// transcript source.
+/// One settled window, as the agent maintains it from the data plane (`WindowCalibration` +
+/// `Correction` segments). The snapshot carries no windows — this list is the client's
+/// transcript source. The raw/streaming layers live in the `batch_window` / `stream_fragment`
+/// events themselves, so the settled record only needs the final calibrated text.
 #[derive(Debug, Clone)]
 pub struct WindowView {
     pub window_id: u64,
-    /// Window-level batch text (the concat re-run; authoritative pre-calibration).
-    pub raw_text: String,
-    /// Concat of the segments' streaming finals (hotword-biased).
-    pub streaming_text: String,
     pub calibrated: String,
-    pub route_ms: f64,
     /// True once a `Correction` segment for this window arrived (the pair also enters Stage2).
     pub corrected: bool,
 }
 
-/// Everything the agent surfaces to the client — read via [`AuraAgent::events`]. Three
+/// Everything the agent surfaces to the client — read via [`AuraAgent::events`]. Five
 /// recognition events mirroring the daemon's `AsrSegment` variants (boundary paradigm):
-/// ① [`Interim`](AgentEvent::Interim) — a segment's raw streaming partial; ②
-/// [`WindowCalibrated`](AgentEvent::WindowCalibrated) — Stage2's provisional JOINT calibration
-/// of the current window (one per VAD gap, replaces the window's previous calibration);
-/// ③ [`WindowFinal`](AgentEvent::WindowFinal) — the merge window closed (authoritative).
+/// ① [`StreamFragment`](AgentEvent::StreamFragment) — a segment's raw streaming output;
+/// ② [`BatchSegment`](AgentEvent::BatchSegment) — a segment's batch pass; ③
+/// [`BatchWindow`](AgentEvent::BatchWindow) — the whole-window batch re-run;
+/// ④ [`SegmentCalibration`](AgentEvent::SegmentCalibration) — Stage2's provisional JOINT
+/// calibration of the current window (one per VAD gap, replaces the window's previous
+/// calibration); ⑤ [`WindowCalibration`](AgentEvent::WindowCalibration) — the merge window
+/// closed (authoritative).
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     /// Connectivity changed (reconnecting / connected / lost).
     ConnChanged(AuraConn),
     /// The control-plane snapshot refreshed (initial fetch or a `state_changed` ping).
     StateChanged(AuraStateView),
-    /// ① A segment's raw, evolving partial. Update the live UI fast.
-    Interim { window_id: u64, segment_id: u64, partial: String },
-    /// ② Stage2 jointly calibrated the current window's segments so far (per Batch) — the
+    /// ① A segment's raw, evolving streaming output. Update the live UI fast.
+    StreamFragment { window_id: u64, segment_id: u64, text: String },
+    /// ② A segment's batch pass (per-segment batch, at EOS).
+    BatchSegment { window_id: u64, segment_id: u64, text: String },
+    /// ③ The whole-window batch re-run (per WindowEdge) — authoritative raw_text.
+    BatchWindow { window_id: u64, text: String },
+    /// ④ Stage2 jointly calibrated the current window's segments so far (per Batch) — the
     /// calibrated text, same window, replaces the previous calibration.
-    WindowCalibrated { window_id: u64, calibrated: String },
-    /// ③ A window settled (WindowEdge's authoritative final) — appended to /
+    SegmentCalibration { window_id: u64, calibrated: String },
+    /// ⑤ A window settled (WindowEdge's authoritative final) — appended to /
     /// updated in [`AuraAgent::windows`].
-    WindowFinal(WindowView),
+    WindowCalibration(WindowView),
     /// A correction for a window was accepted (the list entry is marked `corrected`).
     WindowCorrected(u64),
 }
@@ -333,35 +337,35 @@ fn set_state(inner: &AgentInner, snap: AuraStateView) {
 /// test (only touches the RwLocks + event queue).
 fn apply_segment(inner: &AgentInner, seg: AsrSegment) {
     match seg {
-        AsrSegment::Interim { window_id, segment_id, partial, .. } => {
-            *inner.live.write().unwrap() = Some((window_id, partial.clone()));
-            let _ = inner.tx.send(AgentEvent::Interim { window_id, segment_id, partial });
+        AsrSegment::StreamFragment { window_id, segment_id, text, .. } => {
+            *inner.live.write().unwrap() = Some((window_id, text.clone()));
+            let _ = inner.tx.send(AgentEvent::StreamFragment { window_id, segment_id, text });
         }
-        AsrSegment::WindowCalibrated { window_id, calibrated } => {
+        AsrSegment::BatchSegment { window_id, segment_id, text } => {
+            let _ = inner.tx.send(AgentEvent::BatchSegment { window_id, segment_id, text });
+        }
+        AsrSegment::BatchWindow { window_id, text } => {
+            let _ = inner.tx.send(AgentEvent::BatchWindow { window_id, text });
+        }
+        AsrSegment::SegmentCalibration { window_id, calibrated } => {
             *inner.live.write().unwrap() = Some((window_id, calibrated.clone()));
-            let _ = inner.tx.send(AgentEvent::WindowCalibrated { window_id, calibrated });
+            let _ = inner.tx.send(AgentEvent::SegmentCalibration { window_id, calibrated });
         }
-        AsrSegment::WindowFinal { window_id, raw_text, streaming_text, calibrated, route_ms } => {
+        AsrSegment::WindowCalibration { window_id, calibrated } => {
             *inner.live.write().unwrap() = None;
             let mut wins = inner.windows.write().unwrap();
             // Upsert by window_id (defensive — windows settle in ascending order, but a
-            // reconnect could replay an older one).
+            // reconnect could replay an older one). Preserve the corrected flag.
             if let Some(existing) = wins.iter_mut().find(|w| w.window_id == window_id) {
-                *existing = WindowView {
-                    window_id, raw_text, streaming_text, calibrated, route_ms,
-                    corrected: existing.corrected,
-                };
+                existing.calibrated = calibrated;
             } else {
-                wins.push(WindowView {
-                    window_id, raw_text, streaming_text, calibrated, route_ms,
-                    corrected: false,
-                });
+                wins.push(WindowView { window_id, calibrated, corrected: false });
                 wins.sort_by_key(|w| w.window_id);
             }
             let view = wins.iter().find(|w| w.window_id == window_id).cloned();
             drop(wins);
             if let Some(view) = view {
-                let _ = inner.tx.send(AgentEvent::WindowFinal(view));
+                let _ = inner.tx.send(AgentEvent::WindowCalibration(view));
             }
         }
         AsrSegment::Correction { window_id, .. } => {
@@ -396,21 +400,12 @@ mod tests {
     }
 
     #[test]
-    fn folds_window_final_into_windows_and_clears_live() {
+    fn folds_window_calibration_into_windows_and_clears_live() {
         let i = inner();
-        apply_segment(&i, AsrSegment::WindowCalibrated { window_id: 1, calibrated: "蛇声".into() });
+        apply_segment(&i, AsrSegment::SegmentCalibration { window_id: 1, calibrated: "蛇声".into() });
         assert_eq!(i.live.read().unwrap().as_ref().map(|(_, t)| t.as_str()), Some("蛇声"));
-        apply_segment(
-            &i,
-            AsrSegment::WindowFinal {
-                window_id: 1,
-                raw_text: "蛇声".into(),
-                streaming_text: "蛇声".into(),
-                calibrated: "蛇身".into(),
-                route_ms: 12.3,
-            },
-        );
-        assert!(i.live.read().unwrap().is_none(), "WindowFinal clears the live text");
+        apply_segment(&i, AsrSegment::WindowCalibration { window_id: 1, calibrated: "蛇身".into() });
+        assert!(i.live.read().unwrap().is_none(), "WindowCalibration clears the live text");
         let wins = i.windows.read().unwrap();
         assert_eq!(wins.len(), 1);
         assert_eq!(wins[0].window_id, 1);
@@ -419,28 +414,28 @@ mod tests {
     }
 
     #[test]
-    fn interim_keys_live_by_window() {
+    fn stream_fragment_keys_live_by_window() {
         let i = inner();
         apply_segment(
             &i,
-            AsrSegment::Interim { window_id: 7, segment_id: 3, partial: "你好".into(), at_s: 1.0 },
+            AsrSegment::StreamFragment { window_id: 7, segment_id: 3, text: "你好".into(), at_s: 1.0 },
         );
         assert_eq!(i.live.read().unwrap().as_ref().map(|(w, _)| *w), Some(7));
     }
 
     #[test]
+    fn batch_segment_and_window_forward_without_live() {
+        let i = inner();
+        apply_segment(&i, AsrSegment::BatchSegment { window_id: 7, segment_id: 3, text: "你好".into() });
+        assert!(i.live.read().unwrap().is_none(), "BatchSegment does not touch live");
+        apply_segment(&i, AsrSegment::BatchWindow { window_id: 7, text: "你好".into() });
+        assert!(i.live.read().unwrap().is_none(), "BatchWindow does not touch live");
+    }
+
+    #[test]
     fn correction_marks_window() {
         let i = inner();
-        apply_segment(
-            &i,
-            AsrSegment::WindowFinal {
-                window_id: 2,
-                raw_text: "蛇声".into(),
-                streaming_text: "蛇声".into(),
-                calibrated: "蛇声".into(),
-                route_ms: 0.0,
-            },
-        );
+        apply_segment(&i, AsrSegment::WindowCalibration { window_id: 2, calibrated: "蛇声".into() });
         apply_segment(
             &i,
             AsrSegment::Correction { window_id: 2, raw: "蛇声".into(), corrected: "蛇身".into() },
@@ -452,16 +447,7 @@ mod tests {
     fn windows_are_sorted_by_id() {
         let i = inner();
         for window_id in [3u64, 1, 2] {
-            apply_segment(
-                &i,
-                AsrSegment::WindowFinal {
-                    window_id,
-                    raw_text: "x".into(),
-                    streaming_text: "x".into(),
-                    calibrated: "x".into(),
-                    route_ms: 0.0,
-                },
-            );
+            apply_segment(&i, AsrSegment::WindowCalibration { window_id, calibrated: "x".into() });
         }
         let ids: Vec<u64> = i.windows.read().unwrap().iter().map(|w| w.window_id).collect();
         assert_eq!(ids, vec![1, 2, 3]);

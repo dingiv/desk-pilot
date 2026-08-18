@@ -53,34 +53,36 @@ pub struct AuraStateView {
 /// [`crate::client::AuraClient::subscribe_segments`]. Serialized as `{type: "...", ...}` via the
 /// internally-tagged `type` field (snake_case variant names). The client builds + maintains its
 /// window list from this stream (boundary paradigm — events are append-only; a window's
-/// calibration is REPLACED by the next `window_calibrated` for the same window, never mutated
-/// in place by unrelated events).
+/// calibration is REPLACED by the next `segment_calibration` / `window_calibration` for the same
+/// window, never mutated in place by unrelated events).
+///
+/// Five recognition events, one per producer:
+/// - Stage1 streaming → [`StreamFragment`](Self::StreamFragment) (live partial + per-segment final);
+/// - Stage1 per-segment batch → [`BatchSegment`](Self::BatchSegment);
+/// - Stage1 whole-window batch re-run → [`BatchWindow`](Self::BatchWindow);
+/// - Stage2 joint calibration (per `Batch`) → [`SegmentCalibration`](Self::SegmentCalibration);
+/// - Stage2 window final (per `WindowEdge`) → [`WindowCalibration`](Self::WindowCalibration).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AsrSegment {
-    /// Live streaming partial for the CURRENT segment (raw, evolving — forward correction as
+    /// Live streaming output for the CURRENT segment (raw, evolving — forward correction as
     /// more audio arrives). Keyed by the real `window_id` (assigned at the window's first SOS)
-    /// + `segment_id` (the per-segment streaming session's own id).
-    Interim { window_id: u64, segment_id: u64, partial: String, at_s: f64 },
+    /// + `segment_id` (the per-segment streaming session's own id). Emitted on every streaming
+    /// decode change, plus one FINAL fragment at EOS with the segment's definitive text.
+    StreamFragment { window_id: u64, segment_id: u64, text: String, at_s: f64 },
+    /// Stage1's per-segment batch pass for the just-closed segment (at its EOS).
+    BatchSegment { window_id: u64, segment_id: u64, text: String },
+    /// Stage1's whole-window batch re-run (per `WindowEdge`) — the authoritative raw_text.
+    BatchWindow { window_id: u64, text: String },
     /// Stage2 provisional JOINT calibration of the current window (one per `Batch` event —
     /// i.e. per VAD gap): the calibrated text of ALL the window's segments so far, replacing
     /// the window's previous calibration.
-    WindowCalibrated { window_id: u64, calibrated: String },
-    /// The settled window's authoritative result (per `WindowEdge`): window-level batch text +
-    /// Stage2 calibration. Window-granularity final — one per closed window.
-    WindowFinal {
-        window_id: u64,
-        /// The window-level batch re-run (authoritative; may be empty when the re-run failed —
-        /// then it fell back to the per-segment concat).
-        raw_text: String,
-        /// Concat of the segments' streaming finals (hotword-biased).
-        streaming_text: String,
-        /// The window's LAST joint calibration (attached at the boundary; NO extra LLM run —
-        /// the final Batch already calibrated the whole window). Equals the last
-        /// `window_calibrated` for this window.
-        calibrated: String,
-        route_ms: f64,
-    },
+    SegmentCalibration { window_id: u64, calibrated: String },
+    /// The settled window's final calibration (per `WindowEdge`) — the window's LAST joint
+    /// calibration (attached at the boundary; NO extra LLM run — the final Batch already
+    /// calibrated the whole window). Equals the last `segment_calibration` for this window;
+    /// semantically a "window closed" marker carrying the final text.
+    WindowCalibration { window_id: u64, calibrated: String },
     /// A user correction was submitted for window `window_id` (POST /api/correct) — mark it
     /// corrected. (The raw→corrected pair also enters the snapshot's `corrections` list as
     /// Stage2 feedback.)

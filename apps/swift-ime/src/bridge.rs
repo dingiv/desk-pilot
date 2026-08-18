@@ -66,27 +66,27 @@ pub fn spawn_aura_client(buffer: Arc<AsrBuffer>, aura_addr: Option<&str>) -> Aur
             buffer.set_connected(matches!(drain_agent.conn(), AuraConn::Connected));
             for ev in drain_agent.poll_events() {
                 match ev {
-                    // ① new Stage1 streaming fragment — raw partial.
-                    AgentEvent::Interim { partial, .. } => {
-                        if !partial.is_empty() {
-                            buffer.set_live(&partial);
-                            tracing::debug!(text = %partial, "asr live (interim)");
+                    // ① new Stage1 streaming fragment — raw live text.
+                    AgentEvent::StreamFragment { text, .. } => {
+                        if !text.is_empty() {
+                            buffer.set_live(&text);
+                            tracing::debug!(text = %text, "asr live (stream)");
                         }
                     }
-                    // ② Stage2 corrected a batch — calibrated text, same seq, in place.
-                    AgentEvent::CalibratedInterim { calibrated, .. } => {
+                    // ② Stage2 jointly calibrated the window (per Batch) — live correction.
+                    AgentEvent::SegmentCalibration { calibrated, .. } => {
                         if !calibrated.is_empty() {
                             buffer.set_live(&calibrated);
-                            tracing::debug!(text = %calibrated, "asr live (calibrated)");
+                            tracing::debug!(text = %calibrated, "asr live (segment calibration)");
                         }
                     }
-                    // ③ the merged paragraph settled — authoritative calibrated text.
-                    AgentEvent::TurnFinal(u)
+                    // ③ the window settled — authoritative calibrated text.
+                    AgentEvent::WindowCalibration(u)
                         if !u.calibrated.is_empty() => {
                             buffer.push_final(&u.calibrated);
                             tracing::info!(text = %u.calibrated, "asr final → candidate #1");
                         }
-                    _ => {} // snapshots / corrections / conn changes aren't voice-buffer input
+                    _ => {} // batch layers / snapshots / corrections / conn changes aren't voice-buffer input
                 }
             }
             thread::sleep(DRAIN_INTERVAL);
