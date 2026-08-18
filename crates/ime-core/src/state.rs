@@ -819,6 +819,11 @@ pub(crate) fn apply_input_casing(word: &str, raw_input: &str) -> String {
     if !raw_input.chars().all(|c| c.is_ascii_alphabetic()) {
         return word.to_string();
     }
+    // 用户全小写 → 保留词典原始大小写(如 iPhone)。只有用户明确打了
+    // 大写才用键入的大小写覆盖前缀。
+    if !raw_input.chars().any(|c| c.is_ascii_uppercase()) {
+        return word.to_string();
+    }
     let word_lower = word.to_ascii_lowercase();
     let raw_lower = raw_input.to_ascii_lowercase();
     if !word_lower.starts_with(&raw_lower) {
@@ -863,4 +868,41 @@ pub trait StepEnv {
     /// The magic command registry — spawns live member instances on trigger
     /// completion, holds the shared resources (voice slot, req config).
     fn magic(&self) -> &crate::family::magic::MagicFamily;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_input_casing;
+
+    #[test]
+    fn all_lowercase_input_preserves_dict_case() {
+        // 用户全小写 → 保留词典原始大小写(专有名词 iPhone)。
+        assert_eq!(apply_input_casing("iPhone", "iphone"), "iPhone");
+        assert_eq!(apply_input_casing("NASA", "nasa"), "NASA");
+        assert_eq!(apply_input_casing("english", "english"), "english");
+    }
+
+    #[test]
+    fn typed_uppercase_overrides_dict_case() {
+        assert_eq!(apply_input_casing("iPhone", "IPHONE"), "IPHONE");
+        assert_eq!(apply_input_casing("english", "English"), "English");
+        assert_eq!(apply_input_casing("iPhone", "iPhone"), "iPhone");
+    }
+
+    #[test]
+    fn prefix_case_applied_to_completion_suffix() {
+        // 补全段(用户没打的)保持词典原始大小写;键入前缀用用户大小写。
+        assert_eq!(apply_input_casing("iPhone", "Iph"), "Iphone");
+        assert_eq!(apply_input_casing("english", "Engli"), "English");
+    }
+
+    #[test]
+    fn non_ascii_and_unrelated_are_noop() {
+        assert_eq!(apply_input_casing("好", "hao"), "好");
+        assert_eq!(apply_input_casing("英语", "yingyu"), "英语");
+        // 候选与输入无前缀关系 → 不动。
+        assert_eq!(apply_input_casing("hello", "world"), "hello");
+        // 空输入 → 不动。
+        assert_eq!(apply_input_casing("iPhone", ""), "iPhone");
+    }
 }

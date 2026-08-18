@@ -110,8 +110,14 @@ fn decile_normalize(mut entries: Vec<(String, u32)>) -> Vec<(String, u32)> {
     }
 
     // Sort alphabetically for binary search.
-    result.sort_by(|a, b| a.0.cmp(&b.0));
+    sort_case_insensitive(&mut result);
     result
+}
+
+/// 大小写不敏感排序:词表里可能有专有名词(iPhone、NASA),按小写键排序,
+/// 二分查找(同样按小写比较)才一致。
+fn sort_case_insensitive(words: &mut [(String, u32)]) {
+    words.sort_by_key(|(w, _)| w.to_ascii_lowercase());
 }
 
 // ── EnglishFamily ───────────────────────────────────────────────────────
@@ -160,36 +166,43 @@ impl EnglishFamily {
             Err(_) => return Vec::new(),
         };
 
-        let mut map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        // key = 小写(去重/排序键),value = (原始大小写, 分数)。词表里的
+        // 专有名词(iPhone、NASA)保留原始大小写,匹配时大小写不敏感,
+        // 提交时回词典原始大小写。
+        let mut map: std::collections::HashMap<String, (String, u32)> = std::collections::HashMap::new();
         for line in s.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') { continue; }
             let parts: Vec<&str> = line.split('\t').collect();
-            let word = parts[0].trim().to_ascii_lowercase();
+            let word = parts[0].trim().to_string();
             if word.is_empty() || word.len() < 2 { continue; }
+            let key = word.to_ascii_lowercase();
             let raw: u32 = parts.get(1).and_then(|s| s.trim().parse().ok()).unwrap_or(100);
             let score = match dict_type {
                 DictType::Grade => grade_to_score(raw),
                 DictType::Frequency | DictType::User => raw,
             };
-            let entry = map.entry(word).or_insert(0);
-            if score > *entry { *entry = score; }
+            match map.get_mut(&key) {
+                Some((_, sc)) if score > *sc => *sc = score,
+                Some(_) => {}
+                None => { map.insert(key, (word, score)); }
+            }
         }
 
         if map.is_empty() { return Vec::new(); }
 
-        let entries: Vec<(String, u32)> = map.into_iter().collect();
-        
+        let entries: Vec<(String, u32)> = map.into_values().collect();
+
         match dict_type {
             DictType::Grade => {
                 let mut w = entries;
-                w.sort_by(|a, b| a.0.cmp(&b.0));
+                sort_case_insensitive(&mut w);
                 w
             }
             DictType::Frequency => decile_normalize(entries),
             DictType::User => {
                 let mut w: Vec<_> = entries.into_iter().map(|(w, _)| (w, 10000u32)).collect();
-                w.sort_by(|a, b| a.0.cmp(&b.0));
+                sort_case_insensitive(&mut w);
                 w
             }
         }
@@ -212,14 +225,11 @@ impl EnglishFamily {
         if word.is_empty() || !word.chars().all(|c| c.is_ascii_alphanumeric()) {
             return;
         }
-        // 匹配是大小写不敏感的(predict 里 input 小写、词典全小写),所以
-        // 学入的英文自生词也要归一小写 —— 否则提交 "English" 会学到
-        // "English",下次输入 english 却匹配不到。提交时的大小写由
-        // 输入路由层按 raw_buffer 回填,不靠词典。
-        let word = word.to_ascii_lowercase();
-        self.merge_into_user(&[(word.clone(), 10_000)]);
+        // 保留原始大小写:专有名词(iPhone、NASA)匹配时大小写不敏感,
+        // 提交时回词典原始大小写。
+        self.merge_into_user(&[(word.to_string(), 10_000)]);
         if let Some(ref store) = *self.store.lock().unwrap() {
-            store.record_en_user(&word);
+            store.record_en_user(word);
         }
     }
 
@@ -229,16 +239,23 @@ impl EnglishFamily {
         self.merge_into_user(words);
     }
 
-    /// Merge `words` into the user word layer.
+    /// Merge `words` into the user word layer(大小写不敏感去重:小写为键,
+    /// 分数取最大,同分时后见的大小写胜出)。
     fn merge_into_user(&self, words: &[(String, u32)]) {
         let mut user = self.user_words.lock().unwrap();
-        let mut merged: std::collections::HashMap<String, u32> = user.iter().cloned().collect();
+        let mut merged: std::collections::HashMap<String, (String, u32)> = user.iter()
+            .map(|(w, s)| (w.to_ascii_lowercase(), (w.clone(), *s)))
+            .collect();
         for (w, s) in words {
-            let entry = merged.entry(w.clone()).or_insert(0);
-            if *s > *entry { *entry = *s; }
+            let key = w.to_ascii_lowercase();
+            let entry = merged.entry(key).or_insert_with(|| (w.clone(), 0));
+            if *s >= entry.1 {
+                entry.0 = w.clone(); // 后见的大小写胜出
+                entry.1 = *s;
+            }
         }
-        *user = merged.into_iter().collect();
-        user.sort_by(|a, b| a.0.cmp(&b.0));
+        *user = merged.into_values().collect();
+        sort_case_insensitive(&mut user);
     }
 
     /// Load from file path. Auto-detects dict type from `# @type:` header.
@@ -346,15 +363,17 @@ impl EnglishFamily {
         out: &mut Vec<ScoredCandidate>,
     ) {
         let start = words.binary_search_by(|(w, _)| {
-            if w.as_str() < input { std::cmp::Ordering::Less }
+            let wl = w.to_ascii_lowercase();
+            if wl.as_str() < input { std::cmp::Ordering::Less }
             else { std::cmp::Ordering::Greater }
         }).unwrap_err();
 
         for (word, freq) in words[start..].iter() {
-            if !word.starts_with(input) { break; }
-            if !seen.insert(word.clone()) { continue; }
+            let wl = word.to_ascii_lowercase();
+            if !wl.starts_with(input) { break; }
+            if !seen.insert(wl.clone()) { continue; }
 
-            if *word == input {
+            if wl == input {
                 out.push(ScoredCandidate {
                     text: word.clone(), family: "english", source: exact_label,
                     raw_score: exact_score,
@@ -389,7 +408,8 @@ impl CandidateFamily for EnglishFamily {
     fn top_n(&self) -> usize { 8 }
 
     fn predict(&self, input: &str) -> Vec<ScoredCandidate> {
-        if input.is_empty() || !input.chars().all(|c| c.is_ascii_lowercase()) {
+        // 大小写不敏感:输入(通常已是小写 buffer)归一小写后匹配。
+        if input.is_empty() || !input.chars().all(|c| c.is_ascii_alphabetic()) {
             return Vec::new();
         }
 
@@ -511,5 +531,29 @@ mod tests {
     #[test]
     fn no_match_garbage() {
         assert!(EnglishFamily::with_default_dict().predict("zzzzz").is_empty());
+    }
+
+    #[test]
+    fn uppercase_dict_words_match_case_insensitively_and_preserve_case() {
+        // 词表里的专有名词(iPhone、NASA)保留原始大小写:小写输入也能
+        // 匹配,候选回词典原始大小写。
+        let fam = EnglishFamily::with_default_dict();
+        fam.load_user_dict_file(&temp_dict("proper", "iPhone\nNASA\n")).unwrap();
+
+        let c = fam.predict("iphone");
+        assert!(c.iter().any(|x| x.text == "iPhone"), "iphone → iPhone: {c:?}");
+        let n = fam.predict("nasa");
+        assert!(n.iter().any(|x| x.text == "NASA"), "nasa → NASA: {n:?}");
+        // 大写输入同样匹配(双向大小写不敏感)。
+        let c2 = fam.predict("IPHONE");
+        assert!(c2.iter().any(|x| x.text == "iPhone"), "IPHONE → iPhone: {c2:?}");
+    }
+
+    #[test]
+    fn learned_word_preserves_case() {
+        let fam = EnglishFamily::new(); // 空 base,只看 learned 层
+        fam.record_learned_word("iPhone");
+        let c = fam.predict("iphone");
+        assert!(c.iter().any(|x| x.text == "iPhone"), "learned iPhone matches iphone: {c:?}");
     }
 }
