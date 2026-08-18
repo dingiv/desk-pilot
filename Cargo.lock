@@ -485,11 +485,9 @@ dependencies = [
  "anyhow",
  "chrono",
  "dp-models",
- "mistralrs",
  "serde",
  "serde_json",
  "shared",
- "tokio",
  "tracing",
 ]
 
@@ -2057,11 +2055,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "mistralrs",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "shared",
  "sherpa-onnx",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 

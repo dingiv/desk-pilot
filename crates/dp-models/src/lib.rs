@@ -19,7 +19,14 @@ pub mod http;
 #[cfg(feature = "speech")]
 pub mod onnx;
 
+/// 本地 Stage2 LLM (mistral.rs Qwen GGUF, feature `mistral`)。从 aura-core 迁入——
+/// 把 mistralrs 重依赖隔离到 dp-models。今后 stage2 走远程,此为过渡形态。
+#[cfg(feature = "mistral")]
+pub mod mistral;
+
 pub use config::ProviderKind;
+#[cfg(feature = "mistral")]
+pub use mistral::Calibrator;
 
 // ── VAD 数据契约(纯数据,不依赖 sherpa;由 onnx 模块与 aura-asr 的 EnergyVad 共用)──
 

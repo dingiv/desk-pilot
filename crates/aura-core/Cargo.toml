@@ -41,14 +41,15 @@ required-features = ["asr", "cuda"]
 
 [features]
 default = []
-cuda = ["mistralrs/cuda"]
+# 本地 Stage2 LLM (mistral.rs)—— 依赖已迁至 dp-models, 这里转发。默认关闭(轻)。
+mistral = ["dp-models/mistral"]
+# 本地 LLM 走 CUDA(mistralrs/cuda; 隐式开启 mistral)。daemon `--features asr,cuda`。
+cuda = ["mistral", "dp-models/cuda"]
 # Stage1 local ASR (Silero VAD + streaming/batch via dp-models' sherpa-onnx wrapper) + the
-# executor/composer modules. Default build stays light (contract + calibrator + storage).
+# executor/composer modules. Default build stays light (contract + storage).
 asr = ["dp-models/speech"]
 
 [dependencies]
-mistralrs = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 dp-models = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
