@@ -1,4 +1,4 @@
-//! composer — the `Pipeline` (组装车间): wires Stage1Executor → Stage2Calibrator and emits
+//! pipeline (原 composer) — the `Pipeline` (组装车间): wires Stage1Executor → Stage2Calibrator and emits
 //! [`TurnEvent`]s to a caller-supplied callback. Pure orchestration — it does no printing, no
 //! file I/O, no Stage3 logic.
 //!
@@ -18,8 +18,8 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Instant;
 
-use audio_aura_asr::executor::{OnnxStage1Executor, Stage1Executor};
-use audio_aura_asr::Stage1Event;
+use crate::recognizer::{OnnxStage1Executor, Stage1Executor};
+use crate::Stage1Event;
 
 use crate::calibrator::Stage2Calibrator;
 
@@ -34,7 +34,7 @@ pub enum TurnEvent<'a> {
     WindowCalibrated { window_id: u64, calibrated: String, route_ms: f64 },
     /// The settled window's final calibration (per WindowEdge) — the window's LAST joint
     /// calibration attached as its field (no extra LLM run). Window-granularity final (D3).
-    WindowFinal { window: &'a audio_aura_asr::VadWindow, calibrated: String, route_ms: f64 },
+    WindowFinal { window: &'a crate::VadWindow, calibrated: String, route_ms: f64 },
 }
 
 pub struct Pipeline {

@@ -1,8 +1,8 @@
 //! Stage1Executor — encapsulates the Stage1 "noodle": the audio ring + omni-scout ingest
 //! thread + Silero VAD + per-segment streaming sessions + per-segment batch passes + the
 //! window tracker. Owns ALL the loop state. It runs the consume loop internally and emits
-//! [`Stage1Event`]s — it does NOT touch files or run Stage2 (that's the composer's job, in
-//! `aura-core::Pipeline`).
+//! [`Stage1Event`]s — it does NOT touch files or run Stage2 (that's `pipeline`'s job,
+//! `audio_aura_core::Pipeline`).
 //!
 //! Boundary paradigm (docs/aura/vad-segment-model.md): the VAD gap (`min_silence`) closes a
 //! [`VadSegment`] (its own streaming session per D1 + one batch pass, packed as a `Batch`
@@ -167,14 +167,14 @@ impl Stage1Config {
     }
 }
 
-/// A Stage1 executor: audio in → [`Stage1Event`]s out. `run` blocks forever (drives the
+/// A Stage1 recognizer: audio in → [`Stage1Event`]s out. `run` blocks forever (drives the
 /// ingest+consume loop) and invokes `on_event` for each interim partial / settled segment /
 /// closed window.
 pub trait Stage1Executor {
     fn run(&self, on_event: &mut dyn FnMut(Stage1Event)) -> !;
 }
 
-/// ONNX-backed Stage1 executor (Silero VAD + streaming Zipformer + batch ASR via the single
+/// ONNX-backed Stage1 recognizer (Silero VAD + streaming Zipformer + batch ASR via the single
 /// [`OnnxRuntimeManager`]). Thread-safe: the ring is shared with the ingest thread; the
 /// consume loop runs on the caller's thread.
 pub struct OnnxStage1Executor {
@@ -254,7 +254,7 @@ impl OnnxStage1Executor {
         &self.mgr
     }
 
-    /// The PCM store this executor owns — clips are addressable by [`AudioId`] until their
+    /// The PCM store this recognizer owns — clips are addressable by [`AudioId`] until their
     /// window settles (then evicted; the window's `Arc<Vec<i16>>` is the surviving copy).
     pub fn audio_store(&self) -> &Arc<AudioStore> {
         &self.audio_store
@@ -281,11 +281,11 @@ fn spawn_ingest(
 }
 
 // ── Window tracker: pure windowing decisions over wall-clock SOS/EOS (unit-testable, no I/O) ──
-// The executor owns the ASR side (sessions, batch passes, the AudioStore); this tracker owns
+// The recognizer owns the ASR side (sessions, batch passes, the AudioStore); this tracker owns
 // ONLY the boundary math — which segment belongs to which window, and when a window closes.
 
 /// The open window: its settled segments + whether a segment is in progress (SOS seen,
-/// EOS pending). The in-progress segment's id/timing live executor-side ([`ActiveSession`]);
+/// EOS pending). The in-progress segment's id/timing live recognizer-side ([`ActiveSession`]);
 /// the tracker only needs "is one active" for settle suppression.
 struct OpenWindow {
     window_id: WindowId,
@@ -293,7 +293,7 @@ struct OpenWindow {
     active: bool,
 }
 
-/// A window closed by a big gap or the settle-timeout — the executor turns this into a
+/// A window closed by a big gap or the settle-timeout — the recognizer turns this into a
 /// [`VadWindow`] (concat PCM + window-level batch re-run) and emits `WindowEdge`.
 struct SettledSpans {
     window_id: WindowId,
@@ -346,7 +346,7 @@ impl WindowTracker {
         }
     }
 
-    /// Record a completed segment (already transcribed by the executor). Returns the Batch
+    /// Record a completed segment (already transcribed by the recognizer). Returns the Batch
     /// payload: the window id + ALL its segments so far — the payload IS the window, so
     /// Stage2 stays stateless (no separate left-boundary bookkeeping to desync).
     fn on_eos(&mut self, seg: VadSegment) -> (WindowId, Vec<VadSegment>) {

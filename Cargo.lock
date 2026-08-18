@@ -479,23 +479,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "audio-aura-asr"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "audio-aura-core",
- "dp-models",
- "serde",
- "shared",
- "tracing",
-]
-
-[[package]]
 name = "audio-aura-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "audio-aura-asr",
  "chrono",
  "dp-models",
  "mistralrs",
@@ -517,19 +504,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "audio-aura-tts"
-version = "0.1.0"
-dependencies = [
- "anyhow",
-]
-
-[[package]]
 name = "aura-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "audio-aura-agent",
- "audio-aura-asr",
  "audio-aura-core",
  "axum",
  "clap",

@@ -6,6 +6,30 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# ── Stage1 ASR examples (former aura-asr) + Stage1→Stage2 bench ──
+[[example]]
+name = "transcribe"
+required-features = ["asr"]
+
+[[example]]
+name = "batch_transcribe"
+required-features = ["asr"]
+
+[[example]]
+name = "qwen3_asr"
+required-features = ["asr"]
+
+[[example]]
+name = "scout_debug"
+
+[[example]]
+name = "streaming_asr"
+required-features = ["asr"]
+
+[[example]]
+name = "streaming_asr_hot"
+required-features = ["asr"]
+
 # Thin Stage1→Stage2 bench built on the Pipeline composer.
 [[example]]
 name = "stage12_live"
@@ -18,11 +42,11 @@ required-features = ["asr", "cuda"]
 [features]
 default = []
 cuda = ["mistralrs/cuda"]
-# Stage1 local ASR (SenseVoice via audio-aura-asr/onnx).
-asr = ["audio-aura-asr/onnx"]
+# Stage1 local ASR (Silero VAD + streaming/batch via dp-models' sherpa-onnx wrapper) + the
+# executor/composer modules. Default build stays light (contract + calibrator + storage).
+asr = ["dp-models/speech"]
 
 [dependencies]
-audio-aura-asr = { path = "../aura-asr" }
 mistralrs = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 dp-models = { workspace = true }

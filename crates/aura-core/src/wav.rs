@@ -73,7 +73,7 @@ mod tests {
     use super::*;
     #[test]
     fn roundtrip() {
-        let tmp = std::env::temp_dir().join("audio_aura_asr_wav_test.wav");
+        let tmp = std::env::temp_dir().join("aura_core_wav_test.wav");
         let pcm: Vec<i16> = (0..16000).map(|i| (i as i16).wrapping_mul(3)).collect();
         save_wav(&tmp, &pcm, 16000).unwrap();
         let (back, sr) = read_wav_i16(&tmp).unwrap();

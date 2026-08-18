@@ -4,14 +4,14 @@
 //! namespace (`assets/models/qwen3-asr/`).
 //!
 //! Run:
-//!   cargo run -p audio-aura-asr --features onnx --example qwen3_asr -- [wav]...
+//!   cargo run -p audio-aura-core --features asr --example qwen3_asr -- [wav]...
 //! (no args → transcribes the bundled `testwavs/zh-standard-0.wav` + `en.wav`)
 
 use std::path::Path;
 use std::time::Instant;
 
 use dp_models::onnx::{AsrBackend, AsrConfig, OnnxAsr};
-use audio_aura_asr::Asr;
+use audio_aura_core::Asr;
 use audio_aura_core::wav;
 
 fn main() -> anyhow::Result<()> {

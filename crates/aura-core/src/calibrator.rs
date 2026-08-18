@@ -12,7 +12,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use audio_aura_asr::{VadSegment, VadWindow, WindowId};
+use crate::{VadSegment, VadWindow, WindowId};
 
 use crate::prompt::PromptBuilder;
 
@@ -107,7 +107,7 @@ impl Stage2CalibratorImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use audio_aura_asr::SegmentId;
+    use crate::SegmentId;
 
     /// Counting LLM stub — the shared handle lets the test READ the call count, proving
     /// finalize_window makes NO LLM call.

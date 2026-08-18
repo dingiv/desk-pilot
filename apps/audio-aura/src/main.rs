@@ -44,7 +44,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use audio_aura_agent::{AddHotwordTool, HotwordManager, SharedHotwordManager, Tool};
 use audio_aura_core::archive::{ArchiveConfig, AudioArchive};
 use audio_aura_core::hub::{FinalTurn, Storage};
-use audio_aura_asr::executor::{OnnxStage1Executor, Stage1Config};
+use audio_aura_core::recognizer::{OnnxStage1Executor, Stage1Config};
 use audio_aura_core::{Pipeline, TurnEvent};
 use audio_aura_core::calibrator::Stage2CalibratorImpl;
 use audio_aura_core::Calibrator;
@@ -63,7 +63,7 @@ const SEED_HOTWORDS: &[&str] = &[
 ];
 
 /// VAD / segmentation overrides from `aura.yaml`'s `vad:` section. All optional — an unset
-/// field falls back to the built-in [`audio_aura_asr`] default (mirrors `VadConfig::default` /
+/// field falls back to the built-in default (mirrors `Stage1Config`'s defaults in
 /// `Stage1Config::merge_gap_s`). Precedence: config file > built-in default (no CLI for these).
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]

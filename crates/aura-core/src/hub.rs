@@ -24,7 +24,7 @@ use tracing::warn;
 /// One finalized window's full Stage1+Stage2 result (what lands in the day log + `/results`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnRecord {
-    /// The settled [`audio_aura_asr::VadWindow`]'s id (the archival unit is a WINDOW now).
+    /// The settled [`crate::VadWindow`]'s id (the archival unit is a WINDOW now).
     pub window_id: u64,
     /// Wall-clock ms since unix epoch (absolute — day files must be self-contained).
     pub unix_ms: i64,

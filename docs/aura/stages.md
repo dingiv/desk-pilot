@@ -3,8 +3,8 @@
 > 代码为准。本文是语音识别两个 stage 的权威梳理。2026-08-17 从"就地修改范式"重构为
 > **边界范式**（VadSegment/VadWindow，设计沿革见 `vad-segment-model.md`）；旧范式的
 > `Utterance`/`Batch`/`MergeBatch` 契约已删除。
-> 代码入口：Stage1 = `crates/aura-asr/src/executor.rs`，Stage2 = `crates/aura-core/src/calibrator.rs`，
-> 组装 = `crates/aura-core/src/composer.rs`，daemon = `apps/audio-aura/src/main.rs`。
+> 代码入口：Stage1 = `crates/aura-core/src/recognizer.rs`，Stage2 = `crates/aura-core/src/calibrator.rs`，
+> 组装 = `crates/aura-core/src/pipeline.rs`，daemon = `apps/audio-aura/src/main.rs`。
 
 ## 总览：数据流
 
@@ -41,7 +41,7 @@ daemon on_turn 回调 → SSE 数据面 /api/asr_stream → UI
 
 ## Stage1：音频 → 文本（ONNX 语音前端）
 
-**位置**：`crates/aura-asr/src/executor.rs`（`OnnxStage1Executor`）+ 纯窗口决策核心
+**位置**：`crates/aura-core/src/recognizer.rs`（`OnnxStage1Executor`，原 aura-asr executor.rs）+ 纯窗口决策核心
 `WindowTracker`（可单测，无 I/O）+ `audio_store.rs`（PCM 按 id 存管）。ONNX 语音栈在
 `dp-models::onnx`。
 
@@ -90,7 +90,7 @@ daemon on_turn 回调 → SSE 数据面 /api/asr_stream → UI
 Batch 整体覆盖它；WindowEdge 取走存档作为该 VadWindow 的纠偏字段并清空（= 移动左
 边界），**不再调用 LLM**（最后一个段的 Batch 到来时全窗口整流已完成）。事件在单一
 worker 线程有序到达（Batch×N → WindowEdge），状态不可能失步。跑在独立 `aura-stage2`
-worker（composer.rs），LLM 耗时不卡 partial。
+worker（pipeline.rs），LLM 耗时不卡 partial。
 
 - `calibrate_window(window_id, segments)`：全部段 `best_text()` 逐行（`PromptBuilder::
   new_multi`，`<raw_transcript>` 信封内一行一段）联合整流 → `WindowCalibrated`（每 VAD
@@ -125,7 +125,7 @@ calibrated 文本加词）。
 
 ## 迁移状态（2026-08-17）
 
-- ✅ aura-asr / aura-core / aura-agent / aura-daemon 已切换新契约（定向构建+测试绿）。
+- ✅ aura-core（含并入的原 aura-asr/aura-tts，2026-08-18）/ aura-agent / aura-daemon 已切换新契约（定向构建+测试绿）。
 - ⬜ **前端三处未迁移**（后续独立任务）：`apps/swift-ime`（bridge 的
   `CalibratedInterim`→`WindowCalibrated`、mock 测试 JSON 换 `window_calibrated`/
   `window_final` 标签）、`apps/geek-familiar`（app.rs 事件改挂）、

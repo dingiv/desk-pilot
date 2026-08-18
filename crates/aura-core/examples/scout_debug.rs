@@ -6,13 +6,13 @@
 //!   - window arrival cadence (windows/s vs expected ~31/s @ 512 samples)
 //!   - ring fill ratio (if consuming)
 //!
-//! Run: cargo run -p audio-aura-asr --example scout_debug -- 127.0.0.1:7879
+//! Run: cargo run -p audio-aura-core --example scout_debug -- 127.0.0.1:7879
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use audio_aura_asr::scout::ScoutAudioSource;
+use audio_aura_core::scout::ScoutAudioSource;
 
 fn main() {
     let addr = std::env::args()

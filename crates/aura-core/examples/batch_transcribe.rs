@@ -1,12 +1,12 @@
 //! Batch-transcribe several WAVs through SenseVoice (loads the model once). Reads each file's real
 //! sample rate via `audio_aura_core::wav`. Model paths resolve via the `MODELS` namespace.
-//! Run: cargo run -p audio-aura-asr --features onnx --example batch_transcribe -- <wav>...
+//! Run: cargo run -p audio-aura-core --features asr --example batch_transcribe -- <wav>...
 
 use std::path::Path;
 use std::time::Instant;
 
 use dp_models::onnx::{AsrBackend, AsrConfig, OnnxAsr};
-use audio_aura_asr::Asr;
+use audio_aura_core::Asr;
 use audio_aura_core::wav;
 
 fn main() -> anyhow::Result<()> {

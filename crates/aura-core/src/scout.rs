@@ -155,7 +155,7 @@ impl ScoutAudioSource {
                             win.clear();
                         }
                     }
-                    if let Some(&b) = rest.chunks_exact(2).remainder().get(0) {
+                    if let Some(&b) = rest.chunks_exact(2).remainder().first() {
                         odd_byte = Some(b);
                     }
                     body.drain(0..remaining + 2); // consume payload + \r\n

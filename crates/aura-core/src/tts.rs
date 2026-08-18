@@ -1,9 +1,9 @@
-//! audio-aura-tts — text-to-speech **capability interface** (placeholder). The text to synthesize
+//! tts — text-to-speech **capability interface** (placeholder; former audio-aura-tts crate). The text to synthesize
 //! is produced upstream by the agent layer (Stage3 / desktop-pet) — e.g. a secretary reply or a
 //! read-back of a calibrated utterance. This crate only defines the [`Tts`] trait + a [`NoopTts`];
 //! a real backend (Kokoro / Piper via sherpa-onnx) plugs in behind the same trait later.
 //!
-//! This is the speech-OUTPUT counterpart to `audio-aura-asr` (speech input). It is a leaf crate.
+//! This is the speech-OUTPUT counterpart to the Stage1 input side (`executor`).
 
 use anyhow::Result;
 

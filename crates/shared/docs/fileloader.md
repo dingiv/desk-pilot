@@ -97,7 +97,7 @@ MODELS = { dev = "../../assets/models", prod = "~/.desk-pilot/models" }
 ```
 
 ```rust
-// crates/aura-asr/src/executor.rs
+// crates/aura-core/src/recognizer.rs
 let loader = shared::loader!("assets");
 let model_path = loader.resolve("MODELS::sensevoice.onnx")
     .expect("model not found");

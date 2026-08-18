@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use audio_aura_asr::buffer::{noise_gate, AudioRing};
-use audio_aura_asr::{EnergyVad, VadConfig, VadEventKind};
+use audio_aura_core::buffer::{noise_gate, AudioRing};
+use audio_aura_core::vad::{EnergyVad, VadConfig};
+use audio_aura_core::VadEventKind;
 
 const FRAME: usize = 320;
 

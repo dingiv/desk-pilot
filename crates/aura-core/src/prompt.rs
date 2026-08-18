@@ -227,7 +227,7 @@ impl PromptBuilder {
         if let Some(ref ctx) = self.context {
             format!("最近对话：\n{ctx}\n\n{transcript}")
         } else {
-            format!("{transcript}")
+            transcript.to_string()
         }
     }
 

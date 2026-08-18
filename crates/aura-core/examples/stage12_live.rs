@@ -12,7 +12,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use audio_aura_asr::executor::{OnnxStage1Executor, Stage1Config};
+use audio_aura_core::recognizer::{OnnxStage1Executor, Stage1Config};
 use audio_aura_core::{Calibrator, Pipeline, Stage2CalibratorImpl, TurnEvent};
 
 // Repo-relative bench dir (crates/aura-core → desk-pilot/bench). Created on startup.

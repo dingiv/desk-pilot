@@ -112,10 +112,11 @@ dp-models (跨子系统, ONNX 侧)
   └── onnx  OnnxRuntimeManager ← sherpa-onnx 单实例，管 VAD/流式ASR/批式ASR 的加载与推理
            (Silero VAD + Zipformer 流式 + SenseVoice/Whisper/Qwen3-ASR 批式)
 
-aura-asr   (Stage1)  OnnxStage1Executor —— 消费 OnnxRuntimeManager, 批式可换 HttpAsr
-aura-core  (Stage2)  Calibrator ← mistral.rs/candle 单实例 (Qwen2.5-3B GGUF),
-                      亦可为 HttpLlm (vLLM/sglang remote)
-           (编排)    Pipeline: 两管理器之间用"文本"串起 Stage1→Stage2
+aura-core  (全栈,原 aura-asr 已并入)  executor (Stage1): OnnxStage1Executor —— 消费
+           OnnxRuntimeManager, 批式可换 HttpAsr
+           Calibrator (Stage2): mistral.rs/candle 单实例 (Qwen2.5-3B GGUF),
+           亦可为 HttpLlm (vLLM/sglang remote)
+           (编排) Pipeline: 两管理器之间用"文本"串起 Stage1→Stage2
 ```
 
 > 迁移已完成（原"现状混用 sherpa-rs(archive) + ort(冲突源)"的清理早已落地）：sherpa-rs 与

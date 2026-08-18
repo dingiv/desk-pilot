@@ -1,11 +1,11 @@
 //! Verify real Stage1 ASR end-to-end: load SenseVoice (sherpa-onnx) and transcribe a 16 kHz mono WAV.
 //! Model paths resolve via the `MODELS` namespace (`assets/models/sensevoice/`).
-//! Run: cargo run -p audio-aura-asr --features onnx --example transcribe [-- <wav>]
+//! Run: cargo run -p audio-aura-core --features asr --example transcribe [-- <wav>]
 
 use std::path::Path;
 
 use dp_models::onnx::{AsrBackend, AsrConfig, OnnxAsr};
-use audio_aura_asr::Asr;
+use audio_aura_core::Asr;
 use audio_aura_core::wav;
 
 fn main() -> anyhow::Result<()> {

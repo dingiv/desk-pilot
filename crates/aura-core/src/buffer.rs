@@ -17,7 +17,7 @@ pub struct AudioRing {
 impl AudioRing {
     pub fn new(capacity_samples: usize) -> Self {
         AudioRing {
-            buf: VecDeque::with_capacity(capacity_samples.min(8192).max(4096)),
+            buf: VecDeque::with_capacity(capacity_samples.clamp(4096, 8192)),
             cap: capacity_samples,
         }
     }
@@ -29,6 +29,10 @@ impl AudioRing {
             let drop_n = self.buf.len() - self.cap;
             self.buf.drain(0..drop_n); // single O(drop_n) trim, only when overflowing
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
     }
 
     pub fn len(&self) -> usize {

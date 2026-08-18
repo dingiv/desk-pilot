@@ -22,33 +22,33 @@ omni-scout (PipeWire 真麦 / mock wav)
 ```
 shared          (FileLoader 叶子) — dev/prod 路径解析
 dp-models       (跨子系统叶子) — AsrProvider/LlmProvider/VlmProvider trait + Http* remote
-aura-asr        (Stage1 叶子)   VAD + 流式Zipformer + 批式ASR + Stage1Executor
-aura-core       (Stage2+组装+存储) ← 2026-08 合并了原 aura-core/aura-dcl/aura-store
-  ├─ composer   Pipeline: Stage1→Stage2 (Stage2 独立线程)
-  ├─ calibrator Stage2CalibratorImpl + Stage2Calibrator trait
-  ├─ prompt     PromptBuilder (精简: 1句指令+few-shot+热词+纠偏+输出格式)
-  ├─ context    ContextWindow (已禁用 — 3B 模型会复读; 7B+ 再开)
-  ├─ decision   Decision/parse_decision (简化: 纯文本输出, 无JSON)
+aura-core       (全栈)         ← 2026-08 合并了原 aura-core/aura-dcl/aura-store,
+  ├─ recognizer (Stage1, 原 aura-asr executor, 2026-08-18 并入, feature `asr`) Silero VAD + 流式Zipformer
+  │             + 批式ASR + WindowTracker 窗口边界 + AudioStore(PCM按id) + vad/buffer/scout 辅件
+  │             + lib.rs 根部的边界契约 (VadSegment/VadWindow/Stage1Event)
+  ├─ pipeline   (原 composer) Pipeline: Stage1→Stage2 (Stage2 独立线程)
+  ├─ calibrator Stage2CalibratorImpl (窗口状态机) + Stage2Calibrator trait
+  ├─ prompt     PromptBuilder (精简: 1句指令+few-shot+热词+纠偏+输出格式+多段联合)
   ├─ lib.rs     Calibrator (mistral.rs Qwen2.5-3B GGUF, impl LlmProvider)
   ├─ hub        Storage 总管: AudioArchive + TurnLog + recent ring
   ├─ archive    日期WAV落盘 + 热层回放
+  ├─ tts        NoopTts 占位 (原 aura-tts 并入; 未来 Kokoro/Piper)
   └─ wav        WAV 读写
 aura-agent      (Stage3+SDK)    能力 trait + HotwordManager + AddHotwordTool
                                 + view(AuraStateView/AsrSegment 线协议) + AuraClient SDK
-aura-tts        (占位)        NoopTts (未来 Kokoro/Piper)
 apps/audio-aura (daemon)      Pipeline + socket(8 routes + SPA fallback) + SSE双面 + Stage3规则触发器
 crates/native                 napi shim (TS via VOICE_LOCAL_ROUTER)
 ```
 
 **线程模型**：`aura-stage1-ingest`（scout→ring）→ `aura-pipeline`（std 线程跑 Stage1
-consume loop）→ `aura-stage2`（LLM worker，mpsc 收 Stage1Action，partials 不被 LLM 卡住）
+consume loop）→ `aura-stage2`（LLM worker，mpsc 收 Batch/WindowEdge，partials 不被 LLM 卡住）
 → `aura-socket`（主线程 tokio，axum SSE）。详见 `stages.md`。
 
 ## 三阶段提交
 
 | 阶段 | 职责 | crate | 抽象 |
 |---|---|---|---|
-| **Stage1** | 录音→VAD→段级流式会话+段级batch→窗口定稿（边界范式：VadSegment/VadWindow） | aura-asr | Stage1Executor（发 Interim + Batch + WindowEdge） |
+| **Stage1** | 录音→VAD→段级流式会话+段级batch→窗口定稿（边界范式：VadSegment/VadWindow） | aura-core (`asr` feature) | Stage1Executor（发 Interim + Batch + WindowEdge） |
 | **Stage2** | 窗口内多句联合整流（加标点/修同音字/英文规范/专有名词），无状态 | aura-core | Stage2Calibrator（calibrate_window / calibrate_final） |
 | **Stage3** | 可选工具：热词 / 用户纠偏 | aura-agent | HotwordManager + CorrectionStore |
 
@@ -120,7 +120,8 @@ CARGO_MANIFEST_DIR=$(pwd) cargo run -p audio-aura-core --example stage12_live --
 
 ## 已验证
 
-- crate 合并后全编译绿（aura-core ~1800 行，合并 dcl+store）。
+- crate 合并后全编译绿（aura-core 收编 dcl+store 后 ~1800 行；2026-08-18 再并入
+  aura-asr/aura-tts 后 ~3250 行，43 单测 + ring_vad 集成测试）。
 - Qwen2.5-3B 纠偏：~300ms/句，加标点+纠偏有效。
 - dp-models remote：qwen-asr-serve + sglang 端到端跑通。
 - 用户纠偏：POST /api/correct → CorrectionStore → Stage2 纠正段注入 → Web UI 编辑。
@@ -134,8 +135,8 @@ CARGO_MANIFEST_DIR=$(pwd) cargo run -p audio-aura-core --example stage12_live --
 
 ## 代码内遗留 TODO（整改时留意）
 
-- `Stage1Executor::run` 静默阻塞线程、睡眠轮询 → 待异步非阻塞化（executor.rs:426）。
-- `Stage1Config::new` 内嵌 IO（模型路径解析）→ 待拆出（executor.rs:75）。
+- `Stage1Executor::run` 静默阻塞线程、睡眠轮询 → 待异步非阻塞化（recognizer.rs）。
+- `Stage1Config::new` 内嵌 IO（模型路径解析）→ 待拆出（recognizer.rs）。
 - daemon 硬编码静态文件路径 `BASE` → 改用 FileLoader 机制（main.rs:582）。
 
 ## 未完成

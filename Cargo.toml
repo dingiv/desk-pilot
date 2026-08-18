@@ -15,8 +15,6 @@ members = [
 
     # audio-aura (voice)
     "crates/aura-core",
-    "crates/aura-asr",
-    "crates/aura-tts",
     "crates/aura-agent",
     "apps/audio-aura",
     "crates/native",
