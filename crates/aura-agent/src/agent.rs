@@ -369,7 +369,19 @@ async fn driver_loop(inner: &Arc<AgentInner>) {
     let hc = tokio::spawn(async move {
         while hc_conn.running.load(Ordering::Relaxed) {
             let ok = health.health().await.unwrap_or(false);
-            set_conn(&hc_conn, AuraConn::from_ok(ok));
+            let c = AuraConn::from_ok(ok);
+            let prev = AuraConn::from_u8(hc_conn.conn.load(Ordering::Relaxed));
+            if c != prev {
+                // set_conn 在断开时清空客户端状态;这里补上重连的对齐:
+                // Disconnected → Connected 时重新请求一次快照,立刻回到新状态。
+                set_conn(&hc_conn, c);
+                if prev == AuraConn::Disconnected && c == AuraConn::Connected {
+                    match health.state().await {
+                        Ok(snap) => set_state(&hc_conn, snap),
+                        Err(e) => tracing::warn!(error = %e, "reconnect snapshot fetch failed"),
+                    }
+                }
+            }
             tokio::time::sleep(HEALTH_PROBE).await;
         }
     });
@@ -413,6 +425,15 @@ fn set_conn(inner: &AgentInner, c: AuraConn) {
     let old = AuraConn::from_u8(inner.conn.load(Ordering::Relaxed));
     if old != c {
         inner.conn.store(c as u8, Ordering::Relaxed);
+        // 断开:清空客户端状态 —— 重连后从干净状态重新请求、对齐。不这么做,
+        // 旧的 windows/live/快照会一直挂着,断开期间看到的还是断线前的语音。
+        if c == AuraConn::Disconnected {
+            *inner.state.write().unwrap() = None;
+            inner.windows.write().unwrap().clear();
+            inner.windows_state.write().unwrap().clear();
+            *inner.live.write().unwrap() = None;
+            tracing::info!("aura disconnected — client state cleared");
+        }
         let _ = inner.tx.send(AgentEvent::ConnChanged(c));
     }
 }
@@ -680,5 +701,33 @@ mod tests {
         let i = inner();
         assert_eq!(preview(&i, 42).0, None);
         assert_eq!(preview(&i, 42).1, None);
+    }
+
+    #[test]
+    fn disconnect_clears_client_state() {
+        // 断开连接时清空客户端状态,重连后从干净状态重新请求对齐。
+        let i = inner();
+        // 造出三样状态:定稿窗口 + 新窗口在流(live 有值)+ 控制面快照。
+        apply_segment(&i, AsrSegment::WindowCalibration { window_id: 1, calibrated: "定稿".into() });
+        apply_segment(
+            &i,
+            AsrSegment::StreamFragment { window_id: 2, segment_id: 1, text: "新窗口".into(), at_s: 0.0 },
+        );
+        let snap: AuraStateView = serde_json::from_str(
+            r#"{"connected":true,"stage3_on":false,"config":{"asr_backend":"","asr_kind":"","asr_provider":"","llm_kind":"","model":"","vad":{"threshold":0.5,"min_silence":0.3,"merge_gap":1.0}},"hotwords":[],"corrections":[]}"#,
+        ).unwrap();
+        set_state(&i, snap);
+
+        assert!(i.state.read().unwrap().is_some());
+        assert_eq!(i.windows.read().unwrap().len(), 1);
+        assert_eq!(i.windows_state.read().unwrap().len(), 2);
+        assert!(i.live.read().unwrap().is_some());
+
+        // 断开 → 全部清空。
+        set_conn(&i, AuraConn::Disconnected);
+        assert!(i.state.read().unwrap().is_none(), "snapshot cleared");
+        assert!(i.windows.read().unwrap().is_empty(), "settled windows cleared");
+        assert!(i.windows_state.read().unwrap().is_empty(), "window state cleared");
+        assert!(i.live.read().unwrap().is_none(), "live cleared");
     }
 }
