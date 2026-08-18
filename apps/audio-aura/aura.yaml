@@ -20,7 +20,7 @@ log_level: "debug"               # 调试语音管线时改 "debug"
 # stream = 流式 ASR (恒本地, 实时 partial 要低延迟); backend 选批式 ASR 部署。
 asr:
   stream:                       # 流式引擎 (未知值启动报错, 不静默回退)
-    model: zipformer            # zipformer (当前唯一)
+    model: x-asr            # zipformer (2023 双语) | x-asr (2026, 100万小时 zh-en, assets/models/x-asr)
   backend: remote               # local | remote | disable
   local:                        # backend=local 时生效
     model: qwen3-asr            # 批式引擎: sensevoice | whisper | qwen3-asr
@@ -45,7 +45,7 @@ asr:
     min_silence: 1.0      # 静音达此秒数 → EOS 切段
     min_speech: 0.3       # 短于此秒数的段直接丢弃
     max_speech: 28.0      # 超长强制切 (backstop, 秒)
-    merge_gap: 2.5        # ★窗口定稿上界 (秒)
+    merge_gap: 3.5        # ★窗口定稿上界 (秒)
     edge_margin: 0.3      # 段边界扩展 (秒), 补 Silero 切掉的软起音/尾音
 
 # ── Stage2 LLM (llm) ──────────────────────────────────────────────────────────
@@ -54,6 +54,10 @@ llm:
   model: "qwen2.5-3b-instruct-q4_k_m.gguf"  # local: GGUF 文件名; remote: 服务端模型名
   # model_dir: "/path/to/models"            # local 时模型根目录覆盖 (默认 MODELS 命名空间)
   # endpoint: "http://127.0.0.1:3000"       # backend=remote 时服务地址
+  input: both                  # Stage2 纠偏输入源: batch (默认) | stream | both
+                                #   batch  = 只用批式结果(best_text: batch 优先)
+                                #   stream = 只用流式结果(热词偏置强/句首全, 但同音字多)
+                                #   both   = 双通道对照(batch 权威 + 流式补句首)
   # backend=disable: 完全关闭第二阶段 —— 不加载 LLM, 校准=恒等 (calibrated 直接承载
   # 原文, 零 LLM 延迟/开销; 纯 ASR 部署或对照 Stage2 贡献用)。
 
