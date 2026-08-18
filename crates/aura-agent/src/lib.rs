@@ -19,6 +19,7 @@
 pub mod agent;
 pub mod capability;
 pub mod client;
+pub mod rules;
 pub mod tool;
 pub mod view;
 
@@ -27,6 +28,9 @@ pub use capability::{
     SharedHotwordManager, StubContextSummarizer, StubFineTuner, StubMemoryStore, MemoryStore,
 };
 pub use tool::{AddHotwordTool, Tool};
+
+// ── Stage3 规则触发器(闭环演示占位;desktop-pet 调度器接管)──────────────────────────
+pub use rules::{looks_like_concat, stage3_rule_trigger};
 
 // ── daemon↔client wire contract + async HTTP/SSE client SDK ──────────────────────────────
 // Light on purpose (no mistralrs/asr): upper layers (desktop-pet, visual-rover, …) depend on

@@ -51,11 +51,28 @@ const PARTIAL_EVERY_FRAMES: u32 = 15;
 /// which resets the session long before the partial could go stale.
 const STALE_SESSION_RESET: Duration = Duration::from_secs(8);
 
+/// Resolve a `MODELS::<sub-path>` model entry. A custom `models_dir` (config override) wins —
+/// the sub-path is joined onto it; otherwise the shared `MODELS` namespace resolves via
+/// FileLoader (dev: workspace `assets/models/`, prod: `~/.desk-pilot/models/`).
+fn resolve_model(models_dir: Option<&str>, rel: &str) -> String {
+    let sub = rel.strip_prefix("MODELS::").unwrap_or(rel);
+    match models_dir {
+        Some(dir) => format!("{dir}/{sub}"),
+        None => shared::loader!()
+            .resolve(rel)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    }
+}
+
 /// Config for [`OnnxStage1Recognizer`] — paths + params for the VAD, batch ASR, and streaming ASR,
 /// plus the omni-scout address, ring capacity, and the connection `active` flag.
 #[derive(Clone)]
 pub struct Stage1Config {
     pub scout_addr: String,
+    /// Custom model-root override (config `asr.local.model_dir` / `llm.model_dir`): all
+    /// `MODELS::` paths resolve under it instead of the shared namespace. `None` = namespace.
+    pub models_dir: Option<String>,
     pub vad: VadConfig,
     pub asr: AsrConfig,
     pub streaming: StreamingAsrConfig,
@@ -81,15 +98,20 @@ impl Stage1Config {
     /// this crate's `Cargo.toml` `[package.metadata.shared]`). Dev: `<workspace>/assets/models/`;
     /// prod: `~/.audio-aura/models/`. No `base` param needed — the caller never sees paths.
     pub fn new(scout_addr: impl Into<String>) -> Self {
+        Self::with_models_dir(scout_addr, None)
+    }
+
+    /// [`Self::new`] with a custom model root: every `MODELS::` path (VAD / streaming / batch
+    /// ASR) resolves under `models_dir` instead of the shared namespace — config 钮
+    /// `asr.local.model_dir`. The builders ([`Self::with_whisper_asr`] / [`Self::with_qwen3_asr`])
+    /// resolve through the same root.
+    pub fn with_models_dir(scout_addr: impl Into<String>, models_dir: Option<String>) -> Self {
         // TODO: 在一个 new 函数中使用了 IO 操作，会失败，将 IO 拆出去作为另一个函数
-        let fs = shared::loader!();
-        let p = |rel: &str| -> String {
-            fs.resolve(rel)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        };
+        let dir = models_dir.clone();
+        let p = |rel: &str| -> String { resolve_model(dir.as_deref(), rel) };
         Self {
             scout_addr: scout_addr.into(),
+            models_dir,
             vad: VadConfig {
                 model: p("MODELS::silero-vad/silero_vad.onnx"),
                 ..Default::default()
@@ -118,12 +140,10 @@ impl Stage1Config {
     }
 
     /// Use Whisper (e.g. large-v3-turbo) as the batch ASR backend instead of SenseVoice.
-    /// Model paths resolve via the same `MODELS` namespace.
+    /// Model paths resolve via the same root (custom `models_dir` if set, else `MODELS`).
     pub fn with_whisper_asr(mut self, language: &str) -> Self {
-        let fs = shared::loader!();
-        let p = |rel: &str| -> String {
-            fs.resolve(rel).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
-        };
+        let dir = self.models_dir.clone();
+        let p = |rel: &str| -> String { resolve_model(dir.as_deref(), rel) };
         self.asr = AsrConfig {
             backend: AsrBackend::Whisper {
                 encoder: p("MODELS::whisper/large-v3-turbo/encoder.onnx"),
@@ -142,10 +162,8 @@ impl Stage1Config {
     /// high-accuracy offline backend, and fast once a CUDA build is available. `tokens` is left
     /// empty (Qwen3 loads its vocab from the tokenizer dir).
     pub fn with_qwen3_asr(mut self) -> Self {
-        let fs = shared::loader!();
-        let p = |rel: &str| -> String {
-            fs.resolve(rel).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
-        };
+        let dir = self.models_dir.clone();
+        let p = |rel: &str| -> String { resolve_model(dir.as_deref(), rel) };
         self.asr = AsrConfig {
             backend: AsrBackend::Qwen3Asr {
                 conv_frontend: p("MODELS::qwen3-asr/conv_frontend.onnx"),

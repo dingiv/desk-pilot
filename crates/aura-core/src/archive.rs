@@ -402,7 +402,7 @@ mod tests {
         // 历史录音恢复可回放(修复"重启后录音丢失")。
         let dir = tmp("rescan");
         let a = AudioArchive::new(cfg(&dir, 5));
-        let p = a.push(1, 0.1, pcm(1));
+        let _p = a.push(1, 0.1, pcm(1));
         a.push(2, 0.2, pcm(2));
         a.flush_now().unwrap();
         drop(a);

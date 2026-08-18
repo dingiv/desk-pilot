@@ -4,7 +4,8 @@
 > **边界范式**（VadSegment/VadWindow，设计沿革见 `vad-segment-model.md`）；旧范式的
 > `Utterance`/`Batch`/`MergeBatch` 契约已删除。
 > 代码入口：Stage1 = `crates/aura-core/src/recognizer.rs`，Stage2 = `crates/aura-core/src/calibrator.rs`，
-> 组装 = `crates/aura-core/src/pipeline.rs`，daemon = `apps/audio-aura/src/main.rs`。
+> 组装 = `crates/aura-core/src/pipeline.rs`（`PipelineSpec` → `Pipeline::assemble` 全栈拼装 +
+> 识别日志 + 窗口归档），daemon = `apps/audio-aura/src/main.rs`（config 解析 + socket）。
 
 ## 总览：数据流
 
@@ -35,8 +36,10 @@ AudioRing（10min @16kHz mono）
 │              作为 VadWindow 纠偏字段，移动左边界（清空状态）             │
 └──────────────────────────────────────────────────────────────────────┘
    ▼
-daemon on_turn 回调 → SSE 数据面 /api/asr_stream → UI
-   └ WindowFinal 同时落盘（recordings WAV + turns jsonl，按 window_id）+ Stage3 规则加词
+Pipeline run()（WindowEdge 臂）→ 识别日志 + record_final 落盘（recordings WAV +
+   turns jsonl，按 window_id；storage 由 daemon 传入）
+   ▼
+daemon on_turn 回调 → SSE 数据面 /api/asr_stream → UI（WindowFinal 时另触发 Stage3 规则加词）
 ```
 
 ## Stage1：音频 → 文本（ONNX 语音前端）

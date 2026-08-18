@@ -2,7 +2,7 @@
 name = "aura-daemon"
 version = "0.1.0"
 edition = "2021"
-description = "audio-aura daemon binary — composes the Pipeline (Stage1→Stage2), runs a Stage3 rule trigger for the closed-loop demo, and exposes a socket skeleton (health real, control/stream/query endpoints stubbed) for desktop-pet."
+description = "audio-aura daemon binary — config parsing (CLI/yaml → PipelineSpec) + client socket (SSE dual-plane + SPA). Pipeline assembly itself lives in aura-core's Pipeline::assemble; the Stage3 rule trigger lives in aura-agent."
 
 [[bin]]
 name = "aura-daemon"
@@ -17,8 +17,6 @@ cuda = ["audio-aura-core/cuda"]
 [dependencies]
 audio-aura-core = { path = "../../crates/aura-core" }
 audio-aura-agent = { path = "../../crates/aura-agent" }
-dp-models = { workspace = true }
-# merged into audio-aura-core
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

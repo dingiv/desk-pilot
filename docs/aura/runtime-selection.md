@@ -112,7 +112,7 @@ dp-models (跨子系统, ONNX 侧)
   └── onnx  OnnxRuntimeManager ← sherpa-onnx 单实例，管 VAD/流式ASR/批式ASR 的加载与推理
            (Silero VAD + Zipformer 流式 + SenseVoice/Whisper/Qwen3-ASR 批式)
 
-aura-core  (全栈,原 aura-asr 已并入)  executor (Stage1): OnnxStage1Recognizer —— 消费
+aura-core  (全栈,原 aura-asr 已并入)  recognizer (Stage1): OnnxStage1Recognizer —— 消费
            OnnxRuntimeManager, 批式可换 HttpAsr
            Calibrator (Stage2): mistral.rs/candle 单实例 (Qwen2.5-3B GGUF),
            亦可为 HttpLlm (vLLM/sglang remote)

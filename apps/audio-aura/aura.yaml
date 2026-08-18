@@ -1,61 +1,65 @@
-# aura-daemon 配置 (YAML — 支持 # 注释, 比 JSON 更适合复杂嵌套配置)
+# aura-daemon 配置 (YAML — 支持 # 注释, 按模块分层)
 # 优先级: CLI > 本文件 > 内置默认。aura.yaml 优先于 aura.json (向下兼容)。
+# 注意: 未知键直接报错回退内置默认 (deny_unknown_fields) —— 键名拼错不会静默失效。
 
-scout_addr: "127.0.0.1:7878"   # omni-scout /audio 地址
+# ── daemon 服务 ───────────────────────────────────────────────────────────────
+scout_addr: "127.0.0.1:7878"   # omni-scout /audio 地址 (音频源; local/remote ASR 都吃它)
+bind_addr: "127.0.0.1"          # daemon socket 监听地址
 port: 9091                      # daemon socket 端口
 stage3: true                    # 运行进程内 Stage3 规则触发器
+# web_dist: "../dist"           # 内置 SPA 静态目录 (默认: workspace dist/)
 
 # ── 日志 ──────────────────────────────────────────────────────────────────────
 # 等级: trace | debug | info | warn | error; 也支持 EnvFilter 指令语法 (如
-# "aura_daemon=debug,info")。RUST_LOG 环境变量优先于此处 (逃生舱)。
+# "audio_aura_core=debug,info")。RUST_LOG 环境变量优先于此处 (逃生舱)。
 # 注意: 高频识别日志 (流式 partial ~0.5s/条、纠偏碎片 ~1s/条) 只在 debug 可见;
 # info 只出 final (每定稿一句一条, 含 batch/streaming/calibrated 三层文本)。
 log_level: "info"               # 调试语音管线时改 "debug"
 
-# ── Stage2 LLM (mistral.rs Qwen3-1.7B GGUF, local; 或 remote vLLM/sglang) ──
-model: "qwen2.5-3b-instruct-q4_k_m.gguf"
-llm_kind: "local"               # local | remote
-# llm_endpoint: "http://127.0.0.1:8000"  # llm_kind=remote 时 (sglang/vllm)
-# llm_model: "Qwen3-1.7B"                 # remote 时传给 /v1/chat/completions
+# ── Stage1 语音前端 (asr) ─────────────────────────────────────────────────────
+# backend 选批式 ASR 部署位置; 流式 ASR + VAD 恒为本地 (实时 partial 要低延迟)。
+asr:
+  # stream 流式 asr 模型
+  stream:
+    model: zipformer
+    # ...
+  # batch 批处理 asr 模型, 可以禁用
+  backend: remote               # local | remote | disable
+  local:                        # backend=local 时生效
+    model: qwen3-asr            # 批式引擎: sensevoice | whisper | qwen3-asr
+    language: auto              # 批式语言 (sensevoice/whisper)
+    hardware: cpu               # onnxruntime 装置: cpu | cuda (cuda 需 GPU sherpa lib + cuDNN 9.25)
+    threads: 8                  # 批式 intra-op 线程 (8 核甜点)
+    # model_dir: "/path/to/models"  # 模型根目录覆盖 (默认 MODELS 命名空间; VAD/流式/批式全走它)
+  remote:                       # backend=remote 时生效
+    endpoint: "http://127.0.0.1:8000"  # OpenAI 兼容服务地址 (qwen-asr-serve 等)
+    # api_key: ...              # 未来: HttpAsr 尚未支持鉴权, 落键无行为故先不开
+  # ── VAD / 分段 (Silero; 全部可选, 不写用内置默认) ──
+  #   min_silence 和 merge_gap 解耦, 分别切出段与窗口两级边界:
+  #     · min_silence = VAD 静音达此秒数 → EOS 切段 (切段灵敏度) —— 保持小 (1s),
+  #                     停顿一过立即段级 batch, 响应快
+  #     · merge_gap   = 窗口定稿上界: 段间静音短于此值 → 并入同一 VadWindow
+  #                    (窗口级 batch 重跑出权威文本); ≥ 此值 → 窗口定稿出 WindowEdge。
+  #                    "什么算一句话"的旋钮, 0 = 每段独立成窗。
+  vad:
+    threshold: 0.5        # Silero 灵敏度 (高=迟钝少误触; 低=灵敏可能切轻声头)
+    min_silence: 1.0      # 静音达此秒数 → EOS 切段
+    min_speech: 0.3       # 短于此秒数的段直接丢弃
+    max_speech: 28.0      # 超长强制切 (backstop, 秒)
+    merge_gap: 2.5        # ★窗口定稿上界 (秒)
+    edge_margin: 0.3      # 段边界扩展 (秒), 补 Silero 切掉的软起音/尾音
 
-# ── Stage1 batch ASR (当前 flat 字段; 未来升级为 stage_asr 嵌套, 见 docs/dp-models.md) ──
-asr_backend: "qwen3-asr"        # sensevoice | whisper | qwen3-asr
-asr_language: "auto"
-asr_provider: "cpu"             # cpu | cuda (cuda 需 GPU sherpa lib + cuDNN 9.25)
-asr_threads: 8                  # onnxruntime intra-op 线程 (8 核甜点)
-# asr_kind: "local"               # local | remote (remote → qwen-asr-serve)
-asr_kind: "remote"               # local | remote (remote → qwen-asr-serve)
-asr_endpoint: "http://127.0.0.1:8000"  # asr_kind=remote 时
+# ── Stage2 LLM (llm) ──────────────────────────────────────────────────────────
+llm:
+  backend: local                # local (mistral.rs) | remote (vLLM/sglang, OpenAI 兼容)
+  model: "qwen2.5-3b-instruct-q4_k_m.gguf"  # local: GGUF 文件名; remote: 服务端模型名
+  # model_dir: "/path/to/models"            # local 时模型根目录覆盖 (默认 MODELS 命名空间)
+  # endpoint: "http://127.0.0.1:3000"       # backend=remote 时服务地址
 
-# ── 种子热词 (流式 recognizer beam bias + Stage2 整流参考) ──
+# ── 种子热词 (流式 recognizer beam bias + Stage2 整流参考) ────────────────────
 hotwords: ["Rust", "Bevy", "贪吃蛇"]
 
-# ── VAD / 分段 (Silero; 全部可选, 不写用内置默认) ──
-#   min_silence 和 merge_gap 解耦, 共同构成"中等间隔多句 merge"窗口:
-#     · min_silence = VAD 多久静音判 EOS (切段灵敏度) —— 保持小 (1s), 停顿一过立即
-#                     batch 识别, 响应快; 代价是长句被强切成碎片
-#     · merge_gap   = 补偿: 碎片间隔静音 (1s~此值) 拼回一个长段落 (批处理重跑合并 PCM,
-#                    结果同一 seq 就地更新已有句子); ≥此值才定稿。窗口下界由
-#                    min_silence 天然保证, 上界即此值。"什么算一句话"的旋钮。
-vad:
-  threshold: 0.5        # Silero 灵敏度 (高=迟钝少误触; 低=灵敏可能切轻声头)
-  min_silence: 1.0      # 静音达此秒数 → EOS 切段
-  min_speech: 0.3       # 短于此秒数的段直接丢弃
-  max_speech: 28.0      # 超长强制切 (backstop, 秒)
-  merge_gap: 2.5        # ★碎片合并窗口上界 (秒): 段间静音 1~5s 拼一句; 0=关闭合并
-
-# ── 未来: dp-models ModelSpec 结构化配置 (当前 AuraConf 不认, 待整改 docs/dp-models.md) ──
-# stage_asr:
-#   type: local              # local | remote
-#   model: qwen3-asr-1.7b-hf # 模型名 (local: onnx/gguf 路径; remote: HF id)
-#   language: auto
-#   hardware: gpu            # cpu | gpu
-#   thread: null             # null = 默认
-# stage_llm:
-#   type: local
-#   model: Qwen3-1.7B-Q8_0.gguf
-
-# ── 音频持久化 (短期记录, 供复盘 + 未来 Stage3) ──
-# recordings_dir: "~/.desk-pilot/data/recordings"   # 覆盖录音根目录 (默认 DATA::recordings)
-recordings_retention_days: 7   # 保留期(天): 超过该天数的录音 + turn 日志被过期清理
-                               # (启动时 + 每 24h 一次)。0/缺省 = 7
+# ── 存储 (音频持久化: 短期记录供复盘 + 未来 Stage3) ───────────────────────────
+storage:
+  retention_days: 7             # 保留期(天): 超期的录音 + turn 日志被清理 (启动时 + 每 24h)
+  # recordings_dir: "~/.desk-pilot/data/recordings"  # 录音根目录覆盖 (默认 DATA::recordings)

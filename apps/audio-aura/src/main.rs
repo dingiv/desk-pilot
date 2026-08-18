@@ -1,15 +1,16 @@
-//! aura-daemon — the audio-aura binary entry point. Composes the [`Pipeline`] (Stage1→Stage2),
-//! runs an in-process **Stage3 rule trigger**, and exposes a snapshot-sync socket for the
-//! desktop-pet / web UI:
+//! aura-daemon — the audio-aura binary entry point: config 解析 + tracing + 客户端 socket。
+//! 流水线拼装(Stage1Config 组装/ASR·LLM 选型/模型加载/识别日志/窗口归档)全部在
+//! aura-core 的 [`Pipeline::assemble`] —— 这里只产出 [`PipelineSpec`]、按下开关、搭服务。
+//! Socket 面:
 //! - `GET /api/state` — the complete [`AuraStateView`] snapshot (one source of truth).
 //! - `GET /api/stream?state_changed_frequency=<ms>` — SSE: `hello`, then `state_changed` pings
 //!   (throttled ≥250ms) whenever `version` advances. The client re-GETs /api/state on a ping.
 //! - `POST /api/control/scout` (toggle), `POST /api/correct` (user correction), `GET /api/audio/:window_id`.
 //!
-//! Threading: the Pipeline runs Stage1 on a dedicated **std thread** (it blocks forever) and
-//! Stage2 on its own internal `aura-stage2` worker (so partials never freeze behind a 1-2s LLM
-//! route); the axum socket runs on a multi-thread tokio runtime on the main thread. The
-//! Pipeline's `on_turn` callback pushes recognition [`AsrSegment`]s onto a broadcast channel
+//! Threading: the pipeline runs on a dedicated **std thread** ([`Pipeline::spawn`]) with Stage2
+//! on its own internal `aura-stage2` worker (so partials never freeze behind a 1-2s LLM route);
+//! the axum socket runs on a multi-thread tokio runtime on the main thread. The `on_turn`
+//! callback pushes recognition [`AsrSegment`]s onto a broadcast channel
 //! (the **data plane**, `/api/asr_stream`); settings changes (scout toggle / correction / Stage3
 //! hotword) bump a global `version: AtomicU64` (the **control plane** — `/api/stream` pings
 //! `state_changed`, clients re-GET `/api/state`). Recognition events do NOT bump `version`.
@@ -22,7 +23,6 @@
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -34,20 +34,17 @@ use axum::Router;
 use clap::Parser;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{error, info, warn};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
-use audio_aura_agent::{AddHotwordTool, HotwordManager, SharedHotwordManager, Tool};
+use audio_aura_agent::{stage3_rule_trigger, AddHotwordTool, HotwordManager, SharedHotwordManager};
 use audio_aura_core::archive::{ArchiveConfig, AudioArchive};
-use audio_aura_core::hub::{FinalTurn, Storage};
-use audio_aura_core::recognizer::{OnnxStage1Recognizer, Stage1Config};
-use audio_aura_core::{Pipeline, TurnEvent};
-use audio_aura_core::calibrator::Stage2CalibratorImpl;
-use audio_aura_core::Calibrator;
+use audio_aura_core::hub::Storage;
+use audio_aura_core::{AsrSpec, LlmSpec, Pipeline, PipelineSpec, TurnEvent, VadSpec};
 
 const BASE: &str = "/workspaces/gui_agent/audio-aura/native";
 
@@ -62,11 +59,11 @@ const SEED_HOTWORDS: &[&str] = &[
     "README", "贪吃蛇", "蛇身", "计分器",
 ];
 
-/// VAD / segmentation overrides from `aura.yaml`'s `vad:` section. All optional — an unset
-/// field falls back to the built-in default (mirrors `Stage1Config`'s defaults in
-/// `Stage1Config::merge_gap_s`). Precedence: config file > built-in default (no CLI for these).
+/// VAD / segmentation overrides from `aura.yaml`'s `asr.vad:` section (VAD 属 Stage1 语音
+/// 前端,故挂 asr 下). All optional — an unset field falls back to the built-in default
+/// (= `VadSpec::default`,与 Stage1Config 内置默认一致,core 有防漂移单测).
 #[derive(Debug, Default, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct VadConf {
     /// Silero speech-probability threshold (default 0.5). Higher = less sensitive (fewer false
     /// triggers, may clip soft onsets); lower = more sensitive (may catch breath as speech).
@@ -78,13 +75,11 @@ struct VadConf {
     min_speech: Option<f32>,
     /// Force-split backstop for very long utterances, seconds (default 28.0).
     max_speech: Option<f32>,
-    /// ★Segment-merge gap, seconds (default 5.0) — the UPPER bound of the medium-interval
-    /// merge window. VAD fragments whose inter-speech silence < this absorb into one utterance
-    /// (batch ASR re-runs on the concatenated PCM, same seq — the result UPDATES the sentence
-    /// in place); ≥ this settles the previous utterance. Lower bound is implicit: `min_silence`
-    /// is what splits fragments in the first place, so the effective window is
-    /// (min_silence, merge_gap) ≈ 1–5s. Decoupled from `min_silence` — VAD stays sensitive,
-    /// merging repairs the fragmentation. 0 disables merging.
+    /// ★Merge-window gap, seconds (default 5.0) — the UPPER bound of the medium-interval
+    /// window. Segments whose inter-speech silence < this join the SAME VadWindow (窗口级
+    /// batch 重跑,权威文本); ≥ this settles the window → WindowEdge 定稿. Lower bound is
+    /// implicit: `min_silence` is what splits segments in the first place, so the effective
+    /// window is (min_silence, merge_gap) ≈ 1–2.5s. "什么算一句话"的旋钮。0 = 每段独立成窗。
     merge_gap: Option<f64>,
     /// ★Segment edge-extension, seconds (default 0.3; 0 = off). Silero cuts the soft onset
     /// (before its probability crosses `threshold`) and the fading coda (after it drops
@@ -94,58 +89,99 @@ struct VadConf {
     edge_margin: Option<f32>,
 }
 
-/// Runtime config (`CONF::aura.json` via the shared FileLoader — dev: this crate's dir;
-/// prod: the unified `~/.desk-pilot/` folder). Every field is optional; precedence is
-/// CLI arg / env var > config file > built-in default.
+/// `asr:` — Stage1 语音前端:批式 ASR 部署选择 + VAD。`backend` 选边,未选中一侧的
+/// 字段被忽略(写了也不生效)。
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct AuraConf {
-    /// omni-scout `/audio` address (default `127.0.0.1:7878`).
-    scout_addr: Option<String>,
-    /// Daemon socket port (default 9091).
-    port: Option<u16>,
-    /// Run the in-process Stage3 rule trigger (default true).
-    stage3: Option<bool>,
-    /// Stage2 GGUF model file name, resolved inside the MODELS namespace.
+#[serde(default, deny_unknown_fields)]
+struct AsrConf {
+    /// Batch-ASR deployment: "local" (默认, in-process sherpa) | "remote" (HTTP)。
+    backend: Option<String>,
+    local: LocalAsrConf,
+    remote: RemoteAsrConf,
+    vad: Option<VadConf>,
+}
+
+/// `asr.local:` — in-process sherpa 批式 ASR。
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LocalAsrConf {
+    /// 批式引擎: "sensevoice" (默认) | "whisper" | "qwen3-asr"。
     model: Option<String>,
-    /// Stage1 batch ASR backend: "sensevoice" (default) | "whisper" | "qwen3-asr".
-    asr_backend: Option<String>,
-    /// ASR language code (default "auto" for SenseVoice, "zh" for Whisper).
-    asr_language: Option<String>,
-    /// Batch-ASR ONNX provider: "cpu" (default) | "cuda". GPU only helps the BATCH ASR
-    /// (SenseVoice/Whisper/Qwen3) — VAD + streaming stay CPU regardless. Requires the
-    /// CUDA-enabled sherpa shared lib; with the CPU-only lib, "cuda" fails at startup.
-    asr_provider: Option<String>,
-    /// Batch-ASR onnxruntime intra-op threads (default 8 = sweet spot on 8C/16T; 2 wastes
-    /// cores, 16 contends on mem bandwidth). Lower if it starves the streaming recognizer.
-    asr_threads: Option<i32>,
-    /// Batch-ASR location: "local" (default, in-process sherpa) | "remote" (HTTP).
-    asr_kind: Option<String>,
-    /// Remote ASR endpoint (OpenAI-compatible base, e.g. http://127.0.0.1:8080). asr_kind=remote.
-    asr_endpoint: Option<String>,
-    /// Stage2 LLM location: "local" (default, in-process mistral.rs) | "remote" (HTTP).
-    llm_kind: Option<String>,
-    /// Remote LLM endpoint (OpenAI-compatible base). llm_kind=remote.
-    llm_endpoint: Option<String>,
-    /// Remote LLM model name (passed to /v1/chat/completions). llm_kind=remote.
-    llm_model: Option<String>,
-    /// Seed hotwords for the streaming recognizer + the shared Stage2 store.
-    hotwords: Option<Vec<String>>,
-    /// Built SPA dist dir the daemon serves (default: workspace `dist/`).
-    web_dist: Option<String>,
+    /// ASR language code (default "auto")。
+    language: Option<String>,
+    /// onnxruntime 执行装置: "cpu" (默认) | "cuda"。GPU 只加速批式 —— VAD + 流式恒 CPU。
+    /// cuda 需 GPU sherpa lib (cuDNN 9.25);CPU-only lib 下启动即失败。
+    hardware: Option<String>,
+    /// onnxruntime intra-op threads (default 8 = 8C/16T 甜点)。压低若它抢了流式线程。
+    threads: Option<i32>,
+    /// 模型根目录覆盖:所有模型路径(VAD/流式/批式)改在其下解析(默认 MODELS 命名空间)。
+    model_dir: Option<String>,
+}
+
+/// `asr.remote:` — OpenAI 兼容 HTTP 批式 ASR。流式/VAD 仍本地。
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RemoteAsrConf {
+    /// 服务地址 (e.g. http://127.0.0.1:8000)。
+    endpoint: Option<String>,
+}
+
+/// `llm:` — Stage2 LLM。
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LlmConf {
+    /// Deployment: "local" (默认, in-process mistral.rs) | "remote" (HTTP)。
+    backend: Option<String>,
+    /// local: GGUF 文件名(在 `model_dir` 或 MODELS 命名空间内);
+    /// remote: 服务端模型名(传给 /v1/chat/completions)。
+    model: Option<String>,
+    /// local-only:模型根目录覆盖(默认 MODELS 命名空间)。
+    model_dir: Option<String>,
+    /// remote-only:服务地址。
+    endpoint: Option<String>,
+}
+
+/// `storage:` — 音频持久化。
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct StorageConf {
     /// Recordings base dir override (default: DATA::recordings — dev: this crate's data/,
     /// prod: ~/.desk-pilot/data/). Clips land in per-day subdirs (`<YYYY-MM-DD>/`).
     recordings_dir: Option<String>,
     /// 录音 + turn 日志保留期(天,默认 7)——短期记录供复盘/Stage3;超过该
     /// 天数的日期目录/文件被过期清理(启动时 + 每 24h)。
-    recordings_retention_days: Option<u32>,
+    retention_days: Option<u32>,
+}
+
+/// Runtime config (`CONF::aura.yaml` via the shared FileLoader — dev: this crate's dir;
+/// prod: the unified `~/.desk-pilot/` folder; `aura.json` 向下兼容 fallback). Every field
+/// is optional; precedence is CLI > config file > built-in default. **未知键直接拒绝**
+/// (deny_unknown_fields):拼错/过时的键让 parse 失败 → Malformed 回退(warn + 内置默认),
+/// 而不是静默不生效。
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AuraConf {
+    /// omni-scout `/audio` 地址 (default `127.0.0.1:7878`)。音频源,与 ASR 部署无关
+    /// (local/remote 批式都吃它)。
+    scout_addr: Option<String>,
+    /// Daemon socket 监听地址 (default `127.0.0.1`)。
+    bind_addr: Option<String>,
+    /// Daemon socket port (default 9091)。
+    port: Option<u16>,
+    /// Run the in-process Stage3 rule trigger (default true)。
+    stage3: Option<bool>,
     /// Log filter (default "info"). Accepts a plain level (trace|debug|info|warn|error) or
-    /// full EnvFilter directives ("aura_daemon=debug,info"). RUST_LOG still wins (escape
+    /// full EnvFilter directives ("audio_aura_core=debug,info"). RUST_LOG still wins (escape
     /// hatch). High-frequency recognition logging (流式 partial / 纠偏碎片) is `debug` —
     /// set this to debug to watch the live pipeline.
     log_level: Option<String>,
-    /// VAD / segmentation overrides (see [`VadConf`]). All-None by default.
-    vad: Option<VadConf>,
+    /// Built SPA dist dir the daemon serves (default: workspace `dist/`).
+    web_dist: Option<String>,
+    /// Seed hotwords for the streaming recognizer + the shared Stage2 store.
+    hotwords: Option<Vec<String>>,
+    asr: AsrConf,
+    llm: LlmConf,
+    storage: StorageConf,
 }
 
 /// Which config source [`AuraConf::load`] ended up on — reported by `main` AFTER tracing is
@@ -219,84 +255,77 @@ struct Cli {
     no_stage3: bool,
 }
 
-/// Fully-resolved VAD settings (config value, else built-in default). Mirrors the fields of
-/// [`VadConf`] but concrete — `resolve` fills every field, so `main` applies them unconditionally.
-#[derive(Debug, PartialEq)]
-struct VadResolved {
-    threshold: f32,
-    min_silence: f32,
-    min_speech: f32,
-    max_speech: f32,
-    merge_gap: f64,
-    edge_margin: f32,
-}
-
-/// Fully-resolved runtime settings (what `main` actually runs on).
+/// Fully-resolved runtime settings (what `main` actually runs on). The pipeline subset is a
+/// ready [`PipelineSpec`] — handed straight to [`Pipeline::assemble`].
 #[derive(Debug, PartialEq)]
 struct Settings {
-    scout_addr: String,
+    bind_addr: String,
     port: u16,
     stage3_on: bool,
-    model: String,
-    asr_backend: String,
-    asr_language: String,
-    asr_provider: String,
-    asr_threads: i32,
-    asr_kind: String,
-    asr_endpoint: Option<String>,
-    llm_kind: String,
-    llm_endpoint: Option<String>,
-    llm_model: Option<String>,
-    hotwords: Vec<String>,
     web_dist: Option<String>,
     recordings_dir: Option<String>,
     recordings_retention_days: u32,
     /// Log filter (RUST_LOG env still wins at subscriber init — see
     /// `shared::init_tracing_with_filter`).
     log_level: String,
-    vad: VadResolved,
+    spec: PipelineSpec,
 }
 
-/// Pure merge: CLI > `aura.json` > built-in default. (`--no-stage3` wins over the file;
+/// Pure merge: CLI > `aura.yaml` > built-in default. (`--no-stage3` wins over the file;
 /// model / hotwords / web_dist / vad are config-file-only — low-frequency knobs.)
 fn resolve(cli: Cli, conf: AuraConf) -> Settings {
-    // VAD: each field is the config value or the built-in default (mirrors VadConfig::default /
-    // Stage1Config::merge_gap_s — single source of truth lives in aura-asr; if those defaults
-    // change, update the fallbacks here too).
-    let v = conf.vad.unwrap_or_default();
-    let vad = VadResolved {
-        threshold: v.threshold.unwrap_or(0.5),
-        min_silence: v.min_silence.unwrap_or(1.0),
-        min_speech: v.min_speech.unwrap_or(0.3),
-        max_speech: v.max_speech.unwrap_or(28.0),
-        merge_gap: v.merge_gap.unwrap_or(5.0),
-        edge_margin: v.edge_margin.unwrap_or(0.3),
+    let AuraConf { scout_addr, bind_addr, port, stage3, log_level, web_dist, hotwords, asr, llm, storage } = conf;
+    // VAD: each field is the config value or the pipeline's built-in default
+    // (`VadSpec::default` — pinned equal to Stage1Config's defaults by a core unit test,
+    // so this can't drift from what the recognizer would use anyway).
+    let v = asr.vad.unwrap_or_default();
+    let d = VadSpec::default();
+    let vad = VadSpec {
+        threshold: v.threshold.unwrap_or(d.threshold),
+        min_silence: v.min_silence.unwrap_or(d.min_silence),
+        min_speech: v.min_speech.unwrap_or(d.min_speech),
+        max_speech: v.max_speech.unwrap_or(d.max_speech),
+        merge_gap: v.merge_gap.unwrap_or(d.merge_gap),
+        edge_margin: v.edge_margin.unwrap_or(d.edge_margin),
+    };
+    // Stage1 batch ASR: remote HTTP, or local ONNX (model/hardware/threads/model_dir)。
+    let asr_spec = if asr.backend.as_deref() == Some("remote") {
+        AsrSpec::Remote { endpoint: asr.remote.endpoint.clone().unwrap_or_default() }
+    } else {
+        AsrSpec::Local {
+            backend: asr.local.model.clone().unwrap_or_else(|| "sensevoice".to_string()),
+            language: asr.local.language.clone().unwrap_or_else(|| "auto".to_string()),
+            hardware: asr.local.hardware.clone().unwrap_or_else(|| "cpu".to_string()),
+            threads: asr.local.threads.unwrap_or(8),
+            model_dir: asr.local.model_dir.clone(),
+        }
+    };
+    // Stage2 LLM: local mistral.rs GGUF (可选 model_dir), or remote OpenAI-compatible。
+    let model = llm.model.clone().unwrap_or_else(|| "Qwen3-1.7B-Q8_0.gguf".to_string());
+    let llm_spec = if llm.backend.as_deref() == Some("remote") {
+        LlmSpec::Remote { endpoint: llm.endpoint.clone().unwrap_or_default(), model }
+    } else {
+        LlmSpec::Local { model, model_dir: llm.model_dir.clone() }
     };
     Settings {
-        scout_addr: cli
-            .scout_addr
-            .or(conf.scout_addr)
-            .unwrap_or_else(|| "127.0.0.1:7878".to_string()),
-        port: cli.port.or(conf.port).unwrap_or(9091),
-        stage3_on: !cli.no_stage3 && conf.stage3.unwrap_or(true),
-        model: conf.model.unwrap_or_else(|| "Qwen3-1.7B-Q8_0.gguf".to_string()),
-        asr_backend: conf.asr_backend.unwrap_or_else(|| "sensevoice".to_string()),
-        asr_language: conf.asr_language.unwrap_or_else(|| "auto".to_string()),
-        asr_provider: conf.asr_provider.unwrap_or_else(|| "cpu".to_string()),
-        asr_threads: conf.asr_threads.unwrap_or(8),
-        asr_kind: conf.asr_kind.unwrap_or_else(|| "local".to_string()),
-        asr_endpoint: conf.asr_endpoint,
-        llm_kind: conf.llm_kind.unwrap_or_else(|| "local".to_string()),
-        llm_endpoint: conf.llm_endpoint,
-        llm_model: conf.llm_model,
-        hotwords: conf
-            .hotwords
-            .unwrap_or_else(|| SEED_HOTWORDS.iter().map(|s| s.to_string()).collect()),
-        web_dist: conf.web_dist,
-        recordings_dir: conf.recordings_dir,
-        recordings_retention_days: conf.recordings_retention_days.unwrap_or(7),
-        log_level: conf.log_level.unwrap_or_else(|| "info".to_string()),
-        vad,
+        bind_addr: bind_addr.unwrap_or_else(|| "127.0.0.1".to_string()),
+        port: cli.port.or(port).unwrap_or(9091),
+        stage3_on: !cli.no_stage3 && stage3.unwrap_or(true),
+        web_dist,
+        recordings_dir: storage.recordings_dir,
+        recordings_retention_days: storage.retention_days.unwrap_or(7),
+        log_level: log_level.unwrap_or_else(|| "info".to_string()),
+        spec: PipelineSpec {
+            scout_addr: cli
+                .scout_addr
+                .or(scout_addr)
+                .unwrap_or_else(|| "127.0.0.1:7878".to_string()),
+            hotwords: hotwords
+                .unwrap_or_else(|| SEED_HOTWORDS.iter().map(|s| s.to_string()).collect()),
+            vad,
+            asr: asr_spec,
+            llm: llm_spec,
+        },
     }
 }
 
@@ -375,7 +404,7 @@ fn main() -> Result<()> {
             warn!(what, log_level = %effective_level, "conf parse error — fallback in effect")
         }
     }
-    let Settings { scout_addr, port, stage3_on, model, asr_backend, asr_language, asr_provider, asr_threads, asr_kind, asr_endpoint, llm_kind, llm_endpoint, llm_model, hotwords: seed_hotwords, web_dist, recordings_dir, recordings_retention_days, log_level, vad } = s;
+    let Settings { bind_addr, port, stage3_on, web_dist, recordings_dir, recordings_retention_days, log_level, spec } = s;
 
     // Connection toggle + shared snapshot state, shared across the Pipeline thread + socket
     // handlers. (No event bus — SSE pings off the `version` counter; data lives in the snapshot.)
@@ -384,17 +413,29 @@ fn main() -> Result<()> {
     // Data-plane channel: recognition segments pushed to /api/asr_stream subscribers.
     let (asr_events, _) = broadcast::channel::<AsrSegment>(1024);
     let config = ConfigView {
-        asr_backend: asr_backend.clone(),
-        asr_kind: asr_kind.clone(),
-        asr_provider: asr_provider.clone(),
-        llm_kind: llm_kind.clone(),
-        model: model.clone(),
-        vad: VadView { threshold: vad.threshold, min_silence: vad.min_silence, merge_gap: vad.merge_gap },
+        asr_backend: match &spec.asr {
+            AsrSpec::Local { backend, .. } => backend.clone(),
+            AsrSpec::Remote { .. } => "remote-http".to_string(),
+        },
+        asr_kind: spec.asr.kind().to_string(),
+        asr_provider: match &spec.asr {
+            AsrSpec::Local { hardware, .. } => hardware.clone(),
+            AsrSpec::Remote { .. } => String::new(),
+        },
+        llm_kind: spec.llm.kind().to_string(),
+        model: match &spec.llm {
+            LlmSpec::Local { model, .. } | LlmSpec::Remote { model, .. } => model.clone(),
+        },
+        vad: VadView {
+            threshold: spec.vad.threshold,
+            min_silence: spec.vad.min_silence,
+            merge_gap: spec.vad.merge_gap,
+        },
     };
 
     // Shared hotword store = the Stage3→Stage2 feedback channel (seeded from the config /
     // built-in list; Stage3 grows it at runtime).
-    let hotwords: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(seed_hotwords.clone()));
+    let hotwords: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(spec.hotwords.clone()));
     let corrections: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let mgr: Arc<dyn HotwordManager> = Arc::new(SharedHotwordManager::new(Arc::clone(&hotwords)));
     let tool = AddHotwordTool::new(Arc::clone(&mgr));
@@ -430,154 +471,58 @@ fn main() -> Result<()> {
     }
     let _flusher = storage.audio.spawn_flusher();
 
-    info!("loading Stage1 (ONNX) + Stage2 (Qwen calibrator) …");
-    let mut cfg = Stage1Config::new(scout_addr.clone());
-    cfg.active = Arc::clone(&active); // share the toggle with the executor
-    // VAD / segmentation (configurable via aura.yaml `vad:`; defaults live in aura-asr).
-    cfg.vad.threshold = vad.threshold;
-    cfg.vad.min_silence_duration = vad.min_silence;
-    cfg.vad.min_speech_duration = vad.min_speech;
-    cfg.vad.max_speech_duration = vad.max_speech;
-    cfg.vad.edge_margin_s = vad.edge_margin;
-    cfg.merge_gap_s = vad.merge_gap;
-    info!(
-        threshold = vad.threshold,
-        min_silence_s = vad.min_silence,
-        merge_gap_s = vad.merge_gap,
-        edge_margin_s = ((vad.edge_margin as f64) * 1000.0).round() / 1000.0, // f32 can't hold 0.3 — round in f64 for a clean display
-        "VAD: min_silence 切段 + merge_gap 合并碎片 + edge_margin 补边界 (解耦)"
-    );
-    // Bake the seed hotwords into the streaming recognizer (beam-search biasing).
-    cfg.streaming.hotwords = seed_hotwords;
-    // Select batch ASR backend from config (default: SenseVoice).
-    //   "whisper"   → large-v3-turbo
-    //   "qwen3-asr" → Qwen3-Audio ASR 1.7B int8 (high accuracy, slow on CPU)
-    if asr_kind == "remote" {
-        let endpoint = asr_endpoint.clone().unwrap_or_default();
-        info!("ASR: remote HTTP {endpoint}");
-        cfg = cfg.with_remote_asr(endpoint);
-    } else {
-        if asr_backend == "whisper" {
-            info!("ASR backend: Whisper large-v3-turbo (language: {asr_language})");
-            cfg = cfg.with_whisper_asr(&asr_language);
-        } else if asr_backend == "qwen3-asr" {
-            info!("ASR backend: Qwen3-Audio ASR 1.7B int8");
-            cfg = cfg.with_qwen3_asr();
-        } else {
-            info!("ASR backend: SenseVoice (language: {asr_language})");
-        }
-        // Batch-ASR ONNX provider (VAD + streaming stay CPU). cuDNN 9.25+ for sm_120 numerics.
-        cfg.asr.provider = asr_provider.clone();
-        cfg.asr.num_threads = asr_threads;
-        if asr_backend == "qwen3-asr" && asr_provider == "cuda" {
-            info!("Qwen3-ASR on CUDA: correct (cuDNN 9.25) but autoregressive ⇒ ~CPU speed");
-        }
-        info!("ASR provider: {} | threads: {} (batch ASR; VAD + streaming on CPU)", cfg.asr.provider, cfg.asr.num_threads);
-    }
-    let s1 = OnnxStage1Recognizer::new(cfg)?;
-    // Stage2 LLM: local mistral.rs Calibrator, or remote HttpLlm (vLLM/SGLang, OpenAI-compatible).
-    let llm: Arc<dyn dp_models::LlmProvider> = if llm_kind == "remote" {
-        let ep = llm_endpoint.clone().unwrap_or_default();
-        let m = llm_model.clone().unwrap_or_else(|| model.clone());
-        info!("Stage2 LLM: remote HTTP {ep} (model {m})");
-        Arc::new(dp_models::http::HttpLlm::new(ep, m))
-    } else {
-        let calibrator = Calibrator::load_default(&model)?;
-        let _ = calibrator.calibrate_blocking("你好", None, &[]); // HF warmup
-        info!("Stage2 LLM: local mistral.rs ({model})");
-        Arc::new(calibrator)
-    };
-    let s2 = Stage2CalibratorImpl::new(llm, Arc::clone(&hotwords), Arc::clone(&corrections));
+    // ── 全栈拼装在 core(Stage1Config 组装/ASR·LLM 选型/模型加载/预热/识别日志/窗口归档)──
+    // TODO: 这里是核心的模型推理触发点——assemble 加载模型,spawn 启动推理循环。
+    let pipeline = Pipeline::assemble(
+        &spec,
+        Arc::clone(&active),
+        Arc::clone(&hotwords),
+        Arc::clone(&corrections),
+        Some(Arc::clone(&storage)), // WindowFinal 时自动 record_final(archive+day log+ring)
+    )?;
 
-    // ── Pipeline on a dedicated std thread ── mutates the shared utterance timeline + bumps
-    //    `version` on every change. No event bus: the SSE handler pings off `version`.
+    // ── Pipeline on its core-owned thread ── recognition segments → DATA plane; Stage3 on
+    //    window finals. No event bus: the SSE handler pings off `version`.
     {
         let tool = tool.clone();
-        let storage = Arc::clone(&storage);
         let version = Arc::clone(&version);
         let asr_events = asr_events.clone();
-        thread::Builder::new()
-            .name("aura-pipeline".into())
-            .spawn(move || {
-                // TODO: 这里是核心的模型推理触发点；
-                Pipeline::new(s1, Box::new(s2)).run(move |ev| {
-                    // Recognition events → DATA plane only (broadcast the segment). The control
-                    // plane (version/snapshot) is NOT bumped here — only settings changes bump it.
-                    let segment = match ev {
-                        TurnEvent::Interim { window_id, segment_id, partial, at_s } => {
-                            // High-frequency (every ~0.5s while speaking) — debug; enable via
-                            // aura.yaml `log_level: debug`.
-                            debug!(
-                                window_id,
-                                segment_id,
-                                at_s = (at_s * 10.0).round() / 10.0,
-                                partial = %partial,
-                                "流式"
-                            );
-                            Some(AsrSegment::Interim {
-                                window_id,
-                                segment_id,
-                                partial: partial.to_string(),
-                                at_s,
-                            })
-                        }
-                        TurnEvent::WindowCalibrated { window_id, calibrated, route_ms } => {
-                            // Stage2 jointly calibrated the current window (per VAD gap) —
-                            // high-frequency, debug.
-                            debug!(
-                                window_id,
-                                route_ms = route_ms.round() as u64,
-                                calibrated = %calibrated,
-                                "窗口整流(段)"
-                            );
-                            Some(AsrSegment::WindowCalibrated { window_id, calibrated })
-                        }
-                        TurnEvent::WindowFinal { window: w, calibrated, route_ms } => {
-                            // Log all three text layers — window-level batch (authoritative;
-                            // empty = re-run failed), the streaming concat, and the Stage2
-                            // rewrite — so ASR-level loss is distinguishable from LLM rewriting.
-                            info!(
-                                window_id = w.id,
-                                at_s = (w.start_s * 10.0).round() / 10.0,
-                                segs = w.segments.len(),
-                                route_ms = route_ms.round() as u64,
-                                batch = %w.batch_text.clone().unwrap_or_default(),
-                                streaming = %w.streaming_text,
-                                calibrated = %calibrated,
-                                "final(窗口)"
-                            );
-                            // Record the window's PCM → audio archive, transcript+calibration →
-                            // day log + recent ring (backs /api/audio + /api/recordings).
-                            storage.record_final(FinalTurn {
-                                window_id: w.id,
-                                at_s: w.start_s,
-                                duration_ms: w.duration_ms(),
-                                raw_text: w.batch_text.clone().unwrap_or_default(),
-                                streaming_text: w.streaming_text.clone(),
-                                calibrated: calibrated.clone(),
-                                route_ms,
-                                pcm: (*w.pcm).clone(),
-                            });
-                            // Stage3 may add hotwords — that's a SETTINGS change → control plane.
-                            if stage3_on && stage3_rule_trigger(&tool, &calibrated) {
-                                version.fetch_add(1, Ordering::Release);
-                            }
-                            Some(AsrSegment::WindowFinal {
-                                window_id: w.id,
-                                raw_text: w.batch_text.clone().unwrap_or_default(),
-                                streaming_text: w.streaming_text.clone(),
-                                calibrated,
-                                route_ms,
-                            })
-                        }
-                    };
-                    // Data plane: push the recognition segment directly to /api/asr_stream
-                    // subscribers (low-latency). Err only when there are no receivers (fine).
-                    if let Some(seg) = segment {
-                        let _ = asr_events.send(seg);
+        pipeline.spawn(move |ev| {
+            // Recognition events → DATA plane only (broadcast the segment). The control
+            // plane (version/snapshot) is NOT bumped here — only settings changes bump it.
+            // (识别日志与窗口归档在 core 的 run() 内部——这里只做线协议映射。)
+            let segment = match ev {
+                TurnEvent::Interim { window_id, segment_id, partial, at_s } => {
+                    Some(AsrSegment::Interim {
+                        window_id,
+                        segment_id,
+                        partial: partial.to_string(),
+                        at_s,
+                    })
+                }
+                TurnEvent::WindowCalibrated { window_id, calibrated, .. } => {
+                    Some(AsrSegment::WindowCalibrated { window_id, calibrated })
+                }
+                TurnEvent::WindowFinal { window: w, calibrated, route_ms } => {
+                    // Stage3 may add hotwords — that's a SETTINGS change → control plane.
+                    if stage3_on && stage3_rule_trigger(&tool, &calibrated) {
+                        version.fetch_add(1, Ordering::Release);
                     }
-                });
-            })?;
+                    Some(AsrSegment::WindowFinal {
+                        window_id: w.id,
+                        raw_text: w.batch_text.clone().unwrap_or_default(),
+                        streaming_text: w.streaming_text.clone(),
+                        calibrated,
+                        route_ms,
+                    })
+                }
+            };
+            // Data plane: push the recognition segment directly to /api/asr_stream
+            // subscribers (low-latency). Err only when there are no receivers (fine).
+            if let Some(seg) = segment {
+                let _ = asr_events.send(seg);
+            }
+        })?;
     }
 
     // ── Socket on the main thread's tokio runtime ──
@@ -595,45 +540,13 @@ fn main() -> Result<()> {
         .enable_all()
         .thread_name("aura-socket")
         .build()?;
-    info!(port, "socket: http://127.0.0.1:{port}  (/api/state /api/stream /api/control/scout /api/correct /api/audio)");
-    info!(scout = %scout_addr, stage3 = stage3_on, log_level = %log_level, "pipeline running on bg thread — Ctrl-C 结束");
-    rt.block_on(serve_socket(state, port, web_dist));
+    info!(port, "socket: http://{bind_addr}:{port}  (/api/state /api/stream /api/control/scout /api/correct /api/audio)");
+    info!(scout = %spec.scout_addr, stage3 = stage3_on, log_level = %log_level, "pipeline running on bg thread — Ctrl-C 结束");
+    rt.block_on(serve_socket(state, bind_addr, port, web_dist));
     Ok(())
 }
 
-/// In-process Stage3 rule trigger (temporary; desktop-pet replaces it). Extracts uppercase-latin
-/// proper-noun candidates from the calibrated text and adds them as hotwords — locking in Stage2's
-/// corrections so future turns are reinforced. Concatenation artifacts ("APIdocker" — batch ASR
-/// gluing adjacent terms) are rejected so they can't pollute the store.
-#[instrument(skip(tool))]
-fn stage3_rule_trigger(tool: &AddHotwordTool, text: &str) -> bool {
-    let mut added_any = false;
-    for tok in text.split(|c: char| !c.is_ascii_alphanumeric()) {
-        if tok.len() < 2 || !tok.chars().any(|c| c.is_ascii_uppercase()) || looks_like_concat(tok)
-        {
-            continue;
-        }
-        if let Ok(out) = tool.invoke(&json!({ "word": tok })) {
-            if out["added"].as_bool() == Some(true) {
-                info!(word = %tok, "stage3 规则触发器加词");
-                added_any = true;
-            }
-        }
-    }
-    added_any
-}
-
-/// A concatenation artifact like "APIdocker": an UPPER-UPPER-lower trigram marks the glue seam
-/// (the standard camelCase word-split rule). Legit tokens survive — "GitHub" (single-cap
-/// boundaries), "README" (all caps, no lower after), "Rust" (TitleCase).
-fn looks_like_concat(tok: &str) -> bool {
-    let c: Vec<char> = tok.chars().collect();
-    c.windows(3).any(|w| {
-        w[0].is_ascii_uppercase() && w[1].is_ascii_uppercase() && w[2].is_ascii_lowercase()
-    })
-}
-
-async fn serve_socket(state: DaemonState, port: u16, web_dist: Option<String>) {
+async fn serve_socket(state: DaemonState, bind_addr: String, port: u16, web_dist: Option<String>) {
     // Production: the daemon also serves the built SPA (same origin — no proxy needed). Resolve
     // dist/ from the workspace root (BASE minus "/native") so it's independent of the daemon's
     // cwd; override with `web_dist` (aura.json). In dev Vite serves the page (dist may be
@@ -657,7 +570,7 @@ async fn serve_socket(state: DaemonState, port: u16, web_dist: Option<String>) {
         .fallback_service(static_spa)
         .layer(CorsLayer::permissive())
         .with_state(state);
-    let listener = match tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await {
+    let listener = match tokio::net::TcpListener::bind(format!("{bind_addr}:{port}")).await {
         Ok(l) => l,
         Err(e) => {
             error!(port, error = %e, "socket bind failed");
@@ -797,19 +710,18 @@ async fn correction_handler(State(s): State<DaemonState>, body: Json<Value>) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{looks_like_concat, resolve, AuraConf, Cli};
+    use super::{resolve, AuraConf, AsrConf, Cli, LlmConf, RemoteAsrConf};
+    use audio_aura_core::{AsrSpec, LlmSpec};
 
     #[test]
-    fn concat_seam_rejected_legit_tokens_pass() {
-        // Glue seams (UPPER-UPPER-lower trigram) — the "APIdocker" class.
-        assert!(looks_like_concat("APIdocker"));
-        assert!(looks_like_concat("PDFmarkdown"));
-        assert!(looks_like_concat("APIs")); // plural junk, acceptable loss
-        // Legit proper nouns survive.
-        assert!(!looks_like_concat("Rust"));
-        assert!(!looks_like_concat("GitHub")); // single-cap boundaries
-        assert!(!looks_like_concat("README")); // all caps, no lower after
-        assert!(!looks_like_concat("PDF"));
+    fn unknown_config_key_rejected() {
+        // deny_unknown_fields:拼错/过时的键必须 parse 失败(→ Malformed warn + 默认),
+        // 而不是静默不生效。旧平铺键(asr_backend 等)同理被拒 —— 一次性迁移可见。
+        assert!(serde_yaml::from_str::<AuraConf>("asr_typo: 1").is_err());
+        assert!(serde_yaml::from_str::<AuraConf>("asr_backend: sensevoice").is_err());
+        assert!(serde_yaml::from_str::<AuraConf>("asr:\n  typo: 1").is_err());
+        // 分层 + 已知键正常。
+        assert!(serde_yaml::from_str::<AuraConf>("asr:\n  backend: remote").is_ok());
     }
 
     #[test]
@@ -825,7 +737,7 @@ mod tests {
             conf.log_level.as_deref().map(|v| !v.trim().is_empty()).unwrap_or(false),
             "log_level documented in yaml"
         );
-        let vad = conf.vad.expect("aura.yaml must have a vad: section");
+        let vad = conf.asr.vad.expect("aura.yaml must have an asr.vad: section");
         assert_eq!(vad.merge_gap, Some(2.5), "merge_gap documented in yaml");
         assert_eq!(vad.threshold, Some(0.5));
         assert_eq!(vad.min_silence, Some(1.0));
@@ -843,31 +755,53 @@ mod tests {
             scout_addr: Some("conf:2".into()),
             port: Some(1234),
             stage3: Some(true),
-            model: None,
-            hotwords: None,
             web_dist: Some("/tmp/dist".into()),
-            recordings_dir: None,
             log_level: Some("debug".into()),
             ..Default::default()
         };
         let s = resolve(cli, conf);
-        assert_eq!(s.scout_addr, "cli:1");
+        assert_eq!(s.spec.scout_addr, "cli:1");
         assert_eq!(s.port, 1234);
+        assert_eq!(s.bind_addr, "127.0.0.1", "bind addr default");
         assert!(!s.stage3_on, "--no-stage3 beats the config file");
-        assert_eq!(s.model, "Qwen3-1.7B-Q8_0.gguf", "default model when unset");
-        assert_eq!(s.hotwords.len(), super::SEED_HOTWORDS.len(), "seed fallback");
+        assert!(matches!(&s.spec.llm, LlmSpec::Local { model, .. } if model == "Qwen3-1.7B-Q8_0.gguf"));
+        assert_eq!(s.spec.hotwords.len(), super::SEED_HOTWORDS.len(), "seed fallback");
         assert_eq!(s.web_dist.as_deref(), Some("/tmp/dist"));
         assert_eq!(s.log_level, "debug", "log_level from the config file");
 
         // All-empty → pure defaults.
         let d = resolve(Cli::default(), AuraConf::default());
-        assert_eq!(d.scout_addr, "127.0.0.1:7878");
+        assert_eq!(d.spec.scout_addr, "127.0.0.1:7878");
         assert_eq!(d.port, 9091);
         assert!(d.stage3_on);
         assert_eq!(d.log_level, "info", "log_level default");
+        assert!(matches!(&d.spec.asr, AsrSpec::Local { backend, .. } if backend == "sensevoice"));
         // VAD defaults resolve to the built-ins (no vad: section ⇒ all-None ⇒ fallbacks).
-        assert_eq!(d.vad.merge_gap, 5.0);
-        assert_eq!(d.vad.threshold, 0.5);
-        assert_eq!(d.vad.min_silence, 1.0);
+        assert_eq!(d.spec.vad.merge_gap, 5.0);
+        assert_eq!(d.spec.vad.threshold, 0.5);
+        assert_eq!(d.spec.vad.min_silence, 1.0);
+    }
+
+    #[test]
+    fn resolve_selects_remote_asr_llm() {
+        // asr.backend / llm.backend = remote → 对应 Remote spec(endpoint 各自子节)。
+        let conf = AuraConf {
+            asr: AsrConf {
+                backend: Some("remote".into()),
+                remote: RemoteAsrConf { endpoint: Some("http://127.0.0.1:8000".into()) },
+                ..Default::default()
+            },
+            llm: LlmConf {
+                backend: Some("remote".into()),
+                endpoint: Some("http://127.0.0.1:3000".into()),
+                model: Some("m.gguf".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let s = resolve(Cli::default(), conf);
+        assert!(matches!(&s.spec.asr, AsrSpec::Remote { endpoint } if endpoint == "http://127.0.0.1:8000"));
+        assert!(matches!(&s.spec.llm, LlmSpec::Remote { endpoint, model }
+            if endpoint == "http://127.0.0.1:3000" && model == "m.gguf"));
     }
 }

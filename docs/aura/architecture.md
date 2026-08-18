@@ -26,7 +26,8 @@ aura-core       (全栈)         ← 2026-08 合并了原 aura-core/aura-dcl/aur
   ├─ recognizer (Stage1, 原 aura-asr executor, 2026-08-18 并入, feature `asr`) Silero VAD + 流式Zipformer
   │             + 批式ASR + WindowTracker 窗口边界 + AudioStore(PCM按id) + vad/buffer/scout 辅件
   │             + lib.rs 根部的边界契约 (VadSegment/VadWindow/Stage1Event)
-  ├─ pipeline   (原 composer) Pipeline: Stage1→Stage2 (Stage2 独立线程)
+  ├─ pipeline   (原 composer) Pipeline + PipelineSpec→assemble 全栈拼装 (Stage1Config
+  │             组装/ASR·LLM 选型/模型加载预热/识别日志/窗口归档; Stage2 独立线程; spawn)
   ├─ calibrator Stage2CalibratorImpl (窗口状态机) + Stage2Calibrator trait
   ├─ prompt     PromptBuilder (精简: 1句指令+few-shot+热词+纠偏+输出格式+多段联合)
   ├─ lib.rs     Calibrator (mistral.rs Qwen2.5-3B GGUF, impl LlmProvider)
@@ -35,14 +36,16 @@ aura-core       (全栈)         ← 2026-08 合并了原 aura-core/aura-dcl/aur
   ├─ tts        NoopTts 占位 (原 aura-tts 并入; 未来 Kokoro/Piper)
   └─ wav        WAV 读写
 aura-agent      (Stage3+SDK)    能力 trait + HotwordManager + AddHotwordTool
-                                + view(AuraStateView/AsrSegment 线协议) + AuraClient SDK
-apps/audio-aura (daemon)      Pipeline + socket(8 routes + SPA fallback) + SSE双面 + Stage3规则触发器
+                                + rules(Stage3规则触发器) + view(AuraStateView/AsrSegment 线协议)
+                                + AuraClient SDK
+apps/audio-aura (daemon)      config解析(CLI/yaml→PipelineSpec) + socket(8 routes + SPA fallback)
+                              + SSE双面 + Stage3触发调用(规则本体在 aura-agent rules)
 crates/native                 napi shim (TS via VOICE_LOCAL_ROUTER)
 ```
 
-**线程模型**：`aura-stage1-ingest`（scout→ring）→ `aura-pipeline`（std 线程跑 Stage1
-consume loop）→ `aura-stage2`（LLM worker，mpsc 收 Batch/WindowEdge，partials 不被 LLM 卡住）
-→ `aura-socket`（主线程 tokio，axum SSE）。详见 `stages.md`。
+**线程模型**：`aura-stage1-ingest`（scout→ring）→ `aura-pipeline`（`Pipeline::spawn` 的
+std 线程跑 Stage1 consume loop）→ `aura-stage2`（LLM worker，mpsc 收 Batch/WindowEdge，
+partials 不被 LLM 卡住）→ `aura-socket`（主线程 tokio，axum SSE）。详见 `stages.md`。
 
 ## 三阶段提交
 
@@ -50,7 +53,7 @@ consume loop）→ `aura-stage2`（LLM worker，mpsc 收 Batch/WindowEdge，part
 |---|---|---|---|
 | **Stage1** | 录音→VAD→段级流式会话+段级batch→窗口定稿（边界范式：VadSegment/VadWindow） | aura-core (`asr` feature) | Stage1Recognizer（发 Interim + Batch + WindowEdge） |
 | **Stage2** | 窗口内多句联合整流（加标点/修同音字/英文规范/专有名词），无状态 | aura-core | Stage2Calibrator（calibrate_window / calibrate_final） |
-| **Stage3** | 可选工具：热词 / 用户纠偏 | aura-agent | HotwordManager + CorrectionStore |
+| **Stage3** | 可选工具：热词 / 用户纠偏 | aura-agent | HotwordManager + rules 规则触发器 |
 
 两阶段的完整流程与事件契约见 **`stages.md`**，设计沿革与 D1-D4 裁决见
 `vad-segment-model.md`（2026-08-17 边界范式重构：PCM 由 AudioStore 按 id 持有、
@@ -73,8 +76,9 @@ dp-models/
 └── ProviderKind: Local | Remote { endpoint }
 ```
 
-aura 已接入：executor `batch_asr: Arc<dyn AsrProvider>`（local OnnxAsr / remote HttpAsr）；
-Pipeline `s2: Box<dyn Stage2Calibrator>`；daemon `asr_kind`/`llm_kind` 配置切换。
+aura 已接入：recognizer `batch_asr: Arc<dyn AsrProvider>`（local OnnxAsr / remote HttpAsr）；
+Pipeline `s2: Box<dyn Stage2Calibrator>`；daemon `asr_kind`/`llm_kind` 配置解析成
+`PipelineSpec`（`Pipeline::assemble` 消费）。
 
 ## 双运行时（ONNX + HF）
 
@@ -83,30 +87,42 @@ Pipeline `s2: Box<dyn Stage2Calibrator>`；daemon `asr_kind`/`llm_kind` 配置�
   sherpa .so 在 `assets/lib/`（绝对路径软链，RUNPATH `$ORIGIN` 自定位）。
 - **HF 侧**（mistral.rs/candle，GPU sm_120）：Qwen2.5-3B-Instruct 纠偏（Stage2）。
 
-## 配置（aura.yaml，YAML 支持注释）
+## 配置（aura.yaml，YAML 按模块分层）
 
-当前实跑配置（2026-08-17）：
+当前实跑配置（2026-08-18 重构：命名准确化 + 模块层级，未知键直接拒绝而非静默失效）：
 
 ```yaml
-scout_addr: "127.0.0.1:7878"
+scout_addr: "127.0.0.1:7878"   # 音频源（与 ASR 部署无关，local/remote 都吃它）
+bind_addr: "127.0.0.1"          # daemon socket 监听地址
 port: 9091
-model: "qwen2.5-3b-instruct-q4_k_m.gguf"  # Stage2 GGUF (llm_kind: local)
-asr_backend: "qwen3-asr"        # sensevoice | whisper | qwen3-asr
-asr_kind: "remote"              # local | remote（remote → qwen-asr-serve）
-asr_endpoint: "http://127.0.0.1:8000"
-hotwords: ["Rust", "Bevy", "贪吃蛇"]
+stage3: true
 log_level: "info"               # trace|debug|info|warn|error | EnvFilter 指令; RUST_LOG 优先
-vad:
-  min_silence: 1.0   # 切段灵敏度（低保响应）
-  merge_gap: 2.5     # ★碎片合并窗口上界（"什么算一句话"的旋钮）
+
+asr:                            # Stage1 语音前端
+  backend: remote               # local | remote —— 批式 ASR 部署位置（流式/VAD 恒本地）
+  local:  { model: qwen3-asr, language: auto, hardware: cpu, threads: 8 }  # + model_dir 可选
+  remote:  { endpoint: "http://127.0.0.1:8000" }
+  vad:    { min_silence: 1.0, merge_gap: 2.5 }   # 切段/窗口两级边界（+threshold 等）
+
+llm:                            # Stage2
+  backend: local                # local (mistral.rs) | remote (vLLM/sglang)
+  model: "qwen2.5-3b-instruct-q4_k_m.gguf"       # local: GGUF 文件名; remote: 服务端模型名
+
+hotwords: ["Rust", "Bevy", "贪吃蛇"]
+storage: { retention_days: 7 }  # + recordings_dir 可选
 ```
+
+命名要点：`asr.backend`/`llm.backend` 选部署边（local/remote 子节各持其参数）；
+`local.model_dir`/`llm.model_dir` 覆盖模型根目录（默认 MODELS 命名空间）；VAD 挂
+`asr.vad`（属 Stage1 前端）。**deny_unknown_fields**：拼错/过时键（如旧平铺
+`asr_kind`）→ parse 失败 → Malformed warn + 内置默认，不静默。
 
 日志分级：**info 只出 final**（每定稿一句一条，含 batch/streaming/calibrated 三层文本）；
 流式 partial（~0.5s/条）与纠偏碎片（~1s/条）为 **debug**——调管线时 `log_level: "debug"`。
 
 优先级：CLI > aura.yaml > 内置默认（aura.json 仅作 loader 向下兼容 fallback）。
-未来计划升级为 dp-models ModelSpec 结构化配置（`stage_asr:` / `stage_llm:` 嵌套段，
-见 docs/dp-models.md）。
+dp-models 跨子系统 ModelSpec 统一仍是后续（docs/dp-models.md）——本次分层已是其
+aura 侧雏形。
 
 ## 运行
 
