@@ -44,6 +44,12 @@ impl Default for EnglishWeights {
     }
 }
 
+/// 1~2 字母短词的降权倍率。两字母输入几乎总是中文简拼(承担/程度/成都)或
+/// 常用缩写,"a"/"an"/"cd" 这类英文短词不该压过它们 —— exact 0.88×0.6 =
+/// 0.528(经 priority 70 → 0.37),低于中文简拼 0.503。只作用于**词典层**:
+/// 用户显式学入的短词(自生词)不降权,学习语义保留。
+const SHORT_WORD_PENALTY: f64 = 0.6;
+
 // ── Frequency normalization ─────────────────────────────────────────────
 
 /// Detected dictionary type from the `# @type:` header.
@@ -359,6 +365,7 @@ impl EnglishFamily {
         prefix_label: &'static str,
         exact_score: f64,
         prefix_ratio: f64,
+        short_penalty: bool,
         seen: &mut std::collections::HashSet<String>,
         out: &mut Vec<ScoredCandidate>,
     ) {
@@ -373,10 +380,15 @@ impl EnglishFamily {
             if !wl.starts_with(input) { break; }
             if !seen.insert(wl.clone()) { continue; }
 
+            // 1~2 字母短词降权(词典层):两字母输入几乎总是中文简拼,
+            // 英文短词不该压过它们。
+            let short = short_penalty && word.chars().count() <= 2;
+
             if wl == input {
+                let score = if short { exact_score * SHORT_WORD_PENALTY } else { exact_score };
                 out.push(ScoredCandidate {
                     text: word.clone(), family: "english", source: exact_label,
-                    raw_score: exact_score,
+                    raw_score: score,
                 });
             } else {
                 let freq_score = Self::freq_to_score(*freq);
@@ -387,7 +399,8 @@ impl EnglishFamily {
                 // 0.503),词频 × 匹配率在 [0.60, 0.85] 内提供区分度 ——
                 // smile(匹配 4/5)排在 smilacaceous(4/13)前,而非全体
                 // 贴地板后退化成字母序。
-                let score = 0.60 + 0.25 * freq_score * prefix_ratio * len_ratio;
+                let base = 0.60 + 0.25 * freq_score * prefix_ratio * len_ratio;
+                let score = if short { base * SHORT_WORD_PENALTY } else { base };
                 out.push(ScoredCandidate {
                     text: word.clone(), family: "english", source: prefix_label,
                     raw_score: score,
@@ -417,14 +430,14 @@ impl CandidateFamily for EnglishFamily {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
-        // Layer 1: user dict (highest priority).
+        // Layer 1: user dict (highest priority). 自生词不降权(学习语义保留)。
         let user = self.user_words.lock().unwrap();
         let user_exact = (self.weights.exact * self.weights.user_boost).min(1.0);
-        Self::query_layer(&user, &input_lower, "user", "user_prefix", user_exact, self.weights.prefix_ratio * 1.1, &mut seen, &mut out);
+        Self::query_layer(&user, &input_lower, "user", "user_prefix", user_exact, self.weights.prefix_ratio * 1.1, false, &mut seen, &mut out);
         drop(user);
 
-        // Layer 2: base dict.
-        Self::query_layer(&self.base_words, &input_lower, "exact", "prefix", self.weights.exact, self.weights.prefix_ratio, &mut seen, &mut out);
+        // Layer 2: base dict. 1~2 字母短词降权。
+        Self::query_layer(&self.base_words, &input_lower, "exact", "prefix", self.weights.exact, self.weights.prefix_ratio, true, &mut seen, &mut out);
 
         out.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap());
         out.truncate(16);
@@ -555,5 +568,34 @@ mod tests {
         fam.record_learned_word("iPhone");
         let c = fam.predict("iphone");
         assert!(c.iter().any(|x| x.text == "iPhone"), "learned iPhone matches iphone: {c:?}");
+    }
+
+    #[test]
+    fn short_base_words_are_penalized() {
+        // 词典里的 1~2 字母短词降权:exact 0.88 → 0.88×0.6=0.528(两字母输入
+        // 几乎总是中文简拼,英文短词不该压过它们)。长词不受影响。
+        let mut fam = EnglishFamily::new();
+        fam.load_into_base(b"cd\t3000\ncat\t1000\n");
+        let cands = fam.predict("cd");
+        let cd = cands.iter().find(|c| c.text == "cd").expect("cd in base");
+        assert!(
+            (cd.raw_score - 0.88 * super::SHORT_WORD_PENALTY).abs() < 1e-9,
+            "2-letter word penalized: {}",
+            cd.raw_score,
+        );
+
+        let cands = fam.predict("cat");
+        let cat = cands.iter().find(|c| c.text == "cat").expect("cat in base");
+        assert_eq!(cat.raw_score, 0.88, "long word keeps exact score");
+    }
+
+    #[test]
+    fn learned_short_words_not_penalized() {
+        // 自生词(用户层)不降权:学入 "cd" 后仍以全权重出现。
+        let fam = EnglishFamily::new(); // 空 base,只看 learned 层
+        fam.record_learned_word("cd");
+        let cands = fam.predict("cd");
+        let c = cands.iter().find(|x| x.text == "cd").expect("learned cd surfaces");
+        assert_eq!(c.raw_score, 0.88, "learned short word keeps full weight");
     }
 }

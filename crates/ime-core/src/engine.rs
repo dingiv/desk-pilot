@@ -1116,14 +1116,23 @@ mod tests {
         }
     }
 
-    /// Poll `magic_tick` until the worker thread's result lands (or fail).
+    /// Poll until the worker thread's result lands (or fail). 结果可能在两种
+    /// 时刻出现:pick 后的 predict 已读到 Done(worker 太快,候选已是 body),
+    /// 或 magic_tick 检测到版本变化。两种都算落地。
     /// Budget 30s with fine-grained polling — under full parallel test load
     /// (150+ tests, starved CI containers) the spawned worker thread can be
     /// delayed tens of seconds; the tests assert correctness, not speed.
-    /// (10s still tripped on an 11.6s-loaded run — last flake, 2026-08-15.)
     fn wait_req_tick(e: &ImeEngine) {
         for _ in 0..15_000 {
             if e.magic_tick().is_some() { return; }
+            // 结果已在 predict 里落地(worker 快于重查)—— 候选不再是
+            // "回车请求…" / "请求中…"。
+            if e.candidates().first()
+                .map(|c| !c.contains("请求中") && !c.contains("回车请求"))
+                .unwrap_or(false)
+            {
+                return;
+            }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         panic!("req result never landed");
