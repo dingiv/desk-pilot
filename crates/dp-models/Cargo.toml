@@ -19,7 +19,7 @@ sherpa-onnx = { version = "1.13", default-features = false, features = ["shared"
 # feature 转发开启。目的:把 GPU/LLM 重依赖隔离到 dp-models(今后 stage2 走远程)。
 mistralrs = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = true }
-# `Calibrator::load_default` 的 MODELS 命名空间解析(见 build.rs + [package.metadata.shared])。
+# `MistralLlm::load_default` 的 MODELS 命名空间解析(见 build.rs + [package.metadata.shared])。
 shared = { path = "../shared", features = ["log"], optional = true }
 
 [build-dependencies]

@@ -35,7 +35,7 @@ use crate::calibrator::{LlmInput, PassThroughCalibrator, Stage2Calibrator, Stage
 use crate::hub::{FinalTurn, Storage};
 use crate::recognizer::{OnnxStage1Recognizer, Stage1Config, Stage1Recognizer};
 use crate::Stage1Event;
-// 本地 LLM (mistral.rs) 已迁 dp-models; aura-core 只在 mistral feature 下 re-export。
+// 本地 LLM (aura 封装层 Calibrator, 持有 dp_models::MistralLlm), 仅 mistral feature 下存在。
 #[cfg(feature = "mistral")]
 use crate::Calibrator;
 
@@ -454,17 +454,16 @@ fn stage2_calibrator(
             #[cfg(feature = "mistral")]
             {
                 let calibrator = match model_dir {
-                    Some(dir) => crate::Calibrator::load(dir, model)?,
-                    None => crate::Calibrator::load_default(model)?,
+                    Some(dir) => Calibrator::load(dir, model)?,
+                    None => Calibrator::load_default(model)?,
                 };
-                // HF warmup(本地 LLM 已迁 dp-models; 预热用原始 complete, prompt 组装在
-                // Stage2CalibratorImpl 内完成)。
-                let _ = dp_models::LlmProvider::complete(&calibrator, "", "你好");
+                let _ = calibrator.calibrate_blocking("你好", None, &[]); // HF warmup
                 info!("Stage2 LLM: local mistral.rs ({model})");
                 Arc::new(calibrator)
             }
             #[cfg(not(feature = "mistral"))]
             {
+                let _ = (model, model_dir);
                 anyhow::bail!(
                     "llm.backend: local 需要 audio-aura-core 的 mistral/cuda feature \
                      (daemon 用 `--features asr,cuda` 构建), 或改用 llm.backend: remote"

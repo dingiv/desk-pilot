@@ -49,14 +49,11 @@ impl Task for RouteTask {
     type JsValue = String;
 
     fn compute(&mut self) -> Result<String> {
-        // `calibrate_blocking` 已随 Calibrator 迁往 dp-models 并移除(prompt 组装属业务层);
-        // 这里用 audio-aura-core 的 PromptBuilder 拼好 prompt, 再调模型的原始 infer。
-        let mut pb = audio_aura_core::PromptBuilder::new(&self.raw_text);
-        if let Some(c) = self.context.as_deref() {
-            pb = pb.context(c);
-        }
-        let (system, user) = pb.build();
-        self.inner.infer(&system, &user).map_err(err)
+        // aura 的 Calibrator 封装层持有 dp_models::MistralLlm, 并保留 calibrate_blocking
+        // (PromptBuilder 组装 + infer) 作为 Stage2 便捷入口。
+        self.inner
+            .calibrate_blocking(&self.raw_text, self.context.as_deref(), &[])
+            .map_err(err)
     }
 
     fn resolve(&mut self, _env: Env, output: String) -> Result<String> {

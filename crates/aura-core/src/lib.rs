@@ -150,10 +150,53 @@ pub use dp_models::{VadEvent, VadEventKind};
 /// The ASR provider abstraction (local OnnxAsr / remote HttpAsr both impl it).
 pub use dp_models::AsrProvider as Asr;
 
-// ── Stage2 本地 LLM — 已迁至 dp-models ───────────────────────────────────────
-// mistral.rs Calibrator (Qwen GGUF 加载器) 已从本 crate 移入 `dp_models::mistral`
-// (2026-08-18): 把 mistralrs 重依赖隔离到 dp-models, aura-core 只保留流程逻辑。
-// 今后 batch ASR / Stage2 / Stage3 走远程, 本地 LLM 是过渡形态。这里仅 re-export
-// 以保持 `audio_aura_core::Calibrator` 兼容(napi / examples)。
+// ── Calibrator (aura 的 Stage2 本地 LLM 封装层) ─────────────────────────────
+// 模型本体 (mistralrs GGUF 加载) 在 `dp_models::mistral::MistralLlm` —— dp-models 是通用
+// 模型提供库, 命名面向通用能力 (local-mistral provider)。`Calibrator` 是 aura 自己的
+// 封装层: 持有 MistralLlm, 附加 Stage2 的 prompt 组装 (calibrate_blocking), 保持
+// `audio_aura_core::Calibrator` 的 API 不变 (native/examples 直接用)。
 #[cfg(feature = "mistral")]
-pub use dp_models::Calibrator;
+pub struct Calibrator {
+    inner: dp_models::MistralLlm,
+}
+
+#[cfg(feature = "mistral")]
+impl Calibrator {
+    pub fn load(model_dir: &str, model_file: &str) -> anyhow::Result<Self> {
+        Ok(Self { inner: dp_models::MistralLlm::load(model_dir, model_file)? })
+    }
+
+    /// Load by model file name only — the model **directory** is resolved via the shared
+    /// `MODELS` namespace (declared in dp-models' `Cargo.toml`; dev = workspace
+    /// `assets/models`, prod = `~/.desk-pilot/models`).
+    pub fn load_default(model_file: &str) -> anyhow::Result<Self> {
+        Ok(Self { inner: dp_models::MistralLlm::load_default(model_file)? })
+    }
+
+    /// Run the merged 整流+路由 on one utterance; returns the model's raw JSON text.
+    pub fn calibrate_blocking(
+        &self,
+        raw_text: &str,
+        context: Option<&str>,
+        hotwords: &[String],
+    ) -> anyhow::Result<String> {
+        let mut pb = crate::prompt::PromptBuilder::new(raw_text).hotwords(hotwords);
+        if let Some(c) = context {
+            pb = pb.context(c);
+        }
+        let (system, user) = pb.build();
+        self.infer(&system, &user)
+    }
+
+    /// Raw one-shot chat: send a (system, user) pair.
+    pub fn infer(&self, system: &str, user: &str) -> anyhow::Result<String> {
+        self.inner.infer(system, user)
+    }
+}
+
+#[cfg(feature = "mistral")]
+impl dp_models::LlmProvider for Calibrator {
+    fn complete(&self, system: &str, user: &str) -> anyhow::Result<String> {
+        self.inner.complete(system, user)
+    }
+}
