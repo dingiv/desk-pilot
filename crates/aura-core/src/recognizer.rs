@@ -51,11 +51,11 @@ const PARTIAL_EVERY_FRAMES: u32 = 15;
 /// which resets the session long before the partial could go stale.
 const STALE_SESSION_RESET: Duration = Duration::from_secs(8);
 
-/// 能量预门 RMS 门限(i16 幅度)。帧能量低于此值 **且** 无流式 partial(空闲)→ 判为"安静",
-/// 跳过 Silero VAD 推理与流式解码(NN 贵,静音期占绝大多数时间)。仍喂 accept_waveform +
+/// 能量预门 RMS 门限(i16 幅度)。帧能量低于此值 **且** 距上次有能量已过冷却期(空闲)→ 判为
+/// "安静",跳过 Silero VAD 推理与流式解码(NN 贵,静音期占绝大多数时间)。仍喂 accept_waveform +
 /// 累积 PCM(纯缓冲,便宜——保 D1 连续喂帧与流式/batch 共享音频)。语音 RMS 通常 500+,
-/// 软起音 ~200-500,数字静音 ~0。200 为保守门限:只跳真正安静的帧,不截软起音。
-const VAD_GATE_RMS: f32 = 200.0;
+/// 软起音 ~200-500,数字静音 ~0。100 兼顾灵敏度(不截轻声)与省 CPU(门只跳近静音的帧)。
+const VAD_GATE_RMS: f32 = 100.0;
 
 /// Resolve a `MODELS::<sub-path>` model entry. A custom `models_dir` (config override) wins —
 /// the sub-path is joined onto it; otherwise the shared `MODELS` namespace resolves via

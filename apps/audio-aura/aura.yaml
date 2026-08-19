@@ -46,7 +46,7 @@ asr:
   #                    (窗口级 batch 重跑出权威文本); ≥ 此值 → 窗口定稿出 WindowEdge。
   #                    "什么算一句话"的旋钮, 0 = 每段独立成窗。
   vad:
-    threshold: 0.5        # Silero 灵敏度 (高=迟钝少误触; 低=灵敏可能切轻声头)
+    threshold: 0.3        # Silero 灵敏度 (高=迟钝少误触; 低=灵敏可能切轻声头; 0.3 兼容轻声/软起音)
     min_silence: 1.0      # 静音达此秒数 → EOS 切段
     min_speech: 0.3       # 短于此秒数的段直接丢弃
     max_speech: 28.0      # 超长强制切 (backstop, 秒)

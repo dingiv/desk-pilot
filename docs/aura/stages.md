@@ -87,7 +87,7 @@ zh-en，自带标点；tokens.txt 必须保持官方"token id"两列格式）。
    batch 结果（含 None，不做失败重试）；单段是常态（merge 仅发生在 <merge_gap 的
    停顿后），故大多数窗口省掉一整次 batch 调用。
 5. **AudioStore**：`Mutex<BTreeMap<id, PCM>>`，容量按样本（10min ≈19MB），超限逐最旧。
-6. **能量门（2026-08-19）**：空闲（帧 RMS < 200 且距上次有能量 > min_silence+0.5s）时跳过
+6. **能量门（2026-08-19）**：空闲（帧 RMS < 100 且距上次有能量 > min_silence+0.5s）时跳过
    Silero VAD 推理、流式解码、`accept_waveform` 与 PCM 累积——静音期 NN 成本归零。
    冷却期保证说话中/尾静音必喂 VAD（才能判 EOS）。**不用流式 partial 作条件**——
    x-asr 在静音上幻觉复读会让 partial 恒非空（门永不触发，自锁）。顺带修了挂机时
