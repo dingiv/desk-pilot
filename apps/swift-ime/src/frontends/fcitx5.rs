@@ -21,6 +21,7 @@
 //! 该 lint 只对**Rust 调用方**有保护价值,而这里没有 Rust 调用方。
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::collections::HashMap;
 use std::os::raw::c_char;
 use std::sync::{Arc, Mutex};
 
@@ -28,7 +29,49 @@ use ime_core::asr_buffer::AsrBuffer;
 use ime_core::engine::ImeEngine;
 use ime_core::expander::{today_str, VariableProvider};
 use ime_core::family::magic::preview_text;
+use ime_core::frontend::{FrontEndHandle, StateView};
 use ime_core::platform::ImeView;
+
+// ── 前端句柄:C 回调转发(引擎 I/O 线程 → fcitx 主循环)──────────────────
+
+/// C++ 注册的刷新回调:`ctx` = 输入上下文指针转 usize;`userdata` 是 C++ 侧
+/// `this` 指针转 usize(ABI 与 void* 一致,且 usize 是 Send/Sync)。
+type RefreshCb = extern "C" fn(ctx: usize, userdata: usize);
+/// C++ 注册的剪贴板请求回调:引擎要 count 条历史。
+type ClipboardCb = extern "C" fn(count: u32, userdata: usize);
+
+/// 共享的 C 回调槽 —— 引擎持有 FrontEndHandle,注册表持有同一 Arc,`set_ui_cbs`
+/// 之后 C++ 回调生效。
+struct FcitxCbs {
+    refresh: Mutex<Option<(RefreshCb, usize)>>,
+    clipboard: Mutex<Option<(ClipboardCb, usize)>>,
+}
+
+/// 前端句柄实现:I/O 线程推送经 C 回调转到 fcitx 主循环。
+struct FcitxFrontend {
+    cbs: Arc<FcitxCbs>,
+}
+
+impl FrontEndHandle for FcitxFrontend {
+    fn get_clipboard_item(&self, count: u32) {
+        if let Some((cb, ud)) = *self.cbs.clipboard.lock().unwrap() {
+            cb(count, ud);
+        }
+    }
+
+    fn refresh_ui(&self, sv: StateView) {
+        if let Some((cb, ud)) = *self.cbs.refresh.lock().unwrap() {
+            cb(sv.ctx, ud);
+        }
+    }
+}
+
+/// 引擎指针 → C 回调槽(供 `swift_ime_set_ui_cbs` 设置)。
+static FRONTS: std::sync::OnceLock<Mutex<HashMap<usize, Arc<FcitxCbs>>>> = std::sync::OnceLock::new();
+
+fn front_registry() -> &'static Mutex<HashMap<usize, Arc<FcitxCbs>>> {
+    FRONTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Max displayed bytes for one candidate row in the fcitx5 panel (≈8 CJK
 /// chars). The panel adapts its width to the longest row — truncating here
@@ -91,13 +134,18 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
         .iter()
         .map(|s| (s.trigger.clone(), s.expand.clone()))
         .collect();
+    // 前端句柄:C 回调槽,稍后由 `swift_ime_set_ui_cbs` 注入。
+    let cbs = Arc::new(FcitxCbs {
+        refresh: Mutex::new(None),
+        clipboard: Mutex::new(None),
+    });
     let mut engine = ImeEngine::with_config(
         weights,
         eng_weights,
         Box::new(FcitxProvider::default()),
         snippets,
         cfg.weights.to_scoring(),
-        Box::new(ime_core::frontend::NoopFrontend::default()),
+        Arc::new(FcitxFrontend { cbs: Arc::clone(&cbs) }),
     );
     // 候选每页条数(swift-ime.yaml → input.page_size)。
     engine.set_page_size(cfg.input.page_size);
@@ -170,12 +218,16 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
         }
     }
 
-    Box::into_raw(Box::new(engine))
+    // 注册 C 回调槽(引擎指针 → cbs),`swift_ime_set_ui_cbs` 据此设置。
+    let engine_ptr = Box::into_raw(Box::new(engine));
+    front_registry().lock().unwrap().insert(engine_ptr as usize, cbs);
+    engine_ptr
 }
 
 #[no_mangle]
 pub extern "C" fn swift_ime_destroy(engine: *mut ImeEngine) {
     if engine.is_null() { return; }
+    front_registry().lock().unwrap().remove(&(engine as usize));
     unsafe { drop(Box::from_raw(engine)); }
 }
 
@@ -260,27 +312,27 @@ pub extern "C" fn swift_ime_commit_pending(
     1
 }
 
+/// 注册前端 UI 回调(C++ 在引擎创建后调用一次):
+/// - `refresh_cb(ctx, userdata)`:引擎 I/O 线程异步状态推进 → 前端主循环拉视图;
+/// - `clipboard_cb(count, userdata)`:引擎请求剪贴板历史 → 前端取到回填。
 #[no_mangle]
-pub extern "C" fn swift_ime_poll_async(
+pub extern "C" fn swift_ime_set_ui_cbs(
     engine: *mut ImeEngine,
-    ctx: *const std::ffi::c_void,
-    out_view: *mut ImeView,
+    refresh_cb: RefreshCb,
+    clipboard_cb: ClipboardCb,
+    userdata: usize,
 ) -> i32 {
-    if engine.is_null() || out_view.is_null() { return 0; }
-    let (code, mut view) = unsafe { &*engine }.poll_async_ctx(ctx as usize);
-    if code != 0 {
-        truncate_candidate_rows(&mut view);
-        unsafe { *out_view = view; }
-    }
-    code
+    if engine.is_null() { return 0; }
+    let key = engine as usize;
+    let reg = front_registry().lock().unwrap();
+    let Some(cbs) = reg.get(&key).cloned() else { return 0; };
+    *cbs.refresh.lock().unwrap() = Some((refresh_cb, userdata));
+    *cbs.clipboard.lock().unwrap() = Some((clipboard_cb, userdata));
+    1
 }
 
-/// Poll for changes while a live magic command (`#asr` voice anchor, `#req`
-/// HTTP request, …) is active — the async candidate refresh entry point.
-/// Returns 1 + fills `out_view` if the active member's async state advanced
-/// and the ctx is in Magic mode; 0 otherwise. Called by the C++ glue's
-/// periodic TimeEvent (main loop) so the candidate area updates live WITHOUT
-/// a keypress — same `magic_tick` the TUI uses.
+/// 拉取当前 live 视图(异步状态推进后,前端主循环经 refresh 回调调这里)。
+/// 返回 1 + 填 `out_view` 若该 ctx 有 live 命令且状态推进;否则 0。
 #[no_mangle]
 pub extern "C" fn swift_ime_magic_tick(
     engine: *mut ImeEngine,

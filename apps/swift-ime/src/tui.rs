@@ -6,6 +6,8 @@
 //! (Ctrl+Q/Ctrl+C)退出。
 
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -13,8 +15,24 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::ExecutableCommand;
 use ime_core::asr_buffer::AsrBuffer;
 use ime_core::engine::ImeEngine;
+use ime_core::frontend::{FrontEndHandle, StateView};
 use ime_core::router::{KeyKind, KeyEvent};
 use ime_core::ImeView;
+
+/// TUI 前端句柄:引擎 I/O 线程推送刷新时只记一个计数,渲染循环每帧检查并
+/// drain(`magic_tick` 拉最新视图)。TUI 是前台应用,自带渲染节奏,不做
+/// 剪贴板历史(无 clipboard)。
+#[derive(Default)]
+struct TuiFrontend {
+    pending: AtomicU64,
+}
+
+impl FrontEndHandle for TuiFrontend {
+    fn get_clipboard_item(&self, _count: u32) {}
+    fn refresh_ui(&self, _sv: StateView) {
+        self.pending.fetch_add(1, Ordering::Release);
+    }
+}
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -29,7 +47,10 @@ const POLL_MS: u64 = 100; // voice live-refresh cadence (was 200)
 
 // ── Entry point ────────────────────────────────────────────────────────
 
-pub fn run(cfg: MockConfig) -> io::Result<()> {
+pub fn run(mut cfg: MockConfig) -> io::Result<()> {
+    // 前端句柄:引擎 I/O 线程推送刷新 → TUI 渲染循环 drain。
+    let frontend = Arc::new(TuiFrontend::default());
+    cfg.frontend = Some(Arc::clone(&frontend) as Arc<dyn FrontEndHandle>);
     let (mut engine, asr_buffer, aura_status) = swift_ime::frontends::mock::build_engine(&cfg);
 
     let mut history: Vec<String> = Vec::new();
@@ -38,7 +59,7 @@ pub fn run(cfg: MockConfig) -> io::Result<()> {
     io::stdout().execute(crossterm::terminal::EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
-    let res = run_loop(&mut terminal, &mut engine, &asr_buffer, &aura_status, &mut history);
+    let res = run_loop(&mut terminal, &mut engine, &asr_buffer, &aura_status, &mut history, &frontend);
 
     disable_raw_mode()?;
     io::stdout().execute(crossterm::terminal::LeaveAlternateScreen)?;
@@ -53,6 +74,7 @@ fn run_loop(
     asr_buffer: &AsrBuffer,
     aura_status: &Option<AuraConnHandle>,
     history: &mut Vec<String>,
+    frontend: &Arc<TuiFrontend>,
 ) -> io::Result<()> {
     let mut last_view = ImeView::empty();
     let mut should_quit = false;
@@ -64,6 +86,13 @@ fn run_loop(
             let flags = engine.state_flags();
             render(f, &last_view, history, asr_buffer, aura_status, &detailed, flags)
         })?;
+
+        // 引擎 I/O 线程推送过刷新(voice/req 异步推进)→ 拉最新 live 视图。
+        if frontend.pending.swap(0, Ordering::AcqRel) > 0 {
+            if let Some(v) = engine.magic_tick() {
+                last_view = v;
+            }
+        }
 
         if event::poll(Duration::from_millis(POLL_MS))? {
             if let Event::Key(key) = event::read()? {
@@ -85,25 +114,6 @@ fn run_loop(
                     history.push(committed.to_string());
                 }
             }
-        }
-
-        // ── Async poll ──
-        let (code, view) = engine.poll_async();
-        if code == 1 {
-            last_view = view;
-        } else if code == 2 {
-            let committed = ImeView::str_field(&view.commit_text);
-            if !committed.is_empty() {
-                history.push(committed.to_string());
-            }
-            last_view = view;
-        }
-
-        // ── Magic live-refresh ── while a live magic command is active (`#asr`
-        // voice anchor, `#req` HTTP request, …), rebuild the candidate view when
-        // the member's async state advanced, without a keypress.
-        if let Some(v) = engine.magic_tick() {
-            last_view = v;
         }
     }
 

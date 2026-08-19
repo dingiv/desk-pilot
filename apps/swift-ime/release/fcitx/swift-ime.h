@@ -13,6 +13,8 @@
 #include <fcitx-utils/event.h>
 #include <stdint.h>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -79,11 +81,16 @@ extern "C" {
                                     unsigned int index, ImeView *out_view);
     int  swift_ime_commit_pending(ImeHandle *handle, void *ctx,
                                   ImeView *out_view);
-    int  swift_ime_poll_async(ImeHandle *handle, void *ctx,
-                              ImeView *out_view);
-    /// Magic live-command async refresh (`#asr` voice anchor, `#req` HTTP request, …):
-    /// returns 1 + fills out_view when the active member's async state advanced and the ctx
-    /// is in Magic mode. Polled by the C++ TimeEvent so candidates update live.
+    /// Register the frontend UI callbacks (engine I/O thread → fcitx main loop):
+    /// refresh_cb(ctx, userdata) on async advance; clipboard_cb(count, userdata)
+    /// on clipboard request. Called once at engine construction.
+    int  swift_ime_set_ui_cbs(ImeHandle *handle,
+                              void (*refresh_cb)(uintptr_t ctx, void *userdata),
+                              void (*clipboard_cb)(uint32_t count, void *userdata),
+                              void *userdata);
+    /// Pull the current live view (async state advanced — the refresh callback
+    /// schedules a main-loop call to this). Returns 1 + fills out_view when the
+    /// ctx has a live command whose async state advanced; 0 otherwise.
     int  swift_ime_magic_tick(ImeHandle *handle, void *ctx,
                               ImeView *out_view);
     /// Reconfigure the `#req` backend base URL at runtime (default http://127.0.0.1:14555/api).
@@ -124,14 +131,22 @@ private:
     /// Per-context last view for diffing.
     std::unordered_map<fcitx::InputContext *, ImeView> lastViews_;
 
-    std::unique_ptr<fcitx::EventSourceTime> pollTimer_;
-    void startAsyncPoll();
-
-    /// Active input contexts (added on activate, removed on deactivate/reset). The magic poll
-    /// timer iterates these to refresh live-command candidates (`#asr`/`#req`) async.
+    /// Active input contexts (added on activate, removed on deactivate/reset).
     std::unordered_set<fcitx::InputContext *> activeContexts_;
-    std::unique_ptr<fcitx::EventSourceTime> magicTimer_;
-    void startMagicPoll();
+
+    // ── 按需 UI 刷新(引擎 I/O 线程推送,替代旧的 100ms 轮询)───────────
+    /// 引擎 I/O 线程异步推进时经 C 回调进入(marshal 到主循环)。
+    void onRefresh(uintptr_t ctx);
+    void onClipboardRequest(uint32_t count);
+    static void uiRefreshCb(uintptr_t ctx, void *userdata);
+    static void uiClipboardCb(uint32_t count, void *userdata);
+
+    /// 待刷新的 ctx 集合(跨线程,I/O 线程写、主循环 drain)。
+    std::mutex refreshMutex_;
+    std::set<uintptr_t> pendingRefreshes_;
+    /// 单发 drain 定时器(有 pending 才排,空闲零轮询)。
+    bool refreshArmed_ = false;
+    std::unique_ptr<fcitx::EventSourceTime> refreshTimer_;
 };
 
 // ── Candidate word ──────────────────────────────────────────────────────────

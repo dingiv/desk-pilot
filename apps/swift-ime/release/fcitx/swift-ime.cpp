@@ -38,6 +38,8 @@ SwiftImeEngine::SwiftImeEngine(fcitx::Instance *instance)
     for (auto sym : syms) {
         selectionKeys_.emplace_back(sym, fcitx::KeyStates());
     }
+    // 注册前端 UI 回调:引擎 I/O 线程推送刷新 / 请求剪贴板。
+    swift_ime_set_ui_cbs(handle_, uiRefreshCb, uiClipboardCb, this);
 }
 
 SwiftImeEngine::~SwiftImeEngine() {
@@ -166,72 +168,63 @@ void SwiftImeEngine::apply_view(fcitx::InputContext *ic, const ImeView &v) {
     prev = v;
 }
 
-// ── Async poll timer ────────────────────────────────────────────────────
+// ── 按需 UI 刷新(替代旧的 100ms 轮询)──────────────────────────────────
+//
+// 引擎 I/O 线程在异步状态推进(voice/req/clipboard)后经 FrontEndHandle
+// 调 `onRefresh(ctx)` —— 这里把它 marshal 到 fcitx 主循环:记录 pending ctx,
+// 若尚未有 drain 定时器则排一个单发事件,主循环上 `swift_ime_magic_tick`
+// 拉最新视图 + apply_view。空闲(无 pending)时零轮询。
 
-void SwiftImeEngine::startAsyncPoll() {
-    if (pollTimer_) return;
-    // fcitx5 recurring-timer idiom: first fire = now + period, interval = dummy, re-arm manually
-    // via setTime + setOneShot in the callback (interval arg alone doesn't repeat). See
-    // startMagicPoll + fcitx5-chinese-addons/pinyincandidate.cpp.
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    uint64_t now = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
-    pollTimer_ = instance_->eventLoop().addTimeEvent(
-        CLOCK_MONOTONIC, now + 100000, 1,
-        [this](fcitx::EventSourceTime *event, uint64_t time) {
-            for (uintptr_t probe = 1; probe < 1024; probe++) {
-                void *ctx = (void *)probe;
-                ImeView view;
-                int r = swift_ime_poll_async(handle_, ctx, &view);
-                if (r == 0) continue;
-                auto *ic =
-                    reinterpret_cast<fcitx::InputContext *>(ctx);
-                apply_view(ic, view);
-                if (r == 2) {
-                    pollTimer_.reset();
-                    return false;  // #wait demo completed — stop the timer
+void SwiftImeEngine::onRefresh(uintptr_t ctx) {
+    {
+        std::lock_guard<std::mutex> lk(refreshMutex_);
+        pendingRefreshes_.insert(ctx);
+    }
+    if (!refreshArmed_) {
+        refreshArmed_ = true;
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t now = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+        refreshTimer_ = instance_->eventLoop().addTimeEvent(
+            CLOCK_MONOTONIC, now + 1000, 1,
+            [this](fcitx::EventSourceTime *, uint64_t) {
+                refreshArmed_ = false;
+                std::set<uintptr_t> ctxs;
+                {
+                    std::lock_guard<std::mutex> lk2(refreshMutex_);
+                    ctxs.swap(pendingRefreshes_);
                 }
-                break;
-            }
-            event->setTime(time + 100000);  // re-arm
-            event->setOneShot();
-            return true;
-        });
+                for (uintptr_t c : ctxs) {
+                    auto *ic = reinterpret_cast<fcitx::InputContext *>(c);
+                    ImeView view;
+                    if (swift_ime_magic_tick(handle_, (void *)ic, &view)) {
+                        apply_view(ic, view);
+                    }
+                }
+                return false; // 单发:跑完即停,下次 onRefresh 再排
+            });
+    }
 }
 
-// ── Magic live-command async-refresh timer ──────────────────────────────
-//
-// A dedicated 100 ms TimeEvent (decoupled from the #wait pollTimer_) that, for every active
-// input context, calls swift_ime_magic_tick and applies the view if the active live magic
-// member's async state advanced (voice buffer for `#asr`, HTTP result for `#req`). This is
-// what makes the candidate area update live WITHOUT a keypress — the Rust engine reads the
-// AsrBuffer (written by the background aura SSE thread) / the HTTP worker result and rebuilds
-// candidates; we just push them into fcitx5's inputPanel + repaint. Runs on fcitx5's main loop
-// → thread-safe.
+/// `#clip` 请求剪贴板:公开接口只给当前值,推给引擎累积历史。
+void SwiftImeEngine::onClipboardRequest(uint32_t) {
+    if (activeContexts_.empty()) return;
+    auto *ic = *activeContexts_.begin();
+    if (auto *cb = instance_->addonManager().addon("clipboard")) {
+        auto text = cb->call<fcitx::IClipboard::clipboard>(ic);
+        if (!text.empty()) {
+            swift_ime_set_clipboard(handle_, text.c_str());
+        }
+    }
+}
 
-void SwiftImeEngine::startMagicPoll() {
-    if (magicTimer_) return;
-    FCITX_INFO() << "magic poll timer started (100ms)";
-    // fcitx5's addTimeEvent does NOT auto-repeat by the interval arg. The recurring idiom (per
-    // fcitx5-chinese-addons/pinyincandidate.cpp) is: first fire = now + period, interval = dummy,
-    // then in the callback manually setTime(next) + setOneShot() to re-arm. Returning true alone
-    // fires only once.
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    uint64_t now = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
-    magicTimer_ = instance_->eventLoop().addTimeEvent(
-        CLOCK_MONOTONIC, now + 100000, 1,
-        [this](fcitx::EventSourceTime *event, uint64_t time) {
-            for (auto *ic : activeContexts_) {
-                ImeView view;
-                if (swift_ime_magic_tick(handle_, (void *)ic, &view)) {
-                    apply_view(ic, view);
-                }
-            }
-            event->setTime(time + 100000);  // re-arm: next fire 100ms after this one
-            event->setOneShot();
-            return true;
-        });
+/// C 回调转发(引擎 I/O 线程调用)。
+void SwiftImeEngine::uiRefreshCb(uintptr_t ctx, void *userdata) {
+    static_cast<SwiftImeEngine *>(userdata)->onRefresh(ctx);
+}
+
+void SwiftImeEngine::uiClipboardCb(uint32_t count, void *userdata) {
+    static_cast<SwiftImeEngine *>(userdata)->onClipboardRequest(count);
 }
 
 // ── Candidate word ──────────────────────────────────────────────────────
@@ -268,17 +261,7 @@ void SwiftImeEngine::activate(const fcitx::InputMethodEntry &entry,
     // Safety: ensure no stale lastView carries over from a previous session.
     lastViews_.erase(ic);
     activeContexts_.insert(ic);
-    if (!magicTimer_) startMagicPoll();
     swift_ime_activate(handle_, (void *)ic);
-
-    // 焦点进入即推送当前剪贴板 —— 用户从别处复制后切回,`#clip` 立刻能
-    // 取到最近项。
-    if (auto *cb = instance_->addonManager().addon("clipboard")) {
-        auto text = cb->call<fcitx::IClipboard::clipboard>(ic);
-        if (!text.empty()) {
-            swift_ime_set_clipboard(handle_, text.c_str());
-        }
-    }
 }
 
 void SwiftImeEngine::deactivate(const fcitx::InputMethodEntry &entry,
@@ -331,13 +314,16 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
     auto *ic = keyEvent.inputContext();
     if (!ic) return;
 
-    // 剪贴板推送:每次按键都把当前剪贴板推给引擎 —— 既供 `$CLIPBOARD` 片段
-    // 变量解析,也累积成 `#clip/N` 的历史环(引擎侧去重,重复推送无成本)。
-    // 剪贴板 addon 无公开变化信号,逐键查询(进程内调用,微秒级)。
-    if (auto *cb = instance_->addonManager().addon("clipboard")) {
-        auto text = cb->call<fcitx::IClipboard::clipboard>(ic);
-        if (!text.empty()) {
-            swift_ime_set_clipboard(handle_, text.c_str());
+    // $CLIPBOARD 片段变量:仅在组合 `/`/`#` 触发时推送当前剪贴板(既供变量
+    // 解析,也顺手累积 #clip 历史)。历史主来源是 `#clip` 的按需请求
+    // (onClipboardRequest);这里不再逐键推送。
+    auto &prev = lastViews_[ic];
+    if (prev.preedit_text[0] == '/' || prev.preedit_text[0] == '#') {
+        if (auto *cb = instance_->addonManager().addon("clipboard")) {
+            auto text = cb->call<fcitx::IClipboard::clipboard>(ic);
+            if (!text.empty()) {
+                swift_ime_set_clipboard(handle_, text.c_str());
+            }
         }
     }
 
@@ -363,18 +349,7 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
     }
 
     keyEvent.filterAndAccept();
-
-    if (!pollTimer_) {
-        startAsyncPoll();
-    }
-    // Track the key-receiving ic + ensure the magic-refresh timer is running. Starting here (not
-    // only in activate) is the robust pattern — activate's ic isn't always the keyEvent ic, and
-    // activate may not fire before the first key in every fcitx5 flow.
     activeContexts_.insert(ic);
-    if (!magicTimer_) {
-        startMagicPoll();
-    }
-
     apply_view(ic, view);
 }
 

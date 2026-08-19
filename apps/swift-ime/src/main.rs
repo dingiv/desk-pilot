@@ -56,6 +56,7 @@ fn main() {
         connect_aura: args.aura, aura_addr: args.aura_addr,
         en_user_dict: args.en_user_dict, en_dicts: args.en_dicts,
         req_base: args.req_base,
+        frontend: None,
     };
 
     if let Some(ref cases_path) = cfg.cases {

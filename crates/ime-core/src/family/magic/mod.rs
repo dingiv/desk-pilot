@@ -367,6 +367,14 @@ impl MagicFamily {
         *self.resources.frontend.lock().unwrap() = Some(frontend);
     }
 
+    /// 前端按需回填剪贴板历史(`#clip` 触发 RequestClipboard → 前端取到后
+    /// 调这里替换整个历史)。
+    pub fn set_clipboard_history(&self, items: Vec<String>) {
+        let mut hist = self.resources.clipboard_history.lock().unwrap();
+        hist.clear();
+        hist.extend(items.into_iter().filter(|t| !t.is_empty()).take(CLIP_HISTORY_CAP));
+    }
+
     /// 推送一条剪贴板文本到历史(最近在前,去重连续重复)。C++ 每次按键/激活
     /// 推送当前剪贴板,`#clip/N` 读这个环。
     pub fn push_clipboard(&self, text: &str) {

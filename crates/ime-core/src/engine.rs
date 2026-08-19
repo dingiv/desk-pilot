@@ -25,7 +25,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use crate::dispatcher::Dispatcher;
 use crate::family::InputContext;
@@ -54,13 +53,6 @@ impl PerContext {
     }
 }
 
-// ── WaitState (async #wait demo) ────────────────────────────────────────
-
-struct WaitState {
-    trigger_time: Instant,
-    chars: Vec<(u64, char)>,
-}
-
 // ── ImeEngine ───────────────────────────────────────────────────────────
 
 const DEFAULT_CTX: usize = 0; // used by single-context convenience methods
@@ -70,7 +62,6 @@ const DEFAULT_CTX: usize = 0; // used by single-context convenience methods
 pub struct ImeEngine {
     dispatcher: Dispatcher,
     contexts: Mutex<HashMap<usize, PerContext>>,
-    async_waits: Mutex<HashMap<usize, WaitState>>,
     /// Unified persistence manager — owns the SQLite store and coordinates all
     /// user-model persistence (recency / bigrams / phrases / L0). `None` until
     /// [`init_store`](ImeEngine::init_store).
@@ -108,7 +99,7 @@ impl ImeEngine {
             Box::new(crate::expander::DefaultProvider),
             Vec::new(),
             crate::scoring::ScoringConfig::default(),
-            Box::new(crate::frontend::NoopFrontend::default()),
+            Arc::new(crate::frontend::NoopFrontend::default()),
         )
     }
 
@@ -133,16 +124,13 @@ impl ImeEngine {
         provider: Box<dyn crate::expander::VariableProvider>,
         extra_snippets: Vec<(String, String)>,
         scoring: crate::scoring::ScoringConfig,
-        frontend: Box<dyn crate::frontend::FrontEndHandle>,
+        frontend: Arc<dyn crate::frontend::FrontEndHandle>,
     ) -> Self {
         // Magic command entries are generated from the member registry (#asr, #flush,
         // #submit, #req, #date, #password …) — adding a command = one member, nothing
-        // here. `/`-snippets are now the empty-name snippet magic command (`#/sig`);
-        // the `#wait` async demo stays a plain matcher entry.
+        // here. `/`-snippets are now the empty-name snippet magic command (`#/sig`).
         let magic = Arc::new(MagicFamily::new());
-        let mut entries = magic.matcher_entries();
-        entries.push(("#wait".into(), "__WAIT_DEMO__".into()));
-        let matcher = crate::Matcher::new(entries);
+        let matcher = crate::Matcher::new(magic.matcher_entries());
         // 片段注册表:内置 + 配置片段;名字去掉前导 `/`(触发名 `/sig` → `sig`,
         // 调用 `#/sig`)。
         let mut snippets: Vec<(String, String)> = vec![
@@ -158,13 +146,11 @@ impl ImeEngine {
         let provider: Arc<dyn crate::expander::VariableProvider> = Arc::from(provider);
         let expander = crate::Expander::new(Arc::clone(&provider));
         // 单条 tokio I/O 线程(事件响应模型)+ 前端句柄注入。
-        let frontend: Arc<dyn crate::frontend::FrontEndHandle> = Arc::from(frontend);
         let io_thread = Arc::new(crate::io_thread::IoThread::spawn(Arc::clone(&frontend)));
         magic.set_io(Arc::clone(&io_thread), Arc::clone(&frontend));
         let engine = ImeEngine {
             dispatcher: Dispatcher::with_config(matcher, expander, Arc::clone(&magic), pinyin_weights, english_weights, scoring),
             contexts: Mutex::new(HashMap::new()),
-            async_waits: Mutex::new(HashMap::new()),
             persistence: Mutex::new(None),
             magic,
             provider,
@@ -238,7 +224,6 @@ impl ImeEngine {
 
     fn remove_ctx(&self, ctx: usize) {
         self.contexts.lock().unwrap().remove(&ctx);
-        self.async_waits.lock().unwrap().remove(&ctx);
     }
 
     // ── Multi-context API (used by fcitx5 C ABI) ────────────────────────
@@ -251,7 +236,7 @@ impl ImeEngine {
     pub fn key_ctx(&self, ctx: usize, key: KeyEvent) -> ImeView {
         self.with_ctx(ctx, |disp, pc| {
             pc.sm.context = pc.text_context.clone();
-            let mut view = pc.table.route(&mut pc.sm, key, disp);
+            let view = pc.table.route(&mut pc.sm, key, disp);
             let committed = ImeView::str_field(&view.commit_text);
             if !committed.is_empty() {
                 pc.text_context.update(committed);
@@ -262,17 +247,6 @@ impl ImeEngine {
                 if pc.sm.take_last_commit_family() != Some("english") {
                     self.learn_english_if_ascii(committed);
                 }
-            }
-            // #wait demo interceptor.
-            // FIXME: 删除 demo 代码
-            if ImeView::str_field(&view.commit_text) == "__WAIT_DEMO__" {
-                self.async_waits.lock().unwrap().insert(ctx, WaitState {
-                    trigger_time: Instant::now(),
-                    chars: vec![(0, 'a'), (1000, 'b'), (2000, 'c')],
-                });
-                view.commit_text = [0u8; 512];
-                ImeView::set_str(&mut view.preedit_text, "a");
-                view.preedit_cursor = 1;
             }
             view
         })
@@ -343,24 +317,6 @@ impl ImeEngine {
         v
     }
 
-    /// Poll async state (#wait demo). Returns (0=nothing, 1=preedit, 2=commit).
-    pub fn poll_async_ctx(&self, ctx: usize) -> (i32, ImeView) {
-        let mut waits = self.async_waits.lock().unwrap();
-        let Some(ws) = waits.get(&ctx) else { return (0, ImeView::empty()) };
-        let ms = ws.trigger_time.elapsed().as_millis() as u64;
-        let text: String = ws.chars.iter().filter(|(t,_)| *t <= ms).map(|(_,c)| *c).collect();
-        let mut v = ImeView::empty();
-        if ms > 2100 {
-            waits.remove(&ctx);
-            ImeView::set_str(&mut v.commit_text, &text);
-            (2, v)
-        } else {
-            ImeView::set_str(&mut v.preedit_text, &text);
-            v.preedit_cursor = text.len() as u32;
-            (1, v)
-        }
-    }
-
     // ── Single-context convenience API (tests / mock) ───────────────────
 
     /// Feed a [`KeyEvent`] into the default context (ctx=0) — 单上下文版的
@@ -382,11 +338,6 @@ impl ImeEngine {
     /// Select a candidate in the default context.
     pub fn select_candidate(&mut self, index: usize) -> ImeView {
         self.select_ctx(DEFAULT_CTX, index)
-    }
-
-    /// Poll async state for the default context.
-    pub fn poll_async(&self) -> (i32, ImeView) {
-        self.poll_async_ctx(DEFAULT_CTX)
     }
 
     /// Rebuild the ImeView from current state (for display after navigation).
@@ -797,7 +748,7 @@ mod tests {
             Box::new(NoVars),
             vec![("/hello".into(), "Hello, my name is $name.".into())],
             crate::scoring::ScoringConfig::default(),
-            Box::new(crate::frontend::NoopFrontend::default()),
+            Arc::new(crate::frontend::NoopFrontend::default()),
         );
         let mut e = e;
         for c in "#/hello?name=Mike".chars() { e.predict(KeyEvent::char(c)); }
@@ -1533,7 +1484,7 @@ mod tests {
             Box::new(FixedDate),
             vec![("/sig".into(), "Best regards,\nAlice\n$DATE".into())],
             crate::scoring::ScoringConfig::default(),
-            Box::new(crate::frontend::NoopFrontend::default()),
+            Arc::new(crate::frontend::NoopFrontend::default()),
         );
         let mut e = e;
         for c in "#/sig".chars() { e.predict(KeyEvent::char(c)); }
@@ -1809,7 +1760,7 @@ mod tests {
                 Box::new(crate::expander::DefaultProvider),
                 Vec::new(),
                 scoring,
-                Box::new(crate::frontend::NoopFrontend::default()),
+                Arc::new(crate::frontend::NoopFrontend::default()),
             );
             for c in "black".chars() { e.predict(KeyEvent::char(c)); }
             e.candidates_detailed().iter().find(|c| c.text == "black")
@@ -1844,7 +1795,7 @@ mod tests {
             Box::new(Recording { values: Arc::clone(&values) }),
             Vec::new(),
             crate::scoring::ScoringConfig::default(),
-            Box::new(crate::frontend::NoopFrontend::default()),
+            Arc::new(crate::frontend::NoopFrontend::default()),
         );
         e.set_variable("CLIPBOARD", "剪贴板文本");
         e.set_variable("CLIPBOARD", "更新后的文本");

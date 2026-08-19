@@ -15,7 +15,7 @@ use ime_core::ImeView;
 // ── Config ─────────────────────────────────────────────────────────────
 
 /// All configuration for the mock frontend, passed from main.rs.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MockConfig {
     pub cases: Option<String>,
     pub input: Option<String>,
@@ -31,6 +31,8 @@ pub struct MockConfig {
     pub en_dicts: Vec<String>,
     /// `#req` backend base URL — CLI override of `magic.req_base` config.
     pub req_base: Option<String>,
+    /// 前端句柄(引擎 I/O 线程推送刷新)。None → NoopFrontend。
+    pub frontend: Option<Arc<dyn ime_core::frontend::FrontEndHandle>>,
 }
 
 impl Default for MockConfig {
@@ -43,6 +45,7 @@ impl Default for MockConfig {
             commit: false, async_wait: 0,
             connect_aura: false, aura_addr: None,
             en_user_dict: None, en_dicts: Vec::new(),
+            frontend: None,
         }
     }
 }
@@ -101,7 +104,7 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<AsrBuffer>, Option<crat
         Box::new(ime_core::expander::DefaultProvider),
         snippets,
         sw_cfg.weights.to_scoring(),
-        Box::new(ime_core::frontend::NoopFrontend::default()),
+        cfg.frontend.clone().unwrap_or_else(|| Arc::new(ime_core::frontend::NoopFrontend::default())),
     );
     engine.set_page_size(sw_cfg.input.page_size);
     engine.set_context_aware(sw_cfg.input.context_aware);

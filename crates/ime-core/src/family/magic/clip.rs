@@ -22,11 +22,23 @@ pub const CLIP_HISTORY_CAP: usize = 20;
 /// 剪贴板历史命令(`#clip`)。
 pub struct ClipMember {
     resources: Arc<MagicResources>,
+    /// 已向前端请求过剪贴板历史(避免每次 predict 都发 RequestClipboard)。
+    requested: bool,
 }
 
 impl ClipMember {
     pub fn new(resources: Arc<MagicResources>) -> Self {
-        ClipMember { resources }
+        ClipMember { resources, requested: false }
+    }
+
+    /// 历史为空且未请求过 → 发 IoEvent::RequestClipboard 让前端按需取剪贴板
+    /// 历史回填;回填后 refresh_ui 触发重新预测。
+    fn ensure_history(&mut self, ctx: usize, count: u32) {
+        if self.requested { return; }
+        self.requested = true;
+        if let Some(io) = self.resources.io() {
+            io.send(crate::io_thread::IoEvent::RequestClipboard { ctx, count });
+        }
     }
 }
 
@@ -43,10 +55,18 @@ impl MagicMember for ClipMember {
         Box::new(ClipMember::new(Arc::clone(&self.resources)))
     }
 
-    fn predict(&mut self, _ctx: usize, input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
+    fn predict(&mut self, ctx: usize, input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
         let raw = input.strip_prefix("#clip").unwrap_or("");
         let args = CommandArgs::parse(raw);
+        let count = if args.path.is_empty() { 4 } else { 1 };
         let hist = self.resources.clipboard_history.lock().unwrap();
+        // 历史为空且未请求过 → 按需向前端取剪贴板历史(占位提示,回填后
+        // refresh_ui 触发重新预测)。
+        if hist.is_empty() {
+            drop(hist);
+            self.ensure_history(ctx, count);
+            return vec![Prediction::interactive("正在获取剪贴板...")];
+        }
         // 无参数:`#clip` → 展示最近 4 个 clipboard item(换行转义展示、原文提交)。
         if args.path.is_empty() {
             return hist.iter()
