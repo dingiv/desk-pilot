@@ -494,8 +494,12 @@ impl ImeEngine {
     /// Update a snippet variable's value at runtime — e.g. the fcitx5 frontend
     /// pushes clipboard changes here (via the C ABI) so `$CLIPBOARD` templates
     /// expand to the current text. Providers that don't support updates ignore it.
+    /// 剪贴板值同时累积进 `#clip` 的历史环。
     pub fn set_variable(&self, name: &str, value: &str) {
         self.provider.set(name, value);
+        if name == "CLIPBOARD" {
+            self.magic.push_clipboard(value);
+        }
     }
 
     /// Poll for changes while a live magic command (`#asr` voice anchor, `#req`
@@ -988,6 +992,47 @@ mod tests {
         assert_eq!(cands.first().map(|s| s.as_str()), Some("aura 未连接，语音不可用"), "{cands:?}");
         let v = e.predict(KeyEvent::space());
         assert!(ImeView::str_field(&v.commit_text).is_empty(), "explainer not committed");
+    }
+
+    #[test]
+    fn clip_command_outputs_history_item() {
+        // #clip/N:输出剪贴板历史倒数第 N+1 项。
+        let mk = || {
+            let e = eng();
+            e.set_variable("CLIPBOARD", "第一");
+            e.set_variable("CLIPBOARD", "第二");
+            e.set_variable("CLIPBOARD", "第三");
+            e
+        };
+
+        // #clip == #clip/0 → 倒数第一个(最近)。
+        let mut e = mk();
+        for c in "#clip".chars() { e.predict(KeyEvent::char(c)); }
+        assert_eq!(e.candidates().first().map(|s| s.as_str()), Some("第三"), "{:?}", e.candidates());
+        let v = e.predict(KeyEvent::space());
+        assert_eq!(ImeView::str_field(&v.commit_text), "第三", "选中即上屏");
+
+        // #clip/0 → 同样倒数第一个。
+        let mut e = mk();
+        for c in "#clip/0".chars() { e.predict(KeyEvent::char(c)); }
+        assert_eq!(e.candidates().first().map(|s| s.as_str()), Some("第三"));
+
+        // #clip/1 → 倒数第二个。
+        let mut e = mk();
+        for c in "#clip/1".chars() { e.predict(KeyEvent::char(c)); }
+        assert_eq!(e.candidates().first().map(|s| s.as_str()), Some("第二"));
+
+        // #clip/2 → 倒数第三个。
+        let mut e = mk();
+        for c in "#clip/2".chars() { e.predict(KeyEvent::char(c)); }
+        assert_eq!(e.candidates().first().map(|s| s.as_str()), Some("第一"));
+
+        // 历史不足 → 交互式提示(不可提交)。
+        let mut e = mk();
+        for c in "#clip/5".chars() { e.predict(KeyEvent::char(c)); }
+        assert!(e.candidates().first().map(|s| s.contains("历史不足")).unwrap_or(false), "{:?}", e.candidates());
+        let v = e.predict(KeyEvent::space());
+        assert!(ImeView::str_field(&v.commit_text).is_empty(), "不足提示不可提交");
     }
 
     #[test]

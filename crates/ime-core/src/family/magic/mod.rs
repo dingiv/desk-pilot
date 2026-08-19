@@ -10,6 +10,7 @@
 //! from this registry — adding a command is one struct + one registration, with no
 //! engine / FSM special-casing.
 
+mod clip;
 mod member;
 mod req;
 mod snippet;
@@ -18,6 +19,7 @@ mod voice;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+pub use clip::{ClipMember, CLIP_HISTORY_CAP};
 pub use member::{preview_text, CANDIDATE_PREVIEW_MAX, CommandArgs, MagicMember, Prediction};
 pub use req::{ReqFetcher, DEFAULT_REQ_BASE};
 pub use snippet::SnippetMember;
@@ -54,6 +56,9 @@ pub struct MagicResources {
     /// 片段注册表:名字(无前导 `/`)→ 模板。`#/hello?name=Mike` 的 `hello`
     /// 在此查表;`?name=Mike` 作为模板变量注入。
     pub snippets: Mutex<HashMap<String, String>>,
+    /// 剪贴板历史(最近在前,`#clip/N` 读)。由 C++ 推送当前剪贴板、引擎去重
+    /// 累积 —— fcitx5 clipboard 公开接口只给当前值。
+    pub clipboard_history: Mutex<Vec<String>>,
 }
 
 fn default_fetcher() -> Arc<dyn ReqFetcher> {
@@ -74,6 +79,7 @@ impl Default for MagicResources {
             req_base: Mutex::new(DEFAULT_REQ_BASE.to_string()),
             req_fetcher: Mutex::new(default_fetcher()),
             snippets: Mutex::new(HashMap::new()),
+            clipboard_history: Mutex::new(Vec::new()),
         }
     }
 }
@@ -148,6 +154,7 @@ impl MagicFamily {
             Arc::new(VoiceMember::new(Arc::clone(&resources))),
             Arc::new(SubmitMember::new(Arc::clone(&resources))),
             Arc::new(ReqMember::new(Arc::clone(&resources))),
+            Arc::new(ClipMember::new(Arc::clone(&resources))),
             // 片段命令:空名魔法命令(`#/hello?name=Mike`),经 `#` + `/` 路由。
             Arc::new(SnippetMember::new(Arc::clone(&resources))),
         ];
@@ -332,6 +339,18 @@ impl MagicFamily {
         for (name, tpl) in snippets {
             map.insert(name, tpl);
         }
+    }
+
+    /// 推送一条剪贴板文本到历史(最近在前,去重连续重复)。C++ 每次按键/激活
+    /// 推送当前剪贴板,`#clip/N` 读这个环。
+    pub fn push_clipboard(&self, text: &str) {
+        if text.is_empty() { return; }
+        let mut hist = self.resources.clipboard_history.lock().unwrap();
+        if hist.first().map(|s| s == text).unwrap_or(false) {
+            return; // 连续推送同一项(每次按键都会推)
+        }
+        hist.insert(0, text.to_string());
+        hist.truncate(CLIP_HISTORY_CAP);
     }
 
     /// Shared resources — member instances and the engine talk through these.

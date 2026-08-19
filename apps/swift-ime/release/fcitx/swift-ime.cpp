@@ -270,6 +270,15 @@ void SwiftImeEngine::activate(const fcitx::InputMethodEntry &entry,
     activeContexts_.insert(ic);
     if (!magicTimer_) startMagicPoll();
     swift_ime_activate(handle_, (void *)ic);
+
+    // 焦点进入即推送当前剪贴板 —— 用户从别处复制后切回,`#clip` 立刻能
+    // 取到最近项。
+    if (auto *cb = instance_->addonManager().addon("clipboard")) {
+        auto text = cb->call<fcitx::IClipboard::clipboard>(ic);
+        if (!text.empty()) {
+            swift_ime_set_clipboard(handle_, text.c_str());
+        }
+    }
 }
 
 void SwiftImeEngine::deactivate(const fcitx::InputMethodEntry &entry,
@@ -322,19 +331,13 @@ void SwiftImeEngine::keyEvent(const fcitx::InputMethodEntry &entry,
     auto *ic = keyEvent.inputContext();
     if (!ic) return;
 
-    // $CLIPBOARD support: while composing a snippet/#-command (preedit starts
-    // with '/' or '#'), push the current clipboard to the engine so the
-    // template expands with live text. The clipboard addon has no public
-    // change signal — querying per composing key is the unicodetempmode
-    // pattern (in-process addon call, microseconds) and only happens while a
-    // trigger is actually being typed.
-    auto &prev = lastViews_[ic];
-    if (prev.preedit_text[0] == '/' || prev.preedit_text[0] == '#') {
-        if (auto *cb = instance_->addonManager().addon("clipboard")) {
-            auto text = cb->call<fcitx::IClipboard::clipboard>(ic);
-            if (!text.empty()) {
-                swift_ime_set_clipboard(handle_, text.c_str());
-            }
+    // 剪贴板推送:每次按键都把当前剪贴板推给引擎 —— 既供 `$CLIPBOARD` 片段
+    // 变量解析,也累积成 `#clip/N` 的历史环(引擎侧去重,重复推送无成本)。
+    // 剪贴板 addon 无公开变化信号,逐键查询(进程内调用,微秒级)。
+    if (auto *cb = instance_->addonManager().addon("clipboard")) {
+        auto text = cb->call<fcitx::IClipboard::clipboard>(ic);
+        if (!text.empty()) {
+            swift_ime_set_clipboard(handle_, text.c_str());
         }
     }
 
