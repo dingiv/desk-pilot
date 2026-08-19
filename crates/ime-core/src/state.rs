@@ -388,7 +388,15 @@ impl StateMachine {
         view.candidate_highlight = self.candidate_highlight as u32;
         view.candidate_page = self.candidate_page as u32;
         view.candidate_page_size = self.candidate_page_size as u32;
-        ImeView::set_str(&mut view.aux_up, &self.preedit);
+        // aux_up(候选框顶部)= **原始输入**(你打了什么),与 preedit_text(应用
+        // 高亮,将提交的合成结果)严格区分。命令态显示 `#asr`,拼音态显示
+        // 正在打的拼音(raw_buffer,保留大小写)。
+        let raw = match self.state {
+            ComposeState::Snippet => self.buffer.clone(),
+            ComposeState::Pinyin => self.raw_buffer.clone(),
+            ComposeState::Idle => String::new(),
+        };
+        ImeView::set_str(&mut view.aux_up, &raw);
     }
 
     /// Build a view from the current state (no key processed). Used by the state

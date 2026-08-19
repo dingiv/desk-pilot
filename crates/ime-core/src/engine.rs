@@ -822,6 +822,24 @@ mod tests {
     }
 
     #[test]
+    fn aux_up_shows_raw_input_distinct_from_result_preedit() {
+        // 严格区分:候选框顶部 aux_up = 原始输入(#asr);应用高亮 preedit_text =
+        // 合成结果(首条预测)。二者不同。
+        use std::sync::Arc;
+        use crate::asr_buffer::AsrBuffer;
+        let mut e = eng();
+        let buf = Arc::new(AsrBuffer::new());
+        buf.set_connected(true);
+        buf.push_final("语音结果");
+        e.set_asr_buffer(Arc::clone(&buf));
+        let mut v = ImeView::empty();
+        for c in "#asr".chars() { v = e.predict(KeyEvent::char(c)); }
+        assert_eq!(ImeView::str_field(&v.aux_up), "#asr", "panel top = raw input");
+        assert_eq!(ImeView::str_field(&v.preedit_text), "语音结果", "app highlight = result");
+        assert_ne!(ImeView::str_field(&v.aux_up), ImeView::str_field(&v.preedit_text));
+    }
+
+    #[test]
     fn asr_placeholder_when_no_voice_data() {
         // 连接但暂无语音 → 占位预测(选中不上屏)。
         use std::sync::Arc;

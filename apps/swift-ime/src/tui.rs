@@ -171,8 +171,18 @@ fn render(
 }
 
 fn render_preedit(f: &mut Frame, area: Rect, view: &ImeView) {
-    let preedit = ImeView::str_field(&view.preedit_text);
-    let p = Paragraph::new(if preedit.is_empty() { " ".into() } else { preedit.to_string() })
+    // 严格区分:aux_up = 原始输入(你打了什么);preedit_text = 合成结果(将提交)。
+    let raw = ImeView::str_field(&view.aux_up);
+    let result = ImeView::str_field(&view.preedit_text);
+    let mut spans: Vec<Span> = Vec::new();
+    if !raw.is_empty() {
+        spans.push(Span::styled(format!("输入: {raw} "), Style::new().fg(Color::DarkGray)));
+    }
+    if !result.is_empty() && result != raw {
+        spans.push(Span::styled(format!("→ 提交: {result}"), Style::new().fg(Color::Cyan)));
+    }
+    let text = if spans.is_empty() { " ".into() } else { Line::from(spans) };
+    let p = Paragraph::new(text)
         .block(Block::new().borders(Borders::ALL).title("Input"));
     f.render_widget(p, area);
 }
