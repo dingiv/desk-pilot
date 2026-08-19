@@ -231,7 +231,11 @@ impl ImeEngine {
                 pc.text_context.update(committed);
                 // Record bigram: prev_word → committed_word (both SQLite + in-memory).
                 self.dispatcher.record_commit(committed);
-                self.learn_english_if_ascii(committed);
+                // 提交来源是英文候选 → 已是在词典中的词,不学成自生词
+                // (空格/数字提交英文候选的陈旧 bug)。
+                if pc.sm.take_last_commit_family() != Some("english") {
+                    self.learn_english_if_ascii(committed);
+                }
             }
             // #wait demo interceptor.
             // FIXME: 删除 demo 代码
@@ -271,7 +275,10 @@ impl ImeEngine {
             if !committed.is_empty() {
                 pc.text_context.update(committed);
                 self.dispatcher.record_commit(committed);
-                self.learn_english_if_ascii(committed);
+                // 英文候选提交 → 不学成自生词(空格/数字提交的陈旧 bug)。
+                if pc.sm.take_last_commit_family() != Some("english") {
+                    self.learn_english_if_ascii(committed);
+                }
             }
             // 路由之外的 sm 变更 —— 状态机表重新同步。
             pc.table.sync_from(&pc.sm);
@@ -371,9 +378,9 @@ impl ImeEngine {
                     ImeView::set_str(&mut v.candidates[i].text, c);
                     // 调试模式:meta 与 fill_view 对齐。
                     if pc.sm.candidate_meta_enabled {
-                        if let Some((score, fam, src)) = pc.sm.last_meta().get(i) {
+                        if let Some(m) = pc.sm.last_meta().get(i) {
                             ImeView::set_str(&mut v.candidates[i].meta,
-                                &format!("[{score:.3} {fam}/{src}]"));
+                                &format!("[{:.3} {}/{}]", m.score, m.family, m.source));
                         }
                     }
                 }
@@ -629,6 +636,60 @@ mod tests {
         let idx = cands.iter().position(|c| c == "english").expect("english candidate");
         let v = e.select_candidate(idx);
         assert_eq!(ImeView::str_field(&v.commit_text), "english");
+    }
+
+    /// 提交后的候选来源助手:重打一遍,查该词现在的来源。
+    fn source_of(e: &mut ImeEngine, word: &str) -> &'static str {
+        for c in word.chars() { e.predict(KeyEvent::char(c)); }
+        e.candidates_detailed()
+            .into_iter()
+            .find(|d| d.text == word)
+            .map(|d| d.source)
+            .unwrap_or("")
+    }
+
+    #[test]
+    fn committing_english_dict_word_does_not_learn_it_as_user() {
+        // 陈年 bug:空格/数字提交英文词典候选 → 词变成 english/user(不该)。
+        // 提交来源是英文候选时,不学成自生词。
+        let mut e = eng();
+        for c in "world".chars() { e.predict(KeyEvent::char(c)); }
+        assert_eq!(
+            e.candidates_detailed().iter().find(|d| d.text == "world").unwrap().source,
+            "exact",
+            "world is a dict word",
+        );
+
+        e.predict(KeyEvent::space()); // 空格提交高亮(english/exact)→ 缓冲 reset
+
+        // 重新输入:仍是 dict 词,未学成 user。
+        for c in "world".chars() { e.predict(KeyEvent::char(c)); }
+        assert_eq!(
+            e.candidates_detailed().iter().find(|d| d.text == "world").unwrap().source,
+            "exact",
+            "space-commit must not learn a dict word",
+        );
+
+        // 数字选中英文候选同样不学。
+        let mut e2 = eng();
+        for c in "world".chars() { e2.predict(KeyEvent::char(c)); }
+        let idx = e2.candidates().iter().position(|c| c == "world").unwrap();
+        e2.select_candidate(idx);
+        for c in "world".chars() { e2.predict(KeyEvent::char(c)); }
+        assert_eq!(
+            e2.candidates_detailed().iter().find(|d| d.text == "world").unwrap().source,
+            "exact",
+            "digit-select must not learn a dict word",
+        );
+    }
+
+    #[test]
+    fn enter_raw_commit_still_learns_english_word() {
+        // Enter 强选 raw(自生词手势)仍学入 user 层。
+        let mut e = eng();
+        for c in "cd".chars() { e.predict(KeyEvent::char(c)); }
+        e.predict(KeyEvent::enter()); // raw commit "cd"
+        assert_eq!(source_of(&mut e, "cd"), "user", "raw Enter learns the word");
     }
 
     #[test]

@@ -81,13 +81,32 @@ pub struct StateMachine {
     pub candidate_meta_enabled: bool,
     /// 最近一次排名的详细结果(score, family, source)——与 candidates 对齐,
     /// 供 fill_view 填充 meta。
-    last_meta: Vec<(f64, &'static str, &'static str)>,
+    last_meta: Vec<CandMeta>,
+    /// 最近一次提交的候选家族(select 时从候选元数据取)。引擎提交点据此
+    /// 判断:提交的是英文候选(来源 english)则不再学成自生词。
+    pub(crate) last_commit_family: Option<&'static str>,
+}
+
+/// 一个候选词 + 它的元数据(来源家族/成员 + 权重)。调试 meta 与
+/// "提交来源判断"(英文候选不再学成自生词)共用。
+#[derive(Debug, Clone)]
+pub(crate) struct CandMeta {
+    pub text: String,
+    pub score: f64,
+    pub family: &'static str,
+    pub source: &'static str,
 }
 
 impl StateMachine {
-    /// 最近一次排名的 (score, family, source)(engine.view 的调试视图用)。
-    pub fn last_meta(&self) -> &[(f64, &'static str, &'static str)] {
+    /// 最近一次排名的候选元数据(含文本,engine.view 的调试视图用)。
+    pub(crate) fn last_meta(&self) -> &[CandMeta] {
         &self.last_meta
+    }
+
+    /// 取走并清空最近一次提交的候选家族(one-shot,引擎提交点读后置空,
+    /// 避免残留在后续 raw 提交上)。
+    pub(crate) fn take_last_commit_family(&mut self) -> Option<&'static str> {
+        self.last_commit_family.take()
     }
 }
 
@@ -297,7 +316,12 @@ impl StateMachine {
                 env.learn_composed_phrase(&full_pinyin, &final_text);
             }
             self.context.update(&final_text);
+            // 记录提交候选的来源家族(供引擎判断是否学成自生词 —— 英文候选不学)。
+            let commit_family = self.last_meta.iter()
+                .find(|m| m.text == picked)
+                .map(|m| m.family);
             self.reset();
+            self.last_commit_family = commit_family;
             Self::commit_view(&final_text)
         } else {
             // Partial commit: append this single character, shrink buffer.
@@ -339,6 +363,9 @@ impl StateMachine {
         self.magic_hints.clear();
         self.magic_predictions.clear();
         self.magic_selectable = false;
+        // last_commit_family 在 select 之后(重置之后)设置,由引擎取走;此处
+        // 清掉以防残留。select 内部会先 reset 再设,不受影响。
+        self.last_commit_family = None;
     }
 
     /// Is the candidate panel OPEN (non-empty candidate list)? Navigation/paging special keys
@@ -378,8 +405,8 @@ impl StateMachine {
             }
             // 调试模式:候选词后附提供者与权重。
             if self.candidate_meta_enabled {
-                if let Some((score, fam, src)) = self.last_meta.get(i) {
-                    let meta = format!("[{score:.3} {fam}/{src}]");
+                if let Some(m) = self.last_meta.get(i) {
+                    let meta = format!("[{:.3} {}/{}]", m.score, m.family, m.source);
                     ImeView::set_str(&mut view.candidates[i].meta, &meta);
                 }
             }
@@ -530,8 +557,14 @@ impl StateMachine {
         // Unified scorer: collects candidates from all enabled families,
         // ranks them by weighted score, returns deduplicated text list.
         let ranked = env.scorer().rank_detailed(&self.buffer, &self.context);
+        // 候选词自带元数据(来源家族/成员 + 权重)—— 调试 meta 与提交来源判断共用。
         self.last_meta = ranked.iter()
-            .map(|c| (c.score, c.family, c.source))
+            .map(|c| CandMeta {
+                text: c.text.clone(),
+                score: c.score,
+                family: c.family,
+                source: c.source,
+            })
             .collect();
         let cands: Vec<String> = ranked.into_iter().map(|c| c.text).collect();
 

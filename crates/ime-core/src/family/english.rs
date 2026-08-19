@@ -227,6 +227,9 @@ impl EnglishFamily {
     /// 学习一个英文自生词:Enter 强制提交 raw 文本(如 cd)时调用。
     /// 内存进 user 层(exact 0.88 × priority 70 ≈ 0.62,压过 emoji 前缀与
     /// 中文简拼)+ SQLite en_user 表持久化。
+    ///
+    /// **是否该学由提交点的候选来源决定**(引擎侧):空格/数字提交英文候选
+    /// (来源 exact/prefix/user)不调这里;只有 raw 提交(Enter 强选)才学。
     pub fn record_learned_word(&self, word: &str) {
         if word.is_empty() || !word.chars().all(|c| c.is_ascii_alphanumeric()) {
             return;
@@ -598,4 +601,5 @@ mod tests {
         let c = cands.iter().find(|x| x.text == "cd").expect("learned cd surfaces");
         assert_eq!(c.raw_score, 0.88, "learned short word keeps full weight");
     }
+
 }
