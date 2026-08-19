@@ -1,5 +1,5 @@
 //! onnx — the single ONNX-runtime owner for Stage1 (ONNX ecosystem side of the dual-runtime
-//! architecture, see docs/aura/runtime-selection.md). All ONNX models — VAD (Silero), ASR (SenseVoice),
+//! architecture, see docs/aura/architecture.md). All ONNX models — VAD (Silero), ASR (SenseVoice),
 //! and future streaming ASR / TTS — are loaded, warmed, and owned by [`OnnxRuntimeManager`],
 //! which holds them through the OFFICIAL `sherpa-onnx` crate (one onnxruntime instance for all).
 //!

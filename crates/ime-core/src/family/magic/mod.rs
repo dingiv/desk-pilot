@@ -18,7 +18,7 @@ mod voice;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-pub use member::{is_arg_char, preview_text, CANDIDATE_PREVIEW_MAX, CommandArgs, MagicMember, MemberAction};
+pub use member::{is_arg_char, preview_text, CANDIDATE_PREVIEW_MAX, CommandArgs, MagicMember, Prediction};
 pub use req::{ReqFetcher, DEFAULT_REQ_BASE};
 pub use snippet::SnippetMember;
 pub use voice::{SubmitMember, VoiceMember};
@@ -76,6 +76,28 @@ impl Default for MagicResources {
             snippets: Mutex::new(HashMap::new()),
         }
     }
+}
+
+/// 精确匹配到的命令(供状态机 spawn / 展开)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MagicCommand {
+    /// 静态命令(无实例,直接展开)。
+    Static,
+    /// live 命令:token 用于 spawn 实例。
+    Live { token: &'static str, name: &'static str },
+}
+
+/// 输入匹配结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MagicMatch {
+    /// 精确匹配某命令(可带参数,如 `#asr?num=2`)。
+    Exact(MagicCommand),
+    /// 输入是某命令触发串的严格前缀 → 补全提示(选中改写输入)。
+    Prefix(Vec<String>),
+    /// 片段命令(`#/…`)精确匹配。
+    Snippet,
+    /// 无匹配。
+    Unknown,
 }
 
 /// A static command: fixed expansion text, no interactive session. The expansion
@@ -182,36 +204,97 @@ impl MagicFamily {
         Some(self.members[idx].spawn())
     }
 
-    /// All magic commands whose trigger is a strict extension of `prefix` — the prediction
-    /// hints shown while typing `#…`. Live members carry their activation token (Space on the
-    /// hint completes INTO the command's Magic mode); static commands carry `None` (Space
-    /// resolves their expansion instead). The raw buffer stays a rollback candidate.
-    pub fn hints(&self, prefix: &str) -> Vec<(String, Option<&'static str>)> {
+    /// All magic commands whose trigger is a strict extension of `prefix` — the completion
+    /// hints shown while typing `#…`. Selecting a hint rewrites the input to that trigger.
+    /// The raw buffer stays a rollback candidate.
+    pub fn hints(&self, prefix: &str) -> Vec<String> {
         if prefix.is_empty() || !prefix.starts_with('#') {
             return Vec::new();
         }
         let mut out = Vec::new();
         for s in &self.statics {
             if s.trigger.starts_with(prefix) && s.trigger != prefix {
-                out.push((s.trigger.to_string(), None));
+                out.push(s.trigger.to_string());
             }
         }
         for m in &self.members {
-            if let Some(token) = m.activation_token() {
-                if m.name().is_empty() { continue; } // 片段命令不作为 `#…` 提示
-                let t = format!("#{}", m.name());
-                if t.starts_with(prefix) && t != prefix {
-                    out.push((t.clone(), Some(token)));
-                }
-                for alias in m.aliases() {
-                    let ta = format!("#{alias}");
-                    if ta.starts_with(prefix) && ta != prefix {
-                        out.push((ta.clone(), Some(token)));
-                    }
+            if m.name().is_empty() { continue; } // 片段命令不作为 `#…` 提示
+            let t = format!("#{}", m.name());
+            if t.starts_with(prefix) && t != prefix {
+                out.push(t.clone());
+            }
+            for alias in m.aliases() {
+                let ta = format!("#{alias}");
+                if ta.starts_with(prefix) && ta != prefix {
+                    out.push(ta.clone());
                 }
             }
         }
         out
+    }
+
+    /// 输入 → 匹配结果。名字段 = `#` + 字母数字(遇 `/` 或 `?` 截止);找最长
+    /// **精确**命令。见 [`MagicMatch`]。
+    pub fn match_command(&self, input: &str) -> MagicMatch {
+        // 片段命令:`#/hello?name=Mike` → 空名命令。
+        if input.starts_with("#/") {
+            return MagicMatch::Snippet;
+        }
+        if input.len() < 2 || !input.starts_with('#') {
+            return MagicMatch::Unknown;
+        }
+        // 名字段:`#` + 字母数字;遇 `/`/`?` 或非字母数字截止。
+        let rest = &input[1..];
+        let name_len = rest.chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .count();
+        if name_len == 0 {
+            return MagicMatch::Unknown;
+        }
+        let name = &rest[..name_len];
+        // 名字段之后必须是 `/`、`?` 或空(否则是别的命令的前缀 / 未知)。
+        let name_is_exact = name_len == rest.len()
+            || rest[name_len..].starts_with('/')
+            || rest[name_len..].starts_with('?');
+
+        if name_is_exact {
+            // 精确:先 live 成员(含 alias),后静态。
+            for m in &self.members {
+                if m.name() == name || m.aliases().iter().any(|a| *a == name) {
+                    if let Some(token) = m.activation_token() {
+                        return MagicMatch::Exact(MagicCommand::Live { token, name: m.name() });
+                    }
+                }
+            }
+            if self.statics.iter().any(|s| s.trigger == format!("#{name}")) {
+                return MagicMatch::Exact(MagicCommand::Static);
+            }
+        }
+
+        // 前缀:输入(整个)是某命令触发串的严格前缀。
+        let mut hints = Vec::new();
+        for s in &self.statics {
+            if s.trigger.starts_with(input) && s.trigger != input {
+                hints.push(s.trigger.to_string());
+            }
+        }
+        for m in &self.members {
+            if m.name().is_empty() { continue; }
+            let t = format!("#{}", m.name());
+            if t.starts_with(input) && t != input {
+                hints.push(t.clone());
+            }
+            for alias in m.aliases() {
+                let ta = format!("#{alias}");
+                if ta.starts_with(input) && ta != input {
+                    hints.push(ta.clone());
+                }
+            }
+        }
+        if !hints.is_empty() {
+            return MagicMatch::Prefix(hints);
+        }
+        MagicMatch::Unknown
     }
 
     /// Static expansion text for a full trigger (e.g. `#date` → today's date).

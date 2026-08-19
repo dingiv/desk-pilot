@@ -4,27 +4,29 @@
 
 ## ✅ 已完成
 
-- [x] crate 合并（aura-core + aura-dcl + aura-store → 一个 aura-core）
-- [x] dp-models Provider 抽象（AsrProvider/LlmProvider/VlmProvider + Http* remote）
-- [x] daemon asr_kind/llm_kind local/remote 配置切换（aura.yaml）
-- [x] Stage2 简化：纯文本输出（无 JSON）、PromptBuilder 精简、模型换 Qwen2.5-3B-Instruct
+- [x] crate 合并（aura-core + aura-dcl + aura-store + aura-asr + aura-tts → 一个 aura-core）
+- [x] **边界范式**（2026-08-17）：VadSegment/VadWindow 一等实体 + append-only 事件
+  （Batch/WindowEdge），替代旧 Utterance/MergeBatch"就地修改"契约；PCM 由 AudioStore
+  按 id 持有，batch 失败显式 Option。
+- [x] **5 事件数据面协议**（2026-08-18）：stream_fragment / batch_segment / batch_window /
+  segment_calibration / window_calibration + correction；aura-core/agent/daemon/swift-ime/
+  geek-familiar 已切换，devtools 待迁。
+- [x] dp-models 通用模型提供库：ModelProvider 伞形 trait + Asr/Llm/Vlm 能力 trait +
+  MistralLlm（mistralrs 迁入）/ OnnxAsr / Http*（远程）。aura-core 默认构建不再编译
+  GPU/LLM 重依赖。
+- [x] daemon asr/llm local/remote/disable 配置切换（aura.yaml，未知键拒绝）
+- [x] **能量门**（2026-08-19）：空闲跳过 VAD/流式 NN + 修 x-asr 静音幻觉 + 挂机 PCM 泄漏
+- [x] 流式引擎第二选项 **x-asr**（自带标点；tokens.txt 官方两列格式）
+- [x] 模型瘦身：assets/models 26GB → 12GB（删孤儿；本地批式只留 sensevoice，whisper/
+  qwen3-asr 本地分支已删）
+- [x] Stage2 简化：纯文本输出、PromptBuilder 精简、`llm.input` 纠偏源（batch/stream/both）
 - [x] ContextWindow 禁用（3B 复读问题）
-- [x] 用户纠偏：POST /api/correct → CorrectionStore → Stage2 corrections 段注入
-- [x] Web UI 编辑纠正（UtteranceList inline edit + SSE correction event）
-- [x] Qwen3-ASR strip_qwen3_markers（修标记泄漏）
-- [x] Ring 空超时 → 喂静音帧触发 VAD EOS（修 batch 不触发 bug）
-- [x] ASR 后端：SenseVoice/Whisper/Qwen3-ASR（onnx）+ remote HttpAsr
-- [x] aura.json → aura.yaml（YAML 支持注释）
+- [x] 用户纠偏：POST /api/correct → Stage2 corrections 段注入 + Web UI 编辑
+- [x] edge_margin 段边界扩展（0.3s）——修句首/尾掉字
+- [x] 停顿碎片化解决：min_silence(切段) 与 merge_gap(合并窗口) 解耦 + 窗口级 batch 重跑
+- [x] 音频持久化：recordings WAV（按日期）+ turns jsonl + 保留期清理（retention_days）
+- [x] aura.json → aura.yaml（支持注释）
 - [x] assets/ 统一（models + sherpa + cudnn + lib）
-- [x] **段合并 SegmentMerger**（原 R2）——min_silence(1s 切段) 与 merge_gap(2.5s 合并上界)
-  解耦；碎片吸收后重跑批式、同一 seq 就地更新；≥merge_gap 定稿 MergeBatch。有单测。
-- [x] **edge_margin 段边界扩展**（0.3s）——修合并句"开头/结尾掉字"（Silero 段边界=
-  threshold 交叉而非语音边界）。
-- [x] **碎片焦虑消除**（原 R3"延迟显示"，以更优方案落地）——不做延迟，而是
-  CalibratedInterim 同 seq 就地更新 + 勤快 Stage2（说话中每 1s 校准一次流式 partial），
-  UI 看到一句持续生长的句子。
-- [x] 音频持久化：recordings WAV（按日期）+ turns jsonl 日志 + 热层 ring + 保留期清理
-  （retention_days，启动重建索引）。
 
 ## 🔴 近期
 

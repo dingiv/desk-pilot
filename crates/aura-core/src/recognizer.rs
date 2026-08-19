@@ -4,7 +4,7 @@
 //! [`Stage1Event`]s — it does NOT touch files or run Stage2 (that's `pipeline`'s job,
 //! `audio_aura_core::Pipeline`).
 //!
-//! Boundary paradigm (docs/aura/vad-segment-model.md): the VAD gap (`min_silence`) closes a
+//! Boundary paradigm (docs/aura/stages.md): the VAD gap (`min_silence`) closes a
 //! [`VadSegment`] (its own streaming session per D1 + one batch pass, packed as a `Batch`
 //! event); the merge window (`merge_gap`) closes a [`VadWindow`] (concatenated PCM re-run
 //! through the batch model, packed as a `WindowEdge` event). PCM lives in the

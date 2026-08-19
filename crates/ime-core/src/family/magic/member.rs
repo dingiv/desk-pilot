@@ -1,32 +1,44 @@
 //! MagicMember — one magic command (a Member of the Magic family).
 //!
-//! `#asr`, `#req`, `#date` … are all members of [`MagicFamily`]. A **live** member
-//! owns an interactive session: after its trigger completes, the FSM enters
-//! [`ComposeState::Magic`] and routes keys + async ticks to the spawned member
-//! instance. A **static** member never activates — it resolves to a fixed
-//! expansion text inline.
+//! `#asr`, `#req`, `#date`, `#/hello` … are all members of [`MagicFamily`]. In the
+//! **prediction model**, a member is a prediction provider: when the user input
+//! exactly matches a command (with optional args), the FSM asks it for prediction
+//! options via [`MagicMember::predict`]; the options appear in the candidate list
+//! (front), the raw trigger is the last rollback. Selecting a prediction commits
+//! it to screen unless it's **interactive** — interactive options are handed back
+//! to the member via [`MagicMember::pick`], which advances the interaction and the
+//! FSM re-queries `predict` (e.g. `#req` fires the request, then shows the body).
 //!
 //! ## Adding a command
 //! Implement [`MagicMember`] and register it in [`MagicFamily::new`] — matcher
 //! entries, prediction hints and activation dispatch are all generated from the
 //! registry. No engine / FSM special-casing needed.
 
-use crate::platform::ImeView;
 use crate::state::{StateMachine, StepEnv};
 
-/// Result of feeding one key to the active live member.
-#[derive(Debug)]
-pub enum MemberAction {
-    /// The member consumed the key — show this view and stay active.
-    /// Boxed: [`ImeView`] is ~3.5 KB(repr(C) 候选槽数组),裸存会把每个
-    /// 瞬态 MemberAction(包括 24 字节的 Commit/Exit)都撑到同尺寸。
-    View(Box<ImeView>),
-    /// The member is done — commit this text and return to Idle.
-    Commit(String),
-    /// Commit with the application caret at a byte offset (snippet `$CURSOR`).
-    CommitAt(String, usize),
-    /// The member is done — exit without committing (cancel).
-    Exit,
+/// 命令的一条预测选项。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prediction {
+    pub text: String,
+    /// 交互式:选中不上屏,结果传给命令重新预测(替换选项);
+    /// false = 选中即上屏。
+    pub interactive: bool,
+    /// 上屏时光标落点(字节偏移,`$CURSOR` 片段用);None = 末尾。
+    pub cursor: Option<usize>,
+}
+
+impl Prediction {
+    pub fn commit(text: impl Into<String>) -> Self {
+        Prediction { text: text.into(), interactive: false, cursor: None }
+    }
+
+    pub fn interactive(text: impl Into<String>) -> Self {
+        Prediction { text: text.into(), interactive: true, cursor: None }
+    }
+
+    pub fn with_cursor(text: impl Into<String>, cursor: usize) -> Self {
+        Prediction { text: text.into(), interactive: false, cursor: Some(cursor) }
+    }
 }
 
 // ── Command arguments:路径参数(/path)与查询参数(?query)───────────────
@@ -93,17 +105,14 @@ pub fn is_arg_char(c: char) -> bool {
     c == '/' || c == '?' || c.is_ascii_alphanumeric() || "=&_-.%~".contains(c)
 }
 
-/// A single magic command.
+/// A single magic command — a prediction provider.
 pub trait MagicMember: Send + Sync {
-    /// Command name, also the trigger suffix (e.g. "asr" → "#asr").
+    /// Command name, also the trigger suffix (e.g. "asr" → "#asr"). Empty for the
+    /// snippet command (`#/…`).
     fn name(&self) -> &'static str;
 
-    /// Short description shown in the prediction hint.
-    fn description(&self) -> &'static str;
-
-    /// Matcher activation token (e.g. "__ASR_BUFFER__"). When the user completes
-    /// the trigger, the FSM looks this token up in the registry and spawns a
-    /// fresh instance. `None` = not a live command.
+    /// Matcher activation token (e.g. "__ASR_BUFFER__"). The FSM spawns a fresh
+    /// instance on exact match. `None` = not a live command.
     fn activation_token(&self) -> Option<&'static str> {
         None
     }
@@ -114,30 +123,36 @@ pub trait MagicMember: Send + Sync {
     }
 
     /// Fresh per-context instance. Each activation gets its own — a member holds
-    /// per-session state (typed suffix, last-seen version, …); shared resources
-    /// live behind `Arc`s.
+    /// per-session state (req's async status, …); shared resources live behind
+    /// `Arc`s.
     fn spawn(&self) -> Box<dyn MagicMember>;
 
-    /// Enter the command: build the initial candidates / preedit into `sm`.
-    fn activate(&mut self, sm: &mut StateMachine, env: &dyn StepEnv) -> ImeView;
+    /// 精确匹配(含参数)时的预测选项(不含 rollback)。`input` 是完整输入
+    /// (如 `#asr?num=2`)。返回空 = 无预测(只剩 rollback)。
+    fn predict(&mut self, input: &str, env: &dyn StepEnv) -> Vec<Prediction>;
 
-    /// One key while this member is active.
-    fn on_key(&mut self, sm: &mut StateMachine, ch: char, env: &dyn StepEnv) -> MemberAction;
+    /// 用户选中了第 `index` 个**交互式**预测。成员更新内部状态后,调用方
+    /// 重新查询 `predict` 替换选项(不上屏)。非交互预测不经过这里。
+    fn pick(
+        &mut self,
+        index: usize,
+        text: &str,
+        sm: &mut StateMachine,
+        env: &dyn StepEnv,
+    ) {
+        let _ = (index, text, sm, env); // 默认:无交互副作用
+    }
 
-    /// Async refresh — called by the engine's tick loop (TUI render / fcitx5
-    /// timer). Return `Some(view)` if the member rebuilt the candidate view.
-    fn tick(&mut self, sm: &mut StateMachine, env: &dyn StepEnv) -> Option<ImeView>;
+    /// 异步刷新预测(live 成员:voice 版本 / req 结果落地)。返回 `Some(新预测)`
+    /// 表示候选变了,调用方据此更新;`None` = 没变。
+    fn tick(&mut self, sm: &mut StateMachine, env: &dyn StepEnv) -> Option<Vec<Prediction>> {
+        let _ = (sm, env);
+        None
+    }
 
     /// The member session ended (commit / cancel / reset). In-flight background
     /// work keeps running via shared `Arc`s — nothing to cancel by default.
     fn deactivate(&mut self) {}
-
-    /// Full (un-truncated) texts of the current candidates, for display paths
-    /// that want the commit-able text (TUI detailed view). Default: the previews
-    /// currently in `sm.candidates`.
-    fn candidate_texts(&self, sm: &StateMachine) -> Vec<String> {
-        sm.candidates.clone()
-    }
 }
 
 // ── Shared display helpers ───────────────────────────────────────────────

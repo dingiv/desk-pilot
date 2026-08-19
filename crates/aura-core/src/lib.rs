@@ -33,7 +33,7 @@ pub use prompt::PromptBuilder;
 pub use hub::{FinalTurn, Storage, TurnRecord};
 
 // ── Stage1 → Stage2 data contract · 边界范式（VadSegment / VadWindow）──────────────
-// 设计: docs/aura/vad-segment-model.md（2026-08-17 重构,替代旧的 Utterance/Stage1Action
+// 设计: docs/aura/stages.md（2026-08-17 重构,替代旧的 Utterance/Stage1Action
 // "就地修改"契约;自 aura-asr 并入,2026-08-18）。两个时间参数切出两级实体:
 //   · VAD 间隔 (vad.min_silence)  → VadSegment  原子录音片段(段级流式会话 + 段级 batch)
 //   · merge 窗口 (vad.merge_gap)  → VadWindow   多段组合(定稿单位,拼接 PCM 重跑 batch)

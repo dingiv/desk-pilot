@@ -97,15 +97,17 @@ fn main() {
         };
         build_mock_audio_dir(&resolved_dir)
     } else {
-        build_real(args.audio_only, args.audio_quantum)
+        build_real(args.enable_video, args.enable_audio, args.audio_quantum)
     };
 
     let mode = if args.mock_audio.is_some() && args.mock.is_none() {
         " [MOCK-AUDIO]"
-    } else if args.audio_only {
+    } else if !args.enable_video {
         " (audio-only)"
     } else if args.mock.is_some() {
         " [MOCK]"
+    } else if !args.enable_audio {
+        " (video-only)"
     } else {
         ""
     };
@@ -142,10 +144,15 @@ fn build_mock_audio_dir(dir: &str) -> (Arc<Mutex<ScreenBox>>, Option<AudioArc>) 
     (src, audio)
 }
 
-/// Real PipeWire sources: ScreenCast portal (may prompt to pick a screen) + mic.
-/// Mic is best-effort: a missing/broken mic degrades to screen-only.
+/// Real PipeWire sources: ScreenCast portal (may prompt to pick a screen) + mic, 各自独立开关。
+/// `enable_video=false` → 跳过 portal(零 GPU), 屏用 stub; `enable_audio=false` → 不初始化 mic
+/// (`/audio` 503)。纯音频模式(无视频)下 mic 必须——失败即 exit;有视频则降级 screen-only。
 /// `audio_quantum` = samples per captured buffer (`node.quantum`); default 1024 @ 16 kHz = 64 ms.
-fn build_real(audio_only: bool, audio_quantum: u32) -> (Arc<Mutex<ScreenBox>>, Option<AudioArc>) {
+fn build_real(
+    enable_video: bool,
+    enable_audio: bool,
+    audio_quantum: u32,
+) -> (Arc<Mutex<ScreenBox>>, Option<AudioArc>) {
     let new_mic = || -> Option<AudioArc> {
         match PipeWireAudioSource::new(audio_quantum) {
             Ok(a) => {
@@ -158,32 +165,42 @@ fn build_real(audio_only: bool, audio_quantum: u32) -> (Arc<Mutex<ScreenBox>>, O
             }
         }
     };
-    if audio_only {
-        info!("audio-only mode — skipping ScreenCast portal");
-        let audio = match new_mic() {
-            Some(a) => Some(a),
-            None => {
-                error!("mic source unavailable (audio-only mode)");
+    let src: Arc<Mutex<ScreenBox>> = if !enable_video {
+        info!("video disabled — skipping ScreenCast portal");
+        Arc::new(Mutex::new(Box::new(scout_drivers::mock::MockCaptureSource::solid(1, 1, 0, 0, 0))))
+    } else {
+        info!("negotiating PipeWire ScreenCast session (the portal may prompt to pick a screen)…");
+        let pw = match PipeWireSource::new() {
+            Ok(s) => s,
+            Err(e) => {
+                error!(error = %e, "capture session failed");
                 std::process::exit(2);
             }
         };
-        return (Arc::new(Mutex::new(Box::new(scout_drivers::mock::MockCaptureSource::solid(1, 1, 0, 0, 0)))), audio);
-    }
-    info!("negotiating PipeWire ScreenCast session (the portal may prompt to pick a screen)…");
-    let pw = match PipeWireSource::new() {
-        Ok(s) => s,
-        Err(e) => {
-            error!(error = %e, "capture session failed");
-            std::process::exit(2);
+        match pw.size() {
+            Some((w, h)) => info!(w, h, "stream size"),
+            None => info!("size unknown yet (learned on the first frame)"),
         }
+        Arc::new(Mutex::new(Box::new(pw)))
     };
-    match pw.size() {
-        Some((w, h)) => info!(w, h, "stream size"),
-        None => info!("size unknown yet (learned on the first frame)"),
-    }
-    let src: Arc<Mutex<ScreenBox>> = Arc::new(Mutex::new(Box::new(pw)));
-
-    (src, new_mic())
+    let audio: Option<AudioArc> = if enable_audio {
+        match new_mic() {
+            Some(a) => Some(a),
+            None => {
+                // 纯音频模式(视频禁用)下麦克风必须;有视频则降级 screen-only。
+                if !enable_video {
+                    error!("mic source unavailable (audio-only mode)");
+                    std::process::exit(2);
+                }
+                warn!("mic unavailable — screen-only mode");
+                None
+            }
+        }
+    } else {
+        info!("audio disabled");
+        None
+    };
+    (src, audio)
 }
 
 /// File-backed mock sources (no portal, no mic): decode a media file to BGRA
@@ -270,7 +287,10 @@ fn acquire_singleton_lock() {
 struct ScoutConf {
     host: Option<String>,
     port: Option<u16>,
-    audio_only: Option<bool>,
+    /// 捕获屏(视频)开关, 默认 true。false = 跳过 ScreenCast portal(零 GPU), 屏用 stub。
+    enable_video: Option<bool>,
+    /// 捕获麦克风(音频)开关, 默认 true。false = 不初始化 mic, `/audio` 返回 503。
+    enable_audio: Option<bool>,
     /// PipeWire capture quantum (samples per buffer, `node.quantum`). Larger = fewer, bigger
     /// `process` callbacks → lower push frequency upstream. Default 1024 @ 16 kHz = 64 ms.
     audio_quantum: Option<u32>,
@@ -332,9 +352,12 @@ struct Cli {
     /// one). With no arg, defaults to the `assets/mock-audio` dir.
     #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "mock-audio")]
     mock_audio: Option<String>,
-    /// Only capture mic audio — skip the ScreenCast portal (zero GPU)
-    #[arg(long)]
-    audio_only: bool,
+    /// Capture the screen (video); `--enable-video false` skips the ScreenCast portal (zero GPU)
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    enable_video: Option<bool>,
+    /// Capture the mic (audio); `--enable-audio false` disables the mic entirely
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    enable_audio: Option<bool>,
     /// PipeWire capture quantum (samples per buffer). Default 1024 @ 16 kHz = 64 ms.
     #[arg(long, value_name = "SAMPLES")]
     audio_quantum: Option<u32>,
@@ -350,7 +373,8 @@ struct Args {
     mock_video: Option<String>,
     /// Override the mock audio file (defaults to `mock`).
     mock_audio: Option<String>,
-    audio_only: bool,
+    enable_video: bool,
+    enable_audio: bool,
     /// PipeWire capture quantum (samples per buffer). Default 1024 @ 16 kHz = 64 ms.
     audio_quantum: u32,
 }
@@ -363,7 +387,8 @@ fn resolve(cli: Cli, conf: ScoutConf) -> Args {
         mock: cli.mock.or(conf.mock),
         mock_video: cli.mock_video.or(conf.mock_video),
         mock_audio: cli.mock_audio.or(conf.mock_audio),
-        audio_only: cli.audio_only || conf.audio_only.unwrap_or(false),
+        enable_video: cli.enable_video.or(conf.enable_video).unwrap_or(true),
+        enable_audio: cli.enable_audio.or(conf.enable_audio).unwrap_or(true),
         audio_quantum: cli.audio_quantum.or(conf.audio_quantum).unwrap_or(DEFAULT_AUDIO_QUANTUM),
     }
 }
@@ -394,7 +419,7 @@ mod tests {
         let conf = ScoutConf {
             host: Some("0.0.0.0".into()),
             port: Some(1234),
-            audio_only: Some(true),
+            enable_video: Some(false),
             mock: Some("conf.m4a".into()),
             ..ScoutConf::default()
         };
@@ -402,7 +427,8 @@ mod tests {
         assert_eq!(a.host, "0.0.0.0", "file wins when CLI silent");
         assert_eq!(a.port, 9000, "CLI wins over file");
         assert_eq!(a.mock.as_deref(), Some("cli.m4a"));
-        assert!(a.audio_only, "file flag applies when CLI flag absent");
+        assert!(!a.enable_video, "file flag applies when CLI flag absent");
+        assert!(a.enable_audio, "audio defaults on");
         assert_eq!(a.audio_quantum, DEFAULT_AUDIO_QUANTUM, "unset quantum falls to default");
 
         // CLI quantum wins over config.
@@ -412,9 +438,13 @@ mod tests {
         // Config wins over built-in default.
         let conf = ScoutConf { audio_quantum: Some(512), ..ScoutConf::default() };
         assert_eq!(resolve(Cli::default(), conf).audio_quantum, 512, "file wins over default");
+        // CLI can disable either capture side.
+        let cli = Cli { enable_audio: Some(false), ..Cli::default() };
+        assert!(!resolve(cli, ScoutConf::default()).enable_audio, "CLI disables audio");
 
         let d = resolve(Cli::default(), ScoutConf::default());
-        assert_eq!((d.host.as_str(), d.port, d.audio_only), ("127.0.0.1", 7878, false));
+        assert_eq!((d.host.as_str(), d.port, d.enable_video, d.enable_audio),
+            ("127.0.0.1", 7878, true, true));
         assert_eq!(d.audio_quantum, DEFAULT_AUDIO_QUANTUM);
     }
 }

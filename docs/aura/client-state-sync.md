@@ -15,42 +15,43 @@
 
 所以每个状态按两个轴归类，落到三种传输之一：
 
-| 轴 | 数据面 push 流 | 控制面 snapshot-sync | 按需 GET |
-|---|---|---|---|
-| 更新频率 | 高（秒级以下） | 低（分钟级 / 启动一次 / 用户动作） | 低 / 按需 |
-| 数据量 | 小（文字片段） | 小（settings） | 大（二进制）/ 查询 |
-| 机制 | 每事件直推、不节流 | 节流 ping(≥250ms) → GET 整快照 | 客户端主动拉 |
+| 轴       | 数据面 push 流     | 控制面 snapshot-sync               | 按需 GET           |
+| -------- | ------------------ | ---------------------------------- | ------------------ |
+| 更新频率 | 高（秒级以下）     | 低（分钟级 / 启动一次 / 用户动作） | 低 / 按需          |
+| 数据量   | 小（文字片段）     | 小（settings）                     | 大（二进制）/ 查询 |
+| 机制     | 每事件直推、不节流 | 节流 ping(≥250ms) → GET 整快照     | 客户端主动拉       |
 
 ## 二、状态清单（盘点 + 分类 + 归属）
 
-### 数据面（`GET /api/asr_stream` → `AsrSegment` 流，每事件直推；边界范式 2026-08-17）
+### 数据面（`GET /api/asr_stream` → `AsrSegment` 流，每事件直推；5 事件协议 2026-08-18）
 
-| # | 状态 | 来源 | 频率 | 数据量 | 段类型 |
-|---|---|---|---|---|---|
-| 1 | 段级流式 partial（raw，前向纠错） | Stage1 段级 Zipformer 会话 | **高**（~0.5s，说话中） | 小（~50–200 字） | `interim {window_id, segment_id}` |
-| 2 | 窗口联合整流（provisional） | Stage2 `calibrate_window`（每 VAD 间隔） | 中（每段 ~1–5s） | 小 | `window_calibrated {window_id}` |
-| 3 | 窗口定稿（窗口 batch / streaming 拼接 / calibrated） | Stage2 `calibrate_final`（WindowEdge） | 低（每窗口） | 小–中 | `window_final {window_id}` |
-| 4 | 用户纠偏标记（per-window） | `POST /api/correct {window_id}` | 极低（用户动作） | 极小 | `correction {window_id}` |
+| #   | 状态                             | 来源                                     | 频率                    | 数据量           | 段类型                                    |
+| --- | -------------------------------- | ---------------------------------------- | ----------------------- | ---------------- | ----------------------------------------- |
+| 1   | 段级流式 partial / 段定稿（raw） | Stage1 流式会话                          | **高**（~0.5s，说话中） | 小（~50–200 字） | `stream_fragment {window_id, segment_id}` |
+| 2   | 段级 batch 结果                  | Stage1 段 EOS                            | 中（每段）              | 小               | `batch_segment {window_id, segment_id}`   |
+| 3   | 整窗 batch 重跑（权威 raw）      | Stage1 窗口 settle                       | 低（每窗口）            | 小               | `batch_window {window_id}`                |
+| 4   | 窗口联合整流（provisional）      | Stage2 `calibrate_window`（每 VAD 间隔） | 中（每段 ~1–5s）        | 小               | `segment_calibration {window_id}`         |
+| 5   | 窗口定稿                         | Stage2 `finalize_window`（WindowEdge）   | 低（每窗口）            | 小–中            | `window_calibration {window_id}`          |
+| 6   | 用户纠偏标记（per-window）       | `POST /api/correct {window_id}`          | 极低（用户动作）        | 极小             | `correction {window_id}`                  |
 
-> **注意**：Stage1 的 `Stage1Event::Batch`（段级双路文本，含 batch 失败的 None）是
-> **内部**的——它进 composer → Stage2 联合整流，产出 `window_calibrated`。客户端不需要
-> 段级 raw 批式文本，不单独暴露在数据面（`window_final` 携带窗口级聚合文本）。
+> **batch 两层都上数据面**（2026-08-18 协议）：`batch_segment`（每段 EOS）+ `batch_window`
+> （整窗重跑，权威 raw）。客户端若只要定稿可忽略前四类。
 
 ### 控制面（`GET /api/state` → `AuraStateView` 快照，节流 ping → 重拉）
 
-| # | 状态 | 来源 | 频率 | 数据量 | 字段 |
-|---|---|---|---|---|---|
-| 5 | connected（scout 开关） | toggle | 低（用户动作） | 极小 | `connected` |
-| 6 | config（asr/llm/vad 参数） | 启动加载 `aura.yaml` | **~不变**（启动一次） | 小 | `config` |
-| 7 | hotwords 列表 | Stage3 加词 | 低–中（每含专名的句） | 小–中（**无 cap，会增长**） | `hotwords` |
-| 8 | corrections 列表（raw→corrected，Stage2 反馈） | `POST /api/correct` | 极低 | 小（cap 20） | `corrections` |
+| #   | 状态                                           | 来源                 | 频率                  | 数据量                      | 字段          |
+| --- | ---------------------------------------------- | -------------------- | --------------------- | --------------------------- | ------------- |
+| 5   | connected（scout 开关）                        | toggle               | 低（用户动作）        | 极小                        | `connected`   |
+| 6   | config（asr/llm/vad 参数）                     | 启动加载 `aura.yaml` | **~不变**（启动一次） | 小                          | `config`      |
+| 7   | hotwords 列表                                  | Stage3 加词          | 低–中（每含专名的句） | 小–中（**无 cap，会增长**） | `hotwords`    |
+| 8   | corrections 列表（raw→corrected，Stage2 反馈） | `POST /api/correct`  | 极低                  | 小（cap 20）                | `corrections` |
 
 ### 按需（客户端主动 GET，不进任何流/快照）
 
-| # | 状态 | 频率 | 数据量 | 端点 |
-|---|---|---|---|---|
-| 9 | 音频 WAV（per-utterance 原声） | 低（每句） | **大**（16kHz mono，5s≈160KB，长句→MB） | `GET /api/audio/{seq}` |
-| 10 | 录音列表（所有 seq） | 低（每句增长） | 小（id 列表） | `GET /api/recordings` |
+| #   | 状态                           | 频率           | 数据量                                  | 端点                   |
+| --- | ------------------------------ | -------------- | --------------------------------------- | ---------------------- |
+| 9   | 音频 WAV（per-utterance 原声） | 低（每句）     | **大**（16kHz mono，5s≈160KB，长句→MB） | `GET /api/audio/{seq}` |
+| 10  | 录音列表（所有 seq）           | 低（每句增长） | 小（id 列表）                           | `GET /api/recordings`  |
 
 ## 三、Stage2 的边界（关键澄清）
 
@@ -59,8 +60,8 @@ Stage2 产生两类东西，**归不同的面**，不能混：
 ```
 Stage2（无状态——窗口状态由事件载荷携带）
  ├─ 输出：纠偏后的文字 ──→ 数据面（识别结果，高频小数据，低延迟直推）
- │    · provisional（每 VAD 间隔，窗口联合）→ AsrSegment::WindowCalibrated
- │    · final（窗口定稿）                  → AsrSegment::WindowFinal.calibrated
+ │    · provisional（每 VAD 间隔，窗口联合）→ AsrSegment::SegmentCalibration
+ │    · final（窗口定稿）                  → AsrSegment::WindowCalibration
  │
  └─ 输入配置：corrections 反馈 ──→ 控制面（一个 setting，低频小数据，Stage2 每轮读）
       · 用户教 Stage2 怎么纠的累积 → AuraStateView.corrections
@@ -94,11 +95,11 @@ Stage2（无状态——窗口状态由事件载荷携带）
 
 现状（`audio-aura-agent::AuraClient`）已覆盖核心：
 
-| SDK 方法 | 面 | 产 | 状态 |
-|---|---|---|---|
-| `subscribe_segments()` | 数据面 | `Stream<AsrSegment>` | ✅ |
-| `subscribe(freq_ms)` | 控制面 | `Stream<AuraStateView>` | ✅ |
-| `state()` / `set_connected()` / `correct(window_id,…)` / `audio(window_id)` / `recordings()` | 按需/动作 | — | ✅ |
+| SDK 方法                                                                                     | 面        | 产                      | 状态 |
+| -------------------------------------------------------------------------------------------- | --------- | ----------------------- | ---- |
+| `subscribe_segments()`                                                                       | 数据面    | `Stream<AsrSegment>`    | ✅    |
+| `subscribe(freq_ms)`                                                                         | 控制面    | `Stream<AuraStateView>` | ✅    |
+| `state()` / `set_connected()` / `correct(window_id,…)` / `audio(window_id)` / `recordings()` | 按需/动作 | —                       | ✅    |
 
 待 §四 决议后可能再加：
 - `subscribe_segments(filter)` —— 按 type 过滤（点 3）。
