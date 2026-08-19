@@ -144,26 +144,41 @@ impl ReqMember {
         }
     }
 
-    /// Fire the GET on a worker thread; the result lands in `async_state` and
-    /// bumps the version. The thread holds its own `Arc`, so canceling the
-    /// member mid-flight is safe — the result is simply dropped.
-    fn fire(&self) {
+    /// 触发 GET:把任务发给引擎的 I/O 线程(事件响应模型,预测主路径不建
+    /// 线程)。任务在 I/O 线程跑,结果落 `async_state` + 版本号,I/O 线程随后
+    /// `refresh_ui(ctx)` 推送前端重渲染。
+    fn fire(&self, ctx: usize) {
         let url = self.url();
         let fetcher = self.resources.req_fetcher.lock().unwrap().clone();
         let shared = Arc::clone(&self.async_state);
         *shared.status.lock().unwrap() = ReqStatus::InFlight;
         shared.version.fetch_add(1, Ordering::Release);
         tracing::debug!(url, "req fire");
-        std::thread::spawn(move || {
-            let result = fetcher.get(&url);
-            let st = match result {
-                Ok(body) => ReqStatus::Done(body),
-                Err(e) => ReqStatus::Failed(e),
-            };
-            tracing::debug!(url, ok = matches!(st, ReqStatus::Done(_)), "req done");
-            *shared.status.lock().unwrap() = st;
-            shared.version.fetch_add(1, Ordering::Release);
-        });
+        match self.resources.io() {
+            Some(io) => io.send(crate::io_thread::IoEvent::Run {
+                ctx,
+                task: Box::new(move || {
+                    let result = fetcher.get(&url);
+                    let st = match result {
+                        Ok(body) => ReqStatus::Done(body),
+                        Err(e) => ReqStatus::Failed(e),
+                    };
+                    tracing::debug!(url, ok = matches!(st, ReqStatus::Done(_)), "req done");
+                    *shared.status.lock().unwrap() = st;
+                    shared.version.fetch_add(1, Ordering::Release);
+                }),
+            }),
+            // 无 I/O 线程(未接线的测试场景)→ 就地执行。
+            None => {
+                let result = fetcher.get(&url);
+                let st = match result {
+                    Ok(body) => ReqStatus::Done(body),
+                    Err(e) => ReqStatus::Failed(e),
+                };
+                *shared.status.lock().unwrap() = st;
+                shared.version.fetch_add(1, Ordering::Release);
+            }
+        }
     }
 }
 
@@ -180,7 +195,7 @@ impl MagicMember for ReqMember {
         Box::new(ReqMember::new(Arc::clone(&self.resources)))
     }
 
-    fn predict(&mut self, input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
+    fn predict(&mut self, _ctx: usize, input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
         // 后缀从输入派生;变了 → 旧结果失效。
         let arg = input.strip_prefix("#req").unwrap_or("").to_string();
         if arg != self.arg {
@@ -192,11 +207,11 @@ impl MagicMember for ReqMember {
         self.predictions()
     }
 
-    fn pick(&mut self, _index: usize, _text: &str, _sm: &mut StateMachine, _env: &dyn StepEnv) {
+    fn pick(&mut self, _index: usize, _text: &str, sm: &mut StateMachine, _env: &dyn StepEnv) {
         // 交互式选项:Idle 的"回车请求 <url>" → 触发;InFlight/Failed 无副作用。
         let idle = matches!(&*self.async_state.status.lock().unwrap(), ReqStatus::Idle);
         if idle {
-            self.fire();
+            self.fire(sm.ctx);
         }
     }
 
@@ -207,7 +222,7 @@ impl MagicMember for ReqMember {
         }
         self.last_version = cur;
         let input = sm.buffer.clone();
-        Some(self.predict(&input, env))
+        Some(self.predict(sm.ctx, &input, env))
     }
 }
 

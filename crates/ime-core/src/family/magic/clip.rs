@@ -43,7 +43,7 @@ impl MagicMember for ClipMember {
         Box::new(ClipMember::new(Arc::clone(&self.resources)))
     }
 
-    fn predict(&mut self, input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
+    fn predict(&mut self, _ctx: usize, input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
         let raw = input.strip_prefix("#clip").unwrap_or("");
         let args = CommandArgs::parse(raw);
         let hist = self.resources.clipboard_history.lock().unwrap();

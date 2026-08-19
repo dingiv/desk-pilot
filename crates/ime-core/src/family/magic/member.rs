@@ -139,9 +139,10 @@ pub trait MagicMember: Send + Sync {
     /// `Arc`s.
     fn spawn(&self) -> Box<dyn MagicMember>;
 
-    /// 精确匹配(含参数)时的预测选项(不含 rollback)。`input` 是完整输入
-    /// (如 `#asr?num=2`)。返回空 = 无预测(只剩 rollback)。
-    fn predict(&mut self, input: &str, env: &dyn StepEnv) -> Vec<Prediction>;
+    /// 精确匹配(含参数)时的预测选项(不含 rollback)。`ctx` 是所属输入上下文
+    /// (成员可发异步事件 + 订阅);`input` 是完整输入(如 `#asr?num=2`)。
+    /// 返回空 = 无预测(只剩 rollback)。
+    fn predict(&mut self, ctx: usize, input: &str, env: &dyn StepEnv) -> Vec<Prediction>;
 
     /// 用户选中了第 `index` 个**交互式**预测。成员更新内部状态后,调用方
     /// 重新查询 `predict` 替换选项(不上屏)。非交互预测不经过这里。
@@ -162,9 +163,10 @@ pub trait MagicMember: Send + Sync {
         None
     }
 
-    /// The member session ended (commit / cancel / reset). In-flight background
+    /// The member session ended (commit / cancel / reset). 传 ctx 供退订
+    /// (如 VoiceMember 取消对 I/O 线程 watcher 的订阅)。In-flight background
     /// work keeps running via shared `Arc`s — nothing to cancel by default.
-    fn deactivate(&mut self) {}
+    fn deactivate(&mut self, _ctx: usize) {}
 }
 
 // ── Shared display helpers ───────────────────────────────────────────────

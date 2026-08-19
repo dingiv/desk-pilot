@@ -97,6 +97,7 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
         Box::new(FcitxProvider::default()),
         snippets,
         cfg.weights.to_scoring(),
+        Box::new(ime_core::frontend::NoopFrontend::default()),
     );
     // 候选每页条数(swift-ime.yaml → input.page_size)。
     engine.set_page_size(cfg.input.page_size);

@@ -7,6 +7,8 @@ pub mod dispatcher;
 pub mod engine;
 pub mod expander;
 pub mod family;
+pub mod frontend;
+pub mod io_thread;
 pub mod matcher;
 pub mod recency;
 pub mod router;

@@ -25,11 +25,33 @@ pub struct VoiceMember {
     last_version: u64,
     /// Last connectivity — 断开/重连不碰 version 计数,单独追踪。
     last_connected: bool,
+    /// 已向 I/O 线程订阅本 ctx 的语音缓冲变化(去重,避免重复订阅)。
+    subscribed: bool,
 }
 
 impl VoiceMember {
     pub fn new(resources: Arc<MagicResources>) -> Self {
-        VoiceMember { resources, last_version: 0, last_connected: false }
+        VoiceMember { resources, last_version: 0, last_connected: false, subscribed: false }
+    }
+
+    /// 向 I/O 线程订阅本 ctx 的语音缓冲版本变化 —— 变化时 I/O 线程
+    /// `refresh_ui(ctx)`,前端在主循环拉取最新视图(不再 100ms 轮询)。
+    fn ensure_subscribed(&mut self, ctx: usize) {
+        if self.subscribed { return; }
+        self.subscribed = true;
+        if let Some(buf) = self.resources.voice.get() {
+            if let Some(io) = self.resources.io() {
+                io.send(crate::io_thread::IoEvent::VoiceSubscribe { ctx, buffer: buf });
+            }
+        }
+    }
+
+    /// 命令退出:取消订阅(退订后 I/O 线程的 watcher 不再轮询该 ctx)。
+    fn unsubscribe(&self, ctx: usize) {
+        if !self.subscribed { return; }
+        if let Some(io) = self.resources.io() {
+            io.send(crate::io_thread::IoEvent::VoiceUnsubscribe { ctx });
+        }
     }
 
     /// 触发名之后的参数串(`#asr/en?num=2` → `/en?num=2`)。
@@ -89,7 +111,8 @@ impl MagicMember for VoiceMember {
         Box::new(VoiceMember::new(Arc::clone(&self.resources)))
     }
 
-    fn predict(&mut self, input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
+    fn predict(&mut self, ctx: usize, input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
+        self.ensure_subscribed(ctx);
         let args = Self::args_of(input);
         let connected = self.resources.voice.get()
             .map(|b| b.is_connected())
@@ -135,6 +158,7 @@ impl MagicMember for VoiceMember {
     }
 
     fn tick(&mut self, sm: &mut StateMachine, env: &dyn StepEnv) -> Option<Vec<Prediction>> {
+        self.ensure_subscribed(sm.ctx);
         let buf = self.resources.voice.get()?;
         let cur = buf.version();
         let connected = buf.is_connected();
@@ -144,7 +168,12 @@ impl MagicMember for VoiceMember {
         self.last_version = cur;
         self.last_connected = connected;
         let input = sm.buffer.clone();
-        Some(self.predict(&input, env))
+        Some(self.predict(sm.ctx, &input, env))
+    }
+
+    fn deactivate(&mut self, ctx: usize) {
+        self.unsubscribe(ctx);
+        self.subscribed = false;
     }
 }
 
@@ -172,7 +201,7 @@ impl MagicMember for SubmitMember {
         Box::new(SubmitMember::new(Arc::clone(&self.resources)))
     }
 
-    fn predict(&mut self, _input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
+    fn predict(&mut self, _ctx: usize, _input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
         let text = self.resources.voice.get().map(|b| b.snapshot()).unwrap_or_default();
         if text.is_empty() {
             vec![Prediction::interactive("无语音内容")]

@@ -40,6 +40,9 @@ pub enum ComposeState { #[default] Idle, Snippet, Pinyin }
 
 #[derive(Default)]
 pub struct StateMachine {
+    /// 所属输入上下文(引擎 `with_ctx` 每次操作前设置)。魔法命令成员用它
+    /// 把异步工作事件发到正确的 ctx 并 refresh 对应上下文。
+    pub ctx: usize,
     pub state: ComposeState,
     /// Raw pinyin buffer — remaining uncommitted pinyin syllables.
     pub buffer: String,
@@ -165,7 +168,7 @@ impl StateMachine {
                 MagicCommand::Live { token, name } => {
                     self.ensure_command(name, Some(token), env);
                     self.magic_predictions = self.active_command.as_mut()
-                        .map(|m| m.predict(&input, env))
+                        .map(|m| m.predict(self.ctx, &input, env))
                         .unwrap_or_default();
                     self.magic_hints.clear();
                     // 无参数时数字用于选中;有参数(拼 `?num=` 等)时数字是文本。
@@ -189,7 +192,7 @@ impl StateMachine {
             MagicMatch::Snippet => {
                 self.ensure_command("", Some("__SNIPPET__"), env);
                 self.magic_predictions = self.active_command.as_mut()
-                    .map(|m| m.predict(&input, env))
+                    .map(|m| m.predict(self.ctx, &input, env))
                     .unwrap_or_default();
                 self.magic_hints.clear();
                 self.magic_selectable = false; // 片段路径/查询里的数字是文本
@@ -216,7 +219,7 @@ impl StateMachine {
 
     fn clear_active_command(&mut self) {
         if let Some(mut m) = self.active_command.take() {
-            m.deactivate();
+            m.deactivate(self.ctx);
         }
     }
 

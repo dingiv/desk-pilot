@@ -87,6 +87,10 @@ pub struct ImeEngine {
     page_size: u32,
     /// 调试模式:候选词显示提供者与权重(swift-ime.yaml → debug.candidate_meta)。
     candidate_meta: bool,
+    /// 前端句柄 —— 引擎 I/O 线程经它推送 UI 刷新 / 请求剪贴板。
+    frontend: Arc<dyn crate::frontend::FrontEndHandle>,
+    /// 单条 tokio I/O 线程(事件响应模型),预测主路径不建线程。
+    io_thread: Arc<crate::io_thread::IoThread>,
 }
 
 impl ImeEngine {
@@ -104,6 +108,7 @@ impl ImeEngine {
             Box::new(crate::expander::DefaultProvider),
             Vec::new(),
             crate::scoring::ScoringConfig::default(),
+            Box::new(crate::frontend::NoopFrontend::default()),
         )
     }
 
@@ -119,12 +124,16 @@ impl ImeEngine {
     /// `scoring` carries every configurable scoring parameter (family priorities,
     /// recency boosts, bigram ceiling, freq→score scale) from `swift-ime.yaml`;
     /// `Default` reproduces the legacy hardcoded values exactly.
+    ///
+    /// `frontend` 是前端句柄 —— 引擎的单条 I/O 线程经它推送 UI 刷新 / 请求
+    /// 剪贴板。前端不再轮询。
     pub fn with_config(
         pinyin_weights: crate::family::pinyin::PinyinWeights,
         english_weights: crate::family::english::EnglishWeights,
         provider: Box<dyn crate::expander::VariableProvider>,
         extra_snippets: Vec<(String, String)>,
         scoring: crate::scoring::ScoringConfig,
+        frontend: Box<dyn crate::frontend::FrontEndHandle>,
     ) -> Self {
         // Magic command entries are generated from the member registry (#asr, #flush,
         // #submit, #req, #date, #password …) — adding a command = one member, nothing
@@ -148,6 +157,10 @@ impl ImeEngine {
         // Shared with the dispatcher's expander — `set_variable` writes through the same Arc.
         let provider: Arc<dyn crate::expander::VariableProvider> = Arc::from(provider);
         let expander = crate::Expander::new(Arc::clone(&provider));
+        // 单条 tokio I/O 线程(事件响应模型)+ 前端句柄注入。
+        let frontend: Arc<dyn crate::frontend::FrontEndHandle> = Arc::from(frontend);
+        let io_thread = Arc::new(crate::io_thread::IoThread::spawn(Arc::clone(&frontend)));
+        magic.set_io(Arc::clone(&io_thread), Arc::clone(&frontend));
         let engine = ImeEngine {
             dispatcher: Dispatcher::with_config(matcher, expander, Arc::clone(&magic), pinyin_weights, english_weights, scoring),
             contexts: Mutex::new(HashMap::new()),
@@ -157,6 +170,8 @@ impl ImeEngine {
             provider,
             page_size: 7,
             candidate_meta: false,
+            frontend,
+            io_thread,
         };
         // Load embedded base dictionary (5KB, compiled into binary).
         let count = engine.dispatcher.scorer().family("pinyin")
@@ -171,12 +186,23 @@ impl ImeEngine {
     /// Embedded base phrase dictionary (TSV format), compiled into the binary.
     const EMBEDDED_BASE_DICT: &[u8] = include_bytes!("../../../apps/swift-ime/assets/dict/base.tsv");
 
+    /// 前端句柄(引擎 I/O 线程经它推送刷新 / 请求剪贴板)。
+    pub fn frontend(&self) -> Arc<dyn crate::frontend::FrontEndHandle> {
+        Arc::clone(&self.frontend)
+    }
+
+    /// 引擎的单条 tokio I/O 线程句柄。
+    pub fn io_thread(&self) -> Arc<crate::io_thread::IoThread> {
+        Arc::clone(&self.io_thread)
+    }
+
     // ── ctx helpers ─────────────────────────────────────────────────────
 
     fn with_ctx<T>(&self, ctx: usize, f: impl FnOnce(&Dispatcher, &mut PerContext) -> T) -> T {
         // FIXME: 一处不必要的 unwrap
         let mut map = self.contexts.lock().unwrap();
         let pc = map.entry(ctx).or_insert_with(|| PerContext::with_page_size(self.page_size, self.candidate_meta));
+        pc.sm.ctx = ctx;
         f(&self.dispatcher, pc)
     }
 
@@ -771,6 +797,7 @@ mod tests {
             Box::new(NoVars),
             vec![("/hello".into(), "Hello, my name is $name.".into())],
             crate::scoring::ScoringConfig::default(),
+            Box::new(crate::frontend::NoopFrontend::default()),
         );
         let mut e = e;
         for c in "#/hello?name=Mike".chars() { e.predict(KeyEvent::char(c)); }
@@ -1506,6 +1533,7 @@ mod tests {
             Box::new(FixedDate),
             vec![("/sig".into(), "Best regards,\nAlice\n$DATE".into())],
             crate::scoring::ScoringConfig::default(),
+            Box::new(crate::frontend::NoopFrontend::default()),
         );
         let mut e = e;
         for c in "#/sig".chars() { e.predict(KeyEvent::char(c)); }
@@ -1781,6 +1809,7 @@ mod tests {
                 Box::new(crate::expander::DefaultProvider),
                 Vec::new(),
                 scoring,
+                Box::new(crate::frontend::NoopFrontend::default()),
             );
             for c in "black".chars() { e.predict(KeyEvent::char(c)); }
             e.candidates_detailed().iter().find(|c| c.text == "black")
@@ -1815,6 +1844,7 @@ mod tests {
             Box::new(Recording { values: Arc::clone(&values) }),
             Vec::new(),
             crate::scoring::ScoringConfig::default(),
+            Box::new(crate::frontend::NoopFrontend::default()),
         );
         e.set_variable("CLIPBOARD", "剪贴板文本");
         e.set_variable("CLIPBOARD", "更新后的文本");

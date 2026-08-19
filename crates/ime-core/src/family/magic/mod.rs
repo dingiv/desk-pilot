@@ -56,9 +56,26 @@ pub struct MagicResources {
     /// 片段注册表:名字(无前导 `/`)→ 模板。`#/hello?name=Mike` 的 `hello`
     /// 在此查表;`?name=Mike` 作为模板变量注入。
     pub snippets: Mutex<HashMap<String, String>>,
-    /// 剪贴板历史(最近在前,`#clip/N` 读)。由 C++ 推送当前剪贴板、引擎去重
-    /// 累积 —— fcitx5 clipboard 公开接口只给当前值。
+    /// 剪贴板历史(最近在前,`#clip/N` 读)。由前端按需回填(fcitx5 clipboard
+    /// 公开接口只给当前值)。
     pub clipboard_history: Mutex<Vec<String>>,
+    /// 引擎的单条 tokio I/O 线程 —— 魔法命令发事件让它做异步 I/O。
+    /// 引擎构造后经 [`MagicFamily::set_io`] 注入;此前为 None。
+    pub io: Mutex<Option<Arc<crate::io_thread::IoThread>>>,
+    /// 前端句柄 —— I/O 线程经它推送 UI 刷新 / 请求剪贴板。
+    pub frontend: Mutex<Option<Arc<dyn crate::frontend::FrontEndHandle>>>,
+}
+
+impl MagicResources {
+    /// 取 I/O 线程句柄(未注入时 None —— 测试/未接线场景)。
+    pub fn io(&self) -> Option<Arc<crate::io_thread::IoThread>> {
+        self.io.lock().unwrap().clone()
+    }
+
+    /// 取前端句柄(未注入时 None)。
+    pub fn frontend(&self) -> Option<Arc<dyn crate::frontend::FrontEndHandle>> {
+        self.frontend.lock().unwrap().clone()
+    }
 }
 
 fn default_fetcher() -> Arc<dyn ReqFetcher> {
@@ -80,6 +97,8 @@ impl Default for MagicResources {
             req_fetcher: Mutex::new(default_fetcher()),
             snippets: Mutex::new(HashMap::new()),
             clipboard_history: Mutex::new(Vec::new()),
+            io: Mutex::new(None),
+            frontend: Mutex::new(None),
         }
     }
 }
@@ -339,6 +358,13 @@ impl MagicFamily {
         for (name, tpl) in snippets {
             map.insert(name, tpl);
         }
+    }
+
+    /// 注入 I/O 线程句柄与前端句柄(引擎构造后调用)。魔法命令发事件给 I/O
+    /// 线程做异步工作;I/O 完成经前端推送刷新。
+    pub fn set_io(&self, io: Arc<crate::io_thread::IoThread>, frontend: Arc<dyn crate::frontend::FrontEndHandle>) {
+        *self.resources.io.lock().unwrap() = Some(io);
+        *self.resources.frontend.lock().unwrap() = Some(frontend);
     }
 
     /// 推送一条剪贴板文本到历史(最近在前,去重连续重复)。C++ 每次按键/激活

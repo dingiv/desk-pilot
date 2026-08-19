@@ -101,6 +101,7 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<AsrBuffer>, Option<crat
         Box::new(ime_core::expander::DefaultProvider),
         snippets,
         sw_cfg.weights.to_scoring(),
+        Box::new(ime_core::frontend::NoopFrontend::default()),
     );
     engine.set_page_size(sw_cfg.input.page_size);
     engine.set_context_aware(sw_cfg.input.context_aware);
