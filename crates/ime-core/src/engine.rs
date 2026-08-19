@@ -918,6 +918,29 @@ mod tests {
     }
 
     #[test]
+    fn asr_preview_includes_finished_batch_plus_current_stream() {
+        // 小停顿产生新 batch 后继续说话:首个候选应为"前段 SegmentBatch +
+        // 当前段流式"(窗口组装预览),而不是只有当前段流式。
+        use std::sync::Arc;
+        use crate::asr_buffer::{AsrBuffer, AsrPreview};
+        let mut e = eng();
+        let buf = Arc::new(AsrBuffer::new());
+        buf.set_connected(true);
+        // 模拟:前段已出 Batch("第一句"),当前段流式("第二句"),组装预览 =
+        // 第一句 + 第二句。
+        buf.set_preview(AsrPreview { window_id: 1, plain: "第一句第二句".into(), calc: String::new() });
+        e.set_asr_buffer(Arc::clone(&buf));
+
+        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
+        let cands = e.candidates();
+        assert_eq!(cands.first().map(|s| s.as_str()), Some("第一句第二句"),
+            "first candidate = previous Batch + current stream: {cands:?}");
+        // 选中即上屏组装文本。
+        let v = e.predict(KeyEvent::space());
+        assert_eq!(ImeView::str_field(&v.commit_text), "第一句第二句");
+    }
+
+    #[test]
     fn aux_up_shows_raw_input_distinct_from_result_preedit() {
         // 严格区分:候选框顶部 aux_up = 原始输入(#asr);应用高亮 preedit_text =
         // 合成结果(首条预测)。二者不同。

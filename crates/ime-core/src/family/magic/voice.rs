@@ -55,8 +55,15 @@ impl VoiceMember {
         };
         let (finals, live) = buf.voice_candidates();
         let mut out = Vec::new();
-        if !live.is_empty() {
-            out.push(Prediction::commit(live));
+        // 首选 = 当前窗口的组装预览:小停顿产生新 batch 后继续说话,预览是
+        // 前段 Batch + 当前段流式("第一句第二句"),而不是只有当前段流式。
+        // 无预览时回退到原始 live。
+        let composed = buf.preview()
+            .map(|p| p.plain)
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| live.clone());
+        if !composed.is_empty() {
+            out.push(Prediction::commit(composed));
         }
         for f in finals.iter().take(4 - out.len()) {
             out.push(Prediction::commit(f.clone()));
