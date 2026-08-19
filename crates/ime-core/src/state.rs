@@ -30,13 +30,13 @@
 //! the PhraseBook for future sessions.
 
 use crate::expander::Expander;
-use crate::family::magic::{MagicMember, MemberAction};
-use crate::matcher::{Match, Matcher};
+use crate::family::magic::{MagicCommand, MagicMatch, MagicMember};
+use crate::matcher::Matcher;
 use crate::platform::{CANDIDATE_SLOTS, ImeView};
 use crate::PinyinEngine;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ComposeState { #[default] Idle, Snippet, Pinyin, Magic }
+pub enum ComposeState { #[default] Idle, Snippet, Pinyin }
 
 #[derive(Default)]
 pub struct StateMachine {
@@ -67,29 +67,16 @@ pub struct StateMachine {
     partial_commit_indices: Vec<bool>,
     /// Short-term input context — accumulates recently committed text.
     pub context: crate::family::InputContext,
-    /// Pending snippet/magic expansion text. When set, the expansion is
-    /// shown as a candidate rather than auto-committed. Space/digit to
-    /// commit, Enter to force raw text.
-    pub(crate) pending_expansion: Option<String>,
-    /// Magic command prediction hints while typing `#…`: all commands whose trigger extends
-    /// the buffer, as `(trigger, activation_token?)` — live members carry their token (Space
-    /// on the hint COMPLETES into that command's Magic mode), static commands carry `None`
-    /// (Space resolves their expansion). The raw buffer is the LAST rollback candidate.
-    /// Only set in Snippet state; cleared on any other transition.
-    pub(crate) magic_hints: Vec<(String, Option<String>)>,
-    /// Preview-state candidate tail. In Magic (preview) mode the candidate panel is assembled
-    /// in three segments: [member candidates…] [`magic_tail`]…] + the final rollback (the raw
-    /// trigger, e.g. `#asr`). `magic_member_cand_count` is where the member segment ends;
-    /// `magic_tail` holds the family-prediction continuations (`#asr` → `#asrplus`) with their
-    /// activation tokens (None = static expansion). Space routes by highlight: member segment
-    /// → the member; a tail continuation → switch into that command's preview; the rollback
-    /// → commit the raw trigger text. Only set in Magic state.
-    magic_member_cand_count: usize,
-    pub(crate) magic_tail: Vec<(String, Option<String>)>,
-    /// The active live magic command (`#asr` voice anchor, `#req` HTTP request, …).
-    /// `Some` only while in [`Magic`](ComposeState::Magic) state. Each activation
-    /// spawns a fresh instance from the [`MagicFamily`] registry.
-    pub magic_member: Option<Box<dyn MagicMember>>,
+    /// 补全提示(输入是某命令触发串的严格前缀):候选 = [补全名…, rollback]。
+    /// 选中补全名 → **改写输入**(不提交)。
+    pub(crate) magic_hints: Vec<String>,
+    /// 精确匹配命令时的预测选项(不含 rollback)。
+    pub(crate) magic_predictions: Vec<crate::family::magic::Prediction>,
+    /// 当前精确匹配的 live 命令实例(保 req 异步态等);静态命令 / 前缀 / 未知
+    /// 时为 None。
+    pub active_command: Option<Box<dyn MagicMember>>,
+    /// 数字键是否用于选中候选(精确无参 / 前缀时 true;拼参数时 false)。
+    magic_selectable: bool,
     /// 调试模式:候选词显示提供者与权重(`[score family/source]`)。
     pub candidate_meta_enabled: bool,
     /// 最近一次排名的详细结果(score, family, source)——与 candidates 对齐,
@@ -114,8 +101,8 @@ impl std::fmt::Debug for StateMachine {
             .field("candidates", &self.candidates)
             .field("candidate_highlight", &self.candidate_highlight)
             .field(
-                "magic_member",
-                &self.magic_member.as_ref().map(|m| m.name()),
+                "active_command",
+                &self.active_command.as_ref().map(|m| m.name()),
             )
             .finish()
     }
@@ -138,115 +125,137 @@ impl StateMachine {
             ComposeState::Idle => self.handle_idle(ch, env),
             ComposeState::Snippet => self.handle_snippet(ch, env),
             ComposeState::Pinyin => self.handle_pinyin(ch, env),
-            ComposeState::Magic => self.handle_magic(ch, env),
         }
     }
 
-    /// Magic (`#`-command live mode / preview): the candidate panel is the member's own
-    /// candidates followed by the family-prediction tail + rollback (see [`magic_tail`]).
-    /// Space routes by highlight: the member segment → the member; a tail continuation
-    /// (`#asrplus`) → switch into that command's preview; the rollback → commit the raw
-    /// trigger text. Other keys route to the member.
-    fn handle_magic(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
-        // Space on the tail segment (continuation / rollback) is handled here, NOT by the
-        // member — the member only owns its own candidates.
-        if ch == ' ' {
-            let hl = self.candidate_highlight;
-            if hl >= self.magic_member_cand_count {
-                let tail_idx = hl - self.magic_member_cand_count;
-                if tail_idx < self.magic_tail.len() {
-                    let (trigger, token) = self.magic_tail[tail_idx].clone();
-                    // Continuation (`#asrplus`): switch into that command's preview.
-                    if let Some(tok) = token {
-                        if let Some(new_member) = env.magic().spawn(&tok) {
-                            let mut new_member = new_member;
-                            self.magic_member.take(); // drop old member (deactivate)
-                            self.buffer = trigger.clone();
-                            self.pending_expansion = None;
-                            self.state = ComposeState::Magic;
-                            let view = new_member.activate(self, env);
-                            self.magic_member = Some(new_member);
-                            self.assemble_magic_tail(env);
-                            return view;
-                        }
-                    }
-                    // Static continuation or rollback fallback: commit the trigger text.
-                    // (Rollback is the LAST tail entry — commit the raw trigger.)
-                    return self.commit_magic_rollback(&trigger);
+    // ── Magic command prediction (Snippet state) ────────────────────────
+
+    /// `#asr?num=2` → `#asr`(名字段,用于静态命令展开 / 无参判定)。
+    fn command_trigger(input: &str) -> String {
+        if input.len() < 2 { return input.to_string(); }
+        let rest = &input[1..];
+        let name_len = rest.chars().take_while(|c| c.is_ascii_alphanumeric()).count();
+        format!("#{}", &rest[..name_len])
+    }
+
+    /// 每次字符变化后重查:精确匹配 → 命令预测;前缀 → 补全提示;未知 → raw。
+    fn query_magic(&mut self, env: &dyn StepEnv) -> ImeView {
+        let input = self.buffer.clone();
+        match env.magic().match_command(&input) {
+            MagicMatch::Exact(cmd) => match cmd {
+                MagicCommand::Live { token, name } => {
+                    self.ensure_command(name, Some(token), env);
+                    self.magic_predictions = self.active_command.as_mut()
+                        .map(|m| m.predict(&input, env))
+                        .unwrap_or_default();
+                    self.magic_hints.clear();
+                    // 无参数时数字用于选中;有参数(拼 `?num=` 等)时数字是文本。
+                    self.magic_selectable = input == format!("#{name}");
                 }
-                // tail_idx == magic_tail.len() → the rollback (raw buffer).
-                let raw = self.buffer.clone();
-                return self.commit_magic_rollback(&raw);
+                MagicCommand::Static => {
+                    self.clear_active_command();
+                    let trigger = Self::command_trigger(&input);
+                    self.magic_predictions = env.magic().static_prediction(&trigger)
+                        .unwrap_or_default();
+                    self.magic_hints.clear();
+                    self.magic_selectable = input == trigger;
+                }
+            },
+            MagicMatch::Prefix(hints) => {
+                self.clear_active_command();
+                self.magic_predictions.clear();
+                self.magic_hints = hints;
+                self.magic_selectable = true; // 前缀 → 数字选中补全
+            }
+            MagicMatch::Snippet => {
+                self.ensure_command("", Some("__SNIPPET__"), env);
+                self.magic_predictions = self.active_command.as_mut()
+                    .map(|m| m.predict(&input, env))
+                    .unwrap_or_default();
+                self.magic_hints.clear();
+                self.magic_selectable = false; // 片段路径/查询里的数字是文本
+            }
+            MagicMatch::Unknown => {
+                self.clear_active_command();
+                self.magic_predictions.clear();
+                self.magic_hints.clear();
+                self.magic_selectable = false;
             }
         }
-        let Some(mut member) = self.magic_member.take() else {
-            self.reset();
-            return ImeView::empty();
-        };
-        
-        match member.on_key(self, ch, env) {
-            MemberAction::View(view) => {
-                self.magic_member = Some(member);
-                self.assemble_magic_tail(env);
-                *view
-            }
-            MemberAction::Commit(text) => {
-                member.deactivate();
-                self.reset();
-                Self::commit_view(&text)
-            }
-            MemberAction::CommitAt(text, cursor) => {
-                member.deactivate();
-                self.reset();
-                Self::commit_view_at(&text, cursor)
-            }
-            MemberAction::Exit => {
-                member.deactivate();
-                self.reset();
-                ImeView::empty()
-            }
+        self.rebuild_magic_view()
+    }
+
+    /// 精确匹配时复用同名命令实例(保 req 异步态),否则新建。
+    fn ensure_command(&mut self, name: &'static str, token: Option<&'static str>, env: &dyn StepEnv) {
+        let keep = self.active_command.as_ref().map(|m| m.name() == name).unwrap_or(false);
+        if keep { return; }
+        self.clear_active_command();
+        if let Some(tok) = token {
+            self.active_command = env.magic().spawn(tok);
         }
     }
 
-    /// Commit the raw trigger text (`#asr`) as a rollback: deactivate the member, leave
-    /// Magic mode, 上屏. (The buffer holds the trigger during preview.)
-    fn commit_magic_rollback(&mut self, trigger: &str) -> ImeView {
-        if let Some(mut m) = self.magic_member.take() {
+    fn clear_active_command(&mut self) {
+        if let Some(mut m) = self.active_command.take() {
             m.deactivate();
         }
-        let text = trigger.to_string();
-        self.reset();
-        Self::commit_view(&text)
     }
 
-    /// Assemble the preview candidate panel: member candidates + family-prediction tail
-    /// (continuations like `#asrplus`) + final rollback (the raw trigger). Called after the
-    /// member rebuilds its candidates (activate / refresh / tick).
-    pub(crate) fn assemble_magic_tail(&mut self, env: &dyn StepEnv) {
-        if self.state != ComposeState::Magic {
-            return;
-        }
-        self.magic_member_cand_count = self.candidates.len();
-        // 片段命令(空名)全权管理候选列表:无 `#command` 续写 tail,Space 直接
-        // 路由到成员(否则候选高亮会落到 tail/rollback 段,提交成原始 `#`)。
-        if self.magic_member.as_ref().map(|m| m.name().is_empty()).unwrap_or(false) {
-            self.magic_tail.clear();
-            return;
-        }
-        // Continuations: all commands whose trigger strictly extends the current one.
-        self.magic_tail = env.magic()
-            .hints(&self.buffer)
-            .into_iter()
-            .map(|(t, tok)| (t, tok.map(|s| s.to_string())))
-            .collect();
-        // Panel = [member…] + [tail…] + [rollback].
-        let mut cands = self.candidates.clone();
-        for (t, _) in &self.magic_tail {
-            cands.push(t.clone());
-        }
-        cands.push(self.buffer.clone()); // rollback
+    /// 从 `magic_predictions` / `magic_hints` 重建候选列表 + preedit + 视图。
+    /// 候选 = [预测…, 补全…, rollback];preedit = 首条预测(精确)否则输入。
+    pub(crate) fn rebuild_magic_view(&mut self) -> ImeView {
+        let mut cands: Vec<String> = Vec::new();
+        for p in &self.magic_predictions { cands.push(p.text.clone()); }
+        for h in &self.magic_hints { cands.push(h.clone()); }
+        cands.push(self.buffer.clone()); // rollback — 最后一项
         self.candidates = cands;
         self.candidates_fresh = true;
+        self.candidate_highlight = 0;
+        self.candidate_page = 0;
+        self.full_comp_count = self.candidates.len();
+        self.partial_commit_indices = vec![false; self.candidates.len()];
+        if let Some(head) = self.magic_predictions.first() {
+            self.preedit = head.text.clone();
+        } else {
+            self.preedit = self.buffer.clone();
+        }
+        self.cursor = self.preedit.len();
+        self.make_view()
+    }
+
+    /// 选中候选(index):补全改写 / 预测提交(交互 or 上屏)/ rollback 提交。
+    pub fn select_magic(&mut self, index: usize, env: &dyn StepEnv) -> ImeView {
+        let n_preds = self.magic_predictions.len();
+        let n_hints = self.magic_hints.len();
+        // 1. 精确匹配的预测选项。
+        if index < n_preds {
+            let pred = self.magic_predictions[index].clone();
+            if pred.interactive {
+                // 交互式:传给命令 → 重新预测,替换选项(不上屏)。
+                if let Some(mut m) = self.active_command.take() {
+                    m.pick(index, &pred.text, self, env);
+                    self.active_command = Some(m);
+                }
+                return self.query_magic(env);
+            }
+            self.clear_active_command();
+            self.reset();
+            return match pred.cursor {
+                Some(c) => Self::commit_view_at(&pred.text, c),
+                None => Self::commit_view(&pred.text),
+            };
+        }
+        // 2. 补全提示:改写输入(不提交)。
+        if index < n_preds + n_hints {
+            let hint = self.magic_hints[index - n_preds].clone();
+            self.buffer = hint;
+            self.magic_hints.clear();
+            return self.query_magic(env);
+        }
+        // 3. rollback:提交原始缓冲。
+        let raw = std::mem::take(&mut self.buffer);
+        self.reset();
+        Self::commit_view(&raw)
     }
 
     /// Select candidate at `index`.
@@ -313,11 +322,7 @@ impl StateMachine {
     }
 
     pub fn reset(&mut self) {
-        // Drop the active magic member (after deactivate) — its per-session state
-        // goes with it; shared resources (voice slot, req fetcher) survive via Arc.
-        if let Some(mut m) = self.magic_member.take() {
-            m.deactivate();
-        }
+        self.clear_active_command();
         self.state = ComposeState::Idle;
         self.buffer.clear();
         self.raw_buffer.clear();
@@ -331,10 +336,9 @@ impl StateMachine {
         self.committed_pinyin_buf.clear();
         self.full_comp_count = 0;
         self.partial_commit_indices.clear();
-        self.pending_expansion = None;
         self.magic_hints.clear();
-        self.magic_member_cand_count = 0;
-        self.magic_tail.clear();
+        self.magic_predictions.clear();
+        self.magic_selectable = false;
     }
 
     /// Is the candidate panel OPEN (non-empty candidate list)? Navigation/paging special keys
@@ -450,188 +454,49 @@ impl StateMachine {
 
     // ── Snippet ────────────────────────────────────────────────────────
 
+    /// Snippet 态:所有 `#…` 输入统一在此处理。
+    ///
+    /// - Backspace 删字符重查;Enter 强选原始文本;
+    /// - Space 选中高亮候选(预测提交 / 补全改写 / rollback 提交);
+    /// - 数字键在可选中态(精确无参 / 前缀)选中候选,否则作为命令文本;
+    /// - 其它字符追加后重查。
     fn handle_snippet(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
-        // Backspace: pop last char from trigger.
+        // Backspace: pop last char, re-query. Empty → reset.
         if ch == '\x08' {
             self.buffer.pop();
-            self.pending_expansion = None;
-            self.magic_hints.clear();
             if self.buffer.is_empty() {
                 self.reset();
                 return ImeView::empty();
             }
-            self.preedit = self.buffer.clone();
-            self.cursor = self.preedit.len();
-            return self.make_view();
+            return self.query_magic(env);
         }
 
-        // Enter: force raw text, ignore any pending expansion.
+        // Enter: force raw text.
         if ch == '\n' || ch == '\r' {
             let raw = std::mem::take(&mut self.buffer);
             self.reset();
             return Self::commit_view(&raw);
         }
 
-        // Space: the highlighted candidate decides. A magic hint (not the last rollback)
-        // COMPLETES into that command — live → enter its Magic mode (`#as` + Space behaves
-        // like typing `#asr`); static → resolve its expansion. The rollback (last candidate,
-        // the raw `#xxx`) and any pending expansion commit text. Preview placeholders (tokens
-        // resolving to text ending with "...") commit empty.
+        // Space: commit the highlighted candidate.
         if ch == ' ' {
-            let hl = self.candidate_highlight;
-            if hl < self.magic_hints.len() {
-                let (trigger, token) = self.magic_hints[hl].clone();
-                self.magic_hints.clear();
-                if let Some(tok) = token {
-                    self.buffer = trigger.clone();
-                    self.pending_expansion = None;
-                    if let Some(member) = env.magic().spawn(&tok) {
-                        let mut member = member;
-                        self.state = ComposeState::Magic;
-                        let view = member.activate(self, env);
-                        self.magic_member = Some(member);
-                        self.assemble_magic_tail(env);
-                        return view;
-                    }
-                    // Token vanished (registry changed?) — fall through to commit raw.
-                    self.buffer = trigger;
-                } else {
-                    // Static command hint (`#date`) — resolve its expansion inline.
-                    let expanded = env.magic().static_expansion(&trigger)
-                        .unwrap_or_else(|| trigger.clone());
-                    self.reset();
-                    if expanded.ends_with("...") {
-                        return Self::commit_view("");
-                    }
-                    return Self::commit_view(&expanded);
-                }
-            }
-            self.magic_hints.clear();
-            if let Some(expansion) = self.pending_expansion.take() {
-                // Expand tracking the `$CURSOR` marker — the caret lands at its
-                // position in the RESULT (variables before it may vary in length).
-                let (expanded, cursor) = match env.expander().expand_with_cursor(&expansion) {
-                    Ok(t) => t,
-                    Err(e) => { tracing::warn!(error = %e, "expand failed"); (expansion, None) }
-                };
-                self.reset();
-                // Preview candidates ("语音识别中...") commit empty.
-                if expanded.ends_with("...") {
-                    return Self::commit_view("");
-                }
-                return match cursor {
-                    Some(pos) => Self::commit_view_at(&expanded, pos),
-                    None => Self::commit_view(&expanded),
-                };
-            }
-            let raw = std::mem::take(&mut self.buffer);
-            self.reset();
-            return Self::commit_view(&raw);
+            let hl = self.candidate_highlight.min(self.candidates.len().saturating_sub(1));
+            return self.select_magic(hl, env);
         }
 
-        // 片段命令(空名魔法命令):`#` 紧跟 `/` → 进入 SnippetMember,`/` 之后
-        // 的 `/hello?name=Mike` 由成员自身逐键积累。这是 `#command` trie 匹配
-        // 之外的特判路由(命令名为空,不进 trie)。
-        if self.buffer == "#" && ch == '/' {
-            if let Some(mut member) = env.magic().spawn("__SNIPPET__") {
-                self.state = ComposeState::Magic;
-                self.pending_expansion = None;
-                let _ = member.activate(self, env);
-                self.magic_member = Some(member);
-                self.assemble_magic_tail(env);
-                return self.handle_magic(ch, env);
+        // 数字键:可选中时选中候选,否则作为命令文本追加(如 `?num=2`)。
+        if let d @ '1'..='9' = ch {
+            if self.magic_selectable {
+                let idx = (d as u8 - b'1') as usize;
+                if idx < self.candidates.len() {
+                    return self.select_magic(idx, env);
+                }
             }
-            // 片段命令未注册(不应发生)—— 退回普通 matcher 流程。
         }
 
-        match env.matcher().step(&self.buffer, ch) {
-            Match::Complete { trigger, expansion } => {
-                self.buffer.push(ch);
-                // The trigger is fully matched — stale prefix hints from earlier Partial steps
-                // must not linger (a later Space would misroute to the hint branch).
-                self.magic_hints.clear();
-                // Live magic commands (e.g. `#asr`, `#req`) enter Magic mode — the registry
-                // spawns a member instance that owns the interactive session (keys + async
-                // ticks are routed to it). Static expansions go the pending-candidate path.
-                if let Some(member) = env.magic().spawn(&expansion) {
-                    let mut member = member;
-                    self.state = ComposeState::Magic;
-                    self.pending_expansion = None;
-                    let view = member.activate(self, env);
-                    self.magic_member = Some(member);
-                    self.assemble_magic_tail(env);
-                    return view;
-                }
-                // Magic static commands carry a sentinel (expansion == trigger)
-                // instead of a frozen value — resolve FRESH so a #date typed
-                // days after engine start commits TODAY, not the startup date.
-                // User snippets (expansion ≠ trigger) keep their own text.
-                let static_expanded = if expansion == trigger {
-                    env.magic().static_expansion(&trigger)
-                        .unwrap_or_else(|| expansion.clone())
-                } else {
-                    expansion.clone()
-                };
-                // Store the expansion as a pending candidate — don't auto-expand.
-                self.preedit = self.buffer.clone();
-                self.cursor = self.preedit.len();
-                let expanded = match env.expander().expand(&static_expanded) {
-                    Ok(t) => t,
-                    Err(e) => { tracing::warn!(error = %e, "expand failed"); static_expanded.clone() }
-                };
-                self.pending_expansion = Some(static_expanded);
-                self.candidates = vec![expanded];
-                self.candidates_fresh = true;
-                self.candidate_highlight = 0;
-                self.full_comp_count = 1;
-                self.partial_commit_indices = vec![false];
-                self.make_view()
-            }
-            Match::Partial => {
-                self.buffer.push(ch);
-                self.preedit = self.buffer.clone();
-                self.cursor = self.preedit.len();
-                self.pending_expansion = None;
-                // Magic prediction: ALL commands extending the buffer become hints (the user
-                // may not know the commands exist), with the raw buffer as the LAST rollback.
-                // Space on a hint completes into that command; Space on the rollback commits
-                // the raw `#xxx`.
-                self.magic_hints = env.magic()
-                    .hints(&self.buffer)
-                    .into_iter()
-                    .map(|(t, tok)| (t, tok.map(|s| s.to_string())))
-                    .collect();
-                let mut cands: Vec<String> = self.magic_hints.iter().map(|(t, _)| t.clone()).collect();
-                cands.push(self.buffer.clone()); // rollback — last default option
-                self.candidates = cands;
-                self.candidates_fresh = true;
-                self.candidate_highlight = 0;
-                self.full_comp_count = self.candidates.len();
-                self.partial_commit_indices = vec![false; self.candidates.len()];
-                self.make_view()
-            }
-            Match::None => {
-                self.buffer.push(ch);
-                self.preedit = self.buffer.clone();
-                self.cursor = self.preedit.len();
-                self.magic_hints.clear();
-                if self.buffer.starts_with('#') || self.buffer.starts_with('/') {
-                    // Unknown trigger: DON'T vanish — keep the raw text as a
-                    // fallback candidate (`/unknown` → candidate `/unknown`),
-                    // Space commits it, Esc/Backspace cancel. The same trie
-                    // fallback serves `#` and `/` uniformly.
-                    self.candidates = vec![self.buffer.clone()];
-                    self.candidates_fresh = true;
-                    self.candidate_highlight = 0;
-                    self.full_comp_count = 1;
-                    self.partial_commit_indices = vec![false];
-                    return self.make_view();
-                }
-                let text = std::mem::take(&mut self.buffer);
-                self.reset();
-                Self::commit_view(&text)
-            }
-        }
+        // 其它字符:追加到缓冲,重查。
+        self.buffer.push(ch);
+        self.query_magic(env)
     }
 
     // ── Pinyin ─────────────────────────────────────────────────────────

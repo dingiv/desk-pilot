@@ -18,7 +18,7 @@ mod voice;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-pub use member::{is_arg_char, preview_text, CANDIDATE_PREVIEW_MAX, CommandArgs, MagicMember, Prediction};
+pub use member::{preview_text, CANDIDATE_PREVIEW_MAX, CommandArgs, MagicMember, Prediction};
 pub use req::{ReqFetcher, DEFAULT_REQ_BASE};
 pub use snippet::SnippetMember;
 pub use voice::{SubmitMember, VoiceMember};
@@ -260,7 +260,7 @@ impl MagicFamily {
         if name_is_exact {
             // 精确:先 live 成员(含 alias),后静态。
             for m in &self.members {
-                if m.name() == name || m.aliases().iter().any(|a| *a == name) {
+                if m.name() == name || m.aliases().contains(&name) {
                     if let Some(token) = m.activation_token() {
                         return MagicMatch::Exact(MagicCommand::Live { token, name: m.name() });
                     }
@@ -300,6 +300,12 @@ impl MagicFamily {
     /// Static expansion text for a full trigger (e.g. `#date` → today's date).
     pub fn static_expansion(&self, trigger: &str) -> Option<String> {
         self.statics.iter().find(|s| s.trigger == trigger).map(|s| s.expansion())
+    }
+
+    /// 静态命令的预测:展开值作为一条提交预测。
+    pub fn static_prediction(&self, trigger: &str) -> Option<Vec<Prediction>> {
+        self.statics.iter().find(|s| s.trigger == trigger)
+            .map(|s| vec![Prediction::commit(s.expansion())])
     }
 
     /// Attach the voice buffer — routed to the shared slot all voice members read.

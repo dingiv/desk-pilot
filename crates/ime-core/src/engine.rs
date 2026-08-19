@@ -403,29 +403,16 @@ impl ImeEngine {
     pub fn candidates_detailed(&self) -> Vec<crate::family::RankedCandidate> {
         let map = self.contexts.lock().unwrap();
         let Some(pc) = map.get(&DEFAULT_CTX) else { return Vec::new() };
-        // Snippet/Magic state: candidates come from the Matcher trie / live member,
-        // not the scorer. Return them directly so #asr / #date expansions appear
-        // correctly. For Magic, the member's full commit texts (voice sentences /
-        // req bodies stay whole — each frontend truncates rows for its own display).
-        if pc.sm.state == crate::state::ComposeState::Magic && pc.sm.candidates_fresh {
-            let family: &'static str = pc.sm.magic_member.as_ref().map(|m| m.name()).unwrap_or("magic");
-            let texts: Vec<String> = match pc.sm.magic_member.as_ref() {
-                Some(m) => m.candidate_texts(&pc.sm),
-                None => pc.sm.candidates.clone(),
-            };
-            return texts.iter().map(|c| crate::family::RankedCandidate {
-                text: c.clone(),
-                score: 1.0,
-                family,
-                source: "exact",
-            }).collect();
-        }
+        // Snippet state (命令组合):candidates 来自命令预测 / 补全,不是 scorer。
+        // 直接返回,让 #asr 语音 / #date 日期 / 补全提示正确显示。
         if pc.sm.state == crate::state::ComposeState::Snippet && pc.sm.candidates_fresh {
-            let source = if pc.sm.buffer.starts_with('#') { "magic" } else { "snippet" };
+            let family: &'static str = pc.sm.active_command.as_ref()
+                .map(|m| if m.name().is_empty() { "snippet" } else { "magic" })
+                .unwrap_or("magic");
             return pc.sm.candidates.iter().map(|c| crate::family::RankedCandidate {
                 text: c.clone(),
                 score: 1.0,
-                family: source,
+                family,
                 source: "exact",
             }).collect();
         }
@@ -516,19 +503,23 @@ impl ImeEngine {
     pub fn magic_tick_ctx(&self, ctx: usize) -> Option<ImeView> {
         self.with_ctx(ctx, |disp, pc| {
             use crate::state::ComposeState;
-            if pc.sm.state != ComposeState::Magic {
-                return None; // not in a live command for this ctx — common
+            if pc.sm.state != ComposeState::Snippet {
+                return None; // not composing a command for this ctx — common
             }
             // The member is taken out so its tick can freely mutate the state
             // machine, then put back (the member may have exited itself).
-            let mut member = pc.sm.magic_member.take()?;
-            let changed = member.tick(&mut pc.sm, disp);
-            pc.sm.magic_member = Some(member);
-            // The member rebuilt its candidates — re-assemble the preview tail.
-            pc.sm.assemble_magic_tail(disp);
-            // 路由之外的 sm 变更 —— 状态机表重新同步。
-            pc.table.sync_from(&pc.sm);
-            changed
+            let mut member = pc.sm.active_command.take()?;
+            let new_preds = member.tick(&mut pc.sm, disp);
+            pc.sm.active_command = Some(member);
+            match new_preds {
+                Some(preds) => {
+                    pc.sm.magic_predictions = preds;
+                    // 路由之外的 sm 变更 —— 状态机表重新同步。
+                    pc.table.sync_from(&pc.sm);
+                    Some(pc.sm.rebuild_magic_view())
+                }
+                None => None,
+            }
         })
     }
 
@@ -763,43 +754,40 @@ mod tests {
     }
 
     #[test]
-    fn asr_path_en_enters_translate_mode_stub() {
-        // #asr/en → /en 传入家族内部,进入英文翻译模式(翻译实现留空,路径已就绪)。
+    fn asr_path_arg_keeps_voice_predictions() {
+        // #asr/en → 参数传家族内部(路径留白);匹配仍精确,预测仍是语音结果。
         use std::sync::Arc;
         use crate::asr_buffer::AsrBuffer;
         let mut e = eng();
         let buf = Arc::new(AsrBuffer::new());
         buf.set_connected(true);
+        buf.push_final("你好");
         e.set_asr_buffer(Arc::clone(&buf));
 
         for c in "#asr/en".chars() { e.predict(KeyEvent::char(c)); }
-        let view = e.view();
-        let preedit = ImeView::str_field(&view.preedit_text);
-        assert!(preedit.contains("#asr/en"), "arg echoed in preedit: {preedit}");
-        assert!(preedit.contains("英文翻译"), "translate marker: {preedit}");
+        let cands = e.candidates();
+        assert_eq!(cands.first().map(|s| s.as_str()), Some("你好"), "{cands:?}");
     }
 
     #[test]
     fn asr_unknown_path_handled_by_family() {
-        // #asr/unknown → 家族内部自行处理(打未知参数标记,不崩溃)。
+        // #asr/unknown → 家族内部自行处理:仍是语音结果(不崩溃)。
         use std::sync::Arc;
         use crate::asr_buffer::AsrBuffer;
         let mut e = eng();
         let buf = Arc::new(AsrBuffer::new());
         buf.set_connected(true);
+        buf.push_final("识别文本");
         e.set_asr_buffer(Arc::clone(&buf));
 
         for c in "#asr/unknown".chars() { e.predict(KeyEvent::char(c)); }
-        let view = e.view();
-        let preedit = ImeView::str_field(&view.preedit_text);
-        assert!(preedit.contains("#asr/unknown"), "arg echoed: {preedit}");
-        assert!(preedit.contains("未知参数"), "unknown marker: {preedit}");
+        let cands = e.candidates();
+        assert_eq!(cands.first().map(|s| s.as_str()), Some("识别文本"), "{cands:?}");
     }
 
     #[test]
     fn asr_calc_uses_calibration_preview() {
-        // #asr/calc → 集成校准:候选 #1 用 calc 预览(WindowCalibration/SegmentCalibration),
-        // 而非 plain 预览。
+        // #asr/calc → 预测 = 校准优先预览(WindowCalibration/SegmentCalibration)。
         use std::sync::Arc;
         use crate::asr_buffer::{AsrBuffer, AsrPreview};
         let mut e = eng();
@@ -811,45 +799,63 @@ mod tests {
         for c in "#asr/calc".chars() { e.predict(KeyEvent::char(c)); }
         let cands = e.candidates();
         assert_eq!(cands.first().map(|s| s.as_str()), Some("校准文本"), "{cands:?}");
-        let view = e.view();
-        assert!(ImeView::str_field(&view.preedit_text).contains("校准预览"), "marker: {:?}", view.preedit_text);
+        assert_eq!(ImeView::str_field(&e.view().preedit_text), "校准文本", "preedit = first prediction");
+        // 选中 → 上屏校准文本。
+        let v = e.predict(KeyEvent::space());
+        assert_eq!(ImeView::str_field(&v.commit_text), "校准文本");
     }
 
     #[test]
-    fn asr_plain_uses_basic_preview_when_available() {
-        // 无 /calc → 用 plain 预览(批处理/逐段拼接);无预览时回退原始 live。
-        use std::sync::Arc;
-        use crate::asr_buffer::{AsrBuffer, AsrPreview};
-        let mut e = eng();
-        let buf = Arc::new(AsrBuffer::new());
-        buf.set_connected(true);
-        buf.set_preview(AsrPreview { window_id: 3, plain: "plain文本".into(), calc: "校准文本".into() });
-        e.set_asr_buffer(Arc::clone(&buf));
-
-        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
-        let cands = e.candidates();
-        assert_eq!(cands.first().map(|s| s.as_str()), Some("plain文本"), "{cands:?}");
-    }
-
-    #[test]
-    fn asr_preview_falls_back_to_live_without_preview() {
-        // bridge 未喂预览(如纯 live/finals 环境)→ 回退原始 live。
+    fn asr_plain_shows_voice_results() {
+        // 无 /calc → 预测 = 语音结果(live + 定稿)。
         use std::sync::Arc;
         use crate::asr_buffer::AsrBuffer;
         let mut e = eng();
         let buf = Arc::new(AsrBuffer::new());
         buf.set_connected(true);
-        buf.set_live("流式原文");
+        buf.set_live("流式文本");
         e.set_asr_buffer(Arc::clone(&buf));
 
         for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
         let cands = e.candidates();
-        assert_eq!(cands.first().map(|s| s.as_str()), Some("流式原文"), "{cands:?}");
+        assert_eq!(cands.first().map(|s| s.as_str()), Some("流式文本"), "{cands:?}");
     }
 
     #[test]
-    fn asr_query_num_commits_latest_n_finals() {
-        // #asr?num=2 → 提交语音队列最新两条定稿。
+    fn asr_placeholder_when_no_voice_data() {
+        // 连接但暂无语音 → 占位预测(选中不上屏)。
+        use std::sync::Arc;
+        use crate::asr_buffer::AsrBuffer;
+        let mut e = eng();
+        let buf = Arc::new(AsrBuffer::new());
+        buf.set_connected(true);
+        e.set_asr_buffer(Arc::clone(&buf));
+
+        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
+        let cands = e.candidates();
+        assert_eq!(cands.first().map(|s| s.as_str()), Some("语音识别中..."), "{cands:?}");
+        // 占位不可提交。
+        let v = e.predict(KeyEvent::space());
+        assert!(ImeView::str_field(&v.commit_text).is_empty(), "placeholder not committed");
+    }
+
+    #[test]
+    fn asr_unavailable_when_disconnected() {
+        // 未连接 → 不可提交的解释预测。
+        use std::sync::Arc;
+        use crate::asr_buffer::AsrBuffer;
+        let mut e = eng();
+        e.set_asr_buffer(Arc::new(AsrBuffer::new()));
+        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
+        let cands = e.candidates();
+        assert_eq!(cands.first().map(|s| s.as_str()), Some("aura 未连接，语音不可用"), "{cands:?}");
+        let v = e.predict(KeyEvent::space());
+        assert!(ImeView::str_field(&v.commit_text).is_empty(), "explainer not committed");
+    }
+
+    #[test]
+    fn asr_query_num_predicts_latest_n_finals() {
+        // #asr?num=2 → 预测 = 语音队列最新两条定稿拼接;选中上屏。
         use std::sync::Arc;
         use crate::asr_buffer::AsrBuffer;
         let mut e = eng();
@@ -860,34 +866,56 @@ mod tests {
         buf.push_final("第三句");
         e.set_asr_buffer(Arc::clone(&buf));
 
-        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
-        let mut last = ImeView::empty();
-        for c in "?num=2".chars() { last = e.predict(KeyEvent::char(c)); }
-        let committed = ImeView::str_field(&last.commit_text);
-        assert_eq!(committed, "第三句\n第二句", "latest 2 finals: {committed:?}");
-        assert!(e.candidates().is_empty(), "session ended after commit");
+        for c in "#asr?num=2".chars() { e.predict(KeyEvent::char(c)); }
+        let cands = e.candidates();
+        assert_eq!(cands.first().map(|s| s.as_str()), Some("第三句\n第二句"), "{cands:?}");
+        let v = e.predict(KeyEvent::space());
+        assert_eq!(ImeView::str_field(&v.commit_text), "第三句\n第二句");
     }
 
     #[test]
-    fn magic_prefix_space_completes_into_command_not_raw() {
-        // `#as` + Space → behaves like typing `#asr` (enters Magic mode), NOT committing "#as".
+    fn magic_completion_rewrites_input_then_break_match() {
+        // 用户例子的完整链路:
+        //   #as → [1. #asr 2. #as];选中(空格)→ 输入改写为 #asr(不上屏、不预览);
+        //   #asr → [语音预测…, #asr];再打 r → #asrr → 只剩 raw(匹配断裂)。
         use std::sync::Arc;
         use crate::asr_buffer::AsrBuffer;
         let mut e = eng();
         let buf = Arc::new(AsrBuffer::new());
-        buf.set_connected(true); // simulate a live aura link
+        buf.set_connected(true);
+        buf.push_final("语音结果1");
+        buf.push_final("语音结果2");
         e.set_asr_buffer(Arc::clone(&buf));
 
+        // 1. #as → 补全提示 + rollback。
         for c in "#as".chars() { e.predict(KeyEvent::char(c)); }
-        // Hint: completion candidate (#asr) + raw (#as).
         let cands = e.candidates();
-        assert!(cands.contains(&"#asr".to_string()), "completion hint shown: {cands:?}");
-        assert!(cands.contains(&"#as".to_string()), "raw kept as fallback: {cands:?}");
+        assert_eq!(cands, vec!["#asr".to_string(), "#as".to_string()], "{cands:?}");
 
-        // Space → enters Voice mode (like #asr), does NOT commit "#as".
+        // 2. Space 选中补全 → 改写输入为 #asr,不提交、不进入预览。
         let v = e.predict(KeyEvent::space());
-        assert_eq!(ImeView::str_field(&v.commit_text), "", "space must not commit raw #as");
-        assert!(e.candidates().iter().any(|c| c.contains("语音识别中")), "now in asr mode: {:?}", e.candidates());
+        assert!(ImeView::str_field(&v.commit_text).is_empty(), "rewrite, not commit");
+        assert_eq!(e.buffer(), "#asr", "input rewritten to #asr");
+
+        // 3. #asr 精确 → 语音预测(最新在前)+ rollback;preedit = 首条预测。
+        let cands = e.candidates();
+        assert_eq!(cands, vec!["语音结果2".to_string(), "语音结果1".to_string(), "#asr".to_string()], "{cands:?}");
+        assert_eq!(ImeView::str_field(&e.view().preedit_text), "语音结果2", "preedit = first prediction");
+
+        // 4. 选预测 → 上屏。
+        let v = e.predict(KeyEvent::space());
+        assert_eq!(ImeView::str_field(&v.commit_text), "语音结果2");
+
+        // 5. 再来一遍,打 r 断开匹配 → #asrr 只剩 raw。
+        let mut e2 = eng();
+        let buf2 = Arc::new(AsrBuffer::new());
+        buf2.set_connected(true);
+        e2.set_asr_buffer(Arc::clone(&buf2));
+        for c in "#asr".chars() { e2.predict(KeyEvent::char(c)); }
+        e2.predict(KeyEvent::char('r'));
+        let cands = e2.candidates();
+        assert_eq!(cands, vec!["#asrr".to_string()], "match broken, raw only: {cands:?}");
+        assert_eq!(ImeView::str_field(&e2.view().preedit_text), "#asrr");
     }
 
     #[test]
@@ -974,11 +1002,11 @@ mod tests {
         e.magic_tick();
         let cands = e.candidates();
         assert_eq!(cands[0], long, "engine candidate is the full text: {cands:?}");
-        // The preedit expands the anchor into the recognized text.
+        // preedit = 首条预测(完整语音文本)。
         let v0 = e.view();
         let preedit = ImeView::str_field(&v0.preedit_text);
-        assert_eq!(preedit, format!("🎙 #asr {long}"), "preedit shows the voice text");
-        // Space commits the FULL text (from voice_full), not any display preview.
+        assert_eq!(preedit, long, "preedit = first prediction (full voice text)");
+        // Space commits the FULL text.
         let v = e.predict(KeyEvent::space());
         assert_eq!(ImeView::str_field(&v.commit_text), long);
     }
@@ -1094,21 +1122,23 @@ mod tests {
     }
 
     #[test]
-    fn req_anchor_hint_then_enter_fires_then_space_commits() {
+    fn req_anchor_hint_then_fire_then_commits_body() {
         let (mut e, fake) = req_eng();
         for c in "#req".chars() { e.predict(KeyEvent::char(c)); }
-        // Activation: hint candidate with the full URL
+        // 未发:交互式"回车请求 <url>" + rollback #req。
         let cands = e.candidates();
-        assert!(cands.iter().any(|c| c.contains("http://127.0.0.1:14555/api")), "hint: {cands:?}");
+        assert!(cands[0].contains("回车请求"), "hint: {cands:?}");
+        assert_eq!(cands.last().map(|s| s.as_str()), Some("#req"), "rollback last: {cands:?}");
 
-        // Enter fires the request → result lands on the worker thread
-        e.predict(KeyEvent::enter());
+        // Space on the hint → 触发请求(不上屏),预测换成"请求中…"。
+        let v = e.predict(KeyEvent::space());
+        assert!(ImeView::str_field(&v.commit_text).is_empty(), "space on hint fires, not commits");
         wait_req_tick(&e);
         let cands = e.candidates();
-        assert!(cands.iter().any(|c| c.contains("这是本地服务返回的正文内容")), "body shown: {cands:?}");
+        assert_eq!(cands[0], "这是本地服务返回的正文内容", "body is #1: {cands:?}");
         assert_eq!(fake.urls.lock().unwrap().as_slice(), ["http://127.0.0.1:14555/api"], "fired the base URL");
 
-        // Space commits the body; member exits, back to idle
+        // Space → 提交 body。
         let v = e.predict(KeyEvent::space());
         assert_eq!(ImeView::str_field(&v.commit_text), "这是本地服务返回的正文内容");
         assert!(e.candidates().is_empty(), "cleared after commit");
@@ -1119,28 +1149,24 @@ mod tests {
         let (mut e, fake) = req_eng();
         for c in "#req/news?query=soccer".chars() { e.predict(KeyEvent::char(c)); }
         let cands = e.candidates();
-        assert!(cands.iter().any(|c| c.contains("http://127.0.0.1:14555/api/news?query=soccer")), "hint shows full URL: {cands:?}");
+        assert!(cands[0].contains("http://127.0.0.1:14555/api/news?query=soccer"), "hint shows full URL: {cands:?}");
 
-        e.predict(KeyEvent::enter());
+        e.predict(KeyEvent::space()); // 触发
         wait_req_tick(&e);
         assert_eq!(fake.urls.lock().unwrap().as_slice(), ["http://127.0.0.1:14555/api/news?query=soccer"], "fired with suffix");
     }
 
     #[test]
-    fn req_long_body_preview_truncates_commit_full() {
+    fn req_long_body_commits_full_text() {
         let body = "长正文".repeat(30); // 270 bytes, ≫ 60
         let mut e = eng();
         e.set_req_fetcher(Arc::new(FakeFetcher { result: Ok(body.clone()), urls: Arc::new(Mutex::new(Vec::new())) }));
         for c in "#req".chars() { e.predict(KeyEvent::char(c)); }
-        e.predict(KeyEvent::enter());
+        e.predict(KeyEvent::space()); // fire
         wait_req_tick(&e);
         let cands = e.candidates();
-        // Preview panel: [member body] + [rollback #req]. The body is #1.
-        assert!(cands.len() >= 2, "body + rollback tail: {cands:?}");
-        assert!(cands[0].ends_with('…'), "preview truncated with ellipsis: {}", cands[0]);
-        assert!(cands[0].chars().count() <= 60, "preview ≤ 60 chars: {}", cands[0]);
-        assert_eq!(cands.last(), Some(&"#req".to_string()), "rollback is the last candidate");
-        // Space on the member candidate commits the FULL body, not the preview
+        // 预测 = 完整 body(展示截断由前端做)。
+        assert_eq!(cands[0], body, "full body is the candidate: {cands:?}");
         let v = e.predict(KeyEvent::space());
         assert_eq!(ImeView::str_field(&v.commit_text), body);
     }
@@ -1150,50 +1176,52 @@ mod tests {
         let mut e = eng();
         e.set_req_fetcher(Arc::new(FakeFetcher { result: Err("HTTP 500".into()), urls: Arc::new(Mutex::new(Vec::new())) }));
         for c in "#req".chars() { e.predict(KeyEvent::char(c)); }
-        e.predict(KeyEvent::enter());
+        e.predict(KeyEvent::space()); // fire → fail
         wait_req_tick(&e);
         let cands = e.candidates();
-        assert!(cands.iter().any(|c| c.contains("请求失败") && c.contains("HTTP 500")), "error shown: {cands:?}");
+        assert_eq!(cands[0], "请求失败: HTTP 500", "error shown: {cands:?}");
 
-        // Space on a failed state re-fires (no garbage commit)
+        // Space on the error (interactive) → 不提交。
         let v = e.predict(KeyEvent::space());
         assert!(ImeView::str_field(&v.commit_text).is_empty(), "error text never committed");
-        wait_req_tick(&e);
-        // Escape cancels the session
+        // Escape cancels the session.
         let v = e.predict(KeyEvent::escape());
         assert!(ImeView::str_field(&v.commit_text).is_empty());
         assert!(e.candidates().is_empty(), "cleared after escape");
     }
 
     #[test]
-    fn req_backspace_edits_suffix_then_exits() {
+    fn req_backspace_edits_suffix() {
         let (mut e, _fake) = req_eng();
         for c in "#req/news".chars() { e.predict(KeyEvent::char(c)); }
-        // Backspace pops one suffix char
+        // Backspace pops one suffix char → URL 缩短。
         e.predict(KeyEvent::backspace());
         let cands = e.candidates();
-        assert!(cands.iter().any(|c| c.contains("/new") && !c.contains("/news")), "suffix edited: {cands:?}");
-        // Delete the rest — when the suffix is empty, Backspace exits the member
-        for _ in 0..5 { e.predict(KeyEvent::backspace()); }
-        assert!(e.candidates().is_empty(), "member exited when suffix emptied: {:?}", e.candidates());
+        assert!(cands[0].contains("/new") && !cands[0].contains("/news"), "suffix edited: {cands:?}");
+        // 删回 #req → 仍精确,恢复基础 URL。
+        for _ in 0..4 { e.predict(KeyEvent::backspace()); }
+        let cands = e.candidates();
+        assert!(cands[0].contains("回车请求 http://127.0.0.1:14555/api"), "back to base: {cands:?}");
     }
 
     #[test]
     fn req_digit_extends_url_without_result_commits_with_result() {
         let (mut e, fake) = req_eng();
         for c in "#req/news".chars() { e.predict(KeyEvent::char(c)); }
-        // No result yet → digit is a URL character
+        // 参数态下数字是 URL 字符 → 追加,不选中。
         e.predict(KeyEvent::char('2'));
         e.predict(KeyEvent::char('0'));
         let cands = e.candidates();
-        assert!(cands.iter().any(|c| c.contains("/news20")), "digit appended to suffix: {cands:?}");
+        assert!(cands[0].contains("/news20"), "digit appended to suffix: {cands:?}");
 
-        // Fire → result lands → digit 1 commits the body
-        e.predict(KeyEvent::enter());
+        // 触发 → 结果 → Space 提交 body。
+        e.predict(KeyEvent::space());
         wait_req_tick(&e);
-        let v = e.predict(KeyEvent::char('1'));
-        assert_eq!(ImeView::str_field(&v.commit_text), "这是本地服务返回的正文内容");
+        let cands = e.candidates();
+        assert_eq!(cands[0], "这是本地服务返回的正文内容", "body shown: {cands:?}");
         assert!(fake.urls.lock().unwrap().iter().any(|u| u.ends_with("/news20")), "fired with digits in URL");
+        let v = e.predict(KeyEvent::space());
+        assert_eq!(ImeView::str_field(&v.commit_text), "这是本地服务返回的正文内容");
     }
 
     #[test]

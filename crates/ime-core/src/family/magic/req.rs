@@ -17,9 +17,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::member::{preview_text, CANDIDATE_PREVIEW_MAX, MagicMember, MemberAction};
+use super::member::{MagicMember, Prediction};
 use super::MagicResources;
-use crate::platform::ImeView;
 use crate::state::{StateMachine, StepEnv};
 
 /// Default local magic backend — override via [`MagicFamily::set_req_base`] (or the
@@ -100,10 +99,9 @@ struct ReqAsync {
 
 pub struct ReqMember {
     resources: Arc<MagicResources>,
-    /// Suffix typed after the trigger: path + query (e.g. "/news?query=soccer").
+    /// Suffix after the trigger — derived fresh from the input each predict
+    /// (path + query, e.g. "/news?query=soccer").
     arg: String,
-    /// Committable text of the latest result (the body) while status is `Done`.
-    full: Option<String>,
     /// Last `version` seen — `tick` compares to detect the worker thread landing.
     last_version: u64,
     async_state: Arc<ReqAsync>,
@@ -114,7 +112,6 @@ impl ReqMember {
         ReqMember {
             resources,
             arg: String::new(),
-            full: None,
             last_version: 0,
             async_state: Arc::new(ReqAsync::default()),
         }
@@ -126,28 +123,19 @@ impl ReqMember {
         format!("{base}{}", self.arg)
     }
 
-    /// Rebuild the candidate view from the async status. One candidate:
-    /// the hint (Idle), a status line (InFlight/Failed), or the body preview (Done).
-    fn rebuild(&mut self, sm: &mut StateMachine) -> ImeView {
+    /// 预测:一个选项 —— 未发:交互式"回车请求 <url>"(选中触发);in-flight:
+    /// 交互式"请求中…";done:提交完整 body(展示截断由前端做);fail:不可提交错误。
+    fn predictions(&mut self) -> Vec<Prediction> {
         let status = &*self.async_state.status.lock().unwrap();
-        let (candidate, full): (String, Option<String>) = match status {
-            ReqStatus::Idle => (format!("回车请求 {}", self.url()), None),
-            ReqStatus::InFlight => ("请求中…".into(), None),
-            ReqStatus::Done(body) => (preview_text(body, CANDIDATE_PREVIEW_MAX), Some(body.clone())),
-            ReqStatus::Failed(err) => (format!("请求失败: {err}"), None),
-        };
-        self.full = full;
-        self.last_version = self.async_state.version.load(Ordering::Acquire);
-        sm.candidates = vec![candidate];
-        sm.candidates_fresh = true;
-        sm.candidate_highlight = 0;
-        sm.candidate_page = 0;
-        sm.preedit = format!("#req{}", self.arg);
-        sm.cursor = sm.preedit.len();
-        sm.make_view()
+        match status {
+            ReqStatus::Idle => vec![Prediction::interactive(format!("回车请求 {}", self.url()))],
+            ReqStatus::InFlight => vec![Prediction::interactive(String::from("请求中…"))],
+            ReqStatus::Done(body) => vec![Prediction::commit(body.clone())],
+            ReqStatus::Failed(err) => vec![Prediction::interactive(format!("请求失败: {err}"))],
+        }
     }
 
-    /// A typed suffix invalidates a previous result — the URL changed.
+    /// 输入的 URL 后缀变了 → 之前的 Done 结果不再适用,复位为 Idle。
     fn invalidate_result(&self) {
         if let Ok(mut st) = self.async_state.status.lock() {
             if matches!(&*st, ReqStatus::Done(_)) {
@@ -184,10 +172,6 @@ impl MagicMember for ReqMember {
         "req"
     }
 
-    fn description(&self) -> &'static str {
-        "request local magic backend"
-    }
-
     fn activation_token(&self) -> Option<&'static str> {
         Some("__REQ__")
     }
@@ -196,78 +180,34 @@ impl MagicMember for ReqMember {
         Box::new(ReqMember::new(Arc::clone(&self.resources)))
     }
 
-    fn activate(&mut self, sm: &mut StateMachine, _env: &dyn StepEnv) -> ImeView {
-        self.rebuild(sm)
+    fn predict(&mut self, input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
+        // 后缀从输入派生;变了 → 旧结果失效。
+        let arg = input.strip_prefix("#req").unwrap_or("").to_string();
+        if arg != self.arg {
+            self.arg = arg;
+            self.invalidate_result();
+        }
+        // 消费当前版本 —— tick 只对之后的异步落地触发重建。
+        self.last_version = self.async_state.version.load(Ordering::Acquire);
+        self.predictions()
     }
 
-    fn on_key(&mut self, sm: &mut StateMachine, ch: char, _env: &dyn StepEnv) -> MemberAction {
-        match ch {
-            '\x08' => {
-                if self.arg.pop().is_some() {
-                    self.invalidate_result();
-                    MemberAction::View(Box::new(self.rebuild(sm)))
-                } else {
-                    // Suffix already empty — Backspace cancels the session.
-                    MemberAction::Exit
-                }
-            }
-            '\x1b' => MemberAction::Exit,
-            ' ' | '\n' | '\r' => {
-                let done = match &*self.async_state.status.lock().unwrap() {
-                    ReqStatus::Done(body) => Some(body.clone()),
-                    _ => None,
-                };
-                match done {
-                    // Result present → Space/Enter commits it.
-                    Some(body) => MemberAction::Commit(body),
-                    // Idle/Failed → fire the request; InFlight → ignore (view refresh).
-                    None => {
-                        self.fire();
-                        MemberAction::View(Box::new(self.rebuild(sm)))
-                    }
-                }
-            }
-            d @ '1'..='9' => {
-                let has_result =
-                    matches!(&*self.async_state.status.lock().unwrap(), ReqStatus::Done(_));
-                if has_result {
-                    // Only one candidate (the whole body) — digit 1 selects it.
-                    match (d == '1').then(|| self.full.clone()).flatten() {
-                        Some(t) => MemberAction::Commit(t),
-                        None => MemberAction::View(Box::new(self.rebuild(sm))),
-                    }
-                } else {
-                    // No result yet — digits are URL characters, extend the suffix.
-                    self.arg.push(d);
-                    MemberAction::View(Box::new(self.rebuild(sm)))
-                }
-            }
-            // URL-ish characters extend the suffix (path + query). Alphanumerics
-            // plus the RFC 3986 unreserved / sub-delim / reserved set — `;`/`@`
-            // etc. must stay in the URL, not pass through to the application.
-            c if c.is_ascii_alphanumeric() || "/?&=:.%+-_~!$'()*,;@[]".contains(c) => {
-                self.arg.push(c);
-                self.invalidate_result();
-                MemberAction::View(Box::new(self.rebuild(sm)))
-            }
-            _ => MemberAction::View(Box::new(StateMachine::passthrough_view())),
+    fn pick(&mut self, _index: usize, _text: &str, _sm: &mut StateMachine, _env: &dyn StepEnv) {
+        // 交互式选项:Idle 的"回车请求 <url>" → 触发;InFlight/Failed 无副作用。
+        let idle = matches!(&*self.async_state.status.lock().unwrap(), ReqStatus::Idle);
+        if idle {
+            self.fire();
         }
     }
 
-    fn tick(&mut self, sm: &mut StateMachine, _env: &dyn StepEnv) -> Option<ImeView> {
+    fn tick(&mut self, sm: &mut StateMachine, env: &dyn StepEnv) -> Option<Vec<Prediction>> {
         let cur = self.async_state.version.load(Ordering::Acquire);
         if cur == self.last_version {
             return None; // no request finished since the last rebuild
         }
-        tracing::debug!(last_version = self.last_version, cur, "req tick rebuild");
-        Some(self.rebuild(sm))
-    }
-
-    fn candidate_texts(&self, sm: &StateMachine) -> Vec<String> {
-        match &self.full {
-            Some(body) => vec![body.clone()],
-            None => sm.candidates.clone(),
-        }
+        self.last_version = cur;
+        let input = sm.buffer.clone();
+        Some(self.predict(&input, env))
     }
 }
 

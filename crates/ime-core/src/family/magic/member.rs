@@ -99,12 +99,6 @@ impl CommandArgs {
     }
 }
 
-/// 参数字符集:`/path` 与 `?query` 允许的字符(字母/数字 + 常用 URL 保留
-/// 标点)。数字在参数开启后也算参数字符(`?num=2` 的 `2`)。
-pub fn is_arg_char(c: char) -> bool {
-    c == '/' || c == '?' || c.is_ascii_alphanumeric() || "=&_-.%~".contains(c)
-}
-
 /// A single magic command — a prediction provider.
 pub trait MagicMember: Send + Sync {
     /// Command name, also the trigger suffix (e.g. "asr" → "#asr"). Empty for the
@@ -214,12 +208,4 @@ mod tests {
         assert_eq!(b.get("flag"), Some(""));
     }
 
-    #[test]
-    fn arg_char_set() {
-        for c in ['/', '?', 'a', 'Z', '0', '=', '&', '_', '-', '.', '%', '~'] {
-            assert!(is_arg_char(c), "{c:?} should be an arg char");
-        }
-        assert!(!is_arg_char(' '));
-        assert!(!is_arg_char('#')); // '#' is a trigger, not an arg char
-    }
 }

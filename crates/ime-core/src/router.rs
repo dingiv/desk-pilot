@@ -178,13 +178,11 @@ impl StateFlags {
     pub const PANEL_OPEN: StateFlags = StateFlags(1 << 1);
     /// 拼音组合模式。
     pub const PINYIN: StateFlags = StateFlags(1 << 2);
-    /// `/` snippet 或静态 `#` 命令组合。
+    /// `#` 命令组合(补全 / 预测)。
     pub const SNIPPET: StateFlags = StateFlags(1 << 3);
-    /// 魔法命令 live 模式(`#asr`/`#req` …)。
-    pub const MAGIC: StateFlags = StateFlags(1 << 4);
     /// 自生词模式:已有逐字提交(`committed_text` 非空)。
     pub const WORD_BUILDING: StateFlags = StateFlags(1 << 5);
-    /// 有待确认的展开候选(pending expansion / magic hints / preview tail)。
+    /// 有待确认的选项(命令预测 / 补全提示)。
     pub const PENDING: StateFlags = StateFlags(1 << 6);
 
     pub const fn empty() -> Self { StateFlags(0) }
@@ -203,7 +201,6 @@ impl StateFlags {
             (Self::PANEL_OPEN, "PANEL_OPEN"),
             (Self::PINYIN, "PINYIN"),
             (Self::SNIPPET, "SNIPPET"),
-            (Self::MAGIC, "MAGIC"),
             (Self::WORD_BUILDING, "WORD_BUILDING"),
             (Self::PENDING, "PENDING"),
         ] {
@@ -278,10 +275,10 @@ impl StateMachineTable {
             return StateMachine::passthrough_view();
         }
 
-        // 2. Magic live 模式:翻页/移光标符号是命令文本的一部分
-        //    (`#req/news?query=x` 的 `=`、URL 里的 `[`/`&`…)—— member 拥有
-        //    它们的键语义,与数字同规则。方向/翻页键仍走导航(语音候选高亮)。
-        if sm.state == ComposeState::Magic {
+        // 2. Snippet 态(组合 `#…` 命令):数字与 `+ - = [ ]` 是命令文本
+        //    (`?num=2` 的 `=`、`#req` URL 的 `-`/`[`/`]`…)—— 由状态机决定
+        //    (数字在可选中态选中候选,否则追加)。方向/翻页键仍导航。
+        if sm.state == ComposeState::Snippet {
             if let Some(c) = command_char(key.kind) {
                 return sm.step(c, env);
             }
@@ -324,7 +321,7 @@ impl StateMachineTable {
                 }
             }
 
-            // 5. Digit 1-9(Magic 模式已在上面 hoist 给 member):面板展开时
+            // 5. Digit 1-9(Snippet 态已在上面 hoist 给状态机):面板展开时
             //    按**当前页内**序号选词(翻页后按 1 选的是新页的第一项,
             //    不是全列表第一项);否则透传(idle 的裸数字属于应用)。
             KeyKind::Digit(n) => {
@@ -445,7 +442,6 @@ impl StateMachine {
             ComposeState::Idle => {}
             ComposeState::Pinyin => f |= StateFlags::PINYIN,
             ComposeState::Snippet => f |= StateFlags::SNIPPET,
-            ComposeState::Magic => f |= StateFlags::MAGIC,
         }
         if !self.committed_text.is_empty() {
             f |= StateFlags::WORD_BUILDING;
@@ -456,11 +452,9 @@ impl StateMachine {
         f
     }
 
-    /// 是否有"待确认"的候选(expansion / magic hints / preview tail)。
+    /// 是否有"待确认"的选项(命令预测 / 补全提示)。
     fn has_pending_choices(&self) -> bool {
-        self.pending_expansion.is_some()
-            || !self.magic_hints.is_empty()
-            || !self.magic_tail.is_empty()
+        !self.magic_predictions.is_empty() || !self.magic_hints.is_empty()
     }
 
     /// Change page by delta.

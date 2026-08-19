@@ -295,14 +295,18 @@ mod tests {
     #[test]
     fn pinyin_and_snippet_coexist() {
         let d = d(); let mut s = sm();
-        // Type #date — shows candidate, space commits.
+        // Type #date — 静态命令预测为今天日期,space commits。
         d.process_key('#', &mut s); d.process_key('d', &mut s); d.process_key('a', &mut s); d.process_key('t', &mut s);
         d.process_key('e', &mut s);
-        assert_eq!(ImeView::str_field(&d.process_key(' ', &mut s).commit_text), "2026-07-23");
-        // After snippet, typing letters enters pinyin.
+        assert_eq!(
+            ImeView::str_field(&d.process_key(' ', &mut s).commit_text),
+            crate::expander::today_str(),
+            "#date commits today"
+        );
+        // After magic, typing letters enters pinyin.
         d.process_key('n', &mut s);
         let a = d.process_key('i', &mut s);
-        assert!(a.candidate_count > 0, "after snippet, ni should produce candidates, got {a:?}");
+        assert!(a.candidate_count > 0, "after magic, ni should produce candidates, got {a:?}");
     }
 
     #[test]
