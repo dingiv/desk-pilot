@@ -87,11 +87,12 @@ zh-en，自带标点；tokens.txt 必须保持官方"token id"两列格式）。
    batch 结果（含 None，不做失败重试）；单段是常态（merge 仅发生在 <merge_gap 的
    停顿后），故大多数窗口省掉一整次 batch 调用。
 5. **AudioStore**：`Mutex<BTreeMap<id, PCM>>`，容量按样本（10min ≈19MB），超限逐最旧。
-6. **能量门（2026-08-19）**：空闲（帧 RMS < 100 且距上次有能量 > min_silence+0.5s）时跳过
-   Silero VAD 推理、流式解码、`accept_waveform` 与 PCM 累积——静音期 NN 成本归零。
-   冷却期保证说话中/尾静音必喂 VAD（才能判 EOS）。**不用流式 partial 作条件**——
-   x-asr 在静音上幻觉复读会让 partial 恒非空（门永不触发，自锁）。顺带修了挂机时
-   PCM 无限增长。
+6. **VAD 门控流式（2026-08-19）**：sherpa `VoiceActivityDetector::detected()` 提供**实时的**
+   "正在检测到语音"信号——它是流式喂帧的唯一门卫：detected() 为 true 才喂流式（accept +
+   解码），空闲零喂帧、零解码、零 CPU。起音翻转（detected false→true）时补喂最近 ~0.5s
+   的 lead-in（Silero 过阈值有延迟，soft onset 靠它补进会话）。`accept_waveform` 与 `pcm`
+   喂**完全相同**的帧 → 流式与 batch 听到同一段音频（共享 PCM 不变式）。替代了此前的
+   能量门（RMS 代理）——VAD 是唯一语音门卫，语义一致（VAD 没检测到，流式也不出字）。
 
 ## Stage2：文本 → 纠偏文本（LLM 联合整流）
 

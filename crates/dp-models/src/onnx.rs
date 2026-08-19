@@ -481,6 +481,13 @@ impl OnnxVad {
     pub fn is_speaking(&self) -> bool {
         self.inner.lock().unwrap().speaking
     }
+
+    /// **实时**"正在检测到语音"信号（sherpa 内部状态，非回溯事件）。Stage1 用它门控流式喂帧：
+    /// 只有 VAD 检测到语音时才喂流式模型，空闲零喂帧/零解码。软起音（detected 翻转前几帧）
+    /// 由 consume 循环的 lead-in 缓冲补喂。
+    pub fn detected(&self) -> bool {
+        self.inner.lock().unwrap().det.detected()
+    }
 }
 
 // ── Segment edge-extension (pure helpers) ──────────────────────────────────

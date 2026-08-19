@@ -155,8 +155,8 @@ CARGO_MANIFEST_DIR=$(pwd) cargo run -p aura-daemon --features asr,cuda -- 127.0.
   segment_calibration/window_calibration）：aura-core/agent/daemon/swift-ime/geek-familiar 切换完成。
 - **x-asr** 流式引擎（`asr.stream.model: x-asr`，2026-08-18）：chunk-480ms 官方导出，
   自带标点；可与 zipformer A/B。tokens.txt 必须官方"token id"两列格式。
-- **能量门**（2026-08-19）：空闲跳过 VAD/流式 NN，静音期 CPU 归零；修 x-asr 静音幻觉
-  复读 + 挂机 PCM 无限增长。
+- **VAD 门控流式**（2026-08-19）：`detected()` 实时信号门控流式喂帧——空闲零流式 CPU；
+  流式与 batch 共享同一段 PCM（一致）。替代了此前的能量门（RMS 代理）。
 - dp-models：mistralrs Calibrator 迁入（MistralLlm）+ ModelProvider 伞形 trait；
   aura-core 默认构建不再编译 GPU/LLM 重依赖。
 - 模型瘦身：assets/models 从 26GB → 12GB（删孤儿；本地批式只留 sensevoice）。

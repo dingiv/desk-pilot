@@ -51,11 +51,9 @@ const PARTIAL_EVERY_FRAMES: u32 = 15;
 /// which resets the session long before the partial could go stale.
 const STALE_SESSION_RESET: Duration = Duration::from_secs(8);
 
-/// 能量预门 RMS 门限(i16 幅度)。帧能量低于此值 **且** 距上次有能量已过冷却期(空闲)→ 判为
-/// "安静",跳过 Silero VAD 推理与流式解码(NN 贵,静音期占绝大多数时间)。仍喂 accept_waveform +
-/// 累积 PCM(纯缓冲,便宜——保 D1 连续喂帧与流式/batch 共享音频)。语音 RMS 通常 500+,
-/// 软起音 ~200-500,数字静音 ~0。100 兼顾灵敏度(不截轻声)与省 CPU(门只跳近静音的帧)。
-const VAD_GATE_RMS: f32 = 100.0;
+/// VAD 门控流式的 lead-in 帧数(每帧 32ms):detected() 翻转起音时补喂最近 ~0.5s 的帧,
+/// 让 soft onset 进入流式/batch(Silero 要几帧过阈值,detected 翻转晚于真实起音)。
+const LEAD_IN_FRAMES: usize = 16;
 
 /// Resolve a `MODELS::<sub-path>` model entry. A custom `models_dir` (config override) wins —
 /// the sub-path is joined onto it; otherwise the shared `MODELS` namespace resolves via
@@ -226,8 +224,6 @@ pub struct OnnxStage1Recognizer {
     ring_cv: Arc<Condvar>,
     /// Merge-window gap (s) — see [`Stage1Config::merge_gap_s`].
     merge_gap_s: f64,
-    /// VAD 尾静音定段时长 (s) — 能量门冷却期的依据(见 [`Stage1Config::vad`])。
-    min_silence_s: f32,
     active: Arc<AtomicBool>,
     /// The PCM store: segments' clips live here by id until their window settles.
     audio_store: Arc<AudioStore>,
@@ -276,7 +272,6 @@ impl OnnxStage1Recognizer {
             ring,
             ring_cv,
             merge_gap_s: cfg.merge_gap_s,
-            min_silence_s: cfg.vad.min_silence_duration,
             active: cfg.active,
             audio_store: Arc::new(AudioStore::new(DEFAULT_CAP_SAMPLES)),
             batch_asr,
@@ -307,7 +302,6 @@ impl OnnxStage1Recognizer {
             ring,
             ring_cv,
             merge_gap_s: cfg.merge_gap_s,
-            min_silence_s: cfg.vad.min_silence_duration,
             active: cfg.active,
             audio_store: Arc::new(AudioStore::new(DEFAULT_CAP_SAMPLES)),
             batch_asr,
@@ -625,11 +619,11 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
         let mut cur_seg: SegmentId = 0;
         // silence-feed 的节流计时器:喂送静音逼 VAD EOS 时,每 100ms 至多喂一帧(避免 CPU 空转)。
         let mut last_silence_feed = Instant::now();
-        // 能量门冷却:说话(帧 RMS ≥ 门限)后的这段时间内不跳过 VAD——VAD 需要累计尾静音
-        // (min_silence)才能判 EOS。冷却 = min_silence + 0.5s 余量。
-        let speech_cooldown = Duration::from_secs_f64(self.min_silence_s as f64 + 0.5);
-        // 上次"有能量"的时刻。初始为冷却已过 → 空闲立即进入能量门。
-        let mut last_loud = Instant::now() - speech_cooldown;
+        // VAD 门控流式的 lead-in:最近 ~0.5s 的帧。detected() 翻转起音时补喂流式会话,
+        // 让 soft onset 进流式/batch(二者一致)。空闲时只累积这个有界缓冲,不喂会话。
+        let mut lead_in: std::collections::VecDeque<Vec<i16>> = std::collections::VecDeque::new();
+        // 上一帧的 detected() 状态——翻转 false→true 时触发 lead-in 补喂。
+        let mut speech_active = false;
 
         loop {
             // Connection toggle: when the scout connection is paused, skip VAD/ASR (the ingest
@@ -749,63 +743,64 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
             };
             frames_in += 1;
 
-            // 能量预门:帧能量低于门限 **且** 距上次有能量已过冷却期(真正空闲)→ 跳过 Silero
-            // VAD 推理与流式解码(NN 贵)。仍喂 accept_waveform + 累积 PCM(便宜,保 D1 连续喂帧
-            // 与共享音频)。
-            // 不用 `speaking`(流式 partial)作条件——x-asr 在静音上幻觉复读会让 partial 恒非空,
-            // 门永远不触发(自锁)。冷却期保证:说话中/说完尾静音(≤min_silence+0.5s)必喂 VAD
-            // 才能累计静音判 EOS;只有静音持续过冷却期才判为真空闲。
-            let frame_rms = crate::vad::rms(&frame);
-            if frame_rms >= VAD_GATE_RMS {
-                last_loud = Instant::now();
-            }
-            let idle_silence = frame_rms < VAD_GATE_RMS && last_loud.elapsed() > speech_cooldown;
+            // (2) VAD FIRST —— 每帧跑(便宜 ~1-2ms),提供实时 detected() 语音门控信号 + 分段事件。
+            //     sherpa 的 `VoiceActivityDetector::detected()` 是实时"正在检测到语音"(非回溯
+            //     事件);它是流式喂帧的唯一门卫——VAD 说没语音,流式就不喂、不解码。
+            let vad = self.mgr.vad().unwrap();
+            let events = vad.push_frame(&frame);
+            let v_detected = vad.detected();
 
-            // (1) live streaming partial — the session is fed CONTINUOUSLY (D1 adaptation:
-            //     this VAD's SOS is retroactive, so gating on speech-start is impossible);
-            //     see [`ActiveSession`]. Throttle to ~0.5s, only on change. Keyed by the
-            //     tracker's prospective ids (authoritative grouping comes with Batch).
-            //     NOT a Stage2 input (D2).
+            // (1) 流式:只在 VAD 检测到语音时喂帧/解码(空闲零喂帧、零解码、零 CPU)。
+            //     · 起音翻转(detected 由 false→true)时补喂最近 ~0.5s 的 lead-in——Silero 要
+            //       几帧过阈值,detected 翻转晚于真实起音,lead-in 把 soft onset 补进会话;
+            //     · accept_waveform 与 pcm 喂的是**完全相同**的帧 → 流式与 batch 听到同一段
+            //       音频(共享 PCM 不变式);段边界会话 reset。
             if let (Some(asr), Some(a)) = (sasr, sess.as_mut()) {
-                // 空闲静音:accept_waveform + PCM 累积都跳过(纯缓冲)。
-                //  · 会话在段边界 reset,静音缓冲对最终文本无贡献
-                //  · pcm 不累积空闲静音 → 防止挂机时无限增长(否则 1h ≈ 100MB+);
-                //    共享 PCM 的 soft-onset 修复在语音内部,不受影响
-                //  · 说话中/尾静音(冷却期内)照常喂,保 D1 连续喂帧 + 共享音频
-                if !idle_silence {
+                if v_detected {
+                    if !speech_active {
+                        // 起音:补喂 lead-in,让流式/batch 都听到 soft onset
+                        for chunk in lead_in.drain(..) {
+                            a.stream.accept_waveform(sr as i32, &chunk);
+                            a.pcm.extend_from_slice(&chunk);
+                            a.fed += 1;
+                        }
+                        a.frames_since_partial = 0; // 补喂后重新起解码节拍
+                    }
                     a.stream.accept_waveform(sr as i32, &frame);
                     a.pcm.extend_from_slice(&frame); // 流式与 batch 共用同一段音频
-                }
-                a.fed += 1;
-                a.frames_since_partial += 1;
-                // 空闲静音:跳过解码 NN(静音产出空文本);`frames_since_partial` 继续累计,
-                // 能量一恢复就立刻解码(不丢音频——accept_waveform 一直在缓冲)。
-                if a.frames_since_partial >= PARTIAL_EVERY_FRAMES && !idle_silence {
-                    let partial = asr.decode_and_result(&a.stream);
-                    if !partial.is_empty() && partial != a.last_partial {
-                        let (window_id, segment_id) = tracker.prospective();
-                        on_event(Stage1Event::StreamFragment {
-                            window_id,
-                            segment_id,
-                            text: partial.clone(),
-                            at_s: start.elapsed().as_secs_f64(),
-                        });
-                        a.last_partial = partial;
-                        a.last_change = Instant::now();
+                    a.fed += 1;
+                    a.frames_since_partial += 1;
+                    if a.frames_since_partial >= PARTIAL_EVERY_FRAMES {
+                        let partial = asr.decode_and_result(&a.stream);
+                        if !partial.is_empty() && partial != a.last_partial {
+                            let (window_id, segment_id) = tracker.prospective();
+                            on_event(Stage1Event::StreamFragment {
+                                window_id,
+                                segment_id,
+                                text: partial.clone(),
+                                at_s: start.elapsed().as_secs_f64(),
+                            });
+                            a.last_partial = partial;
+                            a.last_change = Instant::now();
+                        }
+                        a.frames_since_partial = 0;
                     }
-                    a.frames_since_partial = 0;
+                } else {
+                    // 空闲:流式会话 park;只累积有界 lead-in(供下次起音补喂)
+                    lead_in.push_back(frame.clone());
+                    if lead_in.len() > LEAD_IN_FRAMES {
+                        lead_in.pop_front();
+                    }
                 }
             }
+            speech_active = v_detected;
 
-            // (2) VAD boundaries → WindowTracker → Batch (per segment) / WindowEdge (settle).
+            // (2b) VAD 事件 → WindowTracker → Batch (per segment) / WindowEdge (settle)。
             //     NOTE: this VAD emits SOS RETROACTIVELY — SOS+EOS arrive together in one
             //     push_frame batch when the finished segment pops. The SOS arm records the
             //     ids (for the segment the EOS arm in the same batch builds); the streaming
             //     session lifecycle is boundary-driven instead (see [`ActiveSession`]).
-            //     空闲静音帧跳过 Silero(对"非说话"态等价于喂静音,省每帧 NN 推理);
-            //     说话中/软起音(能量≥门限)照常喂,Silero 照常判起音/定段。
-            if !idle_silence {
-            for ev in self.mgr.vad().unwrap().push_frame(&frame) {
+            for ev in events {
                 match ev.kind {
                     VadEventKind::StartOfSpeech => {
                         // 回溯式 SOS:只分配段号 + 标记 active。merge/split 决策在 EOS
@@ -888,7 +883,6 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                     }
                 }
             }
-            } // !idle_silence — 空闲静音帧跳过 Silero VAD
         }
     }
 }
