@@ -300,15 +300,21 @@ impl StateMachine {
             } else {
                 format!("{}{}", self.committed_text, picked_cased)
             };
-            // Boost this word in inputx-pinyin's L0 user model.
             let full_pinyin = if self.committed_text.is_empty() {
                 self.buffer.clone()
             } else {
                 format!("{}{}", self.committed_pinyin(), self.buffer)
             };
-            // Record the FULL composed word, not just the last character.
-            env.record_pick(&full_pinyin, &final_text);
-            // 自生词模式:唯一的学习入口。经历过 ≥1 次数字键逐字选择
+            // 提交候选的来源家族 —— 两个家族的单词本各自闭环:
+            // 拼音提交 → 拼音 L0/单词本;英文提交 → 英文家族(且词典词不学)。
+            let commit_family = self.last_meta.iter()
+                .find(|m| m.text == picked)
+                .map(|m| m.family);
+            // L0 频率加成只对拼音族提交生效 —— 英文候选提交不写拼音模型。
+            if commit_family == Some("pinyin") {
+                env.record_pick(&full_pinyin, &final_text);
+            }
+            // 自生词模式(拼音族):唯一的学习入口。经历过 ≥1 次数字键逐字选择
             // (committed_text 非空)后提交,整体无条件加入单词本。
             // 直接提交(空格选 top,未逐字选择)**不学** —— decomp 选项
             // 下次输入时 Viterbi 会重新组合出同样的候选,无需入本。
@@ -317,9 +323,6 @@ impl StateMachine {
             }
             self.context.update(&final_text);
             // 记录提交候选的来源家族(供引擎判断是否学成自生词 —— 英文候选不学)。
-            let commit_family = self.last_meta.iter()
-                .find(|m| m.text == picked)
-                .map(|m| m.family);
             self.reset();
             self.last_commit_family = commit_family;
             Self::commit_view(&final_text)

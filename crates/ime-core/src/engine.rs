@@ -693,6 +693,41 @@ mod tests {
     }
 
     #[test]
+    fn families_word_books_stay_closed_loop() {
+        // 两个家族的单词本各自闭环:
+        // - 中文自生词(逐字选)→ 拼音单词本(重新输入出 pinyin/phrase);
+        // - 英文 raw Enter → 英文单词本(english/user);
+        // - 互不污染:中文不产生英文 user,英文不产生拼音 phrase。
+
+        // 中文自生词:lizhengming 逐字选 → 拼音单词本。
+        let mut e = eng();
+        for c in "lizhengming".chars() { e.predict(KeyEvent::char(c)); }
+        let li = e.candidates().iter().position(|c| c == "李").unwrap();
+        e.select_candidate(li);
+        let zheng = e.candidates().iter().position(|c| c == "正").unwrap();
+        e.select_candidate(zheng);
+        let ming = e.candidates().iter().position(|c| c == "明").unwrap();
+        e.select_candidate(ming);
+
+        for c in "lizhengming".chars() { e.predict(KeyEvent::char(c)); }
+        let detailed = e.candidates_detailed();
+        let phrase = detailed.iter().find(|d| d.text == "李正明")
+            .unwrap_or_else(|| panic!("中文自生词入拼音单词本: {detailed:?}"));
+        assert_eq!(phrase.family, "pinyin", "进的是拼音家族单词本");
+
+        // 英文 raw Enter → 英文单词本;family 是 english,不是 pinyin phrase。
+        let mut e2 = eng();
+        for c in "cd".chars() { e2.predict(KeyEvent::char(c)); }
+        e2.predict(KeyEvent::enter());
+        for c in "cd".chars() { e2.predict(KeyEvent::char(c)); }
+        let detailed = e2.candidates_detailed();
+        let cd = detailed.iter().find(|d| d.text == "cd")
+            .unwrap_or_else(|| panic!("英文 Enter 入英文单词本: {detailed:?}"));
+        assert_eq!(cd.family, "english", "进的是英文家族单词本");
+        assert_eq!(cd.source, "user");
+    }
+
+    #[test]
     fn incremental_composition() {
         let mut e = eng();
         for c in "lizhengming".chars() { e.predict(KeyEvent::char(c)); }
