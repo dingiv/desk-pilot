@@ -45,6 +45,16 @@ pub struct VadEvent {
     pub pcm: Vec<i16>,
 }
 
+/// **模型提供者 (伞形 marker)** — 每个 provider 实现类标识自己的 `kind`。真正的能力是
+/// 各领域的 trait object ([`AsrProvider`] / [`LlmProvider`] / [`VlmProvider`]), 一个
+/// provider 实现类额外 impl 它支持的那些能力 trait。上层使用者按需实例化具体实现
+/// (如 `HttpAsr::new(endpoint)` / `OnnxAsr::load(cfg)` / `Calibrator::load(...)`), 再按
+/// 能力取用。dp-models 是通用模型提供库, 不只给 aura 用。
+pub trait ModelProvider: Send + Sync {
+    /// 实现家族标签, 如 `"local-onnx"` / `"remote-http"` / `"local-mistral"`。
+    fn kind(&self) -> &'static str;
+}
+
 /// 语音转文字 (ASR): 输入 PCM i16 mono, 返回转写文本。
 pub trait AsrProvider: Send + Sync {
     fn recognize(&self, pcm: &[i16], sample_rate: u32) -> anyhow::Result<String>;
@@ -58,4 +68,18 @@ pub trait LlmProvider: Send + Sync {
 /// 视觉语言模型 (VLM): (system, user, image_png) -> 文本。local 实现留 visual-rover 未来。
 pub trait VlmProvider: Send + Sync {
     fn complete(&self, system: &str, user: &str, image_png: &[u8]) -> anyhow::Result<String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::{HttpAsr, HttpLlm, HttpVlm};
+
+    /// 伞形 marker 的契约: 每个实现类标识自己的 kind, 上层按 kind/能力取用。
+    #[test]
+    fn providers_identify_their_kind() {
+        assert_eq!(HttpAsr::new("http://x").kind(), "remote-http");
+        assert_eq!(HttpLlm::new("http://x", "m").kind(), "remote-http");
+        assert_eq!(HttpVlm::new("http://x", "m").kind(), "remote-http");
+    }
 }

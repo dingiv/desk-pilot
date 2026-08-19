@@ -16,7 +16,7 @@
 //! mgr.asr().unwrap().recognize(&pcm, 16000)?;
 //! ```
 
-use crate::{AsrProvider as Asr, VadEvent, VadEventKind};
+use crate::{AsrProvider as Asr, ModelProvider, VadEvent, VadEventKind};
 
 use anyhow::Result;
 use sherpa_onnx::{
@@ -719,6 +719,12 @@ impl OnnxAsr {
         let rec = OfflineRecognizer::create(&rc)
             .ok_or_else(|| anyhow::anyhow!("sherpa-onnx OfflineRecognizer::create failed"))?;
         Ok(OnnxAsr { rec: Mutex::new(rec) })
+    }
+}
+
+impl ModelProvider for OnnxAsr {
+    fn kind(&self) -> &'static str {
+        "local-onnx"
     }
 }
 

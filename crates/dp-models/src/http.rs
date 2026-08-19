@@ -5,7 +5,7 @@
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 
-use crate::{AsrProvider, LlmProvider, VlmProvider};
+use crate::{AsrProvider, LlmProvider, ModelProvider, VlmProvider};
 
 /// ASR via OpenAI `/v1/audio/transcriptions` (multipart wav)。
 pub struct HttpAsr {
@@ -16,6 +16,12 @@ pub struct HttpAsr {
 impl HttpAsr {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self { client: reqwest::blocking::Client::new(), endpoint: endpoint.into() }
+    }
+}
+
+impl ModelProvider for HttpAsr {
+    fn kind(&self) -> &'static str {
+        "remote-http"
     }
 }
 
@@ -54,6 +60,12 @@ impl HttpLlm {
     }
 }
 
+impl ModelProvider for HttpLlm {
+    fn kind(&self) -> &'static str {
+        "remote-http"
+    }
+}
+
 impl LlmProvider for HttpLlm {
     fn complete(&self, system: &str, user: &str) -> Result<String> {
         let body = serde_json::json!({
@@ -88,6 +100,12 @@ impl HttpVlm {
             endpoint: endpoint.into(),
             model: model.into(),
         }
+    }
+}
+
+impl ModelProvider for HttpVlm {
+    fn kind(&self) -> &'static str {
+        "remote-http"
     }
 }
 

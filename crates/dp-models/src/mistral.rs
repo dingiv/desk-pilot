@@ -12,7 +12,7 @@ use anyhow::Result;
 use mistralrs::{GgufModelBuilder, Model, TextMessageRole, TextMessages};
 use tokio::runtime::Runtime;
 
-use crate::LlmProvider;
+use crate::{LlmProvider, ModelProvider};
 
 /// Resident engine: GGUF model loaded once, kept warm. Holds its own tokio runtime so
 /// callers (napi Task threadpool, or the daemon via spawn_blocking) can call synchronously.
@@ -56,6 +56,12 @@ impl Calibrator {
             .first()
             .and_then(|c| c.message.content.clone())
             .unwrap_or_default())
+    }
+}
+
+impl ModelProvider for Calibrator {
+    fn kind(&self) -> &'static str {
+        "local-mistral"
     }
 }
 
