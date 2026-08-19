@@ -44,16 +44,23 @@ impl MagicMember for ClipMember {
     }
 
     fn predict(&mut self, input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
-        // 参数 `/N`:N = 倒数第 N+1 个(缺省 /0 = 最近一个)。
         let raw = input.strip_prefix("#clip").unwrap_or("");
         let args = CommandArgs::parse(raw);
+        let hist = self.resources.clipboard_history.lock().unwrap();
+        // 无参数:`#clip` → 展示最近 4 个 clipboard item(换行转义展示、原文提交)。
+        if args.path.is_empty() {
+            return hist.iter()
+                .filter(|t| !t.is_empty())
+                .take(4)
+                .map(|t| Prediction::commit_raw(escape_newlines(t), t.clone()))
+                .collect();
+        }
+        // 有参数 `/N`:N = 倒数第 N+1 个(`#clip/0` = 最近一个)。
         let n = args.path.first()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0);
-        let hist = self.resources.clipboard_history.lock().unwrap();
         match hist.get(n) {
             Some(text) if !text.is_empty() => {
-                // 展示转义回车(preedit/候选行显示 \n),提交原文(真换行)。
                 vec![Prediction::commit_raw(escape_newlines(text), text.clone())]
             }
             Some(_) => vec![Prediction::interactive("剪贴板为空")],

@@ -1005,14 +1005,19 @@ mod tests {
             e
         };
 
-        // #clip == #clip/0 → 倒数第一个(最近)。
+        // 裸 #clip → 展示最近 4 个 item(最近在前)+ rollback。
         let mut e = mk();
         for c in "#clip".chars() { e.predict(KeyEvent::char(c)); }
-        assert_eq!(e.candidates().first().map(|s| s.as_str()), Some("第三"), "{:?}", e.candidates());
+        assert_eq!(
+            e.candidates(),
+            vec!["第三".to_string(), "第二".to_string(), "第一".to_string(), "#clip".to_string()],
+            "bare #clip shows 4 recent items: {:?}",
+            e.candidates(),
+        );
         let v = e.predict(KeyEvent::space());
-        assert_eq!(ImeView::str_field(&v.commit_text), "第三", "选中即上屏");
+        assert_eq!(ImeView::str_field(&v.commit_text), "第三", "选中最近一项上屏");
 
-        // #clip/0 → 同样倒数第一个。
+        // #clip/0 → 单条,倒数第一个。
         let mut e = mk();
         for c in "#clip/0".chars() { e.predict(KeyEvent::char(c)); }
         assert_eq!(e.candidates().first().map(|s| s.as_str()), Some("第三"));
