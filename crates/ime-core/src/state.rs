@@ -387,6 +387,24 @@ impl StateMachine {
                 .checked_div(self.candidate_page_size as u32)
                 .unwrap_or(0) as usize;
         }
+        // 魔法命令预测:应用高亮(将提交)跟随高亮移动。
+        self.sync_magic_preedit();
+    }
+
+    /// 魔法预测模式下,preedit(应用高亮"将提交")跟随候选高亮:
+    /// 高亮在预测上 → 显示该预测;高亮在 rollback/补全上 → 显示原始输入。
+    /// 拼音态不适用(拼音 preedit 是组合,不是候选)。
+    pub(crate) fn sync_magic_preedit(&mut self) {
+        if self.state != ComposeState::Snippet || self.magic_predictions.is_empty() {
+            return;
+        }
+        let hl = self.candidate_highlight;
+        if let Some(p) = self.magic_predictions.get(hl) {
+            self.preedit = p.text.clone();
+        } else {
+            self.preedit = self.buffer.clone();
+        }
+        self.cursor = self.preedit.len();
     }
 
     /// Full pinyin for the committed portion.

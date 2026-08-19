@@ -991,6 +991,40 @@ mod tests {
     }
 
     #[test]
+    fn magic_highlight_move_updates_preedit() {
+        // #asr 预测模式:左右移动高亮 → 应用高亮(将提交)跟随。
+        use std::sync::Arc;
+        use crate::asr_buffer::AsrBuffer;
+        let mut e = eng();
+        let buf = Arc::new(AsrBuffer::new());
+        buf.set_connected(true);
+        buf.push_final("结果一");
+        buf.push_final("结果二");
+        buf.push_final("结果三");
+        e.set_asr_buffer(Arc::clone(&buf));
+
+        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
+        let mut view = e.view();
+        assert_eq!(ImeView::str_field(&view.preedit_text), "结果三", "初始 = 首条预测");
+
+        // 右移 → 高亮到第 2 条 → preedit 跟随。
+        view = e.key(KeyEvent { kind: crate::router::KeyKind::Right, ctrl: false, shift: false, alt: false });
+        assert_eq!(ImeView::str_field(&view.preedit_text), "结果二", "preedit 跟随高亮");
+
+        // 再右移 → 第 3 条。
+        view = e.key(KeyEvent { kind: crate::router::KeyKind::Right, ctrl: false, shift: false, alt: false });
+        assert_eq!(ImeView::str_field(&view.preedit_text), "结果一", "第 3 条");
+
+        // 右移到 rollback(#asr)→ preedit = 原始输入。
+        view = e.key(KeyEvent { kind: crate::router::KeyKind::Right, ctrl: false, shift: false, alt: false });
+        assert_eq!(ImeView::str_field(&view.preedit_text), "#asr", "rollback → 原始输入");
+
+        // 左移回预测 → preedit 跟随。
+        view = e.key(KeyEvent { kind: crate::router::KeyKind::Left, ctrl: false, shift: false, alt: false });
+        assert_eq!(ImeView::str_field(&view.preedit_text), "结果一", "左移回预测");
+    }
+
+    #[test]
     fn asr_query_num_predicts_latest_n_finals() {
         // #asr?num=2 → 预测 = 语音队列最新两条定稿拼接;选中上屏。
         use std::sync::Arc;

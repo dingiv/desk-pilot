@@ -468,6 +468,7 @@ impl StateMachine {
         if new_page != self.candidate_page {
             self.candidate_page = new_page;
             self.candidate_highlight = new_page * self.candidate_page_size;
+            self.sync_magic_preedit();
         }
     }
 }
