@@ -259,9 +259,11 @@ impl StateMachine {
             }
             self.clear_active_command();
             self.reset();
+            // 提交用 commit_text(展示转义时原文提交),光标针对展示文本。
+            let commit = pred.commit_value().to_string();
             return match pred.cursor {
-                Some(c) => Self::commit_view_at(&pred.text, c),
-                None => Self::commit_view(&pred.text),
+                Some(c) => Self::commit_view_at(&commit, c),
+                None => Self::commit_view(&commit),
             };
         }
         // 2. 补全提示:改写输入(不提交)。

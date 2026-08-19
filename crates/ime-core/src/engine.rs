@@ -1036,6 +1036,24 @@ mod tests {
     }
 
     #[test]
+    fn clip_escapes_newlines_in_preedit_but_commits_raw() {
+        // 剪贴板里的换行:preedit/候选行显示为 `\n`,提交时是原文(真换行)。
+        let mut e = eng();
+        e.set_variable("CLIPBOARD", "第一行\n第二行");
+        for c in "#clip".chars() { e.predict(KeyEvent::char(c)); }
+        // 展示:候选行 + preedit 显示转义后的 `\n`(单行)。
+        let cands = e.candidates();
+        assert_eq!(cands.first().map(|s| s.as_str()), Some("第一行\\n第二行"),
+            "display escaped: {cands:?}");
+        assert_eq!(ImeView::str_field(&e.view().preedit_text), "第一行\\n第二行",
+            "preedit escaped");
+        // 提交:原文(真换行)。
+        let v = e.predict(KeyEvent::space());
+        assert_eq!(ImeView::str_field(&v.commit_text), "第一行\n第二行",
+            "commit keeps raw newline");
+    }
+
+    #[test]
     fn magic_highlight_move_updates_preedit() {
         // #asr 预测模式:左右移动高亮 → 应用高亮(将提交)跟随。
         use std::sync::Arc;

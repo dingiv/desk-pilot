@@ -52,9 +52,18 @@ impl MagicMember for ClipMember {
             .unwrap_or(0);
         let hist = self.resources.clipboard_history.lock().unwrap();
         match hist.get(n) {
-            Some(text) if !text.is_empty() => vec![Prediction::commit(text.clone())],
+            Some(text) if !text.is_empty() => {
+                // 展示转义回车(preedit/候选行显示 \n),提交原文(真换行)。
+                vec![Prediction::commit_raw(escape_newlines(text), text.clone())]
+            }
             Some(_) => vec![Prediction::interactive("剪贴板为空")],
             None => vec![Prediction::interactive(format!("剪贴板历史不足(共 {})", hist.len()))],
         }
     }
+}
+
+/// 剪贴板文本展示转义:换行显示为 `\n`(候选行/preedit 单行可读);
+/// `\r\n` 归一为 `\n`,孤立 `\r` 显示为 `\r`。提交不经此函数,保持原文。
+fn escape_newlines(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\n', "\\n").replace('\r', "\\r")
 }

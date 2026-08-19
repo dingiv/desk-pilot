@@ -52,7 +52,11 @@ impl MagicMember for SnippetMember {
             Some(tpl) => {
                 let vars: Vec<(String, String)> = args.query.clone();
                 match env.expander().expand_with_vars(&tpl, &vars) {
-                    Ok((text, cursor)) => vec![Prediction { text, interactive: false, cursor }],
+                    Ok((text, cursor)) => {
+                        let mut p = Prediction::commit(text);
+                        p.cursor = cursor;
+                        vec![p]
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, snippet = %name, "snippet expand failed");
                         vec![Prediction::interactive(format!("片段展开失败: {e}"))]

@@ -19,25 +19,43 @@ use crate::state::{StateMachine, StepEnv};
 /// 命令的一条预测选项。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prediction {
+    /// 展示文本(候选行 + preedit)。可能做转义(`#clip` 把换行显示成 `\n`)。
     pub text: String,
     /// 交互式:选中不上屏,结果传给命令重新预测(替换选项);
     /// false = 选中即上屏。
     pub interactive: bool,
     /// 上屏时光标落点(字节偏移,`$CURSOR` 片段用);None = 末尾。
     pub cursor: Option<usize>,
+    /// 提交文本;None = 与展示文本相同。展示转义/截断时,提交用原始文本。
+    pub commit_text: Option<String>,
 }
 
 impl Prediction {
     pub fn commit(text: impl Into<String>) -> Self {
-        Prediction { text: text.into(), interactive: false, cursor: None }
+        Prediction { text: text.into(), interactive: false, cursor: None, commit_text: None }
+    }
+
+    /// 展示文本与提交文本不同(如 `#clip` 换行转义展示、原文提交)。
+    pub fn commit_raw(display: impl Into<String>, raw: impl Into<String>) -> Self {
+        Prediction {
+            text: display.into(),
+            interactive: false,
+            cursor: None,
+            commit_text: Some(raw.into()),
+        }
     }
 
     pub fn interactive(text: impl Into<String>) -> Self {
-        Prediction { text: text.into(), interactive: true, cursor: None }
+        Prediction { text: text.into(), interactive: true, cursor: None, commit_text: None }
     }
 
     pub fn with_cursor(text: impl Into<String>, cursor: usize) -> Self {
-        Prediction { text: text.into(), interactive: false, cursor: Some(cursor) }
+        Prediction { text: text.into(), interactive: false, cursor: Some(cursor), commit_text: None }
+    }
+
+    /// 实际提交文本(展示 ≠ 提交时用 commit_text)。
+    pub fn commit_value(&self) -> &str {
+        self.commit_text.as_deref().unwrap_or(&self.text)
     }
 }
 
