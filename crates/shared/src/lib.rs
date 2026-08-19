@@ -216,20 +216,25 @@ pub fn emit_namespaces() {
 /// [package.metadata.shared]
 /// CONF_DIR = { dev = "data/conf", prod = "~/.my-app/conf" }
 /// ```
+/// The header is matched at LINE START (not `find` anywhere) — a comment mentioning
+/// `[package.metadata.shared]` must not hijack the scan (2026-08-19 dp-models 踩坑)。
 fn parse_metadata(cargo_toml: &Path) -> Vec<(String, String, String)> {
     let Ok(content) = std::fs::read_to_string(cargo_toml) else {
         return Vec::new();
     };
-    // Find the [package.metadata.shared] section.
-    let marker = "[package.metadata.shared]";
-    let start = match content.find(marker) {
-        Some(i) => i + marker.len(),
-        None => return Vec::new(), // no namespace section — empty table
+    let lines: Vec<&str> = content.lines().collect();
+    // Find the line whose trimmed start IS the section header (comments don't match).
+    let Some(marker_idx) = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("[package.metadata.shared]"))
+    else {
+        return Vec::new(); // no namespace section — empty table
     };
     // Lines until the next `[...]` section header.
-    let section: Vec<&str> = content[start..]
-        .lines()
+    let section: Vec<&str> = lines[marker_idx + 1..]
+        .iter()
         .take_while(|l| !l.trim_start().starts_with('['))
+        .copied()
         .collect();
     // Parse lines like:  KEY = { dev = "...", prod = "..." }
     let mut result = Vec::new();
@@ -465,6 +470,26 @@ mod tests {
         // A Cargo.toml without [package.metadata.shared] → empty vec.
         let v = parse_metadata(Path::new("/dev/null"));
         assert!(v.is_empty());
+    }
+
+    #[test]
+    fn parse_metadata_comment_with_marker_does_not_hijack() {
+        // A comment containing "[package.metadata.shared]" BEFORE the real section must not
+        // be picked as the header (2026-08-19 dp-models 踩坑: 注释含 marker → find 命中注释)。
+        let tmp = std::env::temp_dir().join("shared_ns_test_comment.toml");
+        std::fs::write(
+            &tmp,
+            "# see [package.metadata.shared]\n\
+             [package.metadata.shared]\n\
+             MODELS = { dev = \"../../assets/models\", prod = \"~/.desk-pilot/models\" }\n",
+        )
+        .unwrap();
+        let v = parse_metadata(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(
+            v,
+            vec![("MODELS".to_string(), "../../assets/models".to_string(), "~/.desk-pilot/models".to_string())]
+        );
     }
 
     #[test]
