@@ -118,8 +118,7 @@ impl Stage1Config {
 
     /// [`Self::new`] with a custom model root: every `MODELS::` path (VAD / streaming / batch
     /// ASR) resolves under `models_dir` instead of the shared namespace — config 钮
-    /// `asr.local.model_dir`. The builders ([`Self::with_whisper_asr`] / [`Self::with_qwen3_asr`])
-    /// resolve through the same root.
+    /// `asr.local.model_dir`. Builders resolve through the same root.
     pub fn with_models_dir(scout_addr: impl Into<String>, models_dir: Option<String>) -> Self {
         // TODO: 在一个 new 函数中使用了 IO 操作，会失败，将 IO 拆出去作为另一个函数
         let dir = models_dir.clone();
@@ -186,44 +185,6 @@ impl Stage1Config {
                 "unsupported streaming engine {other:?} (supported: \"zipformer\" | \"x-asr\")"
             ),
         }
-    }
-
-    /// Use Whisper (e.g. large-v3-turbo) as the batch ASR backend instead of SenseVoice.
-    /// Model paths resolve via the same root (custom `models_dir` if set, else `MODELS`).
-    pub fn with_whisper_asr(mut self, language: &str) -> Self {
-        let dir = self.models_dir.clone();
-        let p = |rel: &str| -> String { resolve_model(dir.as_deref(), rel) };
-        self.asr = AsrConfig {
-            backend: AsrBackend::Whisper {
-                encoder: p("MODELS::whisper/large-v3-turbo/encoder.onnx"),
-                decoder: p("MODELS::whisper/large-v3-turbo/decoder.onnx"),
-                language: language.into(),
-            },
-            tokens: p("MODELS::whisper/large-v3-turbo/tokens.txt"),
-            ..Default::default()
-        };
-        self
-    }
-
-    /// Use Qwen3-Audio ASR (e.g. 1.7B int8) as the batch ASR backend instead of SenseVoice.
-    /// `tokenizer` is a HF tokenizer DIRECTORY. Qwen3-ASR is autoregressive (encoder-decoder,
-    /// LLM-style), so it is **slow on CPU** (sherpa-onnx ships CPU-only libs here) — useful as a
-    /// high-accuracy offline backend, and fast once a CUDA build is available. `tokens` is left
-    /// empty (Qwen3 loads its vocab from the tokenizer dir).
-    pub fn with_qwen3_asr(mut self) -> Self {
-        let dir = self.models_dir.clone();
-        let p = |rel: &str| -> String { resolve_model(dir.as_deref(), rel) };
-        self.asr = AsrConfig {
-            backend: AsrBackend::Qwen3Asr {
-                conv_frontend: p("MODELS::qwen3-asr/conv_frontend.onnx"),
-                encoder: p("MODELS::qwen3-asr/encoder.int8.onnx"),
-                decoder: p("MODELS::qwen3-asr/decoder.int8.onnx"),
-                tokenizer: p("MODELS::qwen3-asr/tokenizer"),
-            },
-            tokens: String::new(), // Qwen3 loads tokens from the tokenizer dir
-            ..Default::default()
-        };
-        self
     }
 
     /// Use a remote HTTP ASR (OpenAI-compatible `/v1/audio/transcriptions`) instead of local

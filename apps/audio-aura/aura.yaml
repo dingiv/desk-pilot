@@ -27,7 +27,8 @@ asr:
     model: x-asr            # zipformer (2023 双语) | x-asr (2026, 100万小时 zh-en, assets/models/x-asr)
   backend: remote               # local | remote | disable
   local:                        # backend=local 时生效
-    model: qwen3-asr            # 批式引擎: sensevoice | whisper | qwen3-asr
+    model: sensevoice           # 本地批式引擎: sensevoice (唯一本地; whisper/qwen3-asr 本地模型
+                                #   已删, qwen3-asr 走 asr.backend: remote)
     language: auto              # 批式语言 (sensevoice/whisper)
     hardware: cpu               # onnxruntime 装置: cpu | cuda (cuda 需 GPU sherpa lib + cuDNN 9.25)
     threads: 8                  # 批式 intra-op 线程 (8 核甜点)

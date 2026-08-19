@@ -409,21 +409,18 @@ fn stage1_config(spec: &PipelineSpec, active: Arc<AtomicBool>) -> Result<Stage1C
             cfg
         }
         AsrSpec::Local { backend, language, hardware: provider, threads, .. } => {
-            if backend == "whisper" {
-                info!("ASR backend: Whisper large-v3-turbo (language: {language})");
-                cfg = cfg.with_whisper_asr(language);
-            } else if backend == "qwen3-asr" {
-                info!("ASR backend: Qwen3-Audio ASR 1.7B int8");
-                cfg = cfg.with_qwen3_asr();
-            } else {
-                info!("ASR backend: SenseVoice (language: {language})");
+            // 本地 batch 只保留 SenseVoice —— whisper / qwen3-asr 的本地模型已删
+            // (qwen3-asr 改走 remote, 见 README)。配置它们直接报错, 不静默回退。
+            if backend != "sensevoice" {
+                anyhow::bail!(
+                    "asr.local.model: {backend} 不支持——本地批式仅 sensevoice \
+                     (whisper/qwen3-asr 模型已删; qwen3-asr 请用 asr.backend: remote)"
+                );
             }
+            info!("ASR backend: SenseVoice (language: {language})");
             // Batch-ASR ONNX provider (VAD + streaming stay CPU). cuDNN 9.25+ for sm_120 numerics.
             cfg.asr.provider = provider.clone();
             cfg.asr.num_threads = *threads;
-            if backend == "qwen3-asr" && provider == "cuda" {
-                info!("Qwen3-ASR on CUDA: correct (cuDNN 9.25) but autoregressive ⇒ ~CPU speed");
-            }
             info!(
                 "ASR provider: {} | threads: {} (batch ASR; VAD + streaming on CPU)",
                 cfg.asr.provider,
@@ -516,13 +513,11 @@ mod tests {
         assert!(matches!(cfg.asr_kind, ProviderKind::Remote { .. }));
         assert!(cfg.batch_enabled, "remote batch stays on");
 
-        // whisper / qwen3-asr → 对应 ONNX 后端。
-        let cfg = stage1_config(&spec(local("whisper")), Arc::new(AtomicBool::new(true))).unwrap();
-        assert!(matches!(cfg.asr.backend, AsrBackend::Whisper { .. }));
-        let cfg = stage1_config(&spec(local("qwen3-asr")), Arc::new(AtomicBool::new(true))).unwrap();
-        assert!(matches!(cfg.asr.backend, AsrBackend::Qwen3Asr { .. }));
+        // 本地只支持 sensevoice —— whisper / qwen3-asr 本地模型已删, 配置它们显式报错。
+        assert!(stage1_config(&spec(local("whisper")), Arc::new(AtomicBool::new(true))).is_err());
+        assert!(stage1_config(&spec(local("qwen3-asr")), Arc::new(AtomicBool::new(true))).is_err());
 
-        // 未知/默认 → SenseVoice;provider/threads 落位。
+        // sensevoice → SenseVoice;provider/threads 落位。
         let cfg = stage1_config(&spec(local("sensevoice")), Arc::new(AtomicBool::new(true))).unwrap();
         assert!(matches!(cfg.asr.backend, AsrBackend::SenseVoice { .. }));
         assert_eq!(cfg.asr.provider, "cpu");
@@ -620,13 +615,12 @@ mod tests {
         assert!(matches!(&cfg.asr.backend, AsrBackend::SenseVoice { model, .. }
             if model.starts_with("/custom/models/sensevoice/")));
 
+        // whisper 本地模型已删 —— 即使给了 model_dir 也拒绝(而非拼路径)。
         let mut s = spec(local("whisper"));
         if let AsrSpec::Local { model_dir, .. } = &mut s.asr {
             *model_dir = Some("/m".into());
         }
-        let cfg = stage1_config(&s, Arc::new(AtomicBool::new(true))).unwrap();
-        assert!(matches!(&cfg.asr.backend, AsrBackend::Whisper { encoder, .. }
-            if encoder.starts_with("/m/whisper/")), "builder 走同一根目录");
+        assert!(stage1_config(&s, Arc::new(AtomicBool::new(true))).is_err());
     }
 
     #[test]
