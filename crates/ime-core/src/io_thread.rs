@@ -23,7 +23,7 @@ use audio_aura_agent::view::AsrSegment;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use crate::frontend::{FrontEndHandle, StateView};
+use crate::frontend::{BROADCAST_CTX, FrontEndHandle, StateView};
 use crate::voice_state::SharedVoiceState;
 
 /// 魔法命令发给 I/O 线程的异步工作请求。
@@ -88,9 +88,11 @@ impl IoThread {
             .name("ime-io".into())
             .spawn(move || {
                 rt2.block_on(async move {
+                    // FIXME: 使用 tokio::select! 同时监听 rx 和 其他需要处理的 IO 事件, 而不是使用 tokio::spawn
+
                     // 事件分发任务。**关键:必须独立 spawn 在 local queue 里,**
                     // 才能被 current_thread runtime 在 main future 让出时 poll 到。
-                    // 如果写在 main future 内部 loop,它阻塞在 rx.recv().await 时
+                    // 如果写在 main future 内部 loop,它阻塞在 rx.recv().await 时.
                     // 没人 poll 其他 task(包括 SpawnAux / SpawnVoiceListener)。
                     tokio::spawn(async move {
                         loop {
@@ -213,7 +215,7 @@ async fn voice_listener_task(
                 let ok = health_client.health().await.unwrap_or(false);
                 state.set_connected(ok);
                 if let Some(f) = frontend.upgrade() {
-                    f.refresh_ui(StateView { ctx: 0 });
+                    f.refresh_ui(StateView { ctx: BROADCAST_CTX });
                 }
             }
         }
@@ -228,7 +230,9 @@ fn apply_and_notify(
 ) {
     state.fold_segment(&seg);
     if let Some(f) = frontend.upgrade() {
-        f.refresh_ui(StateView { ctx: 0 });
+        // voice listener 是引擎级全局 SSE —— 不绑定某个输入上下文,用
+        // BROADCAST_CTX 让前端刷新所有活动上下文(见 crate::frontend)。
+        f.refresh_ui(StateView { ctx: BROADCAST_CTX });
     }
 }
 
@@ -314,15 +318,21 @@ mod tests {
             }
         });
 
-        struct CountingFrontend(StdArc<AtomicUsize>);
+        struct CountingFrontend(
+            StdArc<AtomicUsize>,
+            StdArc<std::sync::Mutex<Vec<usize>>>,
+        );
         impl FrontEndHandle for CountingFrontend {
             fn get_clipboard_item(&self, _count: u32) {}
-            fn refresh_ui(&self, _: StateView) {
+            fn refresh_ui(&self, sv: StateView) {
                 self.0.fetch_add(1, Ordering::Relaxed);
+                self.1.lock().unwrap().push(sv.ctx);
             }
         }
         let refresh_count = StdArc::new(AtomicUsize::new(0));
-        let front: Arc<dyn FrontEndHandle> = Arc::new(CountingFrontend(refresh_count.clone()));
+        let refresh_ctxs = StdArc::new(std::sync::Mutex::new(Vec::new()));
+        let front: Arc<dyn FrontEndHandle> =
+            Arc::new(CountingFrontend(refresh_count.clone(), refresh_ctxs.clone()));
 
         let state = Arc::new(SharedVoiceState::new());
         let base = format!("http://127.0.0.1:{port}");
@@ -346,6 +356,14 @@ mod tests {
         assert!(
             refresh_count.load(Ordering::Relaxed) >= 1,
             "listener 应至少推一次 refresh"
+        );
+        // 回归:voice listener 是引擎级全局事件,refresh 必须用 BROADCAST_CTX
+        // (0)—— 曾写死 ctx=0 但被 C++ 当作真实输入上下文指针,导致 #asr
+        // 候选永远不刷新。前端(含单上下文)据此广播到所有活动上下文。
+        let ctxs = refresh_ctxs.lock().unwrap();
+        assert!(
+            !ctxs.is_empty() && ctxs.iter().all(|c| *c == BROADCAST_CTX),
+            "voice refresh 应全部带 BROADCAST_CTX: {ctxs:?}"
         );
     }
 }

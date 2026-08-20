@@ -12,6 +12,7 @@
 #include <fcitx/candidatelist.h>
 #include <fcitx-utils/event.h>
 #include <stdint.h>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -136,6 +137,9 @@ private:
 
     // ── 按需 UI 刷新(引擎 I/O 线程推送,替代旧的 100ms 轮询)───────────
     /// 引擎 I/O 线程异步推进时经 C 回调进入(marshal 到主循环)。
+    /// `ctx == 0` 是引擎级广播哨兵(voice listener 的全局 SSE 段不绑定某个
+    /// 输入上下文)—— 遍历所有活动上下文逐出一次 magic_tick;只有处于 live
+    /// 魔法会话(`#asr`)的 context 产生新视图,其余返回 0 天然跳过。
     void onRefresh(uintptr_t ctx);
     void onClipboardRequest(uint32_t count);
     static void uiRefreshCb(uintptr_t ctx, void *userdata);
@@ -144,8 +148,10 @@ private:
     /// 待刷新的 ctx 集合(跨线程,I/O 线程写、主循环 drain)。
     std::mutex refreshMutex_;
     std::set<uintptr_t> pendingRefreshes_;
-    /// 单发 drain 定时器(有 pending 才排,空闲零轮询)。
-    bool refreshArmed_ = false;
+    /// 单发 drain 定时器(有 pending 才排,空闲零轮询)。原子:被 I/O 线程
+    /// (onRefresh 的 exchange)与主循环 drain 并发读写,非原子 bool 会让
+    /// "刚 drain 完、旧 true 还没被看到"的刷新漏排定时器而丢失。
+    std::atomic<bool> refreshArmed_ = false;
     std::unique_ptr<fcitx::EventSourceTime> refreshTimer_;
 };
 

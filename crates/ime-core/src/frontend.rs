@@ -14,6 +14,10 @@ pub trait FrontEndHandle: Send + Sync {
     /// 结果落地 / 剪贴板回填),请重渲染。这是**轻量信号** —— I/O 线程不碰
     /// 状态机,前端收到后在主循环调 [`crate::engine::ImeEngine::get_live_view`]
     /// 拉取最新视图再渲染。
+    ///
+    /// `ctx` 约定:事件绑定某个输入上下文时传该上下文的 ctx 值;引擎级全局
+    /// 事件(voice listener 的 SSE 段 / 健康探针)不绑定任何上下文,传
+    /// [`BROADCAST_CTX`] —— 前端应刷新它**所有**活动上下文。
     fn refresh_ui(&self, state_view: StateView);
 }
 
@@ -22,6 +26,16 @@ pub trait FrontEndHandle: Send + Sync {
 pub struct StateView {
     pub ctx: usize,
 }
+
+/// 广播哨兵:引擎级异步推进不绑定某个输入上下文,`refresh_ui` 用
+/// `ctx = 0` 表示"刷新所有活动上下文"。
+///
+/// 契约(跨 FFI,fcitx5 的 C++ `onRefresh` 依赖它):
+/// - fcitx5 前端:C++ 侧对 `ctx == 0` 遍历 `activeContexts_` 逐出一次
+///   `swift_ime_magic_tick` —— 只有处于 live 魔法会话(`#asr`)的 context
+///   产生新视图,其余 `magic_tick_ctx` 返回 `None` 天然跳过;
+/// - 单上下文前端(TUI / mock):默认 ctx=0 即唯一上下文,等价于广播。
+pub const BROADCAST_CTX: usize = 0;
 
 /// 空前端句柄(测试 / 无前端场景):记录 refresh 信号,剪贴板请求不响应。
 #[derive(Debug, Default)]

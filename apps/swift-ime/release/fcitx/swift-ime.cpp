@@ -20,6 +20,7 @@
 #include <memory>
 #include <string>
 #include <time.h>
+#include <vector>
 
 // ── Helper ──────────────────────────────────────────────────────────────
 
@@ -180,21 +181,38 @@ void SwiftImeEngine::onRefresh(uintptr_t ctx) {
         std::lock_guard<std::mutex> lk(refreshMutex_);
         pendingRefreshes_.insert(ctx);
     }
-    if (!refreshArmed_) {
-        refreshArmed_ = true;
+    // 原子 test-and-set:refreshArmed_ 被 I/O 线程(onRefresh)与主循环 drain
+    // 并发读写 —— 非原子 bool 会让"刚 drain 完、旧 true 还没被看到"的刷新
+    // 漏排定时器而丢失。exchange 保证每次插入后至多一个 drain 定时器在途。
+    if (!refreshArmed_.exchange(true)) {
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
         uint64_t now = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
         refreshTimer_ = instance_->eventLoop().addTimeEvent(
             CLOCK_MONOTONIC, now + 1000, 1,
             [this](fcitx::EventSourceTime *, uint64_t) {
-                refreshArmed_ = false;
+                refreshArmed_.store(false);
                 std::set<uintptr_t> ctxs;
                 {
                     std::lock_guard<std::mutex> lk2(refreshMutex_);
                     ctxs.swap(pendingRefreshes_);
                 }
                 for (uintptr_t c : ctxs) {
+                    // ctx 0 = 引擎级广播:voice listener 的 SSE 段 / 健康探针
+                    // 是全局事件,不绑定某个输入上下文。遍历所有活动上下文逐
+                    // 出一次 magic_tick —— 只有处于 live 魔法会话(#asr)的
+                    // context 返回新视图,其余 magic_tick 返回 0 天然跳过。
+                    if (c == 0) {
+                        std::vector<fcitx::InputContext *> all(
+                            activeContexts_.begin(), activeContexts_.end());
+                        for (auto *ic : all) {
+                            ImeView view;
+                            if (swift_ime_magic_tick(handle_, (void *)ic, &view)) {
+                                apply_view(ic, view);
+                            }
+                        }
+                        continue;
+                    }
                     auto *ic = reinterpret_cast<fcitx::InputContext *>(c);
                     ImeView view;
                     if (swift_ime_magic_tick(handle_, (void *)ic, &view)) {

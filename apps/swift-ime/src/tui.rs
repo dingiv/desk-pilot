@@ -48,6 +48,7 @@ const POLL_MS: u64 = 100; // voice live-refresh cadence (was 200)
 
 pub fn run(mut cfg: MockConfig) -> io::Result<()> {
     // 前端句柄:引擎 I/O 线程推送刷新 → TUI 渲染循环 drain。
+    // (进程级 tracing subscriber 在 build_engine 里按 debug.log_level 初始化。)
     let frontend = Arc::new(TuiFrontend::default());
     cfg.frontend = Some(Arc::clone(&frontend) as Arc<dyn FrontEndHandle>);
     let (mut engine, voice_state) = swift_ime::frontends::mock::build_engine(&cfg);

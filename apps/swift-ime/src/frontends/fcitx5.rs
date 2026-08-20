@@ -125,10 +125,11 @@ fn truncate_candidate_rows(view: &mut ImeView) {
 
 #[no_mangle]
 pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngine {
-    crate::logger::init_default();
-    crate::ime_log!("swift-ime cdylib loaded");
-
+    // 先读配置(拿 debug.log_level),再装进程级 tracing subscriber —— 之后
+    // 的 ime_log! / 引擎 tracing 事件统一写进 swift-ime.log。
     let cfg = crate::config::SwiftImeConfig::load();
+    crate::logger::init_with_log_level(cfg.debug.log_level.as_deref());
+    crate::ime_log!("swift-ime cdylib loaded");
     let weights = cfg.weights.pinyin.to_engine();
     let eng_weights = ime_core::family::english::EnglishWeights {
         exact: cfg.weights.english.exact,
@@ -170,10 +171,10 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
         if let Some(p) = loader.resolve("DICT::rime-ice.fst") {
             match engine.load_dict(&p.to_string_lossy()) {
                 Ok(n) => crate::ime_log!("loaded rime-ice: {n} entries from {}", p.display()),
-                Err(e) => crate::ime_log!("ERROR loading rime-ice: {e}"),
+                Err(e) => tracing::error!(target: "swift_ime", "loading rime-ice: {e}"),
             }
         } else {
-            crate::ime_log!("rime-ice.fst not found");
+            tracing::warn!(target: "swift_ime", "rime-ice.fst not found");
         }
     }
 
@@ -188,7 +189,7 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
         if let Some(p) = loader.resolve("DICT::emoji.tsv") {
             match engine.load_emoji_dict(&p.to_string_lossy()) {
                 Ok(n) => crate::ime_log!("loaded emoji: {n} keyword rows from {}", p.display()),
-                Err(e) => crate::ime_log!("emoji dict load error: {e}"),
+                Err(e) => tracing::warn!(target: "swift_ime", "emoji dict load error: {e}"),
             }
         }
     }
@@ -197,7 +198,7 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
         if p.exists() {
             match engine.load_emoji_user_dict(&p.to_string_lossy()) {
                 Ok(n) => crate::ime_log!("loaded {n} emoji user rows from {}", p.display()),
-                Err(e) => crate::ime_log!("emoji user dict load error: {e}"),
+                Err(e) => tracing::warn!(target: "swift_ime", "emoji user dict load error: {e}"),
             }
         }
     }
@@ -217,7 +218,7 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
     if let Some(p) = loader.resolve("CONF::en_user.tsv") {
         match engine.load_en_user_dict(&p.to_string_lossy()) {
             Ok(n) => crate::ime_log!("loaded {n} en user words from {}", p.display()),
-            Err(e) => crate::ime_log!("en user dict load error: {e}"),
+            Err(e) => tracing::warn!(target: "swift_ime", "en user dict load error: {e}"),
         }
     }
 

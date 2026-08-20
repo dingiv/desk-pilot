@@ -52,14 +52,12 @@ impl Default for MockConfig {
 
 /// Run batch evaluation against a test cases file.
 pub fn run_cases_mode(cfg: &MockConfig, cases_path: &str) {
-    crate::logger::init_default();
     let (mut engine, _) = build_engine(cfg);
     run_cases(&mut engine, cases_path, cfg.verbose);
 }
 
 /// Run single-input mode (show candidates or commit).
 pub fn run_input_mode(cfg: &MockConfig) {
-    crate::logger::init_default();
     let (mut engine, state) = build_engine(cfg);
     let input = cfg.input.as_deref().unwrap_or("");
     if cfg.async_wait > 0 { wait_for_voice(&state, cfg.async_wait); }
@@ -77,13 +75,18 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<ime_core::voice_state::
         match std::fs::read_to_string(path) {
             Ok(yaml) => match serde_yaml::from_str::<crate::config::SwiftImeConfig>(&yaml) {
                 Ok(c) => { crate::ime_log!("loaded config from {path}"); c }
-                Err(e) => { crate::ime_log!("config parse error: {e}, using defaults"); crate::config::SwiftImeConfig::default() }
+                Err(e) => { tracing::warn!(target: "swift_ime", "config parse error: {e}, using defaults"); crate::config::SwiftImeConfig::default() }
             },
-            Err(e) => { crate::ime_log!("config read error: {e}, using defaults"); crate::config::SwiftImeConfig::default() }
+            Err(e) => { tracing::warn!(target: "swift_ime", "config read error: {e}, using defaults"); crate::config::SwiftImeConfig::default() }
         }
     } else {
         crate::config::SwiftImeConfig::load()
     };
+
+    // 装进程级 tracing subscriber —— mock/TUI 的唯一初始化点(Once 幂等,
+    // fcitx5 cdylib 在 swift_ime_create 里各自初始化)。引擎与前端日志统一
+    // 写进 swift-ime.log,级别取 debug.log_level(默认 info;RUST_LOG 优先)。
+    crate::logger::init_with_log_level(sw_cfg.debug.log_level.as_deref());
 
     let weights = sw_cfg.weights.pinyin.to_engine();
     let eng_weights = ime_core::family::english::EnglishWeights {
@@ -113,7 +116,7 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<ime_core::voice_state::
         if let Some(p) = loader.resolve("DICT::rime-ice.fst") {
             match engine.load_dict(&p.to_string_lossy()) {
                 Ok(n) => crate::ime_log!("loaded {n} dict entries from {}", p.display()),
-                Err(e) => crate::ime_log!("dict load error: {e}"),
+                Err(e) => tracing::warn!(target: "swift_ime", "dict load error: {e}"),
             }
         }
     }
@@ -129,7 +132,7 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<ime_core::voice_state::
         if let Some(p) = loader.resolve("DICT::emoji.tsv") {
             match engine.load_emoji_dict(&p.to_string_lossy()) {
                 Ok(n) => crate::ime_log!("loaded emoji: {n} keyword rows from {}", p.display()),
-                Err(e) => crate::ime_log!("emoji dict load error: {e}"),
+                Err(e) => tracing::warn!(target: "swift_ime", "emoji dict load error: {e}"),
             }
         }
     }
@@ -138,7 +141,7 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<ime_core::voice_state::
         if p.exists() {
             match engine.load_emoji_user_dict(&p.to_string_lossy()) {
                 Ok(n) => crate::ime_log!("loaded {n} emoji user rows from {}", p.display()),
-                Err(e) => crate::ime_log!("emoji user dict load error: {e}"),
+                Err(e) => tracing::warn!(target: "swift_ime", "emoji user dict load error: {e}"),
             }
         }
     }

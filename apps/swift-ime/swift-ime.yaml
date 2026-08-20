@@ -84,4 +84,7 @@ weights:
 debug:
   candidate_meta: true   # 候选词后显示提供者与权重 [score family/source]
                           # (fcitx 显示在候选词右侧注释,TUI 始终显示)
+  # log_level: info      # tracing 日志级别(默认 info;RUST_LOG 环境变量优先)。
+                          # 诊断 #asr 刷新等需看引擎 debug 日志时设 ime_core=debug:
+                          #   log_level: ime_core=debug,info
 

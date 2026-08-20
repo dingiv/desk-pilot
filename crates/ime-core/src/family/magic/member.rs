@@ -21,13 +21,15 @@ use crate::state::{StateMachine, StepEnv};
 pub struct Prediction {
     /// 展示文本(候选行 + preedit)。可能做转义(`#clip` 把换行显示成 `\n`)。
     pub text: String,
+    /// 提交文本;None = 与展示文本相同。展示转义/截断时,提交用原始文本。
+    pub commit_text: Option<String>,
+
+    /// 上屏时光标落点(字节偏移,`$CURSOR` 片段用);None = 末尾。
+    pub cursor: Option<usize>,
+
     /// 交互式:选中不上屏,结果传给命令重新预测(替换选项);
     /// false = 选中即上屏。
     pub interactive: bool,
-    /// 上屏时光标落点(字节偏移,`$CURSOR` 片段用);None = 末尾。
-    pub cursor: Option<usize>,
-    /// 提交文本;None = 与展示文本相同。展示转义/截断时,提交用原始文本。
-    pub commit_text: Option<String>,
 }
 
 impl Prediction {

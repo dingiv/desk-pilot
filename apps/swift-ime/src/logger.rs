@@ -1,103 +1,157 @@
-//! ImeLogger — unified logging for swift-ime.
+//! Unified logging for swift-ime and ime-core — one `tracing` subscriber.
 //!
-//! Reads log path from config. In dev builds, tees to both file and stderr.
-//! In release builds, writes to file only. Truncates the file if it exceeds
-//! `max_bytes` (default 2MB) on open.
+//! Both crates log through the `tracing` facade:
+//! - ime-core uses `tracing::{error, warn, info, debug}!` directly;
+//! - swift-ime keeps [`ime_log!`] as a thin alias to `tracing::info!`
+//!   (target `swift_ime`) so existing call sites route into the same subscriber.
 //!
-//! ```ignore
-//! use logger::ime_log;
+//! A single process-wide subscriber (installed ONCE at frontend init) writes to
+//! a log file — the **only reliable channel** when the `.so` runs inside the
+//! fcitx5 daemon, which detaches stdout/stderr:
+//! - **Dev** (`debug_assertions`): human-readable lines, teed to stderr + file.
+//! - **Release**: one JSON object per line to the file (machine-parseable).
+//! - **Level filter**: `RUST_LOG` env overrides the config default (`"info"`).
+//!   Accepts a bare level or per-target directives (`ime_core=debug,info`).
 //!
-//! ime_log!("loaded {n} dict entries");
-//! ime_log!("ERROR: {e}");
-//! ```
+//! File location: `DATA::swift-ime.log` — dev `apps/swift-ime/data/`, prod
+//! `~/.desk-pilot/`. Truncated on open if larger than [`MAX_BYTES`].
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::sync::Mutex;
-use std::sync::OnceLock;
+use std::sync::{Mutex, Once, OnceLock};
 
-static LOGGER: OnceLock<Mutex<ImeLogger>> = OnceLock::new();
+use tracing_subscriber::fmt::writer::MakeWriter;
+use tracing_subscriber::EnvFilter;
 
-struct ImeLogger {
-    file: Option<std::fs::File>,
-    tee_stderr: bool,
-}
+/// Log file size cap on open (bytes).
+const MAX_BYTES: u64 = 2 * 1024 * 1024;
 
-impl ImeLogger {
-    fn open(path: &str, tee_stderr: bool, max_bytes: u64) -> Self {
-        // Truncate if too large.
-        if let Ok(meta) = fs::metadata(path) {
-            if meta.len() > max_bytes {
-                let _ = fs::write(path, "");
-            }
-        }
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok();
-        ImeLogger { file, tee_stderr }
-    }
+/// The shared append-mode log file. Held for the process lifetime; each tracing
+/// event briefly locks it to write one line.
+static LOG_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
 
-    fn write_line(&mut self, msg: &str) {
-        if self.tee_stderr {
-            eprintln!("{msg}");
-        }
-        if let Some(ref mut f) = self.file {
-            let _ = writeln!(f, "{msg}");
-        }
+/// `MakeWriter` for tracing-subscriber: appends one event line to the log file.
+/// No-op when the logger isn't initialized (tests / no frontend).
+#[derive(Debug)]
+struct FileWriter;
+
+impl<'a> MakeWriter<'a> for FileWriter {
+    type Writer = FileGuard;
+    fn make_writer(&'a self) -> Self::Writer {
+        FileGuard
     }
 }
 
-/// Initialize the logger. Call once at startup.
+#[derive(Debug)]
+struct FileGuard;
+
+impl Write for FileGuard {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(f) = LOG_FILE.get() {
+            f.lock().unwrap().write(buf)
+        } else {
+            Ok(buf.len()) // swallow — logger not initialized
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(f) = LOG_FILE.get() {
+            f.lock().unwrap().flush()
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Open (create/append, truncate if oversized) the log file.
+fn open_log_file(path: &str) -> Option<Mutex<std::fs::File>> {
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.len() > MAX_BYTES {
+            let _ = fs::write(path, "");
+        }
+    }
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+        .map(Mutex::new)
+}
+
+/// Install the process-wide `tracing` subscriber. Idempotent via [`Once`] ——
+/// call at frontend init (fcitx5 `swift_ime_create` / mock / TUI).
 ///
-/// - `path`: log file path (e.g. "~/.desk-pilot/swift-ime.log")
-/// - `tee_stderr`: if true, also print to stderr (dev mode)
-/// - `max_bytes`: truncate file if larger than this (default 2MB)
-pub fn init(path: &str, tee_stderr: bool, max_bytes: u64) {
-    let logger = ImeLogger::open(path, tee_stderr, max_bytes);
-    let _ = LOGGER.set(Mutex::new(logger));
+/// - 每条事件写 `path`(文件 —— fcitx5 daemon 下 stderr 不连终端,文件是
+///   唯一可靠信道);
+/// - dev 双写 stderr(人类可读),release 只写 JSON 行到文件;
+/// - 级别:`RUST_LOG` 环境变量 > `default_filter`(裸级别或 per-target 指令)。
+pub fn init_tracing(path: &str, default_filter: &str) {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if let Some(f) = open_log_file(path) {
+            let _ = LOG_FILE.set(f);
+        }
+        let filter = std::env::var("RUST_LOG")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .and_then(|v| EnvFilter::try_new(v).ok())
+            .unwrap_or_else(|| EnvFilter::new(default_filter));
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let registry = tracing_subscriber::registry().with(filter);
+        if cfg!(debug_assertions) {
+            // 文件 + stderr 双写。std::io::stderr 是 `fn() -> Stderr`,
+            // 满足 `MakeWriter` 的 `F: Fn() -> W, W: Write` 实现。
+            registry
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_target(true)
+                        .with_writer(tracing_subscriber::fmt::writer::Tee::new(
+                            FileWriter,
+                            std::io::stderr,
+                        )),
+                )
+                .init();
+        } else {
+            registry
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_target(true)
+                        .with_writer(FileWriter),
+                )
+                .init();
+        }
+    });
 }
 
-/// Initialize with sensible defaults.
-/// Path: DATA::swift-ime.log — dev: `apps/swift-ime/data/`, prod: `~/.desk-pilot/`
-/// (统一走 FileLoader 命名空间,不硬编码 HOME)。
-/// Dev: also tees to stderr. Release: file only.
+/// Init with default path (`DATA::swift-ime.log`) and level `"info"`。
 pub fn init_default() {
+    init_resolved("info");
+}
+
+/// Init with a config-provided level(`debug.log_level`,默认 `"info"`)。
+/// `RUST_LOG` 环境变量仍然优先。
+pub fn init_with_log_level(level: Option<&str>) {
+    init_resolved(level.unwrap_or("info"));
+}
+
+fn init_resolved(default_filter: &str) {
     let loader = shared::loader!(".");
-    let path = loader.resolve("DATA::swift-ime.log")
+    let path = loader
+        .resolve("DATA::swift-ime.log")
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "/tmp/swift-ime.log".into());
-    init(&path, cfg!(debug_assertions), 2 * 1024 * 1024);
+    init_tracing(&path, default_filter);
 }
 
-/// Initialize from FileLoader CONF namespace (path: CONF::swift-ime.log).
-pub fn init_from_loader() {
-    let loader = shared::loader!(".");
-    let tee = cfg!(debug_assertions);
-    if let Some(p) = loader.resolve("CONF::swift-ime.log") {
-        init(&p.to_string_lossy(), tee, 2 * 1024 * 1024);
-    } else {
-        init_default();
-    }
-}
-
-/// Write a log line. No-op if logger not initialized.
-pub fn log(msg: &str) {
-    if let Some(m) = LOGGER.get() {
-        if let Ok(mut logger) = m.lock() {
-            logger.write_line(msg);
-        }
-    }
-}
-
-/// Macro for convenient logging with format strings.
+/// `ime_log!` —— 兼容旧调用点,统一走 `tracing::info!`(target `swift_ime`)。
+/// 引擎(ime-core)与前端日志因此落在同一个文件、同一套级别过滤下。
 #[macro_export]
 macro_rules! ime_log {
     ($($arg:tt)*) => {
-        $crate::logger::log(&format!($($arg)*))
+        tracing::info!(target: "swift_ime", $($arg)*)
     };
 }

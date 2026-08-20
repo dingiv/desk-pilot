@@ -50,6 +50,11 @@ pub struct DebugConfig {
     /// 词右侧注释,TUI 已有同样的详细视图)。
     #[serde(default)]
     pub candidate_meta: bool,
+    /// 日志级别:`tracing` EnvFilter(默认 `info`;`RUST_LOG` 环境变量优先)。
+    /// 例:`debug` / `ime_core=debug,info` —— 诊断 #asr 刷新等需要看引擎
+    /// debug 日志时设成 `ime_core=debug`。
+    #[serde(default)]
+    pub log_level: Option<String>,
 }
 
 

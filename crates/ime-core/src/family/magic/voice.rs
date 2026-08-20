@@ -63,7 +63,6 @@ impl VoiceMember {
     /// 语音结果预测:流式 live(有则)在前,定稿次之,最多 4 条。
     fn voice_predictions(&self, state: &SharedVoiceState) -> Vec<Prediction> {
         if !state.is_connected() {
-            // FIXME: 触发重连尝试;
             return Vec::new();
         }
         let (finals, live) = state.voice_candidates();

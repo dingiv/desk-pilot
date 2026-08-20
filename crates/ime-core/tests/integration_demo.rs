@@ -410,6 +410,52 @@ fn asr_command_with_buffer_commits_voice_text() {
     assert_eq!(commit(&v), "今天天气不错");
 }
 
+/// 回归:`#asr` 在**非零 ctx** 会话中,voice 状态推进后 `magic_tick_ctx(真实 ctx)`
+/// 必须返回带最新语音文本的视图。
+///
+/// 曾因 voice listener 发 `refresh_ui(StateView { ctx: 0 })` 而 fcitx5 的 C++
+/// `onRefresh` 把 0 当作输入上下文指针 → `swift_ime_magic_tick(nullptr)` →
+/// Rust 侧 `magic_tick_ctx(0)` 操作的是全新 ctx-0 状态机(非 Snippet)→ 返回
+/// None → `apply_view` 从不执行,`#asr` 候选框永远停在"语音识别中..."。
+/// 修复:refresh 用 [`ime_core::frontend::BROADCAST_CTX`] 让 C++ 广播到所有
+/// 活动上下文;这里验证真实 ctx 的 magic_tick 能重建出语音文本候选。
+#[test]
+fn asr_magic_tick_refreshes_real_ctx_after_voice_advance() {
+    let eng = ImeEngine::new();
+    let ctx: usize = 0xCAFE; // fcitx 下 = 真实 InputContext 指针,非 0
+    // 模拟 voice listener 健康探针已把 connected 置真(尚未有语音文本)。
+    eng.voice_state().set_connected(true);
+
+    // 在真实 ctx 输入 #asr → Snippet 态,VoiceMember 激活,候选是占位提示。
+    let mut before = ImeView::empty();
+    for c in "#asr".chars() {
+        before = eng.predict_ctx(ctx, c);
+    }
+    let before_rows: Vec<String> = (0..before.candidate_count as usize)
+        .map(|i| ImeView::str_field(&before.candidates[i].text).to_string())
+        .collect();
+    assert!(
+        before_rows.iter().any(|c| c.contains("语音识别中")),
+        "初始应是占位提示: {before_rows:?}"
+    );
+
+    // voice 推进:模拟 listener 收到 StreamFragment → 折叠进 shared state。
+    eng.voice_state().set_live_raw("你好");
+
+    // 前端收到 BROADCAST_CTX 推送后,对真实 ctx 拉 magic_tick —— 必须重建
+    // 出语音文本候选,而不是对 ctx 0 的(不存在的)#asr 会话返回 None。
+    let after = eng
+        .magic_tick_ctx(ctx)
+        .expect("真实 ctx 的 #asr 会话应返回新视图");
+    let top = ImeView::str_field(&after.candidates[0].text);
+    assert!(
+        top.contains("你好"),
+        "候选应更新为语音文本,got top={top:?}"
+    );
+    // 对不存在的 ctx(0,未输入过任何命令)应返回 None —— 广播的其余上下文天然跳过。
+    assert!(eng.magic_tick_ctx(0).is_none(), "ctx 0 无 #asr 会话,应返回 None");
+}
+
 #[test]
 fn asr_prefix_shows_command_name() {
     let mut eng = ImeEngine::new();
