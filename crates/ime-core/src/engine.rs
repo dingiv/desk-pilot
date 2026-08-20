@@ -610,6 +610,12 @@ impl ImeEngine {
     pub fn magic_tick_ctx(&self, ctx: usize) -> Option<ImeView> {
         self.with_ctx(ctx, |disp, pc| {
             use crate::state::ComposeState;
+            tracing::debug!(
+                ctx,
+                state = ?pc.sm.state,
+                has_member = pc.sm.active_command.is_some(),
+                "magic_tick_ctx"
+            );
             if pc.sm.state != ComposeState::Snippet {
                 return None; // not composing a command for this ctx — common
             }
@@ -626,7 +632,14 @@ impl ImeEngine {
             pc.sm.active_command = Some(member);
             pc.sm.magic_predictions = preds;
             pc.table.sync_from(&pc.sm);
-            Some(pc.sm.rebuild_magic_view())
+            let view = pc.sm.rebuild_magic_view();
+            let top = if view.candidate_count > 0 {
+                ImeView::str_field(&view.candidates[0].text)
+            } else {
+                ""
+            };
+            tracing::debug!(ctx, count = view.candidate_count, top, "magic_tick_ctx → view");
+            Some(view)
         })
     }
 

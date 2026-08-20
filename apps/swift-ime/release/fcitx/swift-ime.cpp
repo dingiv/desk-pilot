@@ -177,6 +177,8 @@ void SwiftImeEngine::apply_view(fcitx::InputContext *ic, const ImeView &v) {
 // 拉最新视图 + apply_view。空闲(无 pending)时零轮询。
 
 void SwiftImeEngine::onRefresh(uintptr_t ctx) {
+    // 诊断:voice listener(引擎级)推 ctx=0 → 广播;req/clip 推真实 ic 指针。
+    FCITX_DEBUG() << "[refresh] onRefresh ctx=" << (void *)ctx;
     {
         std::lock_guard<std::mutex> lk(refreshMutex_);
         pendingRefreshes_.insert(ctx);
@@ -203,17 +205,22 @@ void SwiftImeEngine::onRefresh(uintptr_t ctx) {
                     // 出一次 magic_tick —— 只有处于 live 魔法会话(#asr)的
                     // context 返回新视图,其余 magic_tick 返回 0 天然跳过。
                     if (c == 0) {
+                        FCITX_DEBUG() << "[refresh] broadcast ctx=0 → activeContexts_="
+                                     << activeContexts_.size();
                         std::vector<fcitx::InputContext *> all(
                             activeContexts_.begin(), activeContexts_.end());
                         for (auto *ic : all) {
                             ImeView view;
-                            if (swift_ime_magic_tick(handle_, (void *)ic, &view)) {
+                            int r = swift_ime_magic_tick(handle_, (void *)ic, &view);
+                            FCITX_DEBUG() << "[refresh]   ic=" << ic << " magic_tick=" << r;
+                            if (r) {
                                 apply_view(ic, view);
                             }
                         }
                         continue;
                     }
                     auto *ic = reinterpret_cast<fcitx::InputContext *>(c);
+                    FCITX_DEBUG() << "[refresh] directed ctx=" << (void *)ic;
                     ImeView view;
                     if (swift_ime_magic_tick(handle_, (void *)ic, &view)) {
                         apply_view(ic, view);

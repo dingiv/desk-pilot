@@ -65,6 +65,7 @@ impl FrontEndHandle for FcitxFrontend {
     }
 
     fn refresh_ui(&self, sv: StateView) {
+        tracing::debug!(ctx = sv.ctx, "FcitxFrontend::refresh_ui → C cb");
         if let Some((cb, ud)) = *self.cbs.refresh.lock().unwrap() {
             cb(sv.ctx, ud as *mut c_void);
         }
@@ -350,13 +351,19 @@ pub extern "C" fn swift_ime_magic_tick(
     out_view: *mut ImeView,
 ) -> i32 {
     if engine.is_null() || out_view.is_null() { return 0; }
-    match unsafe { &*engine }.magic_tick_ctx(ctx as usize) {
+    let c = ctx as usize;
+    tracing::debug!(ctx = c, "swift_ime_magic_tick");
+    match unsafe { &*engine }.magic_tick_ctx(c) {
         Some(mut view) => {
+            tracing::debug!(ctx = c, count = view.candidate_count, "magic_tick → Some");
             truncate_candidate_rows(&mut view);
             unsafe { *out_view = view; }
             1
         }
-        None => 0,
+        None => {
+            tracing::debug!(ctx = c, "magic_tick → None");
+            0
+        }
     }
 }
 

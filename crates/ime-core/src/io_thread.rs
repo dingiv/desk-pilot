@@ -214,6 +214,7 @@ async fn voice_listener_task(
             _ = health_tick.tick() => {
                 let ok = health_client.health().await.unwrap_or(false);
                 state.set_connected(ok);
+                tracing::debug!(connected = ok, "health probe → refresh_ui(BROADCAST_CTX)");
                 if let Some(f) = frontend.upgrade() {
                     f.refresh_ui(StateView { ctx: BROADCAST_CTX });
                 }
@@ -229,6 +230,10 @@ fn apply_and_notify(
     seg: AsrSegment,
 ) {
     state.fold_segment(&seg);
+    tracing::debug!(
+        ?seg,
+        "voice segment folded → refresh_ui(BROADCAST_CTX)"
+    );
     if let Some(f) = frontend.upgrade() {
         // voice listener 是引擎级全局 SSE —— 不绑定某个输入上下文,用
         // BROADCAST_CTX 让前端刷新所有活动上下文(见 crate::frontend)。
