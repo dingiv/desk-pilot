@@ -18,7 +18,7 @@ stage3: true                    # 运行进程内 Stage3 规则触发器
 # "audio_aura_core=debug,info")。RUST_LOG 环境变量优先于此处 (逃生舱)。
 # 注意: 高频识别日志 (流式 partial ~0.5s/条、纠偏碎片 ~1s/条) 只在 debug 可见;
 # info 只出 final (每定稿一句一条, 含 batch/streaming/calibrated 三层文本)。
-log_level: "debug"               # 调试语音管线时改 "debug"
+log_level: "info"               # 调试语音管线时改 "debug"
 
 # ── Stage1 语音前端 (asr) ─────────────────────────────────────────────────────
 # stream = 流式 ASR (恒本地, 实时 partial 要低延迟); backend 选批式 ASR 部署。
@@ -55,7 +55,7 @@ asr:
 
 # ── Stage2 LLM (llm) ──────────────────────────────────────────────────────────
 llm:
-  backend: local                # local (mistral.rs) | remote (vLLM/sglang) | disable
+  backend: remote                # local (mistral.rs) | remote (vLLM/sglang) | disable
   model: "qwen2.5-3b-instruct-q4_k_m.gguf"  # local: GGUF 文件名; remote: 服务端模型名
   # model_dir: "/path/to/models"            # local 时模型根目录覆盖 (默认 MODELS 命名空间)
   # endpoint: "http://127.0.0.1:3000"       # backend=remote 时服务地址

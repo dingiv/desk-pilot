@@ -49,6 +49,8 @@
 | M5 | **Stage3→Stage1 ASR 热词反馈** | 中 | 重建 recognizer 动态烘焙热词 |
 | M6 | **Moshi 全双工 spike**（Rust 集成） | 中 | 待 candle 升级支持 sm_120 + sentencepiece 编译修复 |
 
+
+
 ## 🟢 长期
 
 | # | 事项 | 价值 |

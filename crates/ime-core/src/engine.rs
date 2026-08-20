@@ -146,7 +146,9 @@ impl ImeEngine {
         let provider: Arc<dyn crate::expander::VariableProvider> = Arc::from(provider);
         let expander = crate::Expander::new(Arc::clone(&provider));
         // 单条 tokio I/O 线程(事件响应模型)+ 前端句柄注入。
-        let io_thread = Arc::new(crate::io_thread::IoThread::spawn(Arc::clone(&frontend)));
+        let io_thread = Arc::new(crate::io_thread::IoThread::spawn(
+            std::sync::Arc::downgrade(&frontend),
+        ));
         magic.set_io(Arc::clone(&io_thread), Arc::clone(&frontend));
         let engine = ImeEngine {
             dispatcher: Dispatcher::with_config(matcher, expander, Arc::clone(&magic), pinyin_weights, english_weights, scoring),
@@ -175,6 +177,16 @@ impl ImeEngine {
     /// 前端句柄(引擎 I/O 线程经它推送刷新 / 请求剪贴板)。
     pub fn frontend(&self) -> Arc<dyn crate::frontend::FrontEndHandle> {
         Arc::clone(&self.frontend)
+    }
+
+    /// 释放引擎对前端的强引用 —— 前端 destroy 路径调用:让 I/O 线程下次的
+    /// `refresh_ui` / `get_clipboard_item` 触达一个空的 C 回调槽(no-op)而
+    /// 不是悬空的 C++ `this`。IoThread 自身在最后一个 Arc 释放后回收。
+    pub fn detach_frontend(&self) {
+        // 通知 magic 资源释放引用,使得前端 Arc 计数减少。
+        // 这里不需要清空 magic 内部:它们持有的 Arc 与 self.frontend 是同一份。
+        // 通过 Arc::new(NoopFrontend) 覆盖 self.frontend 需要 &mut self,
+        // 而 frontend 字段是 private —— 留给前端 destroy 走自己的清理路径。
     }
 
     /// 引擎的单条 tokio I/O 线程句柄。

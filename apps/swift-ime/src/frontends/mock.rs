@@ -159,7 +159,11 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<AsrBuffer>, Option<crat
     let aura_status = if cfg.connect_aura || cfg.aura_addr.is_some() {
         let addr = cfg.aura_addr.as_deref().unwrap_or("127.0.0.1:9091");
         crate::ime_log!("connecting to aura: {addr}");
-        Some(crate::bridge::spawn_aura_client(Arc::clone(&asr_buffer), Some(addr)))
+        Some(crate::bridge::spawn_aura_client(
+            Arc::clone(&asr_buffer),
+            engine.io_thread(),
+            Some(addr),
+        ))
     } else {
         None
     };

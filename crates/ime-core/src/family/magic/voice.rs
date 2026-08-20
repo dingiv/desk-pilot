@@ -41,7 +41,12 @@ impl VoiceMember {
         self.subscribed = true;
         if let Some(buf) = self.resources.voice.get() {
             if let Some(io) = self.resources.io() {
-                io.send(crate::io_thread::IoEvent::VoiceSubscribe { ctx, buffer: buf });
+                // **race 修复**:`last` 在 send 前取当前 version,而非由 IoThread 处理
+                // 时读 —— 避免"#asr 进入 → 立即说话 → bridge set_live bump version →
+                // IoThread 才收到 VoiceSubscribe(读 last=v1)→ watcher 看 v=v1 不变
+                // → 不 push refresh → 候选不更新" 的时序竞争。
+                let last = buf.version();
+                io.send(crate::io_thread::IoEvent::VoiceSubscribe { ctx, buffer: buf, last });
             }
         }
     }

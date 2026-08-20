@@ -1,6 +1,7 @@
 //! agent.rs — `AuraAgent`: the managed-state facade over [`AuraClient`]. A client (swift-ime,
-//! geek-familiar, …) imports this crate and calls [`AuraAgent::connect`] once — the agent spawns
-//! its own background driver (tokio runtime on a std thread) that keeps EVERYTHING fresh:
+//! geek-familiar, …) imports this crate, constructs the agent with [`AuraAgent::new`], then
+//! hands it an external tokio [`Handle`] via [`AuraAgent::start`] — the agent does NOT own a
+//! runtime or driver thread, the caller does.
 //!
 //! - **Control plane**: the latest [`AuraStateView`] snapshot (re-fetched on each `state_changed`
 //!   ping), readable synchronously via [`AuraAgent::state`].
@@ -11,25 +12,26 @@
 //!
 //! Every change also surfaces as an [`AgentEvent`] on [`AuraAgent::events`] for clients that want
 //! push semantics (e.g. a UI that updates on each StreamFragment / WindowCalibration). Commands
-//! (`set_connected`, `correct`, `audio`) are one-liners. No client-side connection or
-//! state-management code needed.
+//! (`set_connected`, `correct`, `audio`) are async — call them from the same runtime you handed
+//! to `start`, or use the [`AuraAgent::poll_events`] sync drain for legacy loops.
 //!
 //! ```ignore
 //! use audio_aura_agent::agent::AuraAgent;
-//! let agent = AuraAgent::connect("http://127.0.0.1:9091")?;
+//! let agent = AuraAgent::new("http://127.0.0.1:9091")?;
+//! agent.start(&runtime.handle()).await;
 //! let wins = agent.windows();          // sync read, never blocks
-//! agent.correct(3, "蛇声", "蛇身");      // fire-and-forget command (window_id 3)
+//! agent.correct(3, "蛇声", "蛇身").await; // 异步命令 — 由调用方在外部 runtime 上 await
 //! ```
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
 use futures::{Stream, StreamExt};
-use tokio::runtime::Runtime;
+use tokio::runtime::Handle;
+use tokio::task::JoinHandle;
 
 use crate::client::AuraClient;
 use crate::view::{AsrSegment, AuraStateView};
@@ -199,7 +201,6 @@ impl std::hash::Hash for AuraAgent {
 
 struct AgentInner {
     client: AuraClient,
-    rt: Runtime,
     state: RwLock<Option<AuraStateView>>,
     windows: RwLock<Vec<WindowView>>,
     /// 每窗口识别状态(折叠数据面事件)—— `get_window_preview` 的源。
@@ -209,14 +210,14 @@ struct AgentInner {
     tx: tokio::sync::broadcast::Sender<AgentEvent>,
     /// Shared receiver for [`AuraAgent::poll_events`] (sync clients — no tokio runtime needed).
     poll: Mutex<tokio::sync::broadcast::Receiver<AgentEvent>>,
-    running: AtomicBool,
+    /// 三个 driver 任务句柄(health / segments / control),start 时填,drop 时 cancel。
+    driver_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl AuraAgent {
-    /// Connect + start the background driver. Returns immediately (non-blocking); the first
-    /// snapshot arrives on `events()` (and `state()` once fetched). `base` may be a bare
-    /// `host:port` or a full origin.
-    pub fn connect(base: impl Into<String>) -> Result<Self> {
+    /// 构造一个未启动的 agent。`base` 可以是裸 `host:port` 或完整 origin。
+    /// **不起 runtime、driver 线程**—— 这些由调用方通过 [`AuraAgent::start`] 提供。
+    pub fn new(base: impl Into<String>) -> Result<Self> {
         let base = base.into();
         let base = if base.starts_with("http://") || base.starts_with("https://") {
             base
@@ -224,11 +225,9 @@ impl AuraAgent {
             format!("http://{base}")
         };
         let client = AuraClient::new(&base)?;
-        let rt = Runtime::new()?;
         let (tx, rx) = tokio::sync::broadcast::channel(EVENT_CAP);
         let inner = Arc::new(AgentInner {
             client,
-            rt,
             state: RwLock::new(None),
             windows: RwLock::new(Vec::new()),
             windows_state: RwLock::new(HashMap::new()),
@@ -236,17 +235,25 @@ impl AuraAgent {
             conn: AtomicU8::new(AuraConn::Connecting as u8),
             tx,
             poll: Mutex::new(rx),
-            running: AtomicBool::new(true),
+            driver_tasks: Mutex::new(Vec::new()),
         });
-        let driver = Arc::clone(&inner);
-        thread::Builder::new()
-            .name("aura-agent-driver".into())
-            .spawn(move || {
-                let rt = &driver.rt;
-                rt.block_on(driver_loop(&driver));
-            })
-            .expect("spawn aura-agent driver thread");
         Ok(Self { inner })
+    }
+
+    /// 在调用方提供的 runtime handle 上启动 driver 三个任务(health / segments /
+    /// control plane)。返回的 future 在 driver 三个任务**全部**结束时 resolve —— agent
+    /// 析构(driver_tasks join handle drop → task abort)也会让它返回。
+    ///
+    /// 调用方负责保证 `handle` 来自的 runtime 持续存活。
+    pub async fn start(self: &Arc<Self>, handle: &Handle) {
+        let mut guard = self.inner.driver_tasks.lock().unwrap();
+        // 已启动:no-op,避免覆盖。
+        if !guard.is_empty() { return; }
+        let inner = Arc::clone(&self.inner);
+        let h1 = handle.spawn(driver_health(inner.clone()));
+        let h2 = handle.spawn(driver_segments(inner.clone()));
+        let h3 = handle.spawn(driver_control(inner));
+        *guard = vec![h1, h2, h3];
     }
 
     /// Current control-plane snapshot (None until the first fetch completes).
@@ -322,103 +329,93 @@ impl AuraAgent {
         out
     }
 
-    /// `POST /api/control/scout {enabled}` — fire-and-forget (runs on the driver runtime).
-    pub fn set_connected(&self, enabled: bool) {
-        let c = self.inner.client.clone();
-        self.inner.rt.spawn(async move {
-            let _ = c.set_connected(enabled).await;
-        });
+    /// `POST /api/control/scout {enabled}` — fire-and-forget. 调用方在外部 runtime 上
+    /// `spawn(agent.set_connected(...))` 即可。
+    pub async fn set_connected(&self, enabled: bool) -> Result<()> {
+        self.inner.client.set_connected(enabled).await.map(|_| ())
     }
 
     /// `POST /api/correct` — record a user correction for a window (feeds Stage2).
-    /// Fire-and-forget.
-    pub fn correct(&self, window_id: u64, raw: &str, corrected: &str) {
-        let c = self.inner.client.clone();
-        let raw = raw.to_string();
-        let corrected = corrected.to_string();
-        self.inner.rt.spawn(async move {
-            let _ = c.correct(window_id, &raw, &corrected).await;
+    /// 异步,调用方负责 runtime 上下文。
+    pub async fn correct(&self, window_id: u64, raw: &str, corrected: &str) -> Result<()> {
+        self.inner.client.correct(window_id, raw, corrected).await
+    }
+
+    /// `GET /api/audio/{window_id}` — the window's WAV bytes (for playback). 异步。
+    pub async fn audio(&self, window_id: u64) -> Result<Vec<u8>> {
+        self.inner.client.audio(window_id).await
+    }
+}
+
+impl AuraAgent {
+    /// 测试用构造:不起 driver,保留 client + 状态通道(已迁入)。
+    #[cfg(test)]
+    fn for_test() -> Arc<Self> {
+        let inner = Arc::new(AgentInner {
+            client: AuraClient::new("http://127.0.0.1:1").unwrap(),
+            state: RwLock::new(None),
+            windows: RwLock::new(Vec::new()),
+            windows_state: RwLock::new(HashMap::new()),
+            live: RwLock::new(None),
+            conn: AtomicU8::new(AuraConn::Connecting as u8),
+            tx: tokio::sync::broadcast::channel(EVENT_CAP).0,
+            poll: Mutex::new(tokio::sync::broadcast::channel(EVENT_CAP).1),
+            driver_tasks: Mutex::new(Vec::new()),
         });
-    }
-
-    /// `GET /api/audio/{window_id}` — the window's WAV bytes (blocking; runs on the driver
-    /// runtime).
-    pub fn audio(&self, window_id: u64) -> Result<Vec<u8>> {
-        let c = self.inner.client.clone();
-        self.inner.rt.block_on(c.audio(window_id))
+        Arc::new(Self { inner })
     }
 }
 
-impl Drop for AuraAgent {
-    fn drop(&mut self) {
-        self.inner.running.store(false, Ordering::Relaxed);
-    }
-}
-
-/// The background driver: fetches the initial snapshot, then runs three loops concurrently —
-/// control-plane snapshot sync, data-plane segments, and the health probe — writing shared state
-/// and forwarding events. Runs until the agent is dropped (`running` flips false).
-async fn driver_loop(inner: &Arc<AgentInner>) {
-    // Initial snapshot before anything else (clients want state ASAP).
-    match inner.client.state().await {
-        Ok(snap) => set_state(inner, snap),
-        Err(e) => tracing::warn!(error = %e, "initial state fetch failed; retrying on pings"),
-    }
-    let health = inner.client.clone();
-    let hc_conn = Arc::clone(inner);
-    let hc = tokio::spawn(async move {
-        while hc_conn.running.load(Ordering::Relaxed) {
-            let ok = health.health().await.unwrap_or(false);
-            let c = AuraConn::from_ok(ok);
-            let prev = AuraConn::from_u8(hc_conn.conn.load(Ordering::Relaxed));
-            if c != prev {
-                // set_conn 在断开时清空客户端状态;这里补上重连的对齐:
-                // Disconnected → Connected 时重新请求一次快照,立刻回到新状态。
-                set_conn(&hc_conn, c);
-                if prev == AuraConn::Disconnected && c == AuraConn::Connected {
-                    match health.state().await {
-                        Ok(snap) => set_state(&hc_conn, snap),
-                        Err(e) => tracing::warn!(error = %e, "reconnect snapshot fetch failed"),
-                    }
+/// Health 探针任务:周期性 `GET /health`,状态变化时更新 conn + 触发重连时
+/// 主动拉一次快照对齐。每个 driver 任务都是独立 future,由 `start()` 在外部
+/// runtime 上 `spawn` —— 引擎 drop 时 JoinHandle drop → task 自动 abort。
+async fn driver_health(inner: Arc<AgentInner>) {
+    let client = inner.client.clone();
+    loop {
+        let ok = client.health().await.unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "health probe failed");
+            false
+        });
+        let c = AuraConn::from_ok(ok);
+        let prev = AuraConn::from_u8(inner.conn.load(Ordering::Relaxed));
+        if c != prev {
+            // set_conn 在断开时清空客户端状态;这里补上重连的对齐:
+            // Disconnected → Connected 时重新请求一次快照,立刻回到新状态。
+            set_conn(&inner, c);
+            if prev == AuraConn::Disconnected && c == AuraConn::Connected {
+                match client.state().await {
+                    Ok(snap) => set_state(&inner, snap),
+                    Err(e) => tracing::warn!(error = %e, "reconnect snapshot fetch failed"),
                 }
             }
-            tokio::time::sleep(HEALTH_PROBE).await;
         }
-    });
-
-    // Data plane: live segments → shared state + events. The client is cloned into the task so
-    // the borrow-free stream is 'static (the SDK's streams borrow their client).
-    let seg_inner = Arc::clone(inner);
-    let seg_client = inner.client.clone();
-    let seg_task = tokio::spawn(async move {
-        let mut segs = Box::pin(seg_client.subscribe_segments());
-        while let Some(seg) = segs.next().await {
-            set_conn(&seg_inner, AuraConn::Connected); // any segment ⇒ stream is live
-            apply_segment(&seg_inner, seg);
-        }
-    });
-
-    // Control plane: re-fetch the snapshot on each state_changed ping.
-    let ctrl_inner = Arc::clone(inner);
-    let ctrl_client = inner.client.clone();
-    let ctrl = tokio::spawn(async move {
-        let mut s = Box::pin(ctrl_client.subscribe(STATE_FREQ_MS));
-        while s.next().await.is_some() {
-            match ctrl_client.state().await {
-                Ok(snap) => set_state(&ctrl_inner, snap),
-                Err(e) => tracing::warn!(error = %e, "state re-fetch failed"),
-            }
-        }
-    });
-
-    // Wait until the agent is dropped, then let the loops wind down (the spawned tasks check
-    // `running` / end on stream close; block_on returning frees the driver thread).
-    while inner.running.load(Ordering::Relaxed) {
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(HEALTH_PROBE).await;
     }
-    let _ = hc.await;
-    let _ = seg_task.await;
-    let _ = ctrl.await;
+}
+
+/// Data plane:订阅 AsrSegment 流,把每个事件折叠进共享状态 + 广播。
+async fn driver_segments(inner: Arc<AgentInner>) {
+    let mut segs = Box::pin(inner.client.subscribe_segments());
+    while let Some(seg) = segs.next().await {
+        set_conn(&inner, AuraConn::Connected); // any segment ⇒ stream is live
+        apply_segment(&inner, seg);
+    }
+}
+
+/// Control plane:首次拉取快照,再订阅 state_changed ping 触发再拉取。
+async fn driver_control(inner: Arc<AgentInner>) {
+    // Initial snapshot before anything else (clients want state ASAP).
+    match inner.client.state().await {
+        Ok(snap) => set_state(&inner, snap),
+        Err(e) => tracing::warn!(error = %e, "initial state fetch failed; retrying on pings"),
+    }
+    let mut s = Box::pin(inner.client.subscribe(STATE_FREQ_MS));
+    while s.next().await.is_some() {
+        match inner.client.state().await {
+            Ok(snap) => set_state(&inner, snap),
+            Err(e) => tracing::warn!(error = %e, "state re-fetch failed"),
+        }
+    }
 }
 
 fn set_conn(inner: &AgentInner, c: AuraConn) {
@@ -536,20 +533,7 @@ mod tests {
     use super::*;
 
     fn inner() -> Arc<AgentInner> {
-        let client = AuraClient::new("http://127.0.0.1:1").unwrap(); // never connects in tests
-        let (tx, rx) = tokio::sync::broadcast::channel(EVENT_CAP);
-        Arc::new(AgentInner {
-            client,
-            rt: Runtime::new().unwrap(),
-            state: RwLock::new(None),
-            windows: RwLock::new(Vec::new()),
-            windows_state: RwLock::new(HashMap::new()),
-            live: RwLock::new(None),
-            conn: AtomicU8::new(AuraConn::Connecting as u8),
-            tx,
-            poll: Mutex::new(rx),
-            running: AtomicBool::new(true),
-        })
+        AuraAgent::for_test().inner.clone()
     }
 
     #[test]

@@ -22,6 +22,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::os::raw::c_char;
 use std::sync::{Arc, Mutex};
 
@@ -35,13 +36,17 @@ use ime_core::platform::ImeView;
 // ── 前端句柄:C 回调转发(引擎 I/O 线程 → fcitx 主循环)──────────────────
 
 /// C++ 注册的刷新回调:`ctx` = 输入上下文指针转 usize;`userdata` 是 C++ 侧
-/// `this` 指针转 usize(ABI 与 void* 一致,且 usize 是 Send/Sync)。
-type RefreshCb = extern "C" fn(ctx: usize, userdata: usize);
+/// 传入的 `this`(ABI 与 `void*` 一致)。
+type RefreshCb = extern "C" fn(ctx: usize, userdata: *mut c_void);
 /// C++ 注册的剪贴板请求回调:引擎要 count 条历史。
-type ClipboardCb = extern "C" fn(count: u32, userdata: usize);
+type ClipboardCb = extern "C" fn(count: u32, userdata: *mut c_void);
 
 /// 共享的 C 回调槽 —— 引擎持有 FrontEndHandle,注册表持有同一 Arc,`set_ui_cbs`
 /// 之后 C++ 回调生效。
+///
+/// `userdata` 以 `usize` 位模式存储(`*mut c_void` 在 LP64 上位宽等同);
+/// 调用前 cast 回 `*mut c_void` 即可。这样 `Mutex` 的内容是 `Send`(`extern fn`
+/// + `usize` 都是),便于跨线程锁。
 struct FcitxCbs {
     refresh: Mutex<Option<(RefreshCb, usize)>>,
     clipboard: Mutex<Option<(ClipboardCb, usize)>>,
@@ -55,13 +60,14 @@ struct FcitxFrontend {
 impl FrontEndHandle for FcitxFrontend {
     fn get_clipboard_item(&self, count: u32) {
         if let Some((cb, ud)) = *self.cbs.clipboard.lock().unwrap() {
-            cb(count, ud);
+            // userdata 在 LP64 上位宽等同 `void*` —— 位模式转换为裸指针传给 C ABI。
+            cb(count, ud as *mut c_void);
         }
     }
 
     fn refresh_ui(&self, sv: StateView) {
         if let Some((cb, ud)) = *self.cbs.refresh.lock().unwrap() {
-            cb(sv.ctx, ud);
+            cb(sv.ctx, ud as *mut c_void);
         }
     }
 }
@@ -206,7 +212,8 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
     // ── Voice input: spawn aura SSE client + attach buffer to engine ──
     let asr_buffer = Arc::new(AsrBuffer::new());
     engine.set_asr_buffer(Arc::clone(&asr_buffer));
-    crate::bridge::spawn_aura_client(asr_buffer, None);
+    let io_thread = engine.io_thread();
+    crate::bridge::spawn_aura_client(asr_buffer, io_thread, None);
     // ──────────────────────────────────────────────────────────────────
 
     // ── English user dictionary ──
@@ -315,19 +322,25 @@ pub extern "C" fn swift_ime_commit_pending(
 /// 注册前端 UI 回调(C++ 在引擎创建后调用一次):
 /// - `refresh_cb(ctx, userdata)`:引擎 I/O 线程异步状态推进 → 前端主循环拉视图;
 /// - `clipboard_cb(count, userdata)`:引擎请求剪贴板历史 → 前端取到回填。
+///
+/// `userdata` 是 C++ 侧 `SwiftImeEngine::this`,指针宽(64-bit on LP64),
+/// 回调在引擎 I/O 线程执行,但 C++ 内部仅用它定位 `this` + marshal 到
+/// fcitx 主循环,不直接触碰 Rust 状态。
 #[no_mangle]
 pub extern "C" fn swift_ime_set_ui_cbs(
     engine: *mut ImeEngine,
     refresh_cb: RefreshCb,
     clipboard_cb: ClipboardCb,
-    userdata: usize,
+    userdata: *mut c_void,
 ) -> i32 {
     if engine.is_null() { return 0; }
     let key = engine as usize;
     let reg = front_registry().lock().unwrap();
     let Some(cbs) = reg.get(&key).cloned() else { return 0; };
-    *cbs.refresh.lock().unwrap() = Some((refresh_cb, userdata));
-    *cbs.clipboard.lock().unwrap() = Some((clipboard_cb, userdata));
+    // userdata 以 usize 位模式存储(LP64 上等同 void*),便于跨线程锁。
+    let ud = userdata as usize;
+    *cbs.refresh.lock().unwrap() = Some((refresh_cb, ud));
+    *cbs.clipboard.lock().unwrap() = Some((clipboard_cb, ud));
     1
 }
 

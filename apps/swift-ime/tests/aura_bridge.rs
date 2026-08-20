@@ -13,6 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ime_core::asr_buffer::AsrBuffer;
+use ime_core::frontend::NoopFrontend;
+use ime_core::io_thread::IoThread;
 use swift_ime::bridge::spawn_aura_client;
 
 /// A minimal AuraStateView snapshot (the agent fetches `/api/state` on connect).
@@ -59,7 +61,12 @@ fn mock_aura_server() -> String {
 fn bridge_feeds_segments_into_asr_buffer() {
     let addr = mock_aura_server();
     let buf = Arc::new(AsrBuffer::new());
-    spawn_aura_client(Arc::clone(&buf), Some(&addr));
+    // 集成测试:起一个独立 IoThread runtime 作为 aura 的执行环境。
+    // 用 NoopFrontend 包成 Arc<dyn FrontEndHandle> 再 downgrade。
+    let front: Arc<dyn ime_core::frontend::FrontEndHandle> =
+        Arc::new(NoopFrontend::default());
+    let io = IoThread::spawn(Arc::downgrade(&front));
+    spawn_aura_client(Arc::clone(&buf), Arc::new(io), Some(&addr));
 
     // Wait for the final to land in the buffer (becomes candidate #1).
     let deadline = Instant::now() + Duration::from_secs(8);

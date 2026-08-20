@@ -262,6 +262,15 @@ void SwiftImeEngine::activate(const fcitx::InputMethodEntry &entry,
     lastViews_.erase(ic);
     activeContexts_.insert(ic);
     swift_ime_activate(handle_, (void *)ic);
+
+    // 首次激活同步当前剪贴板 —— 否则用户激活后立即打 #clip 时 hist 为空。
+    // 历史累积的主路径仍是按键阶段的按需推送(见 keyEvent)。
+    if (auto *cb = instance_->addonManager().addon("clipboard")) {
+        auto text = cb->call<fcitx::IClipboard::clipboard>(ic);
+        if (!text.empty()) {
+            swift_ime_set_clipboard(handle_, text.c_str());
+        }
+    }
 }
 
 void SwiftImeEngine::deactivate(const fcitx::InputMethodEntry &entry,

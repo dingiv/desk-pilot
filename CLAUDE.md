@@ -77,3 +77,8 @@ apps/{visual_scout,visual_rover_cli,visual_rover_web,visual_scout_devtools}  ←
 - **pnpm forwards a literal `--`:** `pnpm <script> -- <args>` passes `--` *and* the args to the script, so CLI entry points that use `node:util` `parseArgs` must strip a leading `--` before parsing (see `forwardedArgs()` in the apps' `main.ts`).
 - **`loadConfig()` (`@vrover/llm`) throws if `ANTHROPIC_API_KEY` is unset** and caches on first call. Call it lazily (only on the real-LLM path), never at server boot — the Scout server and the rover app must boot key-free.
 - **Apps under `apps/*` are workspace packages**, not examples: they get their own `package.json` declaring `@vrover/*` deps and follow the same composite-tsconfig convention as `packages/*`. (`apps/visual_scout_devtools` is the Vite/Vue exception above — no `@vrover` deps, no composite tsconfig.)
+
+
+## Quick Development
+
+The project now are quickly iterated now. We don't need too much test cases.
