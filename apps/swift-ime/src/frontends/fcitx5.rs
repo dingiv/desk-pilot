@@ -26,7 +26,6 @@ use std::ffi::c_void;
 use std::os::raw::c_char;
 use std::sync::{Arc, Mutex};
 
-use ime_core::asr_buffer::AsrBuffer;
 use ime_core::engine::ImeEngine;
 use ime_core::expander::{today_str, VariableProvider};
 use ime_core::family::magic::preview_text;
@@ -152,6 +151,7 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
         snippets,
         cfg.weights.to_scoring(),
         Arc::new(FcitxFrontend { cbs: Arc::clone(&cbs) }),
+        cfg.voice.aura_base.clone(),
     );
     // 候选每页条数(swift-ime.yaml → input.page_size)。
     engine.set_page_size(cfg.input.page_size);
@@ -209,12 +209,8 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
         .unwrap_or_else(|| "data/swift-ime.db".into());
     engine.init_store(&db);
 
-    // ── Voice input: spawn aura SSE client + attach buffer to engine ──
-    let asr_buffer = Arc::new(AsrBuffer::new());
-    engine.set_asr_buffer(Arc::clone(&asr_buffer));
-    let io_thread = engine.io_thread();
-    crate::bridge::spawn_aura_client(asr_buffer, io_thread, None);
-    // ──────────────────────────────────────────────────────────────────
+    // ── Voice input: voice listener 在 `ImeEngine::with_config` 内部启动,
+    // 跟随引擎 drop 自动清理。无需此处显式接线。 ──
 
     // ── English user dictionary ──
     let loader = shared::loader!(".");

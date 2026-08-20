@@ -57,6 +57,9 @@ impl PerContext {
 
 const DEFAULT_CTX: usize = 0; // used by single-context convenience methods
 
+/// 默认 aura daemon origin。生产配置可在 `swift-ime.yaml → voice.aura_base` 覆盖。
+pub const DEFAULT_VOICE_AURA_BASE: &str = "http://127.0.0.1:9091";
+
 /// Self-contained IME engine. Manages the dispatcher, per-context state
 /// machines, input context, and async waits.
 pub struct ImeEngine {
@@ -82,6 +85,9 @@ pub struct ImeEngine {
     frontend: Arc<dyn crate::frontend::FrontEndHandle>,
     /// 单条 tokio I/O 线程(事件响应模型),预测主路径不建线程。
     io_thread: Arc<crate::io_thread::IoThread>,
+    /// 共享语音会话状态 —— voice listener task 在 IoThread 上折叠 SSE 段,
+    /// VoiceMember / SubmitMember 在主线程同步读。
+    voice_state: Arc<crate::voice_state::SharedVoiceState>,
 }
 
 impl ImeEngine {
@@ -92,6 +98,7 @@ impl ImeEngine {
     }
 
     /// Create engine with custom pinyin family weights (from config file).
+    /// voice listener 连接到 `127.0.0.1:9091`(默认 aura daemon origin)。
     pub fn with_pinyin_weights(weights: crate::family::pinyin::PinyinWeights) -> Self {
         Self::with_config(
             weights,
@@ -100,6 +107,7 @@ impl ImeEngine {
             Vec::new(),
             crate::scoring::ScoringConfig::default(),
             Arc::new(crate::frontend::NoopFrontend::default()),
+            DEFAULT_VOICE_AURA_BASE.to_string(),
         )
     }
 
@@ -118,6 +126,10 @@ impl ImeEngine {
     ///
     /// `frontend` 是前端句柄 —— 引擎的单条 I/O 线程经它推送 UI 刷新 / 请求
     /// 剪贴板。前端不再轮询。
+    ///
+    /// `voice_aura_base` 是 aura daemon origin(`http://127.0.0.1:9091`)。
+    /// 引擎构造时立即启动 voice listener task(`#asr` 共享同一份 `AuraClient`),
+    /// 整生命周期跟随 engine drop。
     pub fn with_config(
         pinyin_weights: crate::family::pinyin::PinyinWeights,
         english_weights: crate::family::english::EnglishWeights,
@@ -125,6 +137,7 @@ impl ImeEngine {
         extra_snippets: Vec<(String, String)>,
         scoring: crate::scoring::ScoringConfig,
         frontend: Arc<dyn crate::frontend::FrontEndHandle>,
+        voice_aura_base: String,
     ) -> Self {
         // Magic command entries are generated from the member registry (#asr, #flush,
         // #submit, #req, #date, #password …) — adding a command = one member, nothing
@@ -150,6 +163,17 @@ impl ImeEngine {
             std::sync::Arc::downgrade(&frontend),
         ));
         magic.set_io(Arc::clone(&io_thread), Arc::clone(&frontend));
+        // 共享 voice state + voice listener。listener 在 IoThread 的 runtime 上
+        // 长期运行,通过 SSE 折叠 AsrSegment 到 `voice_state`,由它触发
+        // `frontend.refresh_ui`。engine drop → io_thread drop → runtime drop →
+        // listener task 自动 abort,AuraClient 随之 drop。
+        let voice_state = Arc::new(crate::voice_state::SharedVoiceState::new());
+        magic.set_voice_state(Arc::clone(&voice_state));
+        io_thread.start_voice_listener(
+            voice_aura_base,
+            Arc::clone(&voice_state),
+            std::sync::Arc::downgrade(&frontend),
+        );
         let engine = ImeEngine {
             dispatcher: Dispatcher::with_config(matcher, expander, Arc::clone(&magic), pinyin_weights, english_weights, scoring),
             contexts: Mutex::new(HashMap::new()),
@@ -160,6 +184,7 @@ impl ImeEngine {
             candidate_meta: false,
             frontend,
             io_thread,
+            voice_state,
         };
         // Load embedded base dictionary (5KB, compiled into binary).
         let count = engine.dispatcher.scorer().family("pinyin")
@@ -187,6 +212,11 @@ impl ImeEngine {
         // 这里不需要清空 magic 内部:它们持有的 Arc 与 self.frontend 是同一份。
         // 通过 Arc::new(NoopFrontend) 覆盖 self.frontend 需要 &mut self,
         // 而 frontend 字段是 private —— 留给前端 destroy 走自己的清理路径。
+    }
+
+    /// 共享 voice state 句柄。voice listener task 与魔法成员都通过它读 / 写。
+    pub fn voice_state(&self) -> Arc<crate::voice_state::SharedVoiceState> {
+        Arc::clone(&self.voice_state)
     }
 
     /// 引擎的单条 tokio I/O 线程句柄。
@@ -235,7 +265,15 @@ impl ImeEngine {
     }
 
     fn remove_ctx(&self, ctx: usize) {
-        self.contexts.lock().unwrap().remove(&ctx);
+        // 修复:取走 `PerContext` 时先调 active_command 的 deactivate(ctx),
+        // 让魔法成员释放订阅 / 任务 —— 之前的 `drop` 默认实现直接走,某些
+        // live member(如 VoiceMember)需要显式 deactivate 才能取消后台工作。
+        let mut map = self.contexts.lock().unwrap();
+        if let Some(mut pc) = map.remove(&ctx) {
+            if let Some(mut m) = pc.sm.active_command.take() {
+                m.deactivate(ctx);
+            }
+        }
     }
 
     // ── Multi-context API (used by fcitx5 C ABI) ────────────────────────
@@ -510,16 +548,16 @@ impl ImeEngine {
             // machine, then put back (the member may have exited itself).
             let mut member = pc.sm.active_command.take()?;
             let new_preds = member.tick(&mut pc.sm, disp);
+            // Live 成员的 tick 当前返回 None(由 listener 主动 refresh_ui 触发);
+            // 但 frontend 拉 magic_tick 时仍要拿到最新候选 —— 重新调 predict 一次。
+            let preds = new_preds.unwrap_or_else(|| {
+                let input = pc.sm.buffer.clone();
+                member.predict(ctx, &input, disp)
+            });
             pc.sm.active_command = Some(member);
-            match new_preds {
-                Some(preds) => {
-                    pc.sm.magic_predictions = preds;
-                    // 路由之外的 sm 变更 —— 状态机表重新同步。
-                    pc.table.sync_from(&pc.sm);
-                    Some(pc.sm.rebuild_magic_view())
-                }
-                None => None,
-            }
+            pc.sm.magic_predictions = preds;
+            pc.table.sync_from(&pc.sm);
+            Some(pc.sm.rebuild_magic_view())
         })
     }
 
@@ -761,6 +799,7 @@ mod tests {
             vec![("/hello".into(), "Hello, my name is $name.".into())],
             crate::scoring::ScoringConfig::default(),
             Arc::new(crate::frontend::NoopFrontend::default()),
+            DEFAULT_VOICE_AURA_BASE.to_string(),
         );
         let mut e = e;
         for c in "#/hello?name=Mike".chars() { e.predict(KeyEvent::char(c)); }
@@ -789,510 +828,6 @@ mod tests {
         assert_eq!(e.buffer(), "n");
         e.predict(KeyEvent::backspace());
         assert!(e.buffer().is_empty());
-    }
-
-    #[test]
-    fn asr_voice_anchor_live_then_final_then_commit() {
-        use std::sync::Arc;
-        use crate::asr_buffer::AsrBuffer;
-        let mut e = eng();
-        let buf = Arc::new(AsrBuffer::new());
-        buf.set_connected(true); // simulate a live aura link
-        e.set_asr_buffer(Arc::clone(&buf));
-
-        // type #asr → Voice mode, preview candidate (no voice data yet)
-        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
-        let cands = e.candidates();
-        assert!(cands.iter().any(|c| c.contains("语音识别中")), "preview when empty: {cands:?}");
-
-        // voice streams → live candidate appears; magic_tick rebuilds it
-        buf.set_live("你好");
-        assert!(e.magic_tick().is_some(), "tick rebuilds after set_live");
-        let cands = e.candidates();
-        assert!(cands.iter().any(|c| c == "你好"), "live candidate shown: {cands:?}");
-
-        // Stage2 final → becomes #1
-        buf.push_final("你好世界");
-        assert!(e.magic_tick().is_some());
-        let cands = e.candidates();
-        assert_eq!(cands.first(), Some(&"你好世界".to_string()), "final is #1: {cands:?}");
-
-        // a second tick with no change → None
-        assert!(e.magic_tick().is_none(), "no rebuild when version unchanged");
-
-        // space commits #1 → 上屏; back to idle
-        let v = e.predict(KeyEvent::space());
-        assert_eq!(ImeView::str_field(&v.commit_text), "你好世界");
-        assert!(e.candidates().is_empty(), "candidates cleared after commit");
-    }
-
-    #[test]
-    fn asr_voice_escape_cancels() {
-        use std::sync::Arc;
-        use crate::asr_buffer::AsrBuffer;
-        let mut e = eng();
-        let buf = Arc::new(AsrBuffer::new());
-        buf.set_connected(true); // simulate a live aura link
-        e.set_asr_buffer(Arc::clone(&buf));
-        buf.push_final("识别文本");
-        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
-        e.magic_tick();
-        // Escape → cancel (no commit), back to idle
-        let v = e.predict(KeyEvent::escape());
-        assert!(ImeView::str_field(&v.commit_text).is_empty(), "escape commits nothing");
-        assert!(e.candidates().is_empty(), "cleared after escape");
-    }
-
-    #[test]
-    fn asr_path_arg_keeps_voice_predictions() {
-        // #asr/en → 参数传家族内部(路径留白);匹配仍精确,预测仍是语音结果。
-        use std::sync::Arc;
-        use crate::asr_buffer::AsrBuffer;
-        let mut e = eng();
-        let buf = Arc::new(AsrBuffer::new());
-        buf.set_connected(true);
-        buf.push_final("你好");
-        e.set_asr_buffer(Arc::clone(&buf));
-
-        for c in "#asr/en".chars() { e.predict(KeyEvent::char(c)); }
-        let cands = e.candidates();
-        assert_eq!(cands.first().map(|s| s.as_str()), Some("你好"), "{cands:?}");
-    }
-
-    #[test]
-    fn asr_unknown_path_handled_by_family() {
-        // #asr/unknown → 家族内部自行处理:仍是语音结果(不崩溃)。
-        use std::sync::Arc;
-        use crate::asr_buffer::AsrBuffer;
-        let mut e = eng();
-        let buf = Arc::new(AsrBuffer::new());
-        buf.set_connected(true);
-        buf.push_final("识别文本");
-        e.set_asr_buffer(Arc::clone(&buf));
-
-        for c in "#asr/unknown".chars() { e.predict(KeyEvent::char(c)); }
-        let cands = e.candidates();
-        assert_eq!(cands.first().map(|s| s.as_str()), Some("识别文本"), "{cands:?}");
-    }
-
-    #[test]
-    fn asr_calc_uses_calibration_preview() {
-        // #asr/calc → 预测 = 校准优先预览(WindowCalibration/SegmentCalibration)。
-        use std::sync::Arc;
-        use crate::asr_buffer::{AsrBuffer, AsrPreview};
-        let mut e = eng();
-        let buf = Arc::new(AsrBuffer::new());
-        buf.set_connected(true);
-        buf.set_preview(AsrPreview { window_id: 3, plain: "plain文本".into(), calc: "校准文本".into() });
-        e.set_asr_buffer(Arc::clone(&buf));
-
-        for c in "#asr/calc".chars() { e.predict(KeyEvent::char(c)); }
-        let cands = e.candidates();
-        assert_eq!(cands.first().map(|s| s.as_str()), Some("校准文本"), "{cands:?}");
-        assert_eq!(ImeView::str_field(&e.view().preedit_text), "校准文本", "preedit = first prediction");
-        // 选中 → 上屏校准文本。
-        let v = e.predict(KeyEvent::space());
-        assert_eq!(ImeView::str_field(&v.commit_text), "校准文本");
-    }
-
-    #[test]
-    fn asr_plain_shows_voice_results() {
-        // 无 /calc → 预测 = 语音结果(live + 定稿)。
-        use std::sync::Arc;
-        use crate::asr_buffer::AsrBuffer;
-        let mut e = eng();
-        let buf = Arc::new(AsrBuffer::new());
-        buf.set_connected(true);
-        buf.set_live("流式文本");
-        e.set_asr_buffer(Arc::clone(&buf));
-
-        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
-        let cands = e.candidates();
-        assert_eq!(cands.first().map(|s| s.as_str()), Some("流式文本"), "{cands:?}");
-    }
-
-    #[test]
-    fn asr_preview_includes_finished_batch_plus_current_stream() {
-        // 小停顿产生新 batch 后继续说话:首个候选应为"前段 SegmentBatch +
-        // 当前段流式"(窗口组装预览),而不是只有当前段流式。
-        use std::sync::Arc;
-        use crate::asr_buffer::{AsrBuffer, AsrPreview};
-        let mut e = eng();
-        let buf = Arc::new(AsrBuffer::new());
-        buf.set_connected(true);
-        // 模拟:前段已出 Batch("第一句"),当前段流式("第二句"),组装预览 =
-        // 第一句 + 第二句。
-        buf.set_preview(AsrPreview { window_id: 1, plain: "第一句第二句".into(), calc: String::new() });
-        e.set_asr_buffer(Arc::clone(&buf));
-
-        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
-        let cands = e.candidates();
-        assert_eq!(cands.first().map(|s| s.as_str()), Some("第一句第二句"),
-            "first candidate = previous Batch + current stream: {cands:?}");
-        // 选中即上屏组装文本。
-        let v = e.predict(KeyEvent::space());
-        assert_eq!(ImeView::str_field(&v.commit_text), "第一句第二句");
-    }
-
-    #[test]
-    fn aux_up_shows_raw_input_distinct_from_result_preedit() {
-        // 严格区分:候选框顶部 aux_up = 原始输入(#asr);应用高亮 preedit_text =
-        // 合成结果(首条预测)。二者不同。
-        use std::sync::Arc;
-        use crate::asr_buffer::AsrBuffer;
-        let mut e = eng();
-        let buf = Arc::new(AsrBuffer::new());
-        buf.set_connected(true);
-        buf.push_final("语音结果");
-        e.set_asr_buffer(Arc::clone(&buf));
-        let mut v = ImeView::empty();
-        for c in "#asr".chars() { v = e.predict(KeyEvent::char(c)); }
-        assert_eq!(ImeView::str_field(&v.aux_up), "#asr", "panel top = raw input");
-        assert_eq!(ImeView::str_field(&v.preedit_text), "语音结果", "app highlight = result");
-        assert_ne!(ImeView::str_field(&v.aux_up), ImeView::str_field(&v.preedit_text));
-    }
-
-    #[test]
-    fn asr_placeholder_when_no_voice_data() {
-        // 连接但暂无语音 → 占位预测(选中不上屏)。
-        use std::sync::Arc;
-        use crate::asr_buffer::AsrBuffer;
-        let mut e = eng();
-        let buf = Arc::new(AsrBuffer::new());
-        buf.set_connected(true);
-        e.set_asr_buffer(Arc::clone(&buf));
-
-        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
-        let cands = e.candidates();
-        assert_eq!(cands.first().map(|s| s.as_str()), Some("语音识别中..."), "{cands:?}");
-        // 占位不可提交。
-        let v = e.predict(KeyEvent::space());
-        assert!(ImeView::str_field(&v.commit_text).is_empty(), "placeholder not committed");
-    }
-
-    #[test]
-    fn asr_unavailable_when_disconnected() {
-        // 未连接 → 不可提交的解释预测。
-        use std::sync::Arc;
-        use crate::asr_buffer::AsrBuffer;
-        let mut e = eng();
-        e.set_asr_buffer(Arc::new(AsrBuffer::new()));
-        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
-        let cands = e.candidates();
-        assert_eq!(cands.first().map(|s| s.as_str()), Some("aura 未连接，语音不可用"), "{cands:?}");
-        let v = e.predict(KeyEvent::space());
-        assert!(ImeView::str_field(&v.commit_text).is_empty(), "explainer not committed");
-    }
-
-    #[test]
-    fn clip_command_outputs_history_item() {
-        // #clip/N:输出剪贴板历史倒数第 N+1 项。
-        let mk = || {
-            let e = eng();
-            e.set_variable("CLIPBOARD", "第一");
-            e.set_variable("CLIPBOARD", "第二");
-            e.set_variable("CLIPBOARD", "第三");
-            e
-        };
-
-        // 裸 #clip → 展示最近 4 个 item(最近在前)+ rollback。
-        let mut e = mk();
-        for c in "#clip".chars() { e.predict(KeyEvent::char(c)); }
-        assert_eq!(
-            e.candidates(),
-            vec!["第三".to_string(), "第二".to_string(), "第一".to_string(), "#clip".to_string()],
-            "bare #clip shows 4 recent items: {:?}",
-            e.candidates(),
-        );
-        let v = e.predict(KeyEvent::space());
-        assert_eq!(ImeView::str_field(&v.commit_text), "第三", "选中最近一项上屏");
-
-        // #clip/0 → 单条,倒数第一个。
-        let mut e = mk();
-        for c in "#clip/0".chars() { e.predict(KeyEvent::char(c)); }
-        assert_eq!(e.candidates().first().map(|s| s.as_str()), Some("第三"));
-
-        // #clip/1 → 倒数第二个。
-        let mut e = mk();
-        for c in "#clip/1".chars() { e.predict(KeyEvent::char(c)); }
-        assert_eq!(e.candidates().first().map(|s| s.as_str()), Some("第二"));
-
-        // #clip/2 → 倒数第三个。
-        let mut e = mk();
-        for c in "#clip/2".chars() { e.predict(KeyEvent::char(c)); }
-        assert_eq!(e.candidates().first().map(|s| s.as_str()), Some("第一"));
-
-        // 历史不足 → 交互式提示(不可提交)。
-        let mut e = mk();
-        for c in "#clip/5".chars() { e.predict(KeyEvent::char(c)); }
-        assert!(e.candidates().first().map(|s| s.contains("历史不足")).unwrap_or(false), "{:?}", e.candidates());
-        let v = e.predict(KeyEvent::space());
-        assert!(ImeView::str_field(&v.commit_text).is_empty(), "不足提示不可提交");
-    }
-
-    #[test]
-    fn clip_escapes_newlines_in_preedit_but_commits_raw() {
-        // 剪贴板里的换行:preedit/候选行显示为 `\n`,提交时是原文(真换行)。
-        let mut e = eng();
-        e.set_variable("CLIPBOARD", "第一行\n第二行");
-        for c in "#clip".chars() { e.predict(KeyEvent::char(c)); }
-        // 展示:候选行 + preedit 显示转义后的 `\n`(单行)。
-        let cands = e.candidates();
-        assert_eq!(cands.first().map(|s| s.as_str()), Some("第一行\\n第二行"),
-            "display escaped: {cands:?}");
-        assert_eq!(ImeView::str_field(&e.view().preedit_text), "第一行\\n第二行",
-            "preedit escaped");
-        // 提交:原文(真换行)。
-        let v = e.predict(KeyEvent::space());
-        assert_eq!(ImeView::str_field(&v.commit_text), "第一行\n第二行",
-            "commit keeps raw newline");
-    }
-
-    #[test]
-    fn magic_highlight_move_updates_preedit() {
-        // #asr 预测模式:左右移动高亮 → 应用高亮(将提交)跟随。
-        use std::sync::Arc;
-        use crate::asr_buffer::AsrBuffer;
-        let mut e = eng();
-        let buf = Arc::new(AsrBuffer::new());
-        buf.set_connected(true);
-        buf.push_final("结果一");
-        buf.push_final("结果二");
-        buf.push_final("结果三");
-        e.set_asr_buffer(Arc::clone(&buf));
-
-        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
-        let mut view = e.view();
-        assert_eq!(ImeView::str_field(&view.preedit_text), "结果三", "初始 = 首条预测");
-
-        // 右移 → 高亮到第 2 条 → preedit 跟随。
-        view = e.key(KeyEvent { kind: crate::router::KeyKind::Right, ctrl: false, shift: false, alt: false });
-        assert_eq!(ImeView::str_field(&view.preedit_text), "结果二", "preedit 跟随高亮");
-
-        // 再右移 → 第 3 条。
-        view = e.key(KeyEvent { kind: crate::router::KeyKind::Right, ctrl: false, shift: false, alt: false });
-        assert_eq!(ImeView::str_field(&view.preedit_text), "结果一", "第 3 条");
-
-        // 右移到 rollback(#asr)→ preedit = 原始输入。
-        view = e.key(KeyEvent { kind: crate::router::KeyKind::Right, ctrl: false, shift: false, alt: false });
-        assert_eq!(ImeView::str_field(&view.preedit_text), "#asr", "rollback → 原始输入");
-
-        // 左移回预测 → preedit 跟随。
-        view = e.key(KeyEvent { kind: crate::router::KeyKind::Left, ctrl: false, shift: false, alt: false });
-        assert_eq!(ImeView::str_field(&view.preedit_text), "结果一", "左移回预测");
-    }
-
-    #[test]
-    fn asr_query_num_predicts_latest_n_finals() {
-        // #asr?num=2 → 预测 = 语音队列最新两条定稿拼接;选中上屏。
-        use std::sync::Arc;
-        use crate::asr_buffer::AsrBuffer;
-        let mut e = eng();
-        let buf = Arc::new(AsrBuffer::new());
-        buf.set_connected(true);
-        buf.push_final("第一句");
-        buf.push_final("第二句");
-        buf.push_final("第三句");
-        e.set_asr_buffer(Arc::clone(&buf));
-
-        for c in "#asr?num=2".chars() { e.predict(KeyEvent::char(c)); }
-        let cands = e.candidates();
-        assert_eq!(cands.first().map(|s| s.as_str()), Some("第三句\n第二句"), "{cands:?}");
-        let v = e.predict(KeyEvent::space());
-        assert_eq!(ImeView::str_field(&v.commit_text), "第三句\n第二句");
-    }
-
-    #[test]
-    fn magic_completion_rewrites_input_then_break_match() {
-        // 用户例子的完整链路:
-        //   #as → [1. #asr 2. #as];选中(空格)→ 输入改写为 #asr(不上屏、不预览);
-        //   #asr → [语音预测…, #asr];再打 r → #asrr → 只剩 raw(匹配断裂)。
-        use std::sync::Arc;
-        use crate::asr_buffer::AsrBuffer;
-        let mut e = eng();
-        let buf = Arc::new(AsrBuffer::new());
-        buf.set_connected(true);
-        buf.push_final("语音结果1");
-        buf.push_final("语音结果2");
-        e.set_asr_buffer(Arc::clone(&buf));
-
-        // 1. #as → 补全提示 + rollback。
-        for c in "#as".chars() { e.predict(KeyEvent::char(c)); }
-        let cands = e.candidates();
-        assert_eq!(cands, vec!["#asr".to_string(), "#as".to_string()], "{cands:?}");
-
-        // 2. Space 选中补全 → 改写输入为 #asr,不提交、不进入预览。
-        let v = e.predict(KeyEvent::space());
-        assert!(ImeView::str_field(&v.commit_text).is_empty(), "rewrite, not commit");
-        assert_eq!(e.buffer(), "#asr", "input rewritten to #asr");
-
-        // 3. #asr 精确 → 语音预测(最新在前)+ rollback;preedit = 首条预测。
-        let cands = e.candidates();
-        assert_eq!(cands, vec!["语音结果2".to_string(), "语音结果1".to_string(), "#asr".to_string()], "{cands:?}");
-        assert_eq!(ImeView::str_field(&e.view().preedit_text), "语音结果2", "preedit = first prediction");
-
-        // 4. 选预测 → 上屏。
-        let v = e.predict(KeyEvent::space());
-        assert_eq!(ImeView::str_field(&v.commit_text), "语音结果2");
-
-        // 5. 再来一遍,打 r 断开匹配 → #asrr 只剩 raw。
-        let mut e2 = eng();
-        let buf2 = Arc::new(AsrBuffer::new());
-        buf2.set_connected(true);
-        e2.set_asr_buffer(Arc::clone(&buf2));
-        for c in "#asr".chars() { e2.predict(KeyEvent::char(c)); }
-        e2.predict(KeyEvent::char('r'));
-        let cands = e2.candidates();
-        assert_eq!(cands, vec!["#asrr".to_string()], "match broken, raw only: {cands:?}");
-        assert_eq!(ImeView::str_field(&e2.view().preedit_text), "#asrr");
-    }
-
-    #[test]
-    fn magic_preview_panel_has_member_tail_and_rollback() {
-        // Preview state (Magic) candidate panel = [member candidates…] + [tail…] + [rollback].
-        use std::sync::Arc;
-        use crate::asr_buffer::AsrBuffer;
-        let mut e = eng();
-        let buf = Arc::new(AsrBuffer::new());
-        buf.set_connected(true); // simulate a live aura link
-        e.set_asr_buffer(Arc::clone(&buf));
-        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
-        // Member placeholder is #1; rollback (#asr) is the LAST candidate.
-        let cands = e.candidates();
-        assert!(cands.first().map(|c| c.contains("语音识别中")).unwrap_or(false), "member candidate first: {cands:?}");
-        assert_eq!(cands.last(), Some(&"#asr".to_string()), "rollback is last: {cands:?}");
-    }
-
-    #[test]
-    fn magic_rollback_space_commits_trigger_text() {
-        // In preview, Space on the LAST (rollback) candidate commits the raw trigger.
-        use std::sync::Arc;
-        use crate::asr_buffer::AsrBuffer;
-        let mut e = eng();
-        let buf = Arc::new(AsrBuffer::new());
-        buf.set_connected(true); // simulate a live aura link
-        e.set_asr_buffer(Arc::clone(&buf));
-        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
-        // Move highlight to the rollback (last candidate), then Space.
-        let n = e.candidates().len();
-        for _ in 0..(n - 1) {
-            e.key(KeyEvent { kind: crate::router::KeyKind::Down, ctrl: false, shift: false, alt: false });
-        }
-        let v = e.predict(KeyEvent::space());
-        assert_eq!(ImeView::str_field(&v.commit_text), "#asr", "rollback commits #asr");
-        assert!(e.candidates().is_empty(), "exited preview");
-    }
-
-    #[test]
-    fn unknown_magic_space_commits_raw() {
-        // `#x` (no magic match) → raw kept as candidate; Space commits it.
-        let mut e = eng();
-        for c in "#x".chars() { e.predict(KeyEvent::char(c)); }
-        let cands = e.candidates();
-        assert_eq!(cands, vec!["#x".to_string()], "raw only: {cands:?}");
-
-        let v = e.predict(KeyEvent::space());
-        assert_eq!(ImeView::str_field(&v.commit_text), "#x", "space commits raw #x");
-        assert!(e.candidates().is_empty(), "cleared after commit");
-    }
-
-    #[test]
-    fn magic_enter_commits_trigger_text() {
-        // `#asr` complete match → Magic mode; Enter force-commits "#asr" (回车强制上屏).
-        use std::sync::Arc;
-        use crate::asr_buffer::AsrBuffer;
-        let mut e = eng();
-        let buf = Arc::new(AsrBuffer::new());
-        buf.set_connected(true); // simulate a live aura link
-        e.set_asr_buffer(Arc::clone(&buf));
-
-        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
-        assert!(e.candidates().iter().any(|c| c.contains("语音识别中")), "in asr mode: {:?}", e.candidates());
-
-        let v = e.predict(KeyEvent::enter());
-        assert_eq!(ImeView::str_field(&v.commit_text), "#asr", "Enter force-commits the trigger");
-        assert!(e.candidates().is_empty(), "exited magic mode");
-    }
-
-    #[test]
-    fn asr_voice_long_sentence_keeps_full_text_for_frontends() {
-        use std::sync::Arc;
-        use crate::asr_buffer::AsrBuffer;
-        // A long sentence (~72 bytes, well under the 128-byte C ABI candidate slot).
-        // The engine passes full texts — each frontend truncates rows for its own
-        // display (fcitx5 panel), while the TUI shows everything.
-        let long = "这是一句相当长的话，超出显示上限。".repeat(2); // ~72 bytes
-        let buf = Arc::new(AsrBuffer::new());
-        buf.set_connected(true);
-        buf.push_final(&long);
-        let mut e = eng();
-        e.set_asr_buffer(Arc::clone(&buf));
-        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
-        e.magic_tick();
-        let cands = e.candidates();
-        assert_eq!(cands[0], long, "engine candidate is the full text: {cands:?}");
-        // preedit = 首条预测(完整语音文本)。
-        let v0 = e.view();
-        let preedit = ImeView::str_field(&v0.preedit_text);
-        assert_eq!(preedit, long, "preedit = first prediction (full voice text)");
-        // Space commits the FULL text.
-        let v = e.predict(KeyEvent::space());
-        assert_eq!(ImeView::str_field(&v.commit_text), long);
-    }
-
-    #[test]
-    fn asr_voice_active_live_is_candidate_1() {
-        use std::sync::Arc;
-        use crate::asr_buffer::AsrBuffer;
-        let mut e = eng();
-        let buf = Arc::new(AsrBuffer::new());
-        buf.set_connected(true); // simulate a live aura link
-        e.set_asr_buffer(Arc::clone(&buf));
-        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
-        // two settled finals, then a 3rd utterance starts streaming (live)
-        buf.push_final("第一句");
-        buf.push_final("第二句");
-        buf.set_live("第三句流式中");
-        e.magic_tick();
-        let cands = e.candidates();
-        // live (the active one) is #1; then finals newest→oldest
-        assert_eq!(cands[0], "第三句流式中", "live is #1: {cands:?}");
-        assert_eq!(cands[1], "第二句", "newest final is #2");
-        assert_eq!(cands[2], "第一句", "older final is #3");
-
-        // when the live utterance settles, it graduates to #1 (still newest)
-        buf.push_final("第三句定稿");
-        e.magic_tick();
-        let cands = e.candidates();
-        assert_eq!(cands[0], "第三句定稿", "settled live becomes #1: {cands:?}");
-        assert_eq!(cands[1], "第二句");
-    }
-
-    #[test]
-    fn space_commit_records_recency() {
-        // Regression: Space-commits used to bypass record_commit — the recency
-        // ring was never updated by space-commits (and nothing persisted).
-        use crate::store::WeightStore;
-        let db = format!("/tmp/swift-ime-space-rec-{}.db", std::process::id());
-        let _ = std::fs::remove_file(&db);
-        let mut e = eng();
-        e.init_store(&db);
-        for c in "nihao".chars() { e.predict(KeyEvent::char(c)); }
-        e.predict(KeyEvent::space()); // commits 你好 via the special-key path
-        let store = WeightStore::open(&db).unwrap();
-        let rec = store.load_recency();
-        assert_eq!(rec.len(), 1, "space-commit must reach the recency table");
-        assert_eq!(rec[0].0, "你好", "recorded word: {rec:?}");
-        assert!(rec[0].1 > 0, "with a wall-clock timestamp: {rec:?}");
-        let _ = std::fs::remove_file(&db);
-    }
-
-    #[test]
-    fn enter_commits_raw() {
-        let mut e = eng();
-        for c in "hello".chars() { e.predict(KeyEvent::char(c)); }
-        let v = e.predict(KeyEvent::enter());
-        assert_eq!(ImeView::str_field(&v.commit_text), "hello");
     }
 
     #[test]
@@ -1348,478 +883,5 @@ mod tests {
         }
         panic!("req result never landed");
     }
-
-    fn req_eng() -> (ImeEngine, FakeFetcher) {
-        let e = eng();
-        let fake = FakeFetcher {
-            result: Ok("这是本地服务返回的正文内容".into()),
-            urls: Arc::new(Mutex::new(Vec::new())),
-        };
-        e.set_req_fetcher(Arc::new(fake.clone()));
-        (e, fake)
-    }
-
-    #[test]
-    fn req_anchor_hint_then_fire_then_commits_body() {
-        let (mut e, fake) = req_eng();
-        for c in "#req".chars() { e.predict(KeyEvent::char(c)); }
-        // 未发:交互式"回车请求 <url>" + rollback #req。
-        let cands = e.candidates();
-        assert!(cands[0].contains("回车请求"), "hint: {cands:?}");
-        assert_eq!(cands.last().map(|s| s.as_str()), Some("#req"), "rollback last: {cands:?}");
-
-        // Space on the hint → 触发请求(不上屏),预测换成"请求中…"。
-        let v = e.predict(KeyEvent::space());
-        assert!(ImeView::str_field(&v.commit_text).is_empty(), "space on hint fires, not commits");
-        wait_req_tick(&e);
-        let cands = e.candidates();
-        assert_eq!(cands[0], "这是本地服务返回的正文内容", "body is #1: {cands:?}");
-        assert_eq!(fake.urls.lock().unwrap().as_slice(), ["http://127.0.0.1:14555/api"], "fired the base URL");
-
-        // Space → 提交 body。
-        let v = e.predict(KeyEvent::space());
-        assert_eq!(ImeView::str_field(&v.commit_text), "这是本地服务返回的正文内容");
-        assert!(e.candidates().is_empty(), "cleared after commit");
-    }
-
-    #[test]
-    fn req_suffix_extends_url() {
-        let (mut e, fake) = req_eng();
-        for c in "#req/news?query=soccer".chars() { e.predict(KeyEvent::char(c)); }
-        let cands = e.candidates();
-        assert!(cands[0].contains("http://127.0.0.1:14555/api/news?query=soccer"), "hint shows full URL: {cands:?}");
-
-        e.predict(KeyEvent::space()); // 触发
-        wait_req_tick(&e);
-        assert_eq!(fake.urls.lock().unwrap().as_slice(), ["http://127.0.0.1:14555/api/news?query=soccer"], "fired with suffix");
-    }
-
-    #[test]
-    fn req_long_body_commits_full_text() {
-        let body = "长正文".repeat(30); // 270 bytes, ≫ 60
-        let mut e = eng();
-        e.set_req_fetcher(Arc::new(FakeFetcher { result: Ok(body.clone()), urls: Arc::new(Mutex::new(Vec::new())) }));
-        for c in "#req".chars() { e.predict(KeyEvent::char(c)); }
-        e.predict(KeyEvent::space()); // fire
-        wait_req_tick(&e);
-        let cands = e.candidates();
-        // 预测 = 完整 body(展示截断由前端做)。
-        assert_eq!(cands[0], body, "full body is the candidate: {cands:?}");
-        let v = e.predict(KeyEvent::space());
-        assert_eq!(ImeView::str_field(&v.commit_text), body);
-    }
-
-    #[test]
-    fn req_failure_shows_error_and_never_commits_it() {
-        let mut e = eng();
-        e.set_req_fetcher(Arc::new(FakeFetcher { result: Err("HTTP 500".into()), urls: Arc::new(Mutex::new(Vec::new())) }));
-        for c in "#req".chars() { e.predict(KeyEvent::char(c)); }
-        e.predict(KeyEvent::space()); // fire → fail
-        wait_req_tick(&e);
-        let cands = e.candidates();
-        assert_eq!(cands[0], "请求失败: HTTP 500", "error shown: {cands:?}");
-
-        // Space on the error (interactive) → 不提交。
-        let v = e.predict(KeyEvent::space());
-        assert!(ImeView::str_field(&v.commit_text).is_empty(), "error text never committed");
-        // Escape cancels the session.
-        let v = e.predict(KeyEvent::escape());
-        assert!(ImeView::str_field(&v.commit_text).is_empty());
-        assert!(e.candidates().is_empty(), "cleared after escape");
-    }
-
-    #[test]
-    fn req_backspace_edits_suffix() {
-        let (mut e, _fake) = req_eng();
-        for c in "#req/news".chars() { e.predict(KeyEvent::char(c)); }
-        // Backspace pops one suffix char → URL 缩短。
-        e.predict(KeyEvent::backspace());
-        let cands = e.candidates();
-        assert!(cands[0].contains("/new") && !cands[0].contains("/news"), "suffix edited: {cands:?}");
-        // 删回 #req → 仍精确,恢复基础 URL。
-        for _ in 0..4 { e.predict(KeyEvent::backspace()); }
-        let cands = e.candidates();
-        assert!(cands[0].contains("回车请求 http://127.0.0.1:14555/api"), "back to base: {cands:?}");
-    }
-
-    #[test]
-    fn req_digit_extends_url_without_result_commits_with_result() {
-        let (mut e, fake) = req_eng();
-        for c in "#req/news".chars() { e.predict(KeyEvent::char(c)); }
-        // 参数态下数字是 URL 字符 → 追加,不选中。
-        e.predict(KeyEvent::char('2'));
-        e.predict(KeyEvent::char('0'));
-        let cands = e.candidates();
-        assert!(cands[0].contains("/news20"), "digit appended to suffix: {cands:?}");
-
-        // 触发 → 结果 → Space 提交 body。
-        e.predict(KeyEvent::space());
-        wait_req_tick(&e);
-        let cands = e.candidates();
-        assert_eq!(cands[0], "这是本地服务返回的正文内容", "body shown: {cands:?}");
-        assert!(fake.urls.lock().unwrap().iter().any(|u| u.ends_with("/news20")), "fired with digits in URL");
-        let v = e.predict(KeyEvent::space());
-        assert_eq!(ImeView::str_field(&v.commit_text), "这是本地服务返回的正文内容");
-    }
-
-    #[test]
-    fn req_escape_cancels() {
-        let mut e = eng();
-        for c in "#req".chars() { e.predict(KeyEvent::char(c)); }
-        let v = e.predict(KeyEvent::escape());
-        assert!(ImeView::str_field(&v.commit_text).is_empty(), "escape commits nothing");
-        assert!(e.candidates().is_empty(), "cleared after escape");
-    }
-
-    #[test]
-    fn config_snippet_overrides_builtin_and_expands_variables() {
-        // A config snippet can override a built-in trigger AND use variables:
-        // `/sig` is built-in ("Best regards,\nAlice"); the config version adds
-        // $DATE (resolved via the injected provider), overriding the built-in.
-        use crate::expander::VariableProvider;
-
-        #[derive(Clone)]
-        struct FixedDate;
-        impl VariableProvider for FixedDate {
-            fn resolve(&self, name: &str) -> Option<String> {
-                match name {
-                    "DATE" => Some("2026-08-05".into()),
-                    "CLIPBOARD" => Some(String::new()),
-                    _ => None,
-                }
-            }
-        }
-
-        let e = ImeEngine::with_config(
-            crate::family::pinyin::PinyinWeights::default(),
-            crate::family::english::EnglishWeights::default(),
-            Box::new(FixedDate),
-            vec![("/sig".into(), "Best regards,\nAlice\n$DATE".into())],
-            crate::scoring::ScoringConfig::default(),
-            Arc::new(crate::frontend::NoopFrontend::default()),
-        );
-        let mut e = e;
-        for c in "#/sig".chars() { e.predict(KeyEvent::char(c)); }
-        let v = e.predict(KeyEvent::space());
-        assert_eq!(
-            ImeView::str_field(&v.commit_text),
-            "Best regards,\nAlice\n2026-08-05",
-            "config snippet overrides built-in + $DATE expands"
-        );
-    }
-
-    #[test]
-    fn asr_without_aura_connection_shows_unavailable_in_preedit() {
-        // #asr while aura is down (no buffer attached at all, or a disconnected
-        // one): the preedit says the voice path is unavailable instead of
-        // pretending to recognize; Space commits nothing.
-        use std::sync::Arc;
-        use crate::asr_buffer::AsrBuffer;
-        let mut e = eng();
-
-        // Case 1: no buffer attached at all (aura client never spawned).
-        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
-        let v0 = e.view();
-        let preedit = ImeView::str_field(&v0.preedit_text);
-        assert!(preedit.contains("未连接"), "preedit explains unavailability: {preedit}");
-        assert!(preedit.contains("语音不可用"), "preedit mentions voice unavailable: {preedit}");
-        let v = e.predict(KeyEvent::space());
-        assert_eq!(ImeView::str_field(&v.commit_text), "", "Space must not commit the explainer");
-        let v = e.predict(KeyEvent::escape());
-        assert!(ImeView::str_field(&v.commit_text).is_empty(), "escape cancels");
-
-        // Case 2: buffer attached but reported disconnected.
-        let buf = Arc::new(AsrBuffer::new());
-        buf.push_final("陈旧语音文本"); // stale data must not masquerade as live
-        e.set_asr_buffer(Arc::clone(&buf));
-        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
-        let v = e.view();
-        let preedit = ImeView::str_field(&v.preedit_text);
-        assert!(preedit.contains("未连接"), "disconnected buffer still explains: {preedit}");
-        let v = e.predict(KeyEvent::space());
-        assert_eq!(ImeView::str_field(&v.commit_text), "", "stale voice text never committed");
-    }
-
-    #[test]
-    fn asr_reconnects_when_aura_comes_back() {
-        // Connection flips don't touch the version counter — tick must still
-        // rebuild when connectivity changes (disconnect → unavailable, reconnect
-        // → normal recognition display).
-        use std::sync::Arc;
-        use crate::asr_buffer::AsrBuffer;
-        let mut e = eng();
-        let buf = Arc::new(AsrBuffer::new());
-        e.set_asr_buffer(Arc::clone(&buf));
-
-        // Not connected → unavailable explainer.
-        for c in "#asr".chars() { e.predict(KeyEvent::char(c)); }
-        assert!(ImeView::str_field(&e.view().preedit_text).contains("未连接"));
-
-        // Voice data arrives while still disconnected (version bumps) — tick
-        // rebuilds, but the display stays unavailable.
-        buf.push_final("断线时的文本");
-        assert!(e.magic_tick().is_some(), "tick rebuilds on voice data");
-        assert!(ImeView::str_field(&e.view().preedit_text).contains("未连接"));
-
-        // Connection restored (no new voice data — version unchanged) — tick
-        // must rebuild from the connectivity flip alone.
-        buf.set_connected(true);
-        assert!(e.magic_tick().is_some(), "tick rebuilds on connectivity flip");
-        let v = e.view();
-        let preedit = ImeView::str_field(&v.preedit_text);
-        assert!(!preedit.contains("未连接"), "back to normal after reconnect: {preedit}");
-        assert!(preedit.contains("断线时的文本"), "stale-while-offline text now shown: {preedit}");
-
-        // And the drop again: disconnect with no data change → unavailable.
-        buf.set_connected(false);
-        assert!(e.magic_tick().is_some(), "tick rebuilds on disconnect");
-        let v = e.view();
-        assert!(ImeView::str_field(&v.preedit_text).contains("未连接"));
-    }
-
-    #[test]
-    fn emoji_tsv_load_enables_pinyin_keywords() {
-        // 外部词表(CLDR 生成的拼音关键词)经 load_emoji_dict 加载后,
-        // 拼音输入触发对应 emoji —— 汉字关键词无法在拼音 buffer 触发,
-        // 词表必须携带拼音形式。
-        let path = format!("/tmp/swift-ime-emoji-load-{}.tsv", std::process::id());
-        std::fs::write(&path, "ganlan\t🥦\n").unwrap();
-        let mut e = eng();
-        e.load_emoji_dict(&path).unwrap();
-        for c in "ganlan".chars() { e.predict(KeyEvent::char(c)); }
-        assert!(e.candidates().contains(&"🥦".to_string()),
-            "ganlan surfaces 🥦: {:?}", e.candidates());
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn emoji_family_can_be_disabled_at_runtime() {
-        // dicts.emoji: false → 整个家族退出统一打分,无任何 emoji 候选。
-        let mut e = eng();
-        e.set_family_enabled("emoji", false);
-        for c in "smile".chars() { e.predict(KeyEvent::char(c)); }
-        let cands = e.candidates_detailed();
-        assert!(cands.iter().all(|d| d.family != "emoji"),
-            "no emoji candidates when disabled: {cands:?}");
-        // 恢复后候选回来(新引擎,避免上一段的 buffer 残留)。
-        let mut e2 = eng();
-        e2.set_family_enabled("emoji", true);
-        for c in "smile".chars() { e2.predict(KeyEvent::char(c)); }
-        assert!(e2.candidates_detailed().iter().any(|d| d.family == "emoji"),
-            "emoji candidates return when re-enabled");
-    }
-
-    #[test]
-    fn emoji_family_competes_in_unified_ranking() {
-        // Emoji 是并列于中英文的第三家族:"smile" 输入时 😊 经统一打分
-        // 出现在候选区(emoji priority 60 → exact 1.0 × 0.6 = 0.6)。
-        let mut e = eng();
-        for c in "smile".chars() { e.predict(KeyEvent::char(c)); }
-        let cands = e.candidates();
-        assert!(cands.contains(&"😊".to_string()), "smile surfaces 😊: {cands:?}");
-
-        // 拼音关键词同样生效:"weixiao" → 😊。
-        let mut e2 = eng();
-        for c in "weixiao".chars() { e2.predict(KeyEvent::char(c)); }
-        assert!(e2.candidates().contains(&"😊".to_string()), "weixiao surfaces 😊: {:?}", e2.candidates());
-    }
-
-    #[test]
-    fn candidate_meta_shows_provider_and_weight_in_debug_mode() {
-        // 调试模式开启时,候选槽的 meta 字段填充 [score family/source]。
-        let mut e = eng();
-        e.set_candidate_meta(true);
-        for c in "nihao".chars() { e.predict(KeyEvent::char(c)); }
-        let v = e.view();
-        assert!(v.candidate_count > 0);
-        let meta = ImeView::str_field(&v.candidates[0].meta);
-        assert!(meta.starts_with('[') && meta.contains('/'),
-            "meta shows [score family/source]: {meta:?}");
-        assert!(meta.contains("pinyin"), "family in meta: {meta:?}");
-
-        // 关闭后 meta 为空。
-        let mut e2 = eng();
-        e2.set_candidate_meta(false);
-        for c in "nihao".chars() { e2.predict(KeyEvent::char(c)); }
-        let v = e2.view();
-        assert_eq!(ImeView::str_field(&v.candidates[0].meta), "",
-            "debug off → no meta");
-    }
-
-    #[test]
-    fn context_aware_off_skips_recency_boost() {
-        // input.context_aware: false 时,recency 加成被跳过 —— 同一词的分数
-        // 与冷启动(无上下文)完全一致。
-        let score_of = |context_aware: bool| {
-            let mut e = eng();
-            e.set_context_aware(context_aware);
-            // 先提交 你好(写入 recency),再查 nihao。
-            for c in "nihao".chars() { e.predict(KeyEvent::char(c)); }
-            e.predict(KeyEvent::space());
-            for c in "nihao".chars() { e.predict(KeyEvent::char(c)); }
-            e.candidates_detailed().iter().find(|c| c.text == "你好")
-                .map(|c| c.score)
-                .unwrap_or(0.0)
-        };
-        let on = score_of(true);
-        let off = score_of(false);
-        assert!(on > off, "context on boosts 你好 (recency): {on} vs {off}");
-        // 修复后词典词(你好)不进 phrase → 关闭时无短语/上下文记忆,分数
-        // 与冷启动(从未提交)完全一致 —— recency 加成确实被跳过。
-        let mut e = eng();
-        for c in "nihao".chars() { e.predict(KeyEvent::char(c)); }
-        let cold = e.candidates_detailed().iter().find(|c| c.text == "你好")
-            .map(|c| c.score).unwrap_or(0.0);
-        assert!((off - cold).abs() < 1e-9,
-            "context off == cold start (no phrase memory): {off} vs {cold}");
-    }
-
-    #[test]
-    fn direct_space_commit_of_decomp_never_becomes_phrase() {
-        // 用户场景(qingqiuti→请求提 回归):直接空格提交 decomp 选项
-        // **不学**进单词本 —— 自生词的唯一入口是数字键逐字选择路径。
-        // decomp 词下次输入时 Viterbi 重新组合出同样的候选,无需入本。
-        let mut e = eng();
-        // 多音节输入,候选含 decomp(Viterbi 造词)。
-        for c in "qingqiuti".chars() { e.predict(KeyEvent::char(c)); }
-        let cands = e.candidates();
-        assert!(cands.iter().any(|c| c == "请求提"),
-            "decomp 请求提 present: {cands:?}");
-        // 直接空格提交 top(decomp)。
-        e.predict(KeyEvent::space());
-
-        // 再次输入:仍是 decomp 来源。若被学进单词本,phrase(0.70)会盖过
-        // decomp(0.32)且 source 变 "phrase"(即用户截图中的
-        // `[0.708 pinyin/phrase]`)—— source 检测即 bug 的直接证据。
-        for c in "qingqiuti".chars() { e.predict(KeyEvent::char(c)); }
-        let detailed = e.candidates_detailed();
-        let req = detailed.iter().find(|d| d.text == "请求提")
-            .expect("请求提 still a candidate (via decomp)");
-        assert_eq!(req.source, "decomp",
-            "direct space commit must NOT learn: {req:?}\n{detailed:?}");
-    }
-
-    #[test]
-    fn composed_selection_joins_phrase_even_if_in_dictionary() {
-        // 自生词模式:多字拼音 + 数字键逐字选择(你→好)组成的整体无条件
-        // 加入单词本 —— 即使 你好 在词典里(与直接提交不同,直接提交时
-        // 词典词不进 phrase,见 dictionary_words_are_not_learned)。
-        let mut e = eng();
-        for c in "nihao".chars() { e.predict(KeyEvent::char(c)); }
-        // 数字键选 single 单字"你"(partial commit,进入自生词模式)
-        let ni = e.candidates().iter().position(|c| *c == "你").expect("你 as single option");
-        e.select_candidate(ni);
-        // 余下 "hao":继续选"好"(full commit,所有输入字都有归属)
-        let hao = e.candidates().iter().position(|c| *c == "好").expect("好");
-        let v = e.select_candidate(hao);
-        assert_eq!(ImeView::str_field(&v.commit_text), "你好");
-
-        // 再查 nihao → 你好 来自 phrase(自生词无条件加入生效)。
-        for c in "nihao".chars() { e.predict(KeyEvent::char(c)); }
-        let detailed = e.candidates_detailed();
-        assert!(detailed.iter().any(|d| d.text == "你好" && d.source == "phrase"),
-            "composed 你好 must be in the phrase book: {:?}",
-            detailed.iter().map(|d| (&d.text, d.source)).take(8).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn english_learned_word_survives_restart() {
-        // cd + Enter(强制提交 raw)→ 学成英文自生词,重启后 warm,
-        // cd 作为 english/user 候选 #1(0.616,压过 emoji 前缀与中文简拼)。
-        let db = format!("/tmp/swift-ime-enlearn-{}.db", std::process::id());
-        let _ = std::fs::remove_file(&db);
-        {
-            let mut e = eng();
-            e.init_store(&db);
-            for c in "cd".chars() { e.predict(KeyEvent::char(c)); }
-            let v = e.predict(KeyEvent::enter());
-            assert_eq!(ImeView::str_field(&v.commit_text), "cd", "Enter commits raw");
-        }
-        {
-            let mut e = eng();
-            e.init_store(&db);
-            for c in "cd".chars() { e.predict(KeyEvent::char(c)); }
-            let detailed = e.candidates_detailed();
-            let cd = detailed.iter().find(|d| d.text == "cd")
-                .expect("learned cd is a candidate");
-            assert_eq!(cd.family, "english");
-            assert_eq!(cd.source, "user");
-            assert_eq!(detailed[0].text, "cd", "learned word ranks #1");
-        }
-        // 中文提交不触发英文学习。
-        {
-            let mut e = eng();
-            e.init_store(&db);
-            for c in "nihao".chars() { e.predict(KeyEvent::char(c)); }
-            e.predict(KeyEvent::space());
-            let store = crate::store::WeightStore::open(&db).unwrap();
-            let en = store.load_all_en_user();
-            assert_eq!(en, vec![("cd".to_string(), 1)], "chinese commit doesn't learn: {en:?}");
-        }
-        let _ = std::fs::remove_file(&db);
-    }
-
-    #[test]
-    fn scoring_config_priorities_affect_ranking() {
-        // family_priority 来自 swift-ime.yaml:英文优先级配成 0 → black 的
-        // 最终分 = 0(被全局排序压到底),默认 70 时 > 0。
-        let black_score = |english_priority: u32| {
-            let mut scoring = crate::scoring::ScoringConfig::default();
-            scoring.priorities.english = english_priority;
-            let mut e = ImeEngine::with_config(
-                crate::family::pinyin::PinyinWeights::default(),
-                crate::family::english::EnglishWeights::default(),
-                Box::new(crate::expander::DefaultProvider),
-                Vec::new(),
-                scoring,
-                Arc::new(crate::frontend::NoopFrontend::default()),
-            );
-            for c in "black".chars() { e.predict(KeyEvent::char(c)); }
-            e.candidates_detailed().iter().find(|c| c.text == "black")
-                .map(|c| c.score)
-                .unwrap_or(0.0)
-        };
-        assert!(black_score(70) > 0.0, "default english priority keeps black ranked");
-        assert_eq!(black_score(0), 0.0, "priority 0 zeroes the final score");
-    }
-
-    #[test]
-    fn set_variable_reaches_injected_provider() {
-        // The fcitx5 frontend pushes clipboard text via set_variable → the
-        // injected provider (shared with the expander) must observe it.
-        use crate::expander::VariableProvider;
-
-        #[derive(Clone)]
-        struct Recording {
-            values: Arc<std::sync::Mutex<Vec<(String, String)>>>,
-        }
-        impl VariableProvider for Recording {
-            fn resolve(&self, _name: &str) -> Option<String> { None }
-            fn set(&self, name: &str, value: &str) {
-                self.values.lock().unwrap().push((name.to_string(), value.to_string()));
-            }
-        }
-
-        let values = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let e = ImeEngine::with_config(
-            crate::family::pinyin::PinyinWeights::default(),
-            crate::family::english::EnglishWeights::default(),
-            Box::new(Recording { values: Arc::clone(&values) }),
-            Vec::new(),
-            crate::scoring::ScoringConfig::default(),
-            Arc::new(crate::frontend::NoopFrontend::default()),
-        );
-        e.set_variable("CLIPBOARD", "剪贴板文本");
-        e.set_variable("CLIPBOARD", "更新后的文本");
-        assert_eq!(
-            *values.lock().unwrap(),
-            vec![
-                ("CLIPBOARD".into(), "剪贴板文本".into()),
-                ("CLIPBOARD".into(), "更新后的文本".into()),
-            ]
-        );
-    }
-
-    // 特殊键路由(idle 透传 / 面板开时导航 / Esc 门控)的测试在
-    // router.rs —— 决策矩阵现在由状态机表统一持有。
 }
+

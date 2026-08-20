@@ -18,6 +18,9 @@ pub struct SwiftImeConfig {
     pub weights: WeightsConfig,
     #[serde(default)]
     pub magic: MagicConfig,
+    /// voice pipeline 配置:aura daemon origin。
+    #[serde(default)]
+    pub voice: VoiceConfig,
     /// User-defined snippets (merged over the engine's built-ins on trigger
     /// collisions — a config `/sig` replaces the built-in one). Expansions
     /// support `$DATE` / `$CLIPBOARD` / `$CURSOR` variables.
@@ -61,6 +64,25 @@ pub struct MagicConfig {
 
 fn default_req_base() -> String {
     ime_core::family::magic::DEFAULT_REQ_BASE.to_string()
+}
+
+/// voice pipeline(`#asr`)配置 —— aura daemon origin。
+#[derive(Debug, Clone, Deserialize)]
+pub struct VoiceConfig {
+    /// aura daemon 的 HTTP origin(`http://127.0.0.1:9091`)。引擎构造时启动
+    /// voice listener 在 IoThread 上拉 SSE,跟随引擎 drop 自动清理。
+    #[serde(default = "default_voice_aura_base")]
+    pub aura_base: String,
+}
+
+fn default_voice_aura_base() -> String {
+    ime_core::engine::DEFAULT_VOICE_AURA_BASE.to_string()
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        VoiceConfig { aura_base: default_voice_aura_base() }
+    }
 }
 
 impl Default for MagicConfig {
@@ -253,6 +275,7 @@ impl Default for SwiftImeConfig {
             input: InputConfig { fuzzy: true, page_size: 7, context_aware: true },
             weights: WeightsConfig::default(),
             magic: MagicConfig::default(),
+            voice: VoiceConfig::default(),
             snippets: Vec::new(),
             debug: DebugConfig::default(),
         }

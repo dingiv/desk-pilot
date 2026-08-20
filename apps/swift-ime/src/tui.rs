@@ -13,10 +13,10 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::ExecutableCommand;
-use ime_core::asr_buffer::AsrBuffer;
 use ime_core::engine::ImeEngine;
 use ime_core::frontend::{FrontEndHandle, StateView};
 use ime_core::router::{KeyKind, KeyEvent};
+use ime_core::voice_state::SharedVoiceState;
 use ime_core::ImeView;
 
 /// TUI 前端句柄:引擎 I/O 线程推送刷新时只记一个计数,渲染循环每帧检查并
@@ -40,7 +40,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 
-use swift_ime::bridge::{AuraConn, AuraConnHandle};
 use swift_ime::frontends::mock::MockConfig;
 
 const POLL_MS: u64 = 100; // voice live-refresh cadence (was 200)
@@ -51,7 +50,7 @@ pub fn run(mut cfg: MockConfig) -> io::Result<()> {
     // 前端句柄:引擎 I/O 线程推送刷新 → TUI 渲染循环 drain。
     let frontend = Arc::new(TuiFrontend::default());
     cfg.frontend = Some(Arc::clone(&frontend) as Arc<dyn FrontEndHandle>);
-    let (mut engine, asr_buffer, aura_status) = swift_ime::frontends::mock::build_engine(&cfg);
+    let (mut engine, voice_state) = swift_ime::frontends::mock::build_engine(&cfg);
 
     let mut history: Vec<String> = Vec::new();
 
@@ -59,7 +58,7 @@ pub fn run(mut cfg: MockConfig) -> io::Result<()> {
     io::stdout().execute(crossterm::terminal::EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
-    let res = run_loop(&mut terminal, &mut engine, &asr_buffer, &aura_status, &mut history, &frontend);
+    let res = run_loop(&mut terminal, &mut engine, &voice_state, &mut history, &frontend);
 
     disable_raw_mode()?;
     io::stdout().execute(crossterm::terminal::LeaveAlternateScreen)?;
@@ -71,8 +70,7 @@ pub fn run(mut cfg: MockConfig) -> io::Result<()> {
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     engine: &mut ImeEngine,
-    asr_buffer: &AsrBuffer,
-    aura_status: &Option<AuraConnHandle>,
+    voice_state: &SharedVoiceState,
     history: &mut Vec<String>,
     frontend: &Arc<TuiFrontend>,
 ) -> io::Result<()> {
@@ -84,7 +82,7 @@ fn run_loop(
             // 当前预测项的提供者(family/source)与权重(score)。
             let detailed = engine.candidates_detailed();
             let flags = engine.state_flags();
-            render(f, &last_view, history, asr_buffer, aura_status, &detailed, flags)
+            render(f, &last_view, history, voice_state, &detailed, flags)
         })?;
 
         // 引擎 I/O 线程推送过刷新(voice/req 异步推进)→ 拉最新 live 视图。
@@ -159,8 +157,7 @@ fn render(
     f: &mut Frame,
     view: &ImeView,
     history: &[String],
-    asr_buffer: &AsrBuffer,
-    aura_status: &Option<AuraConnHandle>,
+    voice_state: &SharedVoiceState,
     detailed: &[ime_core::family::RankedCandidate],
     flags: ime_core::router::StateFlags,
 ) {
@@ -177,7 +174,7 @@ fn render(
     render_preedit(f, rows[0], view);
     render_candidates(f, rows[1], view, detailed);
     render_history(f, rows[2], history);
-    render_status(f, rows[3], asr_buffer, aura_status, flags);
+    render_status(f, rows[3], voice_state, flags);
 }
 
 fn render_preedit(f: &mut Frame, area: Rect, view: &ImeView) {
@@ -263,19 +260,15 @@ fn render_history(f: &mut Frame, area: Rect, history: &[String]) {
 fn render_status(
     f: &mut Frame,
     area: Rect,
-    asr_buffer: &AsrBuffer,
-    aura_status: &Option<AuraConnHandle>,
+    voice_state: &SharedVoiceState,
     flags: ime_core::router::StateFlags,
 ) {
-    let voice = asr_buffer.snapshot();
+    let voice = voice_state.snapshot();
     let vs = if voice.is_empty() { "ASR: idle".into() } else { format!("ASR: {}", &voice[..voice.len().min(30)]) };
-    let aura = match aura_status {
-        Some(h) => match h.get() {
-            AuraConn::Connected => Span::styled(" aura:✓ ", Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            AuraConn::Disconnected => Span::styled(" aura:✗ ", Style::new().fg(Color::Red)),
-            AuraConn::Connecting => Span::styled(" aura:… ", Style::new().fg(Color::Yellow)),
-        },
-        None => Span::styled(" aura:off ", Style::new().fg(Color::DarkGray)),
+    let aura = if voice_state.is_connected() {
+        Span::styled(" aura:✓ ", Style::new().fg(Color::Green).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled(" aura:✗ ", Style::new().fg(Color::Red))
     };
     // 输入路由层的状态机表 —— 当前处于哪些输入状态。
     let flags_str = if flags.labels().is_empty() {

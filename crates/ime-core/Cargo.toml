@@ -19,8 +19,12 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { workspace = true, optional = true }
-tokio = { version = "1", features = ["time", "sync", "rt", "macros", "rt-multi-thread", "net"] }
+tokio = { version = "1", features = ["time", "sync", "rt", "macros", "rt-multi-thread", "net", "test-util"] }
 shared = { path = "../shared" }
+# `AsrSegment` SSE 事件枚举由 voice listener 折叠进 SharedVoiceState。
+audio-aura-agent = { path = "../aura-agent" }
+# voice_listener 用 `futures::StreamExt::next()` 拉 SSE stream。
+futures = "0.3"
 
 # 用户数据目录(swift-ime 的 data/ 在仓库里与前端共享):
 #   dev:  <repo>/apps/swift-ime/data  (开发期数据文件统一放这里)

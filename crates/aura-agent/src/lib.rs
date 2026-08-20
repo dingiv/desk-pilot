@@ -1,22 +1,12 @@
-//! audio-aura-agent — the **Stage3 capability layer**. Defines the abilities a Stage3 agent (or,
-//! per our architecture, the desktop-pet secretary that schedules them) can invoke to maintain
-//! Stage1/Stage2 state and the user's long-term model:
+//! audio-aura-agent — async HTTP / SSE client SDK for the aura daemon.
 //!
-//! - [`HotwordManager`] — add/remove/list correction hotwords (feeds back into Stage2 immediately;
-//!   Stage1 ASR-layer hotwords are baked by sherpa at recognizer creation, see TODO in AddHotword).
-//! - [`FineTuner`] — trigger dynamic fine-tuning (LoRA) from accumulated correction samples.
-//! - [`ContextSummarizer`] — condense the rolling context window into a long-term summary.
-//! - [`MemoryStore`] — long-term key/value recall across sessions.
+//! 仅保留 [`AuraClient`] + 共享数据类型。原先的 `AuraAgent` managed-state facade
+//! 已被 ime-core 内部的 voice listener + `SharedVoiceState` 取代 ——
+//! engine 构造时启动 voice listener 长期持有 `AuraClient`,在 IoThread 的
+// tokio runtime 上 await SSE 数据面 + 健康探针。
 //!
-//! **This crate holds CAPABILITIES only — no scheduling.** "When to fine-tune / which samples /
-//! which hotword to add" is a decision for the secretary agent (desktop-pet), which calls these
-//! capabilities over the daemon's socket. For the closed-loop demo, the daemon wires a simple
-//! in-process rule trigger; desktop-pet replaces it later.
-//!
-//! This round implements only [`HotwordManager`] (+ [`SharedHotwordManager`]) and the
-//! [`AddHotwordTool`]; the other capability traits are defined but stubbed.
+//! Stage3 capability trait / rule trigger 见 `capability.rs` / `rules.rs`(保留)。
 
-pub mod agent;
 pub mod capability;
 pub mod client;
 pub mod rules;
@@ -35,6 +25,5 @@ pub use rules::{looks_like_concat, stage3_rule_trigger};
 // ── daemon↔client wire contract + async HTTP/SSE client SDK ──────────────────────────────
 // Light on purpose (no mistralrs/asr): upper layers (desktop-pet, visual-rover, …) depend on
 // THIS crate to talk to the aura-daemon without pulling the GPU inference stack.
-pub use agent::{AgentEvent, AuraAgent, AuraConn, WindowView};
 pub use client::AuraClient;
 pub use view::{AsrSegment, AuraStateView, ConfigView, CorrectionView, VadView};

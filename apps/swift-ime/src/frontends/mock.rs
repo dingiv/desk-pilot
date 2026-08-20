@@ -8,7 +8,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ime_core::asr_buffer::AsrBuffer;
 use ime_core::engine::{ImeEngine, KeyEvent};
 use ime_core::ImeView;
 
@@ -25,11 +24,10 @@ pub struct MockConfig {
     pub asr_text: Option<String>,
     pub commit: bool,
     pub async_wait: u64,
-    pub connect_aura: bool,
-    pub aura_addr: Option<String>,
+    pub voice_aura_base: String,
     pub en_user_dict: Option<String>,
     pub en_dicts: Vec<String>,
-    /// `#req` backend base URL — CLI override of `magic.req_base` config.
+    /// `#req` backend base URL — CLI override of `magic.req_base` config。
     pub req_base: Option<String>,
     /// 前端句柄(引擎 I/O 线程推送刷新)。None → NoopFrontend。
     pub frontend: Option<Arc<dyn ime_core::frontend::FrontEndHandle>>,
@@ -43,7 +41,7 @@ impl Default for MockConfig {
             req_base: None,
             config: None, asr_text: None,
             commit: false, async_wait: 0,
-            connect_aura: false, aura_addr: None,
+            voice_aura_base: ime_core::engine::DEFAULT_VOICE_AURA_BASE.to_string(),
             en_user_dict: None, en_dicts: Vec::new(),
             frontend: None,
         }
@@ -55,26 +53,26 @@ impl Default for MockConfig {
 /// Run batch evaluation against a test cases file.
 pub fn run_cases_mode(cfg: &MockConfig, cases_path: &str) {
     crate::logger::init_default();
-    let (mut engine, _, _) = build_engine(cfg);
+    let (mut engine, _) = build_engine(cfg);
     run_cases(&mut engine, cases_path, cfg.verbose);
 }
 
 /// Run single-input mode (show candidates or commit).
 pub fn run_input_mode(cfg: &MockConfig) {
     crate::logger::init_default();
-    let (mut engine, asr, _) = build_engine(cfg);
+    let (mut engine, state) = build_engine(cfg);
     let input = cfg.input.as_deref().unwrap_or("");
-    if cfg.async_wait > 0 { wait_for_voice(&asr, cfg.async_wait); }
+    if cfg.async_wait > 0 { wait_for_voice(&state, cfg.async_wait); }
     if cfg.commit {
         show_commit(&mut engine, input, cfg.verbose);
     } else {
-        show_candidates_with_async(&mut engine, &asr, input, cfg.top_n, cfg.verbose, cfg.async_wait);
+        show_candidates_with_async(&mut engine, &state, input, cfg.top_n, cfg.verbose, cfg.async_wait);
     }
 }
 
-/// Build the IME engine with all config applied. Returns the engine, the shared voice buffer,
-/// and (if connecting to aura) a connectivity handle for the frontend to display.
-pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<AsrBuffer>, Option<crate::bridge::AuraConnHandle>) {
+/// Build the IME engine with all config applied. Returns the engine and the shared voice state
+/// (for callers that want to inspect / seed voice data — TUI mocks can `seed_final` here).
+pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<ime_core::voice_state::SharedVoiceState>) {
     let sw_cfg = if let Some(ref path) = cfg.config {
         match std::fs::read_to_string(path) {
             Ok(yaml) => match serde_yaml::from_str::<crate::config::SwiftImeConfig>(&yaml) {
@@ -105,6 +103,7 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<AsrBuffer>, Option<crat
         snippets,
         sw_cfg.weights.to_scoring(),
         cfg.frontend.clone().unwrap_or_else(|| Arc::new(ime_core::frontend::NoopFrontend::default())),
+        cfg.voice_aura_base.clone(),
     );
     engine.set_page_size(sw_cfg.input.page_size);
     engine.set_context_aware(sw_cfg.input.context_aware);
@@ -144,29 +143,20 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<AsrBuffer>, Option<crat
         }
     }
 
-    let asr_buffer = Arc::new(AsrBuffer::new());
+    let voice_state = engine.voice_state();
     if let Some(ref text) = cfg.asr_text {
-        asr_buffer.update(text);
+        voice_state.set_connected(true);
+        voice_state.seed_final(text);
         crate::ime_log!("asr mock text: {text}");
     }
-    engine.set_asr_buffer(Arc::clone(&asr_buffer));
 
     // `#req` backend base URL — CLI `--req-base` overrides `magic.req_base` config.
     let req_base = cfg.req_base.clone().unwrap_or_else(|| sw_cfg.magic.req_base.clone());
     engine.set_req_base(&req_base);
     crate::ime_log!("#req base: {req_base}");
 
-    let aura_status = if cfg.connect_aura || cfg.aura_addr.is_some() {
-        let addr = cfg.aura_addr.as_deref().unwrap_or("127.0.0.1:9091");
-        crate::ime_log!("connecting to aura: {addr}");
-        Some(crate::bridge::spawn_aura_client(
-            Arc::clone(&asr_buffer),
-            engine.io_thread(),
-            Some(addr),
-        ))
-    } else {
-        None
-    };
+    // voice listener 由 `ImeEngine::with_config` 内部启动,跟随 engine drop
+    // 自动 abort AuraClient。CLI `--voice-aura-base` 覆盖 `voice.aura_base`。
 
     // SQLite weight store — DATA 命名空间(dev: data/, prod: ~/.desk-pilot/)。
     let data = shared::loader!(".");
@@ -174,20 +164,20 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<AsrBuffer>, Option<crat
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "data/swift-ime.db".into());
     engine.init_store(&db);
-    (engine, asr_buffer, aura_status)
+    (engine, voice_state)
 }
 
 // ── Async wait ─────────────────────────────────────────────────────────
 
-fn wait_for_voice(asr_buffer: &AsrBuffer, timeout_secs: u64) {
-    if !asr_buffer.snapshot().is_empty() { return; }
+fn wait_for_voice(state: &ime_core::voice_state::SharedVoiceState, timeout_secs: u64) {
+    if !state.snapshot().is_empty() { return; }
     let timeout = Duration::from_secs(timeout_secs);
     let start = Instant::now();
     eprintln!("⏳ waiting for aura SSE (up to {timeout_secs}s)...");
-    while asr_buffer.snapshot().is_empty() && start.elapsed() < timeout {
+    while state.snapshot().is_empty() && start.elapsed() < timeout {
         std::thread::sleep(Duration::from_millis(200));
     }
-    if asr_buffer.snapshot().is_empty() {
+    if state.snapshot().is_empty() {
         eprintln!("⏰ timeout — no voice data from aura");
     } else {
         eprintln!("📥 voice data received");
@@ -197,7 +187,7 @@ fn wait_for_voice(asr_buffer: &AsrBuffer, timeout_secs: u64) {
 // ── Candidate display ──────────────────────────────────────────────────
 
 fn show_candidates_with_async(
-    engine: &mut ImeEngine, asr_buffer: &AsrBuffer, input: &str,
+    engine: &mut ImeEngine, state: &ime_core::voice_state::SharedVoiceState, input: &str,
     top_n: usize, verbose: bool, async_wait_secs: u64,
 ) -> Vec<String> {
     for c in input.chars() { engine.predict(KeyEvent::char(c)); }
@@ -209,11 +199,11 @@ fn show_candidates_with_async(
         let timeout = Duration::from_secs(async_wait_secs);
         let start = Instant::now();
         eprintln!("⏳ async wait (up to {async_wait_secs}s) — polling for voice data...");
-        while asr_buffer.snapshot().is_empty() && start.elapsed() < timeout {
+        while state.snapshot().is_empty() && start.elapsed() < timeout {
             std::thread::sleep(Duration::from_millis(200));
         }
         let elapsed = start.elapsed();
-        if asr_buffer.snapshot().is_empty() {
+        if state.snapshot().is_empty() {
             eprintln!("⏰ timeout after {:.1}s — no voice data arrived", elapsed.as_secs_f64());
         } else {
             eprintln!("📥 voice data arrived after {:.1}s", elapsed.as_secs_f64());

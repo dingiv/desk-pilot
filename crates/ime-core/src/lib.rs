@@ -17,6 +17,7 @@ pub mod platform;
 pub mod store;
 pub mod snippet_store;
 pub mod state;
+pub mod voice_state;
 
 pub use dispatcher::Dispatcher;
 pub use expander::Expander;

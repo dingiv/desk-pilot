@@ -285,15 +285,11 @@ fn asr_command_with_no_buffer_commits_empty() {
 
 #[test]
 fn asr_command_with_buffer_commits_voice_text() {
-    use ime_core::asr_buffer::AsrBuffer;
     let mut eng = ImeEngine::new();
-
-    // Attach a voice buffer with some text (connected — otherwise #asr shows
-    // "语音不可用" and commits nothing).
-    let buf = std::sync::Arc::new(AsrBuffer::new());
-    buf.set_connected(true);
-    buf.update("今天天气不错");
-    eng.set_asr_buffer(buf);
+    // 模拟 aura 已连接 + 推一条 final —— 直接写 shared voice state(新架构下
+    // 真实 SSE 流由 IoThread 上的 voice listener 折叠;这里是测试 mock)。
+    eng.voice_state().set_connected(true);
+    eng.voice_state().seed_final("今天天气不错");
 
     // Type #asr
     for c in "#asr".chars() { eng.predict(KeyEvent::char(c)); }

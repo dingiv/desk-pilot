@@ -46,11 +46,27 @@ impl VoiceSlot {
     }
 }
 
+/// SharedVoiceState 槽 —— voice listener task 在 IoThread 上折叠 SSE 段写入,
+/// 魔法成员 (`#asr` / `#submit`) 同步读。引擎构造时一次性注入。
+#[derive(Default)]
+pub struct VoiceStateSlot(Mutex<Option<Arc<crate::voice_state::SharedVoiceState>>>);
+
+impl VoiceStateSlot {
+    pub fn set(&self, state: Arc<crate::voice_state::SharedVoiceState>) {
+        *self.0.lock().unwrap() = Some(state);
+    }
+
+    pub fn get(&self) -> Option<Arc<crate::voice_state::SharedVoiceState>> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
 /// Resources shared between the engine and all member instances (across input
 /// contexts): the voice buffer slot and the `#req` backend config. Members grab
 /// `Arc` clones at spawn, so late attachment (start-up ordering) is fine.
 pub struct MagicResources {
     pub voice: Arc<VoiceSlot>,
+    pub voice_state: Arc<VoiceStateSlot>,
     pub req_base: Mutex<String>,
     pub req_fetcher: Mutex<Arc<dyn ReqFetcher>>,
     /// 片段注册表:名字(无前导 `/`)→ 模板。`#/hello?name=Mike` 的 `hello`
@@ -76,6 +92,11 @@ impl MagicResources {
     pub fn frontend(&self) -> Option<Arc<dyn crate::frontend::FrontEndHandle>> {
         self.frontend.lock().unwrap().clone()
     }
+
+    /// 取 shared voice state(未注入时 None —— 测试 / 未接线场景)。
+    pub fn voice_state(&self) -> Option<Arc<crate::voice_state::SharedVoiceState>> {
+        self.voice_state.get()
+    }
 }
 
 fn default_fetcher() -> Arc<dyn ReqFetcher> {
@@ -93,6 +114,7 @@ impl Default for MagicResources {
     fn default() -> Self {
         MagicResources {
             voice: Arc::new(VoiceSlot::default()),
+            voice_state: Arc::new(VoiceStateSlot::default()),
             req_base: Mutex::new(DEFAULT_REQ_BASE.to_string()),
             req_fetcher: Mutex::new(default_fetcher()),
             snippets: Mutex::new(HashMap::new()),
@@ -337,6 +359,12 @@ impl MagicFamily {
     /// Attach the voice buffer — routed to the shared slot all voice members read.
     pub fn set_asr_buffer(&self, buf: Arc<crate::asr_buffer::AsrBuffer>) {
         self.resources.voice.set(buf);
+    }
+
+    /// Attach the shared voice state — voice listener task 与魔法成员都通过它
+    /// 读 / 写。引擎构造时自动调一次(随 `with_config`),外部不需要再调。
+    pub fn set_voice_state(&self, state: Arc<crate::voice_state::SharedVoiceState>) {
+        self.resources.voice_state.set(state);
     }
 
     /// `#req` backend base URL (default `http://127.0.0.1:14555/api`).

@@ -33,10 +33,10 @@ struct Args {
     commit: bool,
     #[arg(long, default_value = "0")]
     async_wait: u64,
-    #[arg(long, default_value = "false")]
-    aura: bool,
+    /// aura daemon origin(默认 http://127.0.0.1:9091)。voice listener 在引擎构造时启动,
+    /// 跟随引擎 drop 自动清理 —— 这里只是配置 URL。
     #[arg(long)]
-    aura_addr: Option<String>,
+    voice_aura_base: Option<String>,
     #[arg(long)]
     en_user_dict: Option<String>,
     #[arg(long)]
@@ -53,7 +53,8 @@ fn main() {
         top_n: args.top_n, verbose: args.verbose,
         config: args.config, asr_text: args.asr_text,
         commit: args.commit, async_wait: args.async_wait,
-        connect_aura: args.aura, aura_addr: args.aura_addr,
+        voice_aura_base: args.voice_aura_base
+            .unwrap_or_else(|| ime_core::engine::DEFAULT_VOICE_AURA_BASE.to_string()),
         en_user_dict: args.en_user_dict, en_dicts: args.en_dicts,
         req_base: args.req_base,
         frontend: None,
