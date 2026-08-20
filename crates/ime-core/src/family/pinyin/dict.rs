@@ -11,8 +11,14 @@
 use std::collections::HashMap;
 
 fn initials_from_pinyin(raw: &str) -> String {
-    inputx_pinyin::segment(raw).first()
-        .map(|seg| seg.syllables.iter().filter_map(|s| s.chars().next()).collect())
+    inputx_pinyin::segment(raw)
+        .first()
+        .map(|seg| {
+            seg.syllables
+                .iter()
+                .filter_map(|s| s.chars().next())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -27,7 +33,9 @@ enum Backend {
 }
 
 impl Default for Backend {
-    fn default() -> Self { Backend::Map(HashMap::new()) }
+    fn default() -> Self {
+        Backend::Map(HashMap::new())
+    }
 }
 
 impl std::fmt::Debug for Backend {
@@ -69,18 +77,21 @@ impl LargeDict {
     pub fn exact(&self, pinyin: &str) -> Vec<String> {
         match &self.backend {
             Backend::Map(m) => m.get(pinyin).cloned().unwrap_or_default(),
-            Backend::Fst(fst) => {
-                fst.get(pinyin.as_bytes()).into_iter()
-                    .map(|(item, _freq)| String::from_utf8(item).unwrap_or_default())
-                    .collect()
-            }
+            Backend::Fst(fst) => fst
+                .get(pinyin.as_bytes())
+                .into_iter()
+                .map(|(item, _freq)| String::from_utf8(item).unwrap_or_default())
+                .collect(),
         }
     }
 
     /// Jianpin (initials-only) lookup — O(1).
     /// "nh" → ["你好", "你还", "年后", ...]
     pub fn jianpin(&self, initials: &str) -> Vec<String> {
-        self.initials_index.get(initials).cloned().unwrap_or_default()
+        self.initials_index
+            .get(initials)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Load from a file — auto-detects TSV vs FST by extension.
@@ -98,20 +109,29 @@ impl LargeDict {
     fn load_fst_file(&mut self, path: &str) -> std::io::Result<usize> {
         let data = std::fs::read(path)?;
         let start = std::time::Instant::now();
-        let fst = inputx_fsa::Dict::new(data)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData,
-                format!("invalid FST: {e:?}")))?;
+        let fst = inputx_fsa::Dict::new(data).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid FST: {e:?}"),
+            )
+        })?;
 
         // Try loading cached jianpin index first.
         let idx_path = format!("{path}.idx");
         if self.try_load_idx_cache(&idx_path, path) {
-            eprintln!("[swift-ime] large dict loaded (FST+cache) in {}ms", start.elapsed().as_millis());
+            eprintln!(
+                "[swift-ime] large dict loaded (FST+cache) in {}ms",
+                start.elapsed().as_millis()
+            );
         } else {
             // Build from scratch and save cache.
             self.build_initials_from_fst(&fst);
             let elapsed = start.elapsed();
             self.save_idx_cache(&idx_path);
-            eprintln!("[swift-ime] large dict loaded (FST, built idx) in {}ms", elapsed.as_millis());
+            eprintln!(
+                "[swift-ime] large dict loaded (FST, built idx) in {}ms",
+                elapsed.as_millis()
+            );
         }
         self.backend = Backend::Fst(fst);
         Ok(self.len())
@@ -120,29 +140,49 @@ impl LargeDict {
     /// Try loading cached jianpin index. Returns true on success.
     /// Only loads if cache is newer than the FST file.
     fn try_load_idx_cache(&mut self, cache_path: &str, fst_path: &str) -> bool {
-        let Ok(cache_meta) = std::fs::metadata(cache_path) else { return false; };
-        let Ok(fst_meta) = std::fs::metadata(fst_path) else { return false; };
+        let Ok(cache_meta) = std::fs::metadata(cache_path) else {
+            return false;
+        };
+        let Ok(fst_meta) = std::fs::metadata(fst_path) else {
+            return false;
+        };
         if let (Ok(cache_mtime), Ok(fst_mtime)) = (cache_meta.modified(), fst_meta.modified()) {
-            if cache_mtime <= fst_mtime { return false; } // stale cache
+            if cache_mtime <= fst_mtime {
+                return false;
+            } // stale cache
         }
-        let Ok(data) = std::fs::read(cache_path) else { return false; };
+        let Ok(data) = std::fs::read(cache_path) else {
+            return false;
+        };
         // Format: binary, pairs of (key_len:u8, key_bytes, count:u16, word_len:u8, word_bytes)...
         let mut pos = 0;
         let mut count_keys = 0;
         while pos < data.len() {
-            if pos + 1 > data.len() { break; }
-            let key_len = data[pos] as usize; pos += 1;
-            if pos + key_len > data.len() { break; }
+            if pos + 1 > data.len() {
+                break;
+            }
+            let key_len = data[pos] as usize;
+            pos += 1;
+            if pos + key_len > data.len() {
+                break;
+            }
             let key = String::from_utf8_lossy(&data[pos..pos + key_len]).to_string();
             pos += key_len;
-            if pos + 2 > data.len() { break; }
+            if pos + 2 > data.len() {
+                break;
+            }
             let n = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
             let mut words = Vec::with_capacity(n);
             for _ in 0..n {
-                if pos + 1 > data.len() { break; }
-                let wl = data[pos] as usize; pos += 1;
-                if pos + wl > data.len() { break; }
+                if pos + 1 > data.len() {
+                    break;
+                }
+                let wl = data[pos] as usize;
+                pos += 1;
+                if pos + wl > data.len() {
+                    break;
+                }
                 words.push(String::from_utf8_lossy(&data[pos..pos + wl]).to_string());
                 pos += wl;
             }
@@ -176,16 +216,26 @@ impl LargeDict {
             if !pinyin.is_empty() && !word.is_empty() {
                 let init = initials_from_pinyin(pinyin);
                 if init.len() >= 2 {
-                    init_map.entry(init).or_default().push((word.to_string(), value as u32));
+                    init_map
+                        .entry(init)
+                        .or_default()
+                        .push((word.to_string(), value as u32));
                 }
             }
         });
         for (init, mut scored) in init_map {
-            scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.chars().count().cmp(&b.0.chars().count())));
+            scored.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then_with(|| a.0.chars().count().cmp(&b.0.chars().count()))
+            });
             scored.dedup_by(|a, b| a.0 == b.0);
-            self.initials_index.insert(init, scored.into_iter().map(|(w, _)| w).take(48).collect());
+            self.initials_index
+                .insert(init, scored.into_iter().map(|(w, _)| w).take(48).collect());
         }
-        eprintln!("[swift-ime] jianpin index: {} initials", self.initials_index.len());
+        eprintln!(
+            "[swift-ime] jianpin index: {} initials",
+            self.initials_index.len()
+        );
     }
 
     /// Load from TSV bytes (for compile-time embedded dicts). Uses HashMap backend.
@@ -200,7 +250,9 @@ impl LargeDict {
         if let Ok(s) = std::str::from_utf8(data) {
             for line in s.lines() {
                 let line = line.trim();
-                if line.is_empty() || line.starts_with('#') { continue; }
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
                 if let Some((pinyin, word)) = line.split_once('\t') {
                     if !pinyin.is_empty() && !word.is_empty() {
                         let key = pinyin.replace(' ', "");
@@ -220,7 +272,9 @@ impl LargeDict {
         for vals in entries.values_mut() {
             vals.sort_by(|a, b| {
                 let len_cmp = a.chars().count().cmp(&b.chars().count());
-                if len_cmp != std::cmp::Ordering::Equal { return len_cmp; }
+                if len_cmp != std::cmp::Ordering::Equal {
+                    return len_cmp;
+                }
                 let fa = freq.get(a).copied().unwrap_or(0);
                 let fb = freq.get(b).copied().unwrap_or(0);
                 fb.cmp(&fa)
@@ -234,22 +288,31 @@ impl LargeDict {
             if init.len() >= 2 {
                 for w in words {
                     let f = *freq.get(w).unwrap_or(&1);
-                    initials_map.entry(init.clone()).or_default().push((w.clone(), f));
+                    initials_map
+                        .entry(init.clone())
+                        .or_default()
+                        .push((w.clone(), f));
                 }
             }
         }
         for (init, mut scored) in initials_map {
             scored.sort_by(|a, b| {
                 let len_cmp = a.0.chars().count().cmp(&b.0.chars().count());
-                if len_cmp != std::cmp::Ordering::Equal { return len_cmp; }
+                if len_cmp != std::cmp::Ordering::Equal {
+                    return len_cmp;
+                }
                 b.1.cmp(&a.1)
             });
             scored.dedup_by(|a, b| a.0 == b.0);
-            self.initials_index.insert(init, scored.into_iter().map(|(w, _)| w).take(48).collect());
+            self.initials_index
+                .insert(init, scored.into_iter().map(|(w, _)| w).take(48).collect());
         }
         let elapsed = start.elapsed();
         let keys = entries.len();
-        eprintln!("[swift-ime] large dict loaded (TSV): {count} entries, {keys} keys in {}ms", elapsed.as_millis());
+        eprintln!(
+            "[swift-ime] large dict loaded (TSV): {count} entries, {keys} keys in {}ms",
+            elapsed.as_millis()
+        );
         self.backend = Backend::Map(entries);
         count
     }

@@ -192,19 +192,21 @@ impl LatticeDecoder {
         let mut imap: HashMap<String, Vec<(String, String, u64)>> = HashMap::new();
         let mut max_freq: u64 = 0;
         self.fst.prefix_for_each(b"", |code, item, value| {
-            if let (Ok(pinyin), Ok(word)) = (
-                std::str::from_utf8(code),
-                std::str::from_utf8(item),
-            ) {
+            if let (Ok(pinyin), Ok(word)) = (std::str::from_utf8(code), std::str::from_utf8(item)) {
                 if !pinyin.is_empty() && !word.is_empty() {
                     max_freq = max_freq.max(value);
                     if let Some(seg) = inputx_pinyin::segment(pinyin).into_iter().next() {
-                        let initials: String = seg.syllables.iter()
+                        let initials: String = seg
+                            .syllables
+                            .iter()
                             .filter_map(|s| s.chars().next())
                             .collect();
                         if initials.len() >= 2 {
-                            imap.entry(initials).or_default()
-                                .push((pinyin.to_string(), word.to_string(), value));
+                            imap.entry(initials).or_default().push((
+                                pinyin.to_string(),
+                                word.to_string(),
+                                value,
+                            ));
                         }
                     }
                 }
@@ -218,8 +220,11 @@ impl LatticeDecoder {
         }
         self.initials_index = imap;
         let elapsed = start.elapsed();
-        eprintln!("[lattice] built initials index: {} entries in {}ms",
-            self.initials_index.len(), elapsed.as_millis());
+        eprintln!(
+            "[lattice] built initials index: {} entries in {}ms",
+            self.initials_index.len(),
+            elapsed.as_millis()
+        );
         // Save cache for next time.
         self.save_cache();
     }
@@ -233,7 +238,9 @@ impl LatticeDecoder {
 
     fn try_load_cache(&mut self) -> bool {
         for cp in Self::cache_paths(&self.fst_path) {
-            let Ok(data) = std::fs::read(&cp) else { continue };
+            let Ok(data) = std::fs::read(&cp) else {
+                continue;
+            };
             let header_end = match data.iter().position(|&b| b == b'\n') {
                 Some(i) => i,
                 None => continue, // no header line — legacy or corrupt
@@ -275,7 +282,9 @@ impl LatticeDecoder {
             // Freshness can't be verified, but it's committed together with the
             // .fst — trusted. Only accepted from the next-to-fst candidate, never
             // the user dir (a re-downloaded stale copy there must not win).
-            let first = Self::cache_paths(&self.fst_path).into_iter().next()
+            let first = Self::cache_paths(&self.fst_path)
+                .into_iter()
+                .next()
                 .is_some_and(|p| p == cp);
             if first && self.parse_cache(&data) {
                 self.max_freq = 0.0; // unknown
@@ -290,27 +299,46 @@ impl LatticeDecoder {
         let mut pos = 0;
         let mut count = 0;
         while pos < data.len() {
-            if pos + 1 > data.len() { break; }
-            let kl = data[pos] as usize; pos += 1;
-            if pos + kl > data.len() { break; }
+            if pos + 1 > data.len() {
+                break;
+            }
+            let kl = data[pos] as usize;
+            pos += 1;
+            if pos + kl > data.len() {
+                break;
+            }
             let key = String::from_utf8_lossy(&data[pos..pos + kl]).to_string();
             pos += kl;
-            if pos + 2 > data.len() { break; }
+            if pos + 2 > data.len() {
+                break;
+            }
             let n = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
             let mut entries = Vec::with_capacity(n);
             for _ in 0..n {
-                if pos + 1 > data.len() { break; }
-                let pl = data[pos] as usize; pos += 1;
-                if pos + pl > data.len() { break; }
+                if pos + 1 > data.len() {
+                    break;
+                }
+                let pl = data[pos] as usize;
+                pos += 1;
+                if pos + pl > data.len() {
+                    break;
+                }
                 let pinyin = String::from_utf8_lossy(&data[pos..pos + pl]).to_string();
                 pos += pl;
-                if pos + 1 > data.len() { break; }
-                let wl = data[pos] as usize; pos += 1;
-                if pos + wl > data.len() { break; }
+                if pos + 1 > data.len() {
+                    break;
+                }
+                let wl = data[pos] as usize;
+                pos += 1;
+                if pos + wl > data.len() {
+                    break;
+                }
                 let word = String::from_utf8_lossy(&data[pos..pos + wl]).to_string();
                 pos += wl;
-                if pos + 8 > data.len() { break; }
+                if pos + 8 > data.len() {
+                    break;
+                }
                 let freq = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
                 pos += 8;
                 entries.push((pinyin, word, freq));
@@ -328,7 +356,13 @@ impl LatticeDecoder {
         // Build the blob once, then write to the first writable candidate (beside the .fst in
         // dev; the user dir when the system dir is read-only). Failing all is fine — next start
         // rebuilds.
-        let mut buf = format!("{} {} {}\n", Self::CACHE_MAGIC_V2, self.fst_len, self.max_freq).into_bytes();
+        let mut buf = format!(
+            "{} {} {}\n",
+            Self::CACHE_MAGIC_V2,
+            self.fst_len,
+            self.max_freq
+        )
+        .into_bytes();
         for (key, entries) in &self.initials_index {
             buf.push(key.len() as u8);
             buf.extend_from_slice(key.as_bytes());
@@ -385,7 +419,8 @@ impl LatticeDecoder {
     /// Full-pinyin exact hit? (rime-ice contains `pinyin` → `word`) — used by
     /// learn_phrase to skip words that are already in the dictionary.
     pub fn has_word(&self, pinyin: &str, word: &str) -> bool {
-        self.fst.get(pinyin.as_bytes())
+        self.fst
+            .get(pinyin.as_bytes())
             .iter()
             .any(|(item, _)| item == word.as_bytes())
     }
@@ -393,7 +428,8 @@ impl LatticeDecoder {
     /// 全拼命中的所有 (word, freq) 对 —— 供上下文感知的"前缀整词联想"
     /// (prev_pinyin + input 拼起来查整词)。
     pub fn words_for(&self, pinyin: &str) -> Vec<(String, u64)> {
-        self.fst.get(pinyin.as_bytes())
+        self.fst
+            .get(pinyin.as_bytes())
             .iter()
             .map(|(item, value)| (String::from_utf8_lossy(item).into_owned(), *value))
             .collect()
@@ -410,73 +446,100 @@ impl LatticeDecoder {
     /// `naozh` → `naozhong`(闹钟)—— 用户还在打字,联想出目标词。
     pub fn predict_prefix(&self, input: &str, max_results: usize) -> Vec<LatticeResult> {
         let mut results = Vec::new();
-        self.fst.prefix_for_each(input.as_bytes(), |code, item, value| {
-            if results.len() >= Self::PREFIX_SCAN_CAP {
-                return;
-            }
-            if let (Ok(word), Ok(pinyin)) = (
-                std::str::from_utf8(item),
-                std::str::from_utf8(code),
-            ) {
-                if !word.is_empty() && !pinyin.is_empty() {
-                    results.push(LatticeResult {
-                        text: word.to_string(),
-                        freq_score: value as f64,
-                        match_type: MatchType::Prefix,
-                        pinyin: pinyin.to_string(),
-                    });
+        self.fst
+            .prefix_for_each(input.as_bytes(), |code, item, value| {
+                if results.len() >= Self::PREFIX_SCAN_CAP {
+                    return;
                 }
-            }
+                if let (Ok(word), Ok(pinyin)) =
+                    (std::str::from_utf8(item), std::str::from_utf8(code))
+                {
+                    if !word.is_empty() && !pinyin.is_empty() {
+                        results.push(LatticeResult {
+                            text: word.to_string(),
+                            freq_score: value as f64,
+                            match_type: MatchType::Prefix,
+                            pinyin: pinyin.to_string(),
+                        });
+                    }
+                }
+            });
+        results.sort_by(|a, b| {
+            b.freq_score
+                .partial_cmp(&a.freq_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
-        results.sort_by(|a, b| b.freq_score.partial_cmp(&a.freq_score).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(max_results);
         results
     }
 
     /// Main entry: predict candidates for any pinyin input.
     pub fn predict(&self, input: &str, max_results: usize) -> Vec<LatticeResult> {
-        if input.is_empty() { return Vec::new(); }
+        if input.is_empty() {
+            return Vec::new();
+        }
 
         let segments = greedy_parse(input);
-        if segments.is_empty() { return Vec::new(); }
+        if segments.is_empty() {
+            return Vec::new();
+        }
 
         let all_full = segments.iter().all(|s| matches!(s, Segment::Full(_)));
         let all_initials = segments.iter().all(|s| matches!(s, Segment::Initial(_)));
-        let match_type = if all_full { MatchType::Full }
-            else if all_initials { MatchType::Initials }
-            else { MatchType::Mixed };
+        let match_type = if all_full {
+            MatchType::Full
+        } else if all_initials {
+            MatchType::Initials
+        } else {
+            MatchType::Mixed
+        };
 
         if all_full {
             let mut results = Vec::new();
-            self.fst.get(input.as_bytes()).into_iter()
+            self.fst
+                .get(input.as_bytes())
+                .into_iter()
                 .for_each(|(item, value)| {
                     if let Ok(word) = String::from_utf8(item) {
                         results.push(LatticeResult {
-                            text: word, freq_score: value as f64, match_type: MatchType::Full,
+                            text: word,
+                            freq_score: value as f64,
+                            match_type: MatchType::Full,
                             pinyin: input.to_string(),
                         });
                     }
                 });
-            results.sort_by(|a, b| b.freq_score.partial_cmp(&a.freq_score).unwrap_or(std::cmp::Ordering::Equal));
+            results.sort_by(|a, b| {
+                b.freq_score
+                    .partial_cmp(&a.freq_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             results.truncate(max_results);
             return results;
         }
 
         let initials: String = segments.iter().map(|s| s.initial()).collect();
         let candidates = match self.initials_index.get(&initials) {
-            Some(v) => v.clone(), None => return Vec::new(),
+            Some(v) => v.clone(),
+            None => return Vec::new(),
         };
 
         let mut results = Vec::new();
         for (code, word, freq) in &candidates {
             if pattern_match(code, &segments) {
                 results.push(LatticeResult {
-                    text: word.clone(), freq_score: *freq as f64, match_type,
+                    text: word.clone(),
+                    freq_score: *freq as f64,
+                    match_type,
                     pinyin: code.clone(),
                 });
             }
         }
-        results.sort_by(|a, b| b.freq_score.partial_cmp(&a.freq_score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.freq_score
+                .partial_cmp(&a.freq_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(max_results);
         results
     }
@@ -519,12 +582,24 @@ mod tests {
         // Priority: beside the .fst (dev ships it in the repo → instant startup), then the
         // DATA 命名空间(dev: apps/swift-ime/data,prod: ~/.desk-pilot)。
         let paths = LatticeDecoder::cache_paths("/usr/share/swift-ime/dict/rime-ice.fst");
-        assert_eq!(paths[0], std::path::PathBuf::from("/usr/share/swift-ime/dict/rime-ice.fst.idx"));
-        assert_eq!(paths[1].file_name().map(|s| s.to_string_lossy().into_owned()),
-            Some("rime-ice.fst.idx".into()), "DATA fallback name: {:?}", paths[1]);
+        assert_eq!(
+            paths[0],
+            std::path::PathBuf::from("/usr/share/swift-ime/dict/rime-ice.fst.idx")
+        );
+        assert_eq!(
+            paths[1]
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned()),
+            Some("rime-ice.fst.idx".into()),
+            "DATA fallback name: {:?}",
+            paths[1]
+        );
         // dev 模式:第二候选落在仓库的 apps/swift-ime/data(不再硬编码 HOME)。
-        assert!(paths[1].to_string_lossy().contains("apps/swift-ime/data"),
-            "dev DATA namespace: {:?}", paths[1]);
+        assert!(
+            paths[1].to_string_lossy().contains("apps/swift-ime/data"),
+            "dev DATA namespace: {:?}",
+            paths[1]
+        );
     }
 
     #[test]
@@ -539,16 +614,36 @@ mod tests {
         b.insert(b"jixu", "急须".as_bytes(), 164_505);
         let dict = inputx_fsa::Dict::new(b.finish()).expect("dict");
         let dec = LatticeDecoder::new(dict, &path);
-        let scale = crate::scoring::FreqScale { max_weight: 0.0, min_score: 0.25, max_score: 1.0 };
+        let scale = crate::scoring::FreqScale {
+            max_weight: 0.0,
+            min_score: 0.25,
+            max_score: 1.0,
+        };
         // Auto + 线性重标:min + (max-min) × log₂ 比值。top word = max_score,
         // 近顶词保持严格更小(不贴顶同分)。
-        assert!((dec.freq_to_score(&scale, 501_276) - 1.0).abs() < 1e-9, "top word = max_score");
+        assert!(
+            (dec.freq_to_score(&scale, 501_276) - 1.0).abs() < 1e-9,
+            "top word = max_score"
+        );
         let s500 = dec.freq_to_score(&scale, 500_369);
-        assert!(s500 < 1.0 && s500 > 0.99, "near-top keeps separation: {s500}");
-        assert!(dec.freq_to_score(&scale, 164_505) < s500, "lower freq scores lower");
+        assert!(
+            s500 < 1.0 && s500 > 0.99,
+            "near-top keeps separation: {s500}"
+        );
+        assert!(
+            dec.freq_to_score(&scale, 164_505) < s500,
+            "lower freq scores lower"
+        );
         // 显式分母 + 更紧的 [min,max]:重标保持单调,顶 = max_score、底 = min_score。
-        let tight = crate::scoring::FreqScale { max_weight: 100_000.0, min_score: 0.25, max_score: 0.90 };
-        assert!((dec.freq_to_score(&tight, 100_000) - 0.90).abs() < 1e-9, "top = max_score");
+        let tight = crate::scoring::FreqScale {
+            max_weight: 100_000.0,
+            min_score: 0.25,
+            max_score: 0.90,
+        };
+        assert!(
+            (dec.freq_to_score(&tight, 100_000) - 0.90).abs() < 1e-9,
+            "top = max_score"
+        );
         // 10000/100000 → log₂ 比值 = 13.29/16.61 ≈ 0.800 → 0.25 + 0.65×0.800
         // ≈ 0.770(单调线性重标;clamp 时代此处为 0.80 贴段)。
         let s10k = dec.freq_to_score(&tight, 10_000);
@@ -556,7 +651,10 @@ mod tests {
         assert!(s10k < 0.90 && s10k > 0.25);
         // f=1:ratio = log₂2/log₂100001 ≈ 0.060 → 0.25 + 0.65×0.060 ≈ 0.289
         //(线性重标下最低频不精确落在 min_score,但严格大于它且单调)。
-        assert!((dec.freq_to_score(&tight, 1) - 0.289).abs() < 0.01, "bottom near min");
+        assert!(
+            (dec.freq_to_score(&tight, 1) - 0.289).abs() < 0.01,
+            "bottom near min"
+        );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}.idx"));
     }

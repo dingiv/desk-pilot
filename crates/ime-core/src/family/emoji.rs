@@ -34,34 +34,118 @@ struct EmojiEntry {
 /// Built-in table — deliberately curated to common, unambiguous terms so a
 /// casual prefix ("he" → heart) doesn't flood the candidate list.
 const EMOJI_TABLE: &[EmojiEntry] = &[
-    EmojiEntry { emoji: "😊", keys: &["smile", "smiling", "weixiao", "微笑", "笑脸"] },
-    EmojiEntry { emoji: "😂", keys: &["laugh", "lol", "daxiao", "大笑", "笑哭"] },
-    EmojiEntry { emoji: "😢", keys: &["cry", "kulei", "哭", "流泪"] },
-    EmojiEntry { emoji: "❤️", keys: &["heart", "love", "aixin", "爱心"] },
-    EmojiEntry { emoji: "👍", keys: &["ok", "good", "zan", "赞", "可以"] },
-    EmojiEntry { emoji: "👏", keys: &["clap", "guzhang", "鼓掌"] },
-    EmojiEntry { emoji: "🔥", keys: &["fire", "huo", "火", "牛"] },
-    EmojiEntry { emoji: "⭐", keys: &["star", "xingxing", "星星"] },
-    EmojiEntry { emoji: "✅", keys: &["check", "done", "dui", "对", "完成"] },
-    EmojiEntry { emoji: "🤔", keys: &["think", "sikao", "思考"] },
-    EmojiEntry { emoji: "😎", keys: &["cool", "ku", "酷"] },
-    EmojiEntry { emoji: "😠", keys: &["angry", "shengqi", "生气", "愤怒"] },
-    EmojiEntry { emoji: "😮", keys: &["surprised", "jingya", "惊讶"] },
-    EmojiEntry { emoji: "😉", keys: &["wink", "zhayan", "眨眼"] },
-    EmojiEntry { emoji: "😘", keys: &["kiss", "qinqin", "亲亲"] },
-    EmojiEntry { emoji: "😴", keys: &["sleep", "shuijiao", "睡觉", "困"] },
-    EmojiEntry { emoji: "😅", keys: &["sweat", "ganga", "尴尬", "汗"] },
-    EmojiEntry { emoji: "🙏", keys: &["pray", "qidao", "祈祷", "拜托"] },
-    EmojiEntry { emoji: "👋", keys: &["wave", "zaijian", "再见", "挥手"] },
-    EmojiEntry { emoji: "🎉", keys: &["party", "celebrate", "qingzhu", "庆祝", "派对"] },
-    EmojiEntry { emoji: "🎁", keys: &["gift", "liwu", "礼物"] },
-    EmojiEntry { emoji: "🚀", keys: &["rocket", "huojian", "火箭"] },
-    EmojiEntry { emoji: "☀️", keys: &["sun", "sunny", "taiyang", "太阳", "晴天"] },
-    EmojiEntry { emoji: "🌙", keys: &["moon", "yueliang", "月亮"] },
-    EmojiEntry { emoji: "☕", keys: &["coffee", "kafei", "咖啡"] },
-    EmojiEntry { emoji: "🍵", keys: &["tea", "cha", "茶"] },
-    EmojiEntry { emoji: "🐱", keys: &["cat", "mao", "猫"] },
-    EmojiEntry { emoji: "🐶", keys: &["dog", "gou", "狗"] },
+    EmojiEntry {
+        emoji: "😊",
+        keys: &["smile", "smiling", "weixiao", "微笑", "笑脸"],
+    },
+    EmojiEntry {
+        emoji: "😂",
+        keys: &["laugh", "lol", "daxiao", "大笑", "笑哭"],
+    },
+    EmojiEntry {
+        emoji: "😢",
+        keys: &["cry", "kulei", "哭", "流泪"],
+    },
+    EmojiEntry {
+        emoji: "❤️",
+        keys: &["heart", "love", "aixin", "爱心"],
+    },
+    EmojiEntry {
+        emoji: "👍",
+        keys: &["ok", "good", "zan", "赞", "可以"],
+    },
+    EmojiEntry {
+        emoji: "👏",
+        keys: &["clap", "guzhang", "鼓掌"],
+    },
+    EmojiEntry {
+        emoji: "🔥",
+        keys: &["fire", "huo", "火", "牛"],
+    },
+    EmojiEntry {
+        emoji: "⭐",
+        keys: &["star", "xingxing", "星星"],
+    },
+    EmojiEntry {
+        emoji: "✅",
+        keys: &["check", "done", "dui", "对", "完成"],
+    },
+    EmojiEntry {
+        emoji: "🤔",
+        keys: &["think", "sikao", "思考"],
+    },
+    EmojiEntry {
+        emoji: "😎",
+        keys: &["cool", "ku", "酷"],
+    },
+    EmojiEntry {
+        emoji: "😠",
+        keys: &["angry", "shengqi", "生气", "愤怒"],
+    },
+    EmojiEntry {
+        emoji: "😮",
+        keys: &["surprised", "jingya", "惊讶"],
+    },
+    EmojiEntry {
+        emoji: "😉",
+        keys: &["wink", "zhayan", "眨眼"],
+    },
+    EmojiEntry {
+        emoji: "😘",
+        keys: &["kiss", "qinqin", "亲亲"],
+    },
+    EmojiEntry {
+        emoji: "😴",
+        keys: &["sleep", "shuijiao", "睡觉", "困"],
+    },
+    EmojiEntry {
+        emoji: "😅",
+        keys: &["sweat", "ganga", "尴尬", "汗"],
+    },
+    EmojiEntry {
+        emoji: "🙏",
+        keys: &["pray", "qidao", "祈祷", "拜托"],
+    },
+    EmojiEntry {
+        emoji: "👋",
+        keys: &["wave", "zaijian", "再见", "挥手"],
+    },
+    EmojiEntry {
+        emoji: "🎉",
+        keys: &["party", "celebrate", "qingzhu", "庆祝", "派对"],
+    },
+    EmojiEntry {
+        emoji: "🎁",
+        keys: &["gift", "liwu", "礼物"],
+    },
+    EmojiEntry {
+        emoji: "🚀",
+        keys: &["rocket", "huojian", "火箭"],
+    },
+    EmojiEntry {
+        emoji: "☀️",
+        keys: &["sun", "sunny", "taiyang", "太阳", "晴天"],
+    },
+    EmojiEntry {
+        emoji: "🌙",
+        keys: &["moon", "yueliang", "月亮"],
+    },
+    EmojiEntry {
+        emoji: "☕",
+        keys: &["coffee", "kafei", "咖啡"],
+    },
+    EmojiEntry {
+        emoji: "🍵",
+        keys: &["tea", "cha", "茶"],
+    },
+    EmojiEntry {
+        emoji: "🐱",
+        keys: &["cat", "mao", "猫"],
+    },
+    EmojiEntry {
+        emoji: "🐶",
+        keys: &["dog", "gou", "狗"],
+    },
 ];
 
 pub struct EmojiFamily {
@@ -80,7 +164,10 @@ impl EmojiFamily {
                 entries.push((k.to_string(), e.emoji.to_string()));
             }
         }
-        EmojiFamily { enabled: AtomicBool::new(true), entries: Mutex::new(entries) }
+        EmojiFamily {
+            enabled: AtomicBool::new(true),
+            entries: Mutex::new(entries),
+        }
     }
 
     pub fn set_enabled(&self, enabled: bool) {
@@ -199,7 +286,11 @@ impl CandidateFamily for EmojiFamily {
             }
         }
         drop(entries);
-        out.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap_or(std::cmp::Ordering::Equal));
+        out.sort_by(|a, b| {
+            b.raw_score
+                .partial_cmp(&a.raw_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         out
     }
 
@@ -253,8 +344,14 @@ mod tests {
         assert!(fam.predict("外星人").is_empty(), "not in base");
         let n = fam.load_tsv(path.to_str().unwrap()).unwrap();
         assert_eq!(n, 2);
-        assert!(fam.predict("外星人").iter().any(|c| c.text == "👽"), "external keyword works");
-        assert!(fam.predict("rocket_e").iter().any(|c| c.text == "🚀"), "english keyword works");
+        assert!(
+            fam.predict("外星人").iter().any(|c| c.text == "👽"),
+            "external keyword works"
+        );
+        assert!(
+            fam.predict("rocket_e").iter().any(|c| c.text == "🚀"),
+            "english keyword works"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -269,25 +366,46 @@ mod tests {
         std::fs::write(&user, "smile\t🥰\n").unwrap(); // override ext → 🥰
         let fam = EmojiFamily::new();
         fam.load_tsv(ext.to_str().unwrap()).unwrap();
-        assert!(fam.predict("smile").iter().any(|c| c.text == "😀"), "external overrides base");
+        assert!(
+            fam.predict("smile").iter().any(|c| c.text == "😀"),
+            "external overrides base"
+        );
         fam.load_tsv(user.to_str().unwrap()).unwrap();
         let cands = fam.predict("smile");
-        assert!(cands.iter().any(|c| c.text == "🥰"), "user overrides external: {cands:?}");
-        assert!(!cands.iter().any(|c| c.text == "😊"), "base replaced: {cands:?}");
+        assert!(
+            cands.iter().any(|c| c.text == "🥰"),
+            "user overrides external: {cands:?}"
+        );
+        assert!(
+            !cands.iter().any(|c| c.text == "😊"),
+            "base replaced: {cands:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn malformed_lines_skipped() {
         let rows = parse_emoji_tsv("a\t😀\n\n# comment\nbadtwo\nc\t\t\nd\t🙂\n");
-        assert_eq!(rows, vec![("a".to_string(), "😀".to_string()), ("d".to_string(), "🙂".to_string())]);
+        assert_eq!(
+            rows,
+            vec![
+                ("a".to_string(), "😀".to_string()),
+                ("d".to_string(), "🙂".to_string())
+            ]
+        );
     }
 
     #[test]
     fn pinyin_and_hanzi_keywords() {
         let fam = EmojiFamily::new();
-        assert!(fam.predict("weixiao").iter().any(|c| c.text == "😊"), "pinyin key");
-        assert!(fam.predict("微笑").iter().any(|c| c.text == "😊"), "hanzi key");
+        assert!(
+            fam.predict("weixiao").iter().any(|c| c.text == "😊"),
+            "pinyin key"
+        );
+        assert!(
+            fam.predict("微笑").iter().any(|c| c.text == "😊"),
+            "hanzi key"
+        );
     }
 
     #[test]
@@ -307,8 +425,11 @@ mod tests {
         let fam = EmojiFamily::new();
         let cands = fam.predict("ok");
         let ok = cands.iter().find(|c| c.text == "👍").unwrap();
-        assert!((ok.raw_score - 0.6).abs() < 1e-9,
-            "two-letter exact demoted to prefix tier: {}", ok.raw_score);
+        assert!(
+            (ok.raw_score - 0.6).abs() < 1e-9,
+            "two-letter exact demoted to prefix tier: {}",
+            ok.raw_score
+        );
     }
 
     #[test]
@@ -323,7 +444,11 @@ mod tests {
 
         let near = fam.predict("weishenm");
         let e = near.iter().find(|c| c.text == "🤌").unwrap();
-        assert!((e.raw_score - 0.6).abs() < 1e-9, "剩 1 不衰减: {}", e.raw_score);
+        assert!(
+            (e.raw_score - 0.6).abs() < 1e-9,
+            "剩 1 不衰减: {}",
+            e.raw_score
+        );
 
         let far = fam.predict("weis");
         let e2 = far.iter().find(|c| c.text == "🤌").unwrap();
@@ -347,7 +472,8 @@ mod tests {
     /// Unique per-test temp dict — tests run in parallel threads (same lesson
     /// as english.rs: a shared temp path made writers race).
     fn temp_emoji_tsv(tag: &str, content: &str) -> String {
-        let path = std::env::temp_dir().join(format!("emoji_test_{}_{tag}.tsv", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("emoji_test_{}_{tag}.tsv", std::process::id()));
         std::fs::write(&path, content).unwrap();
         path.to_string_lossy().to_string()
     }
@@ -360,8 +486,14 @@ mod tests {
         let fam = EmojiFamily::new();
         let path = temp_emoji_tsv("ganlan", "ganlan\t🥦\nweixiao\t☺\n");
         assert_eq!(fam.load_tsv(&path).unwrap(), 2);
-        assert!(fam.predict("ganlan").iter().any(|c| c.text == "🥦"), "ganlan triggers 🥦");
-        assert!(fam.predict("weixiao").iter().any(|c| c.text == "☺"), "weixiao triggers ☺");
+        assert!(
+            fam.predict("ganlan").iter().any(|c| c.text == "🥦"),
+            "ganlan triggers 🥦"
+        );
+        assert!(
+            fam.predict("weixiao").iter().any(|c| c.text == "☺"),
+            "weixiao triggers ☺"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

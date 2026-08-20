@@ -28,13 +28,18 @@ pub struct ClipMember {
 
 impl ClipMember {
     pub fn new(resources: Arc<MagicResources>) -> Self {
-        ClipMember { resources, requested: false }
+        ClipMember {
+            resources,
+            requested: false,
+        }
     }
 
     /// 历史为空且未请求过 → 发 IoEvent::RequestClipboard 让前端按需取剪贴板
     /// 历史回填;回填后 refresh_ui 触发重新预测。
     fn ensure_history(&mut self, ctx: usize, count: u32) {
-        if self.requested { return; }
+        if self.requested {
+            return;
+        }
         self.requested = true;
         if let Some(io) = self.resources.io() {
             io.send(crate::io_thread::IoEvent::RequestClipboard { ctx, count });
@@ -69,14 +74,17 @@ impl MagicMember for ClipMember {
         }
         // 无参数:`#clip` → 展示最近 4 个 clipboard item(换行转义展示、原文提交)。
         if args.path.is_empty() {
-            return hist.iter()
+            return hist
+                .iter()
                 .filter(|t| !t.is_empty())
                 .take(4)
                 .map(|t| Prediction::commit_raw(escape_newlines(t), t.clone()))
                 .collect();
         }
         // 有参数 `/N`:N = 倒数第 N+1 个(`#clip/0` = 最近一个)。
-        let n = args.path.first()
+        let n = args
+            .path
+            .first()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0);
         match hist.get(n) {
@@ -84,7 +92,10 @@ impl MagicMember for ClipMember {
                 vec![Prediction::commit_raw(escape_newlines(text), text.clone())]
             }
             Some(_) => vec![Prediction::interactive("剪贴板为空")],
-            None => vec![Prediction::interactive(format!("剪贴板历史不足(共 {})", hist.len()))],
+            None => vec![Prediction::interactive(format!(
+                "剪贴板历史不足(共 {})",
+                hist.len()
+            ))],
         }
     }
 }
@@ -92,5 +103,7 @@ impl MagicMember for ClipMember {
 /// 剪贴板文本展示转义:换行显示为 `\n`(候选行/preedit 单行可读);
 /// `\r\n` 归一为 `\n`,孤立 `\r` 显示为 `\r`。提交不经此函数,保持原文。
 fn escape_newlines(s: &str) -> String {
-    s.replace("\r\n", "\n").replace('\n', "\\n").replace('\r', "\\r")
+    s.replace("\r\n", "\n")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }

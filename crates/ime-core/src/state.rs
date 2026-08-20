@@ -32,11 +32,16 @@
 use crate::expander::Expander;
 use crate::family::magic::{MagicCommand, MagicMatch, MagicMember};
 use crate::matcher::Matcher;
-use crate::platform::{CANDIDATE_SLOTS, ImeView};
+use crate::platform::{ImeView, CANDIDATE_SLOTS};
 use crate::PinyinEngine;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ComposeState { #[default] Idle, Snippet, Pinyin }
+pub enum ComposeState {
+    #[default]
+    Idle,
+    Snippet,
+    Pinyin,
+}
 
 #[derive(Default)]
 pub struct StateMachine {
@@ -44,21 +49,32 @@ pub struct StateMachine {
     /// 把异步工作事件发到正确的 ctx 并 refresh 对应上下文。
     pub ctx: usize,
     pub state: ComposeState,
-    /// Raw pinyin buffer — remaining uncommitted pinyin syllables.
-    pub buffer: String,
     /// 键入的原始文本(保留大小写)。预测用 [`buffer`](小写);展示与提交
     /// 用这里。英文候选提交时按它回填大小写(English 而非 english)。
     /// 不变式:`buffer` 是 `raw_buffer` 的 ASCII 小写,二者等长。
     pub raw_buffer: String,
+    /// Raw pinyin buffer — remaining uncommitted pinyin syllables.
+    pub buffer: String,
+
     /// Visual preedit: committed hanzi + remaining pinyin.
     pub preedit: String,
+
+    /// 调试模式:候选词显示提供者与权重(`[score family/source]`)。
+    pub candidate_meta_enabled: bool,
+
+    /// Cursor 管理
     /// Cursor byte offset within preedit.
     pub cursor: usize,
+
+    /// 候选项管理
     pub candidates: Vec<String>,
     pub candidates_fresh: bool,
     pub candidate_highlight: usize,
     pub candidate_page: usize,
     pub candidate_page_size: usize,
+
+    /// **pinyin 家族**
+    /// 自生词系统
     /// Hanzi already committed during incremental composition (e.g. "李正").
     pub committed_text: String,
     /// Pinyin corresponding to the committed hanzi (e.g. "lizheng").
@@ -72,6 +88,8 @@ pub struct StateMachine {
     pub context: crate::family::InputContext,
     /// 补全提示(输入是某命令触发串的严格前缀):候选 = [补全名…, rollback]。
     /// 选中补全名 → **改写输入**(不提交)。
+
+    /// 魔法命令家族
     pub(crate) magic_hints: Vec<String>,
     /// 精确匹配命令时的预测选项(不含 rollback)。
     pub(crate) magic_predictions: Vec<crate::family::magic::Prediction>,
@@ -80,13 +98,14 @@ pub struct StateMachine {
     pub active_command: Option<Box<dyn MagicMember>>,
     /// 数字键是否用于选中候选(精确无参 / 前缀时 true;拼参数时 false)。
     magic_selectable: bool,
-    /// 调试模式:候选词显示提供者与权重(`[score family/source]`)。
-    pub candidate_meta_enabled: bool,
+
     /// 最近一次排名的详细结果(score, family, source)——与 candidates 对齐,
     /// 供 fill_view 填充 meta。
     last_meta: Vec<CandMeta>,
+
     /// 最近一次提交的候选家族(select 时从候选元数据取)。引擎提交点据此
     /// 判断:提交的是英文候选(来源 english)则不再学成自生词。
+    /// FIXME: 需要移除
     pub(crate) last_commit_family: Option<&'static str>,
 }
 
@@ -139,7 +158,10 @@ impl StateMachine {
     /// The engine passes `swift-ime.yaml → input.page_size` via
     /// [`ImeEngine::set_page_size`](crate::engine::ImeEngine::set_page_size).
     pub fn with_page_size(page_size: u32) -> Self {
-        StateMachine { candidate_page_size: page_size.max(1) as usize, ..StateMachine::default() }
+        StateMachine {
+            candidate_page_size: page_size.max(1) as usize,
+            ..StateMachine::default()
+        }
     }
 
     pub fn step(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
@@ -154,9 +176,14 @@ impl StateMachine {
 
     /// `#asr?num=2` → `#asr`(名字段,用于静态命令展开 / 无参判定)。
     fn command_trigger(input: &str) -> String {
-        if input.len() < 2 { return input.to_string(); }
+        if input.len() < 2 {
+            return input.to_string();
+        }
         let rest = &input[1..];
-        let name_len = rest.chars().take_while(|c| c.is_ascii_alphanumeric()).count();
+        let name_len = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .count();
         format!("#{}", &rest[..name_len])
     }
 
@@ -164,10 +191,13 @@ impl StateMachine {
     fn query_magic(&mut self, env: &dyn StepEnv) -> ImeView {
         let input = self.buffer.clone();
         match env.magic().match_command(&input) {
+            // TODO: 不用区分了, 魔法命令全都是 LIVE
             MagicMatch::Exact(cmd) => match cmd {
                 MagicCommand::Live { token, name } => {
                     self.ensure_command(name, Some(token), env);
-                    self.magic_predictions = self.active_command.as_mut()
+                    self.magic_predictions = self
+                        .active_command
+                        .as_mut()
                         .map(|m| m.predict(self.ctx, &input, env))
                         .unwrap_or_default();
                     self.magic_hints.clear();
@@ -177,8 +207,8 @@ impl StateMachine {
                 MagicCommand::Static => {
                     self.clear_active_command();
                     let trigger = Self::command_trigger(&input);
-                    self.magic_predictions = env.magic().static_prediction(&trigger)
-                        .unwrap_or_default();
+                    self.magic_predictions =
+                        env.magic().static_prediction(&trigger).unwrap_or_default();
                     self.magic_hints.clear();
                     self.magic_selectable = input == trigger;
                 }
@@ -191,7 +221,9 @@ impl StateMachine {
             }
             MagicMatch::Snippet => {
                 self.ensure_command("", Some("__SNIPPET__"), env);
-                self.magic_predictions = self.active_command.as_mut()
+                self.magic_predictions = self
+                    .active_command
+                    .as_mut()
                     .map(|m| m.predict(self.ctx, &input, env))
                     .unwrap_or_default();
                 self.magic_hints.clear();
@@ -208,9 +240,20 @@ impl StateMachine {
     }
 
     /// 精确匹配时复用同名命令实例(保 req 异步态),否则新建。
-    fn ensure_command(&mut self, name: &'static str, token: Option<&'static str>, env: &dyn StepEnv) {
-        let keep = self.active_command.as_ref().map(|m| m.name() == name).unwrap_or(false);
-        if keep { return; }
+    fn ensure_command(
+        &mut self,
+        name: &'static str,
+        token: Option<&'static str>,
+        env: &dyn StepEnv,
+    ) {
+        let keep = self
+            .active_command
+            .as_ref()
+            .map(|m| m.name() == name)
+            .unwrap_or(false);
+        if keep {
+            return;
+        }
         self.clear_active_command();
         if let Some(tok) = token {
             self.active_command = env.magic().spawn(tok);
@@ -227,8 +270,12 @@ impl StateMachine {
     /// 候选 = [预测…, 补全…, rollback];preedit = 首条预测(精确)否则输入。
     pub(crate) fn rebuild_magic_view(&mut self) -> ImeView {
         let mut cands: Vec<String> = Vec::new();
-        for p in &self.magic_predictions { cands.push(p.text.clone()); }
-        for h in &self.magic_hints { cands.push(h.clone()); }
+        for p in &self.magic_predictions {
+            cands.push(p.text.clone());
+        }
+        for h in &self.magic_hints {
+            cands.push(h.clone());
+        }
         cands.push(self.buffer.clone()); // rollback — 最后一项
         self.candidates = cands;
         self.candidates_fresh = true;
@@ -293,9 +340,15 @@ impl StateMachine {
     /// and re-queries. The character pick is also recorded in L0.
     pub fn select(&mut self, index: usize, env: &dyn StepEnv) -> ImeView {
         let picked = self.candidates.get(index).cloned().unwrap_or_default();
-        if picked.is_empty() { return self.make_view(); }
+        if picked.is_empty() {
+            return self.make_view();
+        }
 
-        let is_partial = self.partial_commit_indices.get(index).copied().unwrap_or(false);
+        let is_partial = self
+            .partial_commit_indices
+            .get(index)
+            .copied()
+            .unwrap_or(false);
         if !is_partial {
             // Full commit: combine committed_text + selected text. 英文候选按
             // 键入的原始大小写回填(raw_buffer),汉字候选天然 no-op。
@@ -312,7 +365,9 @@ impl StateMachine {
             };
             // 提交候选的来源家族 —— 两个家族的单词本各自闭环:
             // 拼音提交 → 拼音 L0/单词本;英文提交 → 英文家族(且词典词不学)。
-            let commit_family = self.last_meta.iter()
+            let commit_family = self
+                .last_meta
+                .iter()
                 .find(|m| m.text == picked)
                 .map(|m| m.family);
             // L0 频率加成只对拼音族提交生效 —— 英文候选提交不写拼音模型。
@@ -383,7 +438,9 @@ impl StateMachine {
     }
 
     pub fn move_highlight(&mut self, delta: i32) {
-        if self.candidates.is_empty() { return; }
+        if self.candidates.is_empty() {
+            return;
+        }
         let new = (self.candidate_highlight as i32 + delta)
             .clamp(0, self.candidates.len() as i32 - 1) as usize;
         self.candidate_highlight = new;
@@ -541,7 +598,9 @@ impl StateMachine {
 
         // Space: commit the highlighted candidate.
         if ch == ' ' {
-            let hl = self.candidate_highlight.min(self.candidates.len().saturating_sub(1));
+            let hl = self
+                .candidate_highlight
+                .min(self.candidates.len().saturating_sub(1));
             return self.select_magic(hl, env);
         }
 
@@ -584,7 +643,8 @@ impl StateMachine {
         // ranks them by weighted score, returns deduplicated text list.
         let ranked = env.scorer().rank_detailed(&self.buffer, &self.context);
         // 候选词自带元数据(来源家族/成员 + 权重)—— 调试 meta 与提交来源判断共用。
-        self.last_meta = ranked.iter()
+        self.last_meta = ranked
+            .iter()
             .map(|c| CandMeta {
                 text: c.text.clone(),
                 score: c.score,
@@ -604,7 +664,9 @@ impl StateMachine {
             if first_syl.len() < self.buffer.len() {
                 let max_full = 8usize.min(cands.len());
                 let max_chars = (CANDIDATE_SLOTS - max_full).min(8);
-                let char_cands: Vec<String> = env.pinyin().candidates(&first_syl)
+                let char_cands: Vec<String> = env
+                    .pinyin()
+                    .candidates(&first_syl)
                     .into_iter()
                     .filter(|c| c.chars().count() == 1 && !merged.contains(c))
                     .take(max_chars)
@@ -612,8 +674,7 @@ impl StateMachine {
 
                 if !char_cands.is_empty() {
                     // Top full comps.
-                    let full_head = cands.iter().take(max_full).cloned()
-                        .collect::<Vec<_>>();
+                    let full_head = cands.iter().take(max_full).cloned().collect::<Vec<_>>();
                     self.full_comp_count = full_head.len();
                     for _ in 0..full_head.len() {
                         self.partial_commit_indices.push(false);
@@ -627,8 +688,11 @@ impl StateMachine {
                     merged.extend(char_cands);
 
                     // Remaining full comps.
-                    let full_tail: Vec<String> = cands.iter()
-                        .skip(max_full).filter(|&c| !merged.contains(c)).cloned()
+                    let full_tail: Vec<String> = cands
+                        .iter()
+                        .skip(max_full)
+                        .filter(|&c| !merged.contains(c))
+                        .cloned()
                         .collect();
                     for _ in 0..full_tail.len() {
                         self.partial_commit_indices.push(false);
@@ -706,7 +770,11 @@ impl StateMachine {
         // Enter 强选 raw 文本:提交原始大小写(raw_buffer),非小写 buffer。
         let raw = std::mem::take(&mut self.raw_buffer);
         let committed = std::mem::take(&mut self.committed_text);
-        let text = if committed.is_empty() { raw } else { format!("{committed}{raw}") };
+        let text = if committed.is_empty() {
+            raw
+        } else {
+            format!("{committed}{raw}")
+        };
         self.reset();
         Self::commit_view(&text)
     }
@@ -719,13 +787,19 @@ impl StateMachine {
             let _ = std::mem::take(&mut self.buffer);
             self.candidates.clear();
             self.state = ComposeState::Idle;
-            let text = if committed.is_empty() { raw } else { format!("{committed}{raw}") };
+            let text = if committed.is_empty() {
+                raw
+            } else {
+                format!("{committed}{raw}")
+            };
             self.candidates_fresh = false;
             return Self::commit_view(&text);
         }
 
         // Fresh candidates: commit the highlighted one.
-        let idx = self.candidate_highlight.min(self.candidates.len().saturating_sub(1));
+        let idx = self
+            .candidate_highlight
+            .min(self.candidates.len().saturating_sub(1));
         // Delegate to select() — it handles full vs partial commit correctly.
         self.candidates_fresh = false;
         self.select(idx, env)
@@ -741,7 +815,11 @@ impl StateMachine {
         self.state = ComposeState::Idle;
         self.candidates.clear();
 
-        let prefix = if committed.is_empty() { String::new() } else { committed };
+        let prefix = if committed.is_empty() {
+            String::new()
+        } else {
+            committed
+        };
         if !fresh {
             return Self::commit_view(&format!("{prefix}{raw}{ch}"));
         }
@@ -751,7 +829,6 @@ impl StateMachine {
         };
         Self::commit_view(&text)
     }
-
 }
 
 /// 提交英文候选时,把用户键入的大小写回填到词典(小写)单词上。

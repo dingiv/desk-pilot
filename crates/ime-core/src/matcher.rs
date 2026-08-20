@@ -128,7 +128,10 @@ mod tests {
     #[test]
     fn trigger_prefix_detection() {
         let m = test_matcher();
-        assert!(!m.is_trigger_prefix('/'), "/ is no longer a trigger — snippets moved to #/…");
+        assert!(
+            !m.is_trigger_prefix('/'),
+            "/ is no longer a trigger — snippets moved to #/…"
+        );
         assert!(m.is_trigger_prefix('#'));
         assert!(!m.is_trigger_prefix('a'));
         assert!(!m.is_trigger_prefix(' '));

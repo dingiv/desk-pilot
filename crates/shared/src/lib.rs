@@ -26,6 +26,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+mod logger;
+
 // ── Namespace ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]

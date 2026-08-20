@@ -44,7 +44,9 @@ pub struct SnippetStore {
 impl SnippetStore {
     /// Create an empty store.
     pub fn new() -> Self {
-        SnippetStore { snippets: Vec::new() }
+        SnippetStore {
+            snippets: Vec::new(),
+        }
     }
 
     /// Load snippets from JSON bytes. Validates no duplicate triggers.
@@ -148,8 +150,16 @@ mod tests {
         let before = store.len();
         // Try to replace with duplicate-ridden data.
         store.replace(vec![
-            Snippet { trigger: "/a".into(), expand: "1".into(), desc: "".into() },
-            Snippet { trigger: "/a".into(), expand: "2".into(), desc: "".into() },
+            Snippet {
+                trigger: "/a".into(),
+                expand: "1".into(),
+                desc: "".into(),
+            },
+            Snippet {
+                trigger: "/a".into(),
+                expand: "2".into(),
+                desc: "".into(),
+            },
         ]);
         // Old store untouched.
         assert_eq!(store.len(), before);
@@ -159,9 +169,11 @@ mod tests {
     #[test]
     fn replace_atomic_swap() {
         let mut store = SnippetStore::from_json(VALID_JSON).unwrap();
-        store.replace(vec![
-            Snippet { trigger: "/new".into(), expand: "new_expand".into(), desc: "".into() },
-        ]);
+        store.replace(vec![Snippet {
+            trigger: "/new".into(),
+            expand: "new_expand".into(),
+            desc: "".into(),
+        }]);
         assert_eq!(store.len(), 1);
         assert_eq!(store.all()[0].trigger, "/new");
     }

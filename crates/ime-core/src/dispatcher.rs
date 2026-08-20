@@ -7,10 +7,10 @@
 use crate::expander::Expander;
 use crate::family::english::EnglishFamily;
 use crate::family::magic::MagicFamily;
+use crate::family::pinyin::engine::InputxPinyin;
 use crate::family::pinyin::PinyinFamily;
 use crate::family::UnifiedScorer;
 use crate::matcher::Matcher;
-use crate::family::pinyin::engine::InputxPinyin;
 use crate::platform::ImeView;
 use crate::state::{StateMachine, StepEnv};
 use crate::PinyinEngine;
@@ -48,11 +48,14 @@ impl Dispatcher {
             .with_config(scoring.priorities.english, english_weights);
         let emoji_family = crate::family::emoji::EmojiFamily::new();
 
-        let scorer = UnifiedScorer::new(vec![
-            Box::new(pinyin_family),
-            Box::new(english_family),
-            Box::new(emoji_family),
-        ], scoring.priorities);
+        let scorer = UnifiedScorer::new(
+            vec![
+                Box::new(pinyin_family),
+                Box::new(english_family),
+                Box::new(emoji_family),
+            ],
+            scoring.priorities,
+        );
 
         Dispatcher {
             matcher,
@@ -76,7 +79,13 @@ impl Dispatcher {
             crate::scoring::FamilyPriorities::default(),
         );
 
-        Dispatcher { matcher, expander, pinyin, scorer, magic: Arc::new(MagicFamily::new()) }
+        Dispatcher {
+            matcher,
+            expander,
+            pinyin,
+            scorer,
+            magic: Arc::new(MagicFamily::new()),
+        }
     }
 
     pub fn process_key(&self, ch: char, sm: &mut StateMachine) -> ImeView {
@@ -109,7 +118,8 @@ impl Dispatcher {
     /// Restore the inputx-pinyin L0 user model from persisted JSON.
     /// Returns the number of pins restored (0 if empty/invalid).
     pub fn import_l0(&self, json: &str) -> usize {
-        self.scorer.family("pinyin")
+        self.scorer
+            .family("pinyin")
             .map(|fam| fam.import_l0_json(json))
             .unwrap_or(0)
     }
@@ -162,15 +172,21 @@ impl Dispatcher {
 
     /// Load an English user dictionary (all words get max priority).
     pub fn load_en_user_dict(&self, path: &str) -> std::io::Result<usize> {
-        self.scorer.family("english")
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "english family not found"))
+        self.scorer
+            .family("english")
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "english family not found")
+            })
             .and_then(|f| f.load_user_dict(path))
     }
 
     /// Load an external English dictionary (auto-detect type, normalize).
     pub fn load_en_dict(&self, path: &str) -> std::io::Result<usize> {
-        self.scorer.family("english")
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "english family not found"))
+        self.scorer
+            .family("english")
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "english family not found")
+            })
             .and_then(|f| f.load_dict(path))
     }
 
@@ -191,10 +207,18 @@ impl Dispatcher {
 }
 
 impl StepEnv for Dispatcher {
-    fn matcher(&self) -> &Matcher { &self.matcher }
-    fn expander(&self) -> &Expander { &self.expander }
-    fn pinyin(&self) -> &dyn PinyinEngine { &*self.pinyin }
-    fn scorer(&self) -> &UnifiedScorer { &self.scorer }
+    fn matcher(&self) -> &Matcher {
+        &self.matcher
+    }
+    fn expander(&self) -> &Expander {
+        &self.expander
+    }
+    fn pinyin(&self) -> &dyn PinyinEngine {
+        &*self.pinyin
+    }
+    fn scorer(&self) -> &UnifiedScorer {
+        &self.scorer
+    }
     fn first_syllable(&self, pinyin: &str) -> Option<String> {
         self.pinyin.first_syllable(pinyin)
     }
@@ -237,7 +261,11 @@ mod tests {
         fn record_pick(&self, _pinyin: &str, _word: &str) {}
         fn learn_phrase(&self, _pinyin: &str, _hanzi: &str) {}
         fn candidates(&self, pinyin: &str) -> Vec<String> {
-            match pinyin { "n" => vec!["嗯".into()], "ni" => vec!["你".into(), "呢".into()], _ => Vec::new() }
+            match pinyin {
+                "n" => vec!["嗯".into()],
+                "ni" => vec!["你".into(), "呢".into()],
+                _ => Vec::new(),
+            }
         }
     }
 
@@ -245,22 +273,32 @@ mod tests {
         let entries = vec![("#date".into(), "2026-07-23".into())];
         let d = Dispatcher::new_for_test(
             Matcher::new(entries),
-            Expander::new(std::sync::Arc::new(StaticProvider { date: "2026-07-23".into(), clipboard: String::new() })),
+            Expander::new(std::sync::Arc::new(StaticProvider {
+                date: "2026-07-23".into(),
+                clipboard: String::new(),
+            })),
             Box::new(StubPinyin),
         );
         // 片段经 magic 注册表(`#/greet`),而非 matcher trie。
-        d.magic().set_snippets(vec![("greet".into(), "你好,我是 AI 秘书".into())]);
+        d.magic()
+            .set_snippets(vec![("greet".into(), "你好,我是 AI 秘书".into())]);
         d
     }
 
-    fn sm() -> StateMachine { StateMachine::new() }
+    fn sm() -> StateMachine {
+        StateMachine::new()
+    }
 
     #[test]
     fn idle_letter_enters_pinyin() {
-        let d = d(); let mut s = sm();
+        let d = d();
+        let mut s = sm();
         let _v = d.process_key('n', &mut s);
-        assert_eq!(s.state, crate::state::ComposeState::Pinyin,
-            "single letter should enter pinyin state");
+        assert_eq!(
+            s.state,
+            crate::state::ComposeState::Pinyin,
+            "single letter should enter pinyin state"
+        );
         // 'n' alone is not a complete syllable; candidates depend on FST/decomp.
         // Subsequent typing of 'i' should produce candidates.
         let v = d.process_key('i', &mut s);
@@ -269,34 +307,60 @@ mod tests {
 
     #[test]
     fn snippet_expansion() {
-        let d = d(); let mut s = sm();
+        let d = d();
+        let mut s = sm();
         // Type #/greet — shows expansion as candidate, doesn't auto-expand.
         let mut view = ImeView::empty();
-        for c in "#/greet".chars() { view = d.process_key(c, &mut s); }
-        assert!(view.candidate_count > 0, "should show expansion as candidate, got {view:?}");
+        for c in "#/greet".chars() {
+            view = d.process_key(c, &mut s);
+        }
+        assert!(
+            view.candidate_count > 0,
+            "should show expansion as candidate, got {view:?}"
+        );
         // Space commits the expansion.
-        assert_eq!(ImeView::str_field(&d.process_key(' ', &mut s).commit_text), "你好,我是 AI 秘书");
+        assert_eq!(
+            ImeView::str_field(&d.process_key(' ', &mut s).commit_text),
+            "你好,我是 AI 秘书"
+        );
     }
 
     #[test]
     fn pinyin_space_commits_top() {
-        let d = d(); let mut s = sm();
-        d.process_key('n', &mut s); d.process_key('i', &mut s);
-        assert_eq!(ImeView::str_field(&d.process_key(' ', &mut s).commit_text), "你");
+        let d = d();
+        let mut s = sm();
+        d.process_key('n', &mut s);
+        d.process_key('i', &mut s);
+        assert_eq!(
+            ImeView::str_field(&d.process_key(' ', &mut s).commit_text),
+            "你"
+        );
     }
 
     #[test]
     fn pinyin_enter_commits_raw() {
-        let d = d(); let mut s = sm();
-        d.process_key('h', &mut s); d.process_key('e', &mut s); d.process_key('l', &mut s); d.process_key('l', &mut s); d.process_key('o', &mut s);
-        assert_eq!(ImeView::str_field(&d.process_key('\n', &mut s).commit_text), "hello");
+        let d = d();
+        let mut s = sm();
+        d.process_key('h', &mut s);
+        d.process_key('e', &mut s);
+        d.process_key('l', &mut s);
+        d.process_key('l', &mut s);
+        d.process_key('o', &mut s);
+        assert_eq!(
+            ImeView::str_field(&d.process_key('\n', &mut s).commit_text),
+            "hello"
+        );
     }
 
     #[test]
     fn pinyin_and_snippet_coexist() {
-        let d = d(); let mut s = sm();
+        let d = d();
+        let mut s = sm();
         // Type #date — 静态命令预测为今天日期,space commits。
-        d.process_key('#', &mut s); d.process_key('d', &mut s); d.process_key('a', &mut s); d.process_key('t', &mut s);
+        d.process_key('#', &mut s);
+        d.process_key('d', &mut s);
+        d.process_key('a', &mut s);
+        d.process_key('t', &mut s);
         d.process_key('e', &mut s);
         assert_eq!(
             ImeView::str_field(&d.process_key(' ', &mut s).commit_text),
@@ -306,14 +370,22 @@ mod tests {
         // After magic, typing letters enters pinyin.
         d.process_key('n', &mut s);
         let a = d.process_key('i', &mut s);
-        assert!(a.candidate_count > 0, "after magic, ni should produce candidates, got {a:?}");
+        assert!(
+            a.candidate_count > 0,
+            "after magic, ni should produce candidates, got {a:?}"
+        );
     }
 
     #[test]
     fn select_candidate_commits_nth() {
-        let d = d(); let mut s = sm();
-        d.process_key('n', &mut s); d.process_key('i', &mut s);
-        assert_eq!(ImeView::str_field(&d.select_candidate(1, &mut s).commit_text), "呢");
+        let d = d();
+        let mut s = sm();
+        d.process_key('n', &mut s);
+        d.process_key('i', &mut s);
+        assert_eq!(
+            ImeView::str_field(&d.select_candidate(1, &mut s).commit_text),
+            "呢"
+        );
     }
 
     #[test]
@@ -345,20 +417,29 @@ mod tests {
             Expander::new(provider),
             Box::new(StubPinyin),
         );
-        d.magic().set_snippets(vec![("note".into(), "$DATE 完成: $CURSOR 记得检查".into())]);
+        d.magic()
+            .set_snippets(vec![("note".into(), "$DATE 完成: $CURSOR 记得检查".into())]);
         let mut s = sm();
-        for c in "#/note".chars() { d.process_key(c, &mut s); }
+        for c in "#/note".chars() {
+            d.process_key(c, &mut s);
+        }
         let v = d.process_key(' ', &mut s);
         let text = ImeView::str_field(&v.commit_text);
         // "$DATE" = 10 bytes + " 完成: " = 9 → marker lands at byte 19.
-        assert_eq!(text, "2026-08-05 完成:  记得检查", "marker removed from text");
+        assert_eq!(
+            text, "2026-08-05 完成:  记得检查",
+            "marker removed from text"
+        );
         assert_eq!(v.commit_cursor, 19, "caret mid-text, after the date prefix");
     }
 
     #[test]
     fn reset_clears_all() {
-        let d = d(); let mut s = sm();
-        d.process_key('n', &mut s); d.reset(&mut s);
-        assert!(s.buffer.is_empty()); assert_eq!(s.state, crate::state::ComposeState::Idle);
+        let d = d();
+        let mut s = sm();
+        d.process_key('n', &mut s);
+        d.reset(&mut s);
+        assert!(s.buffer.is_empty());
+        assert_eq!(s.state, crate::state::ComposeState::Idle);
     }
 }

@@ -48,7 +48,9 @@ pub struct RecentStore {
 
 impl RecentStore {
     pub fn new() -> Self {
-        RecentStore { entries: HashMap::new() }
+        RecentStore {
+            entries: HashMap::new(),
+        }
     }
 
     /// 记录一次使用(word 在提交路径被选中)。`now_ms` = wall-clock ms。
@@ -73,7 +75,7 @@ impl RecentStore {
             return 0;
         };
         let age = now_ms - last;
-        
+
         if age <= T10S {
             5
         } else if age <= T1H {

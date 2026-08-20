@@ -23,6 +23,8 @@ use super::MagicResources;
 use crate::state::{StateMachine, StepEnv};
 use crate::voice_state::SharedVoiceState;
 
+const MAX_SUBMIT: usize = 4;
+
 /// Live voice-input command (`#asr`)。
 pub struct VoiceMember {
     resources: Arc<MagicResources>,
@@ -40,7 +42,10 @@ impl VoiceMember {
 
     /// 触发名之后的参数串(`#asr/en?num=2` → `/en?num=2`)。
     fn args_of(input: &str) -> CommandArgs {
-        let rest = input.strip_prefix('#').and_then(|r| r.strip_prefix("asr")).unwrap_or("");
+        let rest = input
+            .strip_prefix('#')
+            .and_then(|r| r.strip_prefix("asr"))
+            .unwrap_or("");
         CommandArgs::parse(rest)
     }
 
@@ -48,27 +53,33 @@ impl VoiceMember {
     fn commit_last_n(&self, n: usize) -> Option<String> {
         let state = self.state()?;
         let (finals, _) = state.voice_candidates();
-        if finals.is_empty() { return None; }
+        if finals.is_empty() {
+            return None;
+        }
         let take = n.min(finals.len());
         Some(finals[..take].join("\n"))
     }
 
     /// 语音结果预测:流式 live(有则)在前,定稿次之,最多 4 条。
     fn voice_predictions(&self, state: &SharedVoiceState) -> Vec<Prediction> {
-        if !state.is_connected() { return Vec::new(); }
+        if !state.is_connected() {
+            // FIXME: 触发重连尝试;
+            return Vec::new();
+        }
         let (finals, live) = state.voice_candidates();
         let mut out = Vec::new();
         // 首选 = 当前窗口的组装预览:小停顿产生新 batch 后继续说话,预览是
         // 前段 Batch + 当前段流式("第一句第二句"),而不是只有当前段流式。
         // 无预览时回退到原始 live。
-        let composed = state.preview()
+        let composed = state
+            .preview()
             .map(|p| p.plain)
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| live.clone());
         if !composed.is_empty() {
             out.push(Prediction::commit(composed));
         }
-        for f in finals.iter().take(4 - out.len()) {
+        for f in finals.iter().take(MAX_SUBMIT - out.len()) {
             out.push(Prediction::commit(f.clone()));
         }
         out
@@ -168,7 +179,9 @@ impl MagicMember for SubmitMember {
     }
 
     fn predict(&mut self, _ctx: usize, _input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
-        let text = self.resources.voice_state()
+        let text = self
+            .resources
+            .voice_state()
             .map(|s| s.snapshot())
             .unwrap_or_default();
         if text.is_empty() {

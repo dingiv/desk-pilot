@@ -32,7 +32,12 @@ pub struct Prediction {
 
 impl Prediction {
     pub fn commit(text: impl Into<String>) -> Self {
-        Prediction { text: text.into(), interactive: false, cursor: None, commit_text: None }
+        Prediction {
+            text: text.into(),
+            interactive: false,
+            cursor: None,
+            commit_text: None,
+        }
     }
 
     /// 展示文本与提交文本不同(如 `#clip` 换行转义展示、原文提交)。
@@ -46,11 +51,21 @@ impl Prediction {
     }
 
     pub fn interactive(text: impl Into<String>) -> Self {
-        Prediction { text: text.into(), interactive: true, cursor: None, commit_text: None }
+        Prediction {
+            text: text.into(),
+            interactive: true,
+            cursor: None,
+            commit_text: None,
+        }
     }
 
     pub fn with_cursor(text: impl Into<String>, cursor: usize) -> Self {
-        Prediction { text: text.into(), interactive: false, cursor: Some(cursor), commit_text: None }
+        Prediction {
+            text: text.into(),
+            interactive: false,
+            cursor: Some(cursor),
+            commit_text: None,
+        }
     }
 
     /// 实际提交文本(展示 ≠ 提交时用 commit_text)。
@@ -96,7 +111,9 @@ impl CommandArgs {
         }
         if let Some(q) = query_part {
             for pair in q.split('&') {
-                if pair.is_empty() { continue; }
+                if pair.is_empty() {
+                    continue;
+                }
                 match pair.split_once('=') {
                     Some((k, v)) => args.query.push((k.to_string(), v.to_string())),
                     None => args.query.push((pair.to_string(), String::new())),
@@ -113,7 +130,10 @@ impl CommandArgs {
 
     /// 查询参数取值(`?num=2` → `get("num") == Some("2")`)。
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.query.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+        self.query
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
     }
 }
 
@@ -146,13 +166,7 @@ pub trait MagicMember: Send + Sync {
 
     /// 用户选中了第 `index` 个**交互式**预测。成员更新内部状态后,调用方
     /// 重新查询 `predict` 替换选项(不上屏)。非交互预测不经过这里。
-    fn pick(
-        &mut self,
-        index: usize,
-        text: &str,
-        sm: &mut StateMachine,
-        env: &dyn StepEnv,
-    ) {
+    fn pick(&mut self, index: usize, text: &str, sm: &mut StateMachine, env: &dyn StepEnv) {
         let _ = (index, text, sm, env); // 默认:无交互副作用
     }
 
@@ -213,7 +227,13 @@ mod tests {
     fn parse_path_and_query_together() {
         let a = CommandArgs::parse("/en/more?num=2&lang=en");
         assert_eq!(a.path, vec!["en".to_string(), "more".to_string()]);
-        assert_eq!(a.query, vec![("num".to_string(), "2".to_string()), ("lang".to_string(), "en".to_string())]);
+        assert_eq!(
+            a.query,
+            vec![
+                ("num".to_string(), "2".to_string()),
+                ("lang".to_string(), "en".to_string())
+            ]
+        );
         assert_eq!(a.get("num"), Some("2"));
         assert_eq!(a.get("lang"), Some("en"));
         assert_eq!(a.get("missing"), None);
@@ -227,5 +247,4 @@ mod tests {
         let b = CommandArgs::parse("?flag");
         assert_eq!(b.get("flag"), Some(""));
     }
-
 }

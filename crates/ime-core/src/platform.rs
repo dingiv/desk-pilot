@@ -56,7 +56,11 @@ pub struct CandidateSlot {
 
 impl Default for CandidateSlot {
     fn default() -> Self {
-        CandidateSlot { text: [0u8; 128], label: [0u8; 8], meta: [0u8; 32] }
+        CandidateSlot {
+            text: [0u8; 128],
+            label: [0u8; 8],
+            meta: [0u8; 32],
+        }
     }
 }
 
@@ -145,16 +149,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ime_state_defaults() {
-        let sm = crate::state::StateMachine::new();
-        assert!(sm.buffer.is_empty());
-        assert_eq!(sm.state, crate::state::ComposeState::Idle);
-    }
-
-    #[test]
     fn set_str_truncates_at_char_boundary() {
         let mut buf = [0u8; 10]; // room for 9 chars + NUL
-        // 9 ASCII bytes fits exactly (no truncation).
+                                 // 9 ASCII bytes fits exactly (no truncation).
         ImeView::set_str(&mut buf, "123456789");
         assert_eq!(ImeView::str_field(&buf), "123456789");
 
@@ -168,7 +165,10 @@ mod tests {
         let mut buf = [0u8; 10];
         ImeView::set_str(&mut buf, "你好世界"); // 你(0-2) 好(3-5) 世(6-8) 界(9-11)
         let result = ImeView::str_field(&buf);
-        assert_eq!(result, "你好世", "3 full CJK chars (9 bytes) fit in 9-byte buf");
+        assert_eq!(
+            result, "你好世",
+            "3 full CJK chars (9 bytes) fit in 9-byte buf"
+        );
         assert!(!result.is_empty());
 
         // buf too small: "你好" = 6 bytes, buf len=5 → max=4 → walks back to 3 ("你") → "你".

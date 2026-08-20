@@ -191,7 +191,11 @@ impl Expander {
                 } else {
                     // Query params shadow the provider; then fall back to it.
                     let value = vars
-                        .and_then(|v| v.iter().find(|(k, _)| *k == name).map(|(_, val)| val.clone()))
+                        .and_then(|v| {
+                            v.iter()
+                                .find(|(k, _)| *k == name)
+                                .map(|(_, val)| val.clone())
+                        })
                         .or_else(|| self.provider.resolve(&name));
                     match value {
                         Some(value) => result.push_str(&value),
@@ -239,7 +243,10 @@ mod tests {
 
     #[test]
     fn simple_variable() {
-        assert_eq!(expander().expand("Today is $DATE").unwrap(), "Today is 2026-07-23");
+        assert_eq!(
+            expander().expand("Today is $DATE").unwrap(),
+            "Today is 2026-07-23"
+        );
     }
 
     #[test]
@@ -289,7 +296,9 @@ mod tests {
 
     #[test]
     fn expand_tracks_cursor_offset() {
-        let (text, cur) = expander().expand_with_cursor("Hello $CURSOR World").unwrap();
+        let (text, cur) = expander()
+            .expand_with_cursor("Hello $CURSOR World")
+            .unwrap();
         assert_eq!(text, "Hello  World");
         assert_eq!(cur, Some(6)); // byte offset of the marker in the RESULT
     }

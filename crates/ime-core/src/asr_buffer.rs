@@ -126,7 +126,11 @@ impl AsrBuffer {
     /// compatible with the old single-string buffer; used by `__ASR_BUFFER__` expansion.
     pub fn snapshot(&self) -> String {
         let g = self.state.lock().unwrap();
-        g.finals.first().cloned().filter(|s| !s.is_empty()).unwrap_or_else(|| g.live.clone())
+        g.finals
+            .first()
+            .cloned()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| g.live.clone())
     }
 
     /// Seed a final (used by the mock frontend's `--asr-text`). Equivalent to `push_final`.
@@ -204,7 +208,11 @@ mod tests {
         assert_eq!(live, "你好");
         assert!(f.is_empty());
         assert!(b.version() > v0, "version must bump on set_live");
-        assert_eq!(b.snapshot(), "你好", "snapshot falls back to live when no final");
+        assert_eq!(
+            b.snapshot(),
+            "你好",
+            "snapshot falls back to live when no final"
+        );
     }
 
     #[test]
@@ -261,6 +269,10 @@ mod tests {
         // newest pushed = "句{MAX+2}" must be #1
         assert_eq!(f[0], format!("句{}", MAX_FINALS + 2), "newest is #1: {f:?}");
         // oldest retained = "句3" (0,1,2 evicted)
-        assert_eq!(f[f.len() - 1], "句3", "oldest retained is the (MAX+3 - MAX)=3rd pushed");
+        assert_eq!(
+            f[f.len() - 1],
+            "句3",
+            "oldest retained is the (MAX+3 - MAX)=3rd pushed"
+        );
     }
 }

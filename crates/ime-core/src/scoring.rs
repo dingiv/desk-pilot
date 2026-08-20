@@ -19,7 +19,11 @@ pub struct FamilyPriorities {
 
 impl Default for FamilyPriorities {
     fn default() -> Self {
-        FamilyPriorities { pinyin: 100, english: 70, emoji: 60 }
+        FamilyPriorities {
+            pinyin: 100,
+            english: 70,
+            emoji: 60,
+        }
     }
 }
 
@@ -75,18 +79,20 @@ impl Default for FreqScale {
         // max_score 0.90:顶流词封顶在 0.90,给 recent/context 合成公式留
         // 加成空间((1-a)(a+b)/8+a 在 a→1 时失效);1.0 会让顶流顶满、
         // 失去所有加成(违背 yaml 声明的 "top candidates 0.70–0.85" 原则)。
-        FreqScale { max_weight: 0.0, min_score: 0.25, max_score: 0.90 }
+        FreqScale {
+            max_weight: 0.0,
+            min_score: 0.25,
+            max_score: 0.90,
+        }
     }
 }
 
 /// 全部可配置打分参数的聚合,注入 `ImeEngine::with_config`。
-#[derive(Debug, Clone, Copy)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ScoringConfig {
     pub priorities: FamilyPriorities,
     pub freq_scale: FreqScale,
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -100,6 +106,9 @@ mod tests {
         assert_eq!(s.priorities.english, 70);
         assert_eq!(s.priorities.emoji, 60);
         assert_eq!(s.freq_scale.max_weight, 0.0, "auto by default");
-        assert_eq!((s.freq_scale.min_score, s.freq_scale.max_score), (0.25, 0.90));
+        assert_eq!(
+            (s.freq_scale.min_score, s.freq_scale.max_score),
+            (0.25, 0.90)
+        );
     }
 }

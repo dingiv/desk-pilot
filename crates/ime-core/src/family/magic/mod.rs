@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub use clip::{ClipMember, CLIP_HISTORY_CAP};
-pub use member::{preview_text, CANDIDATE_PREVIEW_MAX, CommandArgs, MagicMember, Prediction};
+pub use member::{preview_text, CommandArgs, MagicMember, Prediction, CANDIDATE_PREVIEW_MAX};
 pub use req::{ReqFetcher, DEFAULT_REQ_BASE};
 pub use snippet::SnippetMember;
 pub use voice::{SubmitMember, VoiceMember};
@@ -131,7 +131,10 @@ pub enum MagicCommand {
     /// 静态命令(无实例,直接展开)。
     Static,
     /// live 命令:token 用于 spawn 实例。
-    Live { token: &'static str, name: &'static str },
+    Live {
+        token: &'static str,
+        name: &'static str,
+    },
 }
 
 /// 输入匹配结果。
@@ -162,7 +165,11 @@ impl StaticCmd {
         description: &'static str,
         expansion: impl Fn() -> String + Send + Sync + 'static,
     ) -> Self {
-        StaticCmd { trigger, description, expansion: Arc::new(expansion) }
+        StaticCmd {
+            trigger,
+            description,
+            expansion: Arc::new(expansion),
+        }
     }
 
     pub fn expansion(&self) -> String {
@@ -172,7 +179,11 @@ impl StaticCmd {
 
 impl Clone for StaticCmd {
     fn clone(&self) -> Self {
-        StaticCmd { trigger: self.trigger, description: self.description, expansion: Arc::clone(&self.expansion) }
+        StaticCmd {
+            trigger: self.trigger,
+            description: self.description,
+            expansion: Arc::clone(&self.expansion),
+        }
     }
 }
 
@@ -235,8 +246,12 @@ impl MagicFamily {
         }
         for m in &self.members {
             // 空名成员(片段命令)不进 matcher trie —— 它经 `#` + `/` 特判路由。
-            if m.name().is_empty() { continue; }
-            let token = m.activation_token().expect("live member needs an activation token");
+            if m.name().is_empty() {
+                continue;
+            }
+            let token = m
+                .activation_token()
+                .expect("live member needs an activation token");
             out.push((format!("#{}", m.name()), token.to_string()));
             for alias in m.aliases() {
                 out.push((format!("#{alias}"), token.to_string()));
@@ -266,7 +281,9 @@ impl MagicFamily {
             }
         }
         for m in &self.members {
-            if m.name().is_empty() { continue; } // 片段命令不作为 `#…` 提示
+            if m.name().is_empty() {
+                continue;
+            } // 片段命令不作为 `#…` 提示
             let t = format!("#{}", m.name());
             if t.starts_with(prefix) && t != prefix {
                 out.push(t.clone());
@@ -281,6 +298,7 @@ impl MagicFamily {
         out
     }
 
+    /// **魔法家族匹配核心逻辑**
     /// 输入 → 匹配结果。名字段 = `#` + 字母数字(遇 `/` 或 `?` 截止);找最长
     /// **精确**命令。见 [`MagicMatch`]。
     pub fn match_command(&self, input: &str) -> MagicMatch {
@@ -291,9 +309,10 @@ impl MagicFamily {
         if input.len() < 2 || !input.starts_with('#') {
             return MagicMatch::Unknown;
         }
-        // 名字段:`#` + 字母数字;遇 `/`/`?` 或非字母数字截止。
+        // 名字段:`#` + 字母数字;遇 `/` 或 `?` 或非字母数字截止。
         let rest = &input[1..];
-        let name_len = rest.chars()
+        let name_len = rest
+            .chars()
             .take_while(|c| c.is_ascii_alphanumeric())
             .count();
         if name_len == 0 {
@@ -310,7 +329,10 @@ impl MagicFamily {
             for m in &self.members {
                 if m.name() == name || m.aliases().contains(&name) {
                     if let Some(token) = m.activation_token() {
-                        return MagicMatch::Exact(MagicCommand::Live { token, name: m.name() });
+                        return MagicMatch::Exact(MagicCommand::Live {
+                            token,
+                            name: m.name(),
+                        });
                     }
                 }
             }
@@ -327,7 +349,9 @@ impl MagicFamily {
             }
         }
         for m in &self.members {
-            if m.name().is_empty() { continue; }
+            if m.name().is_empty() {
+                continue;
+            }
             let t = format!("#{}", m.name());
             if t.starts_with(input) && t != input {
                 hints.push(t.clone());
@@ -347,12 +371,17 @@ impl MagicFamily {
 
     /// Static expansion text for a full trigger (e.g. `#date` → today's date).
     pub fn static_expansion(&self, trigger: &str) -> Option<String> {
-        self.statics.iter().find(|s| s.trigger == trigger).map(|s| s.expansion())
+        self.statics
+            .iter()
+            .find(|s| s.trigger == trigger)
+            .map(|s| s.expansion())
     }
 
     /// 静态命令的预测:展开值作为一条提交预测。
     pub fn static_prediction(&self, trigger: &str) -> Option<Vec<Prediction>> {
-        self.statics.iter().find(|s| s.trigger == trigger)
+        self.statics
+            .iter()
+            .find(|s| s.trigger == trigger)
             .map(|s| vec![Prediction::commit(s.expansion())])
     }
 
@@ -390,7 +419,11 @@ impl MagicFamily {
 
     /// 注入 I/O 线程句柄与前端句柄(引擎构造后调用)。魔法命令发事件给 I/O
     /// 线程做异步工作;I/O 完成经前端推送刷新。
-    pub fn set_io(&self, io: Arc<crate::io_thread::IoThread>, frontend: Arc<dyn crate::frontend::FrontEndHandle>) {
+    pub fn set_io(
+        &self,
+        io: Arc<crate::io_thread::IoThread>,
+        frontend: Arc<dyn crate::frontend::FrontEndHandle>,
+    ) {
         *self.resources.io.lock().unwrap() = Some(io);
         *self.resources.frontend.lock().unwrap() = Some(frontend);
     }
@@ -400,13 +433,20 @@ impl MagicFamily {
     pub fn set_clipboard_history(&self, items: Vec<String>) {
         let mut hist = self.resources.clipboard_history.lock().unwrap();
         hist.clear();
-        hist.extend(items.into_iter().filter(|t| !t.is_empty()).take(CLIP_HISTORY_CAP));
+        hist.extend(
+            items
+                .into_iter()
+                .filter(|t| !t.is_empty())
+                .take(CLIP_HISTORY_CAP),
+        );
     }
 
     /// 推送一条剪贴板文本到历史(最近在前,去重连续重复)。C++ 每次按键/激活
     /// 推送当前剪贴板,`#clip/N` 读这个环。
     pub fn push_clipboard(&self, text: &str) {
-        if text.is_empty() { return; }
+        if text.is_empty() {
+            return;
+        }
         let mut hist = self.resources.clipboard_history.lock().unwrap();
         if hist.first().map(|s| s == text).unwrap_or(false) {
             return; // 连续推送同一项(每次按键都会推)
@@ -448,10 +488,19 @@ mod tests {
         let entries: Vec<(String, String)> = fam.matcher_entries();
         // Statics carry a sentinel (trigger == expansion) — resolved FRESH at
         // completion so a long-running engine doesn't commit the startup date.
-        assert!(entries.contains(&("#date".into(), "#date".into())), "{entries:?}");
-        assert!(entries.contains(&("#password".into(), "#password".into())), "{entries:?}");
+        assert!(
+            entries.contains(&("#date".into(), "#date".into())),
+            "{entries:?}"
+        );
+        assert!(
+            entries.contains(&("#password".into(), "#password".into())),
+            "{entries:?}"
+        );
         assert!(entries.contains(&("#asr".into(), "__ASR_BUFFER__".into())));
-        assert!(!entries.iter().any(|(t, _)| t == "#flush"), "#flush alias removed");
+        assert!(
+            !entries.iter().any(|(t, _)| t == "#flush"),
+            "#flush alias removed"
+        );
         assert!(entries.contains(&("#submit".into(), "__ASR_SUBMIT__".into())));
         assert!(entries.contains(&("#req".into(), "__REQ__".into())));
     }
@@ -476,6 +525,9 @@ mod tests {
         fam.set_asr_buffer(Arc::clone(&buf));
         assert!(clone.resources().voice.get().is_some(), "voice slot shared");
         fam.set_req_base("http://example.test:9/x");
-        assert_eq!(*clone.resources().req_base.lock().unwrap(), "http://example.test:9/x");
+        assert_eq!(
+            *clone.resources().req_base.lock().unwrap(),
+            "http://example.test:9/x"
+        );
     }
 }

@@ -27,14 +27,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::dispatcher::Dispatcher;
-use crate::family::InputContext;
 use crate::family::magic::{MagicFamily, ReqFetcher};
-use crate::router::{StateMachineTable, StateFlags};
+use crate::family::InputContext;
+use crate::router::{StateFlags, StateMachineTable};
 // 统一键事件由输入路由层定义(旧名 InputEvent;构造器同名,测试平移)。
-pub use crate::router::KeyEvent;
-use crate::store::PersistenceManager;
 use crate::platform::ImeView;
+pub use crate::router::KeyEvent;
 use crate::state::{StateMachine, StepEnv};
+use crate::store::PersistenceManager;
 
 // ── PerContext ──────────────────────────────────────────────────────────
 
@@ -49,7 +49,11 @@ impl PerContext {
     fn with_page_size(page_size: u32, candidate_meta: bool) -> Self {
         let mut sm = StateMachine::with_page_size(page_size);
         sm.candidate_meta_enabled = candidate_meta;
-        PerContext { sm, table: StateMachineTable::new(), text_context: InputContext::new() }
+        PerContext {
+            sm,
+            table: StateMachineTable::new(),
+            text_context: InputContext::new(),
+        }
     }
 }
 
@@ -147,7 +151,10 @@ impl ImeEngine {
         // 片段注册表:内置 + 配置片段;名字去掉前导 `/`(触发名 `/sig` → `sig`,
         // 调用 `#/sig`)。
         let mut snippets: Vec<(String, String)> = vec![
-            ("greet".into(), "你好，我是 AI 秘书，请问有什么可以帮你的？".into()),
+            (
+                "greet".into(),
+                "你好，我是 AI 秘书，请问有什么可以帮你的？".into(),
+            ),
             ("sig".into(), "Best regards,\nAlice".into()),
         ];
         for (trigger, expand) in extra_snippets {
@@ -175,7 +182,14 @@ impl ImeEngine {
             std::sync::Arc::downgrade(&frontend),
         );
         let engine = ImeEngine {
-            dispatcher: Dispatcher::with_config(matcher, expander, Arc::clone(&magic), pinyin_weights, english_weights, scoring),
+            dispatcher: Dispatcher::with_config(
+                matcher,
+                expander,
+                Arc::clone(&magic),
+                pinyin_weights,
+                english_weights,
+                scoring,
+            ),
             contexts: Mutex::new(HashMap::new()),
             persistence: Mutex::new(None),
             magic,
@@ -187,7 +201,10 @@ impl ImeEngine {
             voice_state,
         };
         // Load embedded base dictionary (5KB, compiled into binary).
-        let count = engine.dispatcher.scorer().family("pinyin")
+        let count = engine
+            .dispatcher
+            .scorer()
+            .family("pinyin")
             .map(|f| f.load_dict_bytes(Self::EMBEDDED_BASE_DICT))
             .unwrap_or(0);
         if count > 0 {
@@ -197,7 +214,8 @@ impl ImeEngine {
     }
 
     /// Embedded base phrase dictionary (TSV format), compiled into the binary.
-    const EMBEDDED_BASE_DICT: &[u8] = include_bytes!("../../../apps/swift-ime/assets/dict/base.tsv");
+    const EMBEDDED_BASE_DICT: &[u8] =
+        include_bytes!("../../../apps/swift-ime/assets/dict/base.tsv");
 
     /// 前端句柄(引擎 I/O 线程经它推送刷新 / 请求剪贴板)。
     pub fn frontend(&self) -> Arc<dyn crate::frontend::FrontEndHandle> {
@@ -229,7 +247,9 @@ impl ImeEngine {
     fn with_ctx<T>(&self, ctx: usize, f: impl FnOnce(&Dispatcher, &mut PerContext) -> T) -> T {
         // FIXME: 一处不必要的 unwrap
         let mut map = self.contexts.lock().unwrap();
-        let pc = map.entry(ctx).or_insert_with(|| PerContext::with_page_size(self.page_size, self.candidate_meta));
+        let pc = map
+            .entry(ctx)
+            .or_insert_with(|| PerContext::with_page_size(self.page_size, self.candidate_meta));
         pc.sm.ctx = ctx;
         f(&self.dispatcher, pc)
     }
@@ -257,7 +277,9 @@ impl ImeEngine {
     /// 候选每页条数(默认 7)。frontend 启动时调用(swift-ime.yaml → input.page_size)。
     /// 已存在的 context 立即生效,后续新建的 context 沿用新值。
     pub fn set_page_size(&mut self, page_size: u32) {
-        if page_size == 0 { return; }
+        if page_size == 0 {
+            return;
+        }
         self.page_size = page_size;
         for pc in self.contexts.lock().unwrap().values_mut() {
             pc.sm.candidate_page_size = page_size as usize;
@@ -288,6 +310,7 @@ impl ImeEngine {
             pc.sm.context = pc.text_context.clone();
             let view = pc.table.route(&mut pc.sm, key, disp);
             let committed = ImeView::str_field(&view.commit_text);
+            // FIXME: 这个业务逻辑应该放在 route 内部, 放的位置太靠外了
             if !committed.is_empty() {
                 pc.text_context.update(committed);
                 // Record bigram: prev_word → committed_word (both SQLite + in-memory).
@@ -304,7 +327,9 @@ impl ImeEngine {
 
     /// 当前输入上下文的状态标志位(状态机表)。TUI 状态栏 / 调试用。
     pub fn state_flags_ctx(&self, ctx: usize) -> StateFlags {
-        self.contexts.lock().unwrap()
+        self.contexts
+            .lock()
+            .unwrap()
             .get(&ctx)
             .map(|pc| pc.table.flags())
             .unwrap_or_else(StateFlags::empty)
@@ -355,9 +380,14 @@ impl ImeEngine {
     /// Commit any pending composition for a context.
     pub fn commit_pending_ctx(&self, ctx: usize) -> ImeView {
         let map = self.contexts.lock().unwrap();
-        let Some(pc) = map.get(&ctx) else { return ImeView::empty() };
+        let Some(pc) = map.get(&ctx) else {
+            return ImeView::empty();
+        };
         // 候选(英文按键入大小写回填)优先,否则提交原始输入 raw_buffer。
-        let text = pc.sm.candidates.first()
+        let text = pc
+            .sm
+            .candidates
+            .first()
             .map(|c| crate::state::apply_input_casing(c, &pc.sm.raw_buffer))
             .unwrap_or_else(|| pc.sm.raw_buffer.clone());
         let mut v = ImeView::empty();
@@ -393,7 +423,9 @@ impl ImeEngine {
     /// Rebuild the ImeView from current state (for display after navigation).
     /// Returns the full UI snapshot without processing a key event.
     pub fn view(&self) -> ImeView {
-        self.contexts.lock().unwrap()
+        self.contexts
+            .lock()
+            .unwrap()
             .get(&DEFAULT_CTX)
             .map(|pc| {
                 let mut v = ImeView::empty();
@@ -406,8 +438,10 @@ impl ImeEngine {
                     // 调试模式:meta 与 fill_view 对齐。
                     if pc.sm.candidate_meta_enabled {
                         if let Some(m) = pc.sm.last_meta().get(i) {
-                            ImeView::set_str(&mut v.candidates[i].meta,
-                                &format!("[{:.3} {}/{}]", m.score, m.family, m.source));
+                            ImeView::set_str(
+                                &mut v.candidates[i].meta,
+                                &format!("[{:.3} {}/{}]", m.score, m.family, m.source),
+                            );
                         }
                     }
                 }
@@ -420,14 +454,22 @@ impl ImeEngine {
 
     /// Current pinyin buffer for the default context.
     pub fn buffer(&self) -> String {
-        self.contexts.lock().unwrap()
-            .get(&DEFAULT_CTX).map(|pc| pc.sm.buffer.clone()).unwrap_or_default()
+        self.contexts
+            .lock()
+            .unwrap()
+            .get(&DEFAULT_CTX)
+            .map(|pc| pc.sm.buffer.clone())
+            .unwrap_or_default()
     }
 
     /// Current candidates for the default context.
     pub fn candidates(&self) -> Vec<String> {
-        self.contexts.lock().unwrap()
-            .get(&DEFAULT_CTX).map(|pc| pc.sm.candidates.clone()).unwrap_or_default()
+        self.contexts
+            .lock()
+            .unwrap()
+            .get(&DEFAULT_CTX)
+            .map(|pc| pc.sm.candidates.clone())
+            .unwrap_or_default()
     }
 
     /// Current candidates with full detail (source, score) for debugging.
@@ -436,19 +478,35 @@ impl ImeEngine {
     /// not the scorer). Otherwise re-runs the scorer on the current buffer.
     pub fn candidates_detailed(&self) -> Vec<crate::family::RankedCandidate> {
         let map = self.contexts.lock().unwrap();
-        let Some(pc) = map.get(&DEFAULT_CTX) else { return Vec::new() };
+        let Some(pc) = map.get(&DEFAULT_CTX) else {
+            return Vec::new();
+        };
         // Snippet state (命令组合):candidates 来自命令预测 / 补全,不是 scorer。
         // 直接返回,让 #asr 语音 / #date 日期 / 补全提示正确显示。
         if pc.sm.state == crate::state::ComposeState::Snippet && pc.sm.candidates_fresh {
-            let family: &'static str = pc.sm.active_command.as_ref()
-                .map(|m| if m.name().is_empty() { "snippet" } else { "magic" })
+            let family: &'static str = pc
+                .sm
+                .active_command
+                .as_ref()
+                .map(|m| {
+                    if m.name().is_empty() {
+                        "snippet"
+                    } else {
+                        "magic"
+                    }
+                })
                 .unwrap_or("magic");
-            return pc.sm.candidates.iter().map(|c| crate::family::RankedCandidate {
-                text: c.clone(),
-                score: 1.0,
-                family,
-                source: "exact",
-            }).collect();
+            return pc
+                .sm
+                .candidates
+                .iter()
+                .map(|c| crate::family::RankedCandidate {
+                    text: c.clone(),
+                    score: 1.0,
+                    family,
+                    source: "exact",
+                })
+                .collect();
         }
         let ctx = pc.text_context.clone();
         let buffer = pc.sm.buffer.clone();
@@ -459,18 +517,28 @@ impl ImeEngine {
 
     /// Manually set the text context (simulates pre-filled text).
     pub fn set_context(&mut self, text: &str) {
-        self.contexts.lock().unwrap()
-            .entry(DEFAULT_CTX).or_insert_with(|| PerContext::with_page_size(self.page_size, self.candidate_meta))
-            .text_context.update(text);
+        self.contexts
+            .lock()
+            .unwrap()
+            .entry(DEFAULT_CTX)
+            .or_insert_with(|| PerContext::with_page_size(self.page_size, self.candidate_meta))
+            .text_context
+            .update(text);
     }
 
     /// Load an external dictionary into the PinyinFamily's phrase book.
     /// Supports TSV (`pinyin\tword`) and JSON (`[{"pinyin":"...","text":"..."}]`).
     /// Returns number of entries loaded.
     pub fn load_dict(&self, path: &str) -> std::io::Result<usize> {
-        self.dispatcher.scorer().load_dict_to("pinyin", path)
-            .unwrap_or_else(|| Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound, "pinyin family not found")))
+        self.dispatcher
+            .scorer()
+            .load_dict_to("pinyin", path)
+            .unwrap_or_else(|| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "pinyin family not found",
+                ))
+            })
     }
 
     /// Initialize the unified persistence manager. Call once at startup —
@@ -480,8 +548,11 @@ impl ImeEngine {
         match PersistenceManager::open(path) {
             Ok(pm) => {
                 pm.warm_all(&self.dispatcher);
-                eprintln!("[swift-ime] weight store: {} phrases, {} en-words from {path}",
-                    pm.phrase_count(), pm.en_user_count());
+                eprintln!(
+                    "[swift-ime] weight store: {} phrases, {} en-words from {path}",
+                    pm.phrase_count(),
+                    pm.en_user_count()
+                );
                 *self.persistence.lock().unwrap() = Some(pm);
             }
             Err(e) => eprintln!("[swift-ime] weight store open failed: {e}"),
@@ -491,9 +562,7 @@ impl ImeEngine {
     /// 提交文本是纯 ASCII 字母数字(如 cd)时,学入英文家族 user 层
     /// (英文自生词)。汉字/emoji/符号不触发。Enter 强选 raw 的主路径。
     fn learn_english_if_ascii(&self, committed: &str) {
-        if !committed.is_empty()
-            && committed.chars().all(|c| c.is_ascii_alphanumeric())
-        {
+        if !committed.is_empty() && committed.chars().all(|c| c.is_ascii_alphanumeric()) {
             self.dispatcher.record_english_word(committed);
         }
     }
@@ -570,17 +639,29 @@ impl ImeEngine {
     /// Load the emoji keyword table (CLDR-generated `emoji.tsv`):
     /// `keyword<TAB>emoji`, overriding the embedded base for the same keyword.
     pub fn load_emoji_dict(&self, path: &str) -> std::io::Result<usize> {
-        self.dispatcher.scorer().load_dict_to("emoji", path)
-            .unwrap_or_else(|| Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound, "emoji family not found")))
+        self.dispatcher
+            .scorer()
+            .load_dict_to("emoji", path)
+            .unwrap_or_else(|| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "emoji family not found",
+                ))
+            })
     }
 
     /// Load the user emoji mapping (`emoji_user.tsv`) — overrides everything
     /// loaded before for the same keyword.
     pub fn load_emoji_user_dict(&self, path: &str) -> std::io::Result<usize> {
-        self.dispatcher.scorer().load_user_dict_to("emoji", path)
-            .unwrap_or_else(|| Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound, "emoji family not found")))
+        self.dispatcher
+            .scorer()
+            .load_user_dict_to("emoji", path)
+            .unwrap_or_else(|| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "emoji family not found",
+                ))
+            })
     }
 
     /// Load an external English dictionary (auto-detect type, normalize, cache).
@@ -590,7 +671,9 @@ impl ImeEngine {
 }
 
 impl Default for ImeEngine {
-    fn default() -> Self { ImeEngine::new() }
+    fn default() -> Self {
+        ImeEngine::new()
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -599,12 +682,16 @@ impl Default for ImeEngine {
 mod tests {
     use super::*;
 
-    fn eng() -> ImeEngine { ImeEngine::new() }
+    fn eng() -> ImeEngine {
+        ImeEngine::new()
+    }
 
     #[test]
     fn type_pinyin_and_commit() {
         let mut e = eng();
-        for c in "nihao".chars() { e.predict(KeyEvent::char(c)); }
+        for c in "nihao".chars() {
+            e.predict(KeyEvent::char(c));
+        }
         assert!(e.candidates().iter().any(|c| c.contains("你好")));
         let v = e.predict(KeyEvent::space());
         assert!(ImeView::str_field(&v.commit_text).contains("你"));
@@ -614,7 +701,9 @@ mod tests {
     fn uppercase_english_predicts_as_lowercase_and_commits_cased() {
         // 大写 E 视作小写 e 预测(词典候选 english 出现),提交保留 English。
         let mut e = eng();
-        for c in "English".chars() { e.predict(KeyEvent::char(c)); }
+        for c in "English".chars() {
+            e.predict(KeyEvent::char(c));
+        }
         let cands = e.candidates();
         assert!(
             cands.iter().any(|c| c == "english"),
@@ -632,7 +721,9 @@ mod tests {
     fn uppercase_english_enter_commits_raw_cased() {
         // Enter 强选 raw 文本:提交原始大小写,非小写 buffer。
         let mut e = eng();
-        for c in "English".chars() { e.predict(KeyEvent::char(c)); }
+        for c in "English".chars() {
+            e.predict(KeyEvent::char(c));
+        }
         let v = e.predict(KeyEvent::enter());
         assert_eq!(ImeView::str_field(&v.commit_text), "English");
     }
@@ -641,7 +732,9 @@ mod tests {
     fn prefix_case_applied_to_completion() {
         // "Engli" → 补全 english:前缀回填大小写,补全段( sh )保持小写。
         let mut e = eng();
-        for c in "Engli".chars() { e.predict(KeyEvent::char(c)); }
+        for c in "Engli".chars() {
+            e.predict(KeyEvent::char(c));
+        }
         let cands = e.candidates();
         assert!(cands.iter().any(|c| c == "english"), "{cands:?}");
         let idx = cands.iter().position(|c| c == "english").unwrap();
@@ -652,9 +745,14 @@ mod tests {
     #[test]
     fn all_caps_english_commits_all_caps() {
         let mut e = eng();
-        for c in "ENGLISH".chars() { e.predict(KeyEvent::char(c)); }
+        for c in "ENGLISH".chars() {
+            e.predict(KeyEvent::char(c));
+        }
         let cands = e.candidates();
-        let idx = cands.iter().position(|c| c == "english").expect("english candidate");
+        let idx = cands
+            .iter()
+            .position(|c| c == "english")
+            .expect("english candidate");
         let v = e.select_candidate(idx);
         assert_eq!(ImeView::str_field(&v.commit_text), "ENGLISH");
     }
@@ -662,16 +760,23 @@ mod tests {
     #[test]
     fn lowercase_english_unchanged() {
         let mut e = eng();
-        for c in "english".chars() { e.predict(KeyEvent::char(c)); }
+        for c in "english".chars() {
+            e.predict(KeyEvent::char(c));
+        }
         let cands = e.candidates();
-        let idx = cands.iter().position(|c| c == "english").expect("english candidate");
+        let idx = cands
+            .iter()
+            .position(|c| c == "english")
+            .expect("english candidate");
         let v = e.select_candidate(idx);
         assert_eq!(ImeView::str_field(&v.commit_text), "english");
     }
 
     /// 提交后的候选来源助手:重打一遍,查该词现在的来源。
     fn source_of(e: &mut ImeEngine, word: &str) -> &'static str {
-        for c in word.chars() { e.predict(KeyEvent::char(c)); }
+        for c in word.chars() {
+            e.predict(KeyEvent::char(c));
+        }
         e.candidates_detailed()
             .into_iter()
             .find(|d| d.text == word)
@@ -684,9 +789,15 @@ mod tests {
         // 陈年 bug:空格/数字提交英文词典候选 → 词变成 english/user(不该)。
         // 提交来源是英文候选时,不学成自生词。
         let mut e = eng();
-        for c in "world".chars() { e.predict(KeyEvent::char(c)); }
+        for c in "world".chars() {
+            e.predict(KeyEvent::char(c));
+        }
         assert_eq!(
-            e.candidates_detailed().iter().find(|d| d.text == "world").unwrap().source,
+            e.candidates_detailed()
+                .iter()
+                .find(|d| d.text == "world")
+                .unwrap()
+                .source,
             "exact",
             "world is a dict word",
         );
@@ -694,21 +805,35 @@ mod tests {
         e.predict(KeyEvent::space()); // 空格提交高亮(english/exact)→ 缓冲 reset
 
         // 重新输入:仍是 dict 词,未学成 user。
-        for c in "world".chars() { e.predict(KeyEvent::char(c)); }
+        for c in "world".chars() {
+            e.predict(KeyEvent::char(c));
+        }
         assert_eq!(
-            e.candidates_detailed().iter().find(|d| d.text == "world").unwrap().source,
+            e.candidates_detailed()
+                .iter()
+                .find(|d| d.text == "world")
+                .unwrap()
+                .source,
             "exact",
             "space-commit must not learn a dict word",
         );
 
         // 数字选中英文候选同样不学。
         let mut e2 = eng();
-        for c in "world".chars() { e2.predict(KeyEvent::char(c)); }
+        for c in "world".chars() {
+            e2.predict(KeyEvent::char(c));
+        }
         let idx = e2.candidates().iter().position(|c| c == "world").unwrap();
         e2.select_candidate(idx);
-        for c in "world".chars() { e2.predict(KeyEvent::char(c)); }
+        for c in "world".chars() {
+            e2.predict(KeyEvent::char(c));
+        }
         assert_eq!(
-            e2.candidates_detailed().iter().find(|d| d.text == "world").unwrap().source,
+            e2.candidates_detailed()
+                .iter()
+                .find(|d| d.text == "world")
+                .unwrap()
+                .source,
             "exact",
             "digit-select must not learn a dict word",
         );
@@ -718,7 +843,9 @@ mod tests {
     fn enter_raw_commit_still_learns_english_word() {
         // Enter 强选 raw(自生词手势)仍学入 user 层。
         let mut e = eng();
-        for c in "cd".chars() { e.predict(KeyEvent::char(c)); }
+        for c in "cd".chars() {
+            e.predict(KeyEvent::char(c));
+        }
         e.predict(KeyEvent::enter()); // raw commit "cd"
         assert_eq!(source_of(&mut e, "cd"), "user", "raw Enter learns the word");
     }
@@ -732,7 +859,9 @@ mod tests {
 
         // 中文自生词:lizhengming 逐字选 → 拼音单词本。
         let mut e = eng();
-        for c in "lizhengming".chars() { e.predict(KeyEvent::char(c)); }
+        for c in "lizhengming".chars() {
+            e.predict(KeyEvent::char(c));
+        }
         let li = e.candidates().iter().position(|c| c == "李").unwrap();
         e.select_candidate(li);
         let zheng = e.candidates().iter().position(|c| c == "正").unwrap();
@@ -740,19 +869,29 @@ mod tests {
         let ming = e.candidates().iter().position(|c| c == "明").unwrap();
         e.select_candidate(ming);
 
-        for c in "lizhengming".chars() { e.predict(KeyEvent::char(c)); }
+        for c in "lizhengming".chars() {
+            e.predict(KeyEvent::char(c));
+        }
         let detailed = e.candidates_detailed();
-        let phrase = detailed.iter().find(|d| d.text == "李正明")
+        let phrase = detailed
+            .iter()
+            .find(|d| d.text == "李正明")
             .unwrap_or_else(|| panic!("中文自生词入拼音单词本: {detailed:?}"));
         assert_eq!(phrase.family, "pinyin", "进的是拼音家族单词本");
 
         // 英文 raw Enter → 英文单词本;family 是 english,不是 pinyin phrase。
         let mut e2 = eng();
-        for c in "cd".chars() { e2.predict(KeyEvent::char(c)); }
+        for c in "cd".chars() {
+            e2.predict(KeyEvent::char(c));
+        }
         e2.predict(KeyEvent::enter());
-        for c in "cd".chars() { e2.predict(KeyEvent::char(c)); }
+        for c in "cd".chars() {
+            e2.predict(KeyEvent::char(c));
+        }
         let detailed = e2.candidates_detailed();
-        let cd = detailed.iter().find(|d| d.text == "cd")
+        let cd = detailed
+            .iter()
+            .find(|d| d.text == "cd")
             .unwrap_or_else(|| panic!("英文 Enter 入英文单词本: {detailed:?}"));
         assert_eq!(cd.family, "english", "进的是英文家族单词本");
         assert_eq!(cd.source, "user");
@@ -761,7 +900,9 @@ mod tests {
     #[test]
     fn incremental_composition() {
         let mut e = eng();
-        for c in "lizhengming".chars() { e.predict(KeyEvent::char(c)); }
+        for c in "lizhengming".chars() {
+            e.predict(KeyEvent::char(c));
+        }
         let li = e.candidates().iter().position(|c| c == "李").unwrap();
         e.select_candidate(li);
         let zheng = e.candidates().iter().position(|c| c == "正").unwrap();
@@ -772,25 +913,15 @@ mod tests {
     }
 
     #[test]
-    fn snippet_expansion() {
-        // 内置片段 greet 经 `#/greet` 展开。
-        let mut e = eng();
-        for c in "#/greet".chars() { e.predict(KeyEvent::char(c)); }
-        let v = e.predict(KeyEvent::space());
-        assert_eq!(
-            ImeView::str_field(&v.commit_text),
-            "你好，我是 AI 秘书，请问有什么可以帮你的？"
-        );
-    }
-
-    #[test]
     fn snippet_query_params_inject_template_variables() {
         // #/hello?name=Mike → 查询参数注入模板变量 $name。
         use crate::expander::VariableProvider;
         #[derive(Clone)]
         struct NoVars;
         impl VariableProvider for NoVars {
-            fn resolve(&self, _name: &str) -> Option<String> { None }
+            fn resolve(&self, _name: &str) -> Option<String> {
+                None
+            }
         }
         let e = ImeEngine::with_config(
             crate::family::pinyin::PinyinWeights::default(),
@@ -802,20 +933,30 @@ mod tests {
             DEFAULT_VOICE_AURA_BASE.to_string(),
         );
         let mut e = e;
-        for c in "#/hello?name=Mike".chars() { e.predict(KeyEvent::char(c)); }
+        for c in "#/hello?name=Mike".chars() {
+            e.predict(KeyEvent::char(c));
+        }
         let v = e.predict(KeyEvent::space());
-        assert_eq!(ImeView::str_field(&v.commit_text), "Hello, my name is Mike.");
+        assert_eq!(
+            ImeView::str_field(&v.commit_text),
+            "Hello, my name is Mike."
+        );
     }
 
     #[test]
     fn snippet_unknown_name_shows_hint_and_commits_empty() {
         // 未知片段名 → 候选"未知片段 /nope",Space 空提交。
         let mut e = eng();
-        for c in "#/nope".chars() { e.predict(KeyEvent::char(c)); }
+        for c in "#/nope".chars() {
+            e.predict(KeyEvent::char(c));
+        }
         let cands = e.candidates();
         assert!(cands.iter().any(|c| c.contains("未知片段")), "{cands:?}");
         let v = e.predict(KeyEvent::space());
-        assert!(ImeView::str_field(&v.commit_text).is_empty(), "unknown snippet commits nothing");
+        assert!(
+            ImeView::str_field(&v.commit_text).is_empty(),
+            "unknown snippet commits nothing"
+        );
     }
 
     #[test]
@@ -870,10 +1011,13 @@ mod tests {
     /// delayed tens of seconds; the tests assert correctness, not speed.
     fn wait_req_tick(e: &ImeEngine) {
         for _ in 0..15_000 {
-            if e.magic_tick().is_some() { return; }
+            if e.magic_tick().is_some() {
+                return;
+            }
             // 结果已在 predict 里落地(worker 快于重查)—— 候选不再是
             // "回车请求…" / "请求中…"。
-            if e.candidates().first()
+            if e.candidates()
+                .first()
                 .map(|c| !c.contains("请求中") && !c.contains("回车请求"))
                 .unwrap_or(false)
             {
@@ -884,4 +1028,3 @@ mod tests {
         panic!("req result never landed");
     }
 }
-

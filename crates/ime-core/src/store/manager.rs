@@ -17,8 +17,8 @@
 
 use std::sync::Arc;
 
-use crate::dispatcher::Dispatcher;
 use super::sqlite::WeightStore;
+use crate::dispatcher::Dispatcher;
 
 /// Unified persistence manager — the engine's single handle to the SQLite
 /// store. Clone is cheap (shared connection behind an `Arc`).
@@ -30,7 +30,9 @@ pub struct PersistenceManager {
 impl PersistenceManager {
     /// Open (or create) the user database — schema migration happens here.
     pub fn open(path: &str) -> rusqlite::Result<Self> {
-        Ok(PersistenceManager { store: Arc::new(WeightStore::open(path)?) })
+        Ok(PersistenceManager {
+            store: Arc::new(WeightStore::open(path)?),
+        })
     }
 
     /// The underlying store — families hold this Arc for inline double-writes.
@@ -105,9 +107,15 @@ mod tests {
         store.save_l0(r#"{"pins":[],"picks":[]}"#);
 
         let pm2 = PersistenceManager::open(&path).expect("reopen");
-        assert_eq!(pm2.store().load_recency(), vec![("a".to_string(), 1000), ("b".to_string(), 2000)]);
+        assert_eq!(
+            pm2.store().load_recency(),
+            vec![("a".to_string(), 1000), ("b".to_string(), 2000)]
+        );
         assert_eq!(pm2.store().load_all_phrases().len(), 1);
-        assert_eq!(pm2.store().load_l0().as_deref(), Some(r#"{"pins":[],"picks":[]}"#));
+        assert_eq!(
+            pm2.store().load_l0().as_deref(),
+            Some(r#"{"pins":[],"picks":[]}"#)
+        );
     }
 
     #[test]

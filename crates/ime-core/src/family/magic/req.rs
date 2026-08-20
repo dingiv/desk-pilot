@@ -76,8 +76,7 @@ impl ReqFetcher for ReqwestFetcher {
 
 /// Async status of one `#req` session. The worker thread writes it; `tick` reads
 /// it; `version` gates view rebuilds.
-#[derive(Debug)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 enum ReqStatus {
     /// Not fired yet — the user is still typing the suffix.
     #[default]
@@ -95,7 +94,6 @@ struct ReqAsync {
     status: Mutex<ReqStatus>,
     version: AtomicU64,
 }
-
 
 pub struct ReqMember {
     resources: Arc<MagicResources>,
@@ -257,7 +255,9 @@ mod http_tests {
     fn reqwest_fetcher_gets_utf8_body() {
         let (base, server) = serve_once("你好, reqwest!", 200);
         let fetcher = ReqwestFetcher::new(Duration::from_secs(5));
-        let out = fetcher.get(&format!("{base}api/news?query=soccer")).unwrap();
+        let out = fetcher
+            .get(&format!("{base}api/news?query=soccer"))
+            .unwrap();
         assert_eq!(out, "你好, reqwest!");
         server.join().unwrap();
     }

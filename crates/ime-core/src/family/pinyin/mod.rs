@@ -1,8 +1,8 @@
 //! PinyinFamily — Chinese full-pinyin prediction using inputx-pinyin's
 //! embedded dictionary + bigram Viterbi composition + PhraseBook recall.
 
-use super::{CandidateFamily, InputContext, ScoredCandidate};
 use self::phrase::PhraseBook;
+use super::{CandidateFamily, InputContext, ScoredCandidate};
 use crate::recency::RecentStore;
 
 pub mod dict;
@@ -60,9 +60,9 @@ pub struct PinyinWeights {
     pub single_syl_decay: f64,
     pub context_boost: f64,
     // ── Post-merge adjustments ──
-    pub stopword_penalty: f64,   // multiplier for all-stopword compositions
-    pub confirm_bonus: f64,      // bonus for dict∩viterbi confirmation
-    pub short_word_bonus: f64,   // bonus per 2-char word
+    pub stopword_penalty: f64, // multiplier for all-stopword compositions
+    pub confirm_bonus: f64,    // bonus for dict∩viterbi confirmation
+    pub short_word_bonus: f64, // bonus per 2-char word
     // ── Take limits ──
     pub large_dict_take: usize,
     pub viterbi_take: usize,
@@ -72,12 +72,19 @@ pub struct PinyinWeights {
 impl Default for PinyinWeights {
     fn default() -> Self {
         PinyinWeights {
-            phrase_book: 0.88, large_dict: 0.85,
-            viterbi_base: 0.25, viterbi_scale: 0.55,
-            jianpin: 0.50, prefix_lookup: 0.75,
-            single_syl_decay: 0.5, context_boost: 0.12,
-            stopword_penalty: 0.5, confirm_bonus: 0.05, short_word_bonus: 0.01,
-            large_dict_take: 96, viterbi_take: 48,
+            phrase_book: 0.88,
+            large_dict: 0.85,
+            viterbi_base: 0.25,
+            viterbi_scale: 0.55,
+            jianpin: 0.50,
+            prefix_lookup: 0.75,
+            single_syl_decay: 0.5,
+            context_boost: 0.12,
+            stopword_penalty: 0.5,
+            confirm_bonus: 0.05,
+            short_word_bonus: 0.01,
+            large_dict_take: 96,
+            viterbi_take: 48,
             jianpin_take: 8,
         }
     }
@@ -85,7 +92,10 @@ impl Default for PinyinWeights {
 
 impl PinyinFamily {
     pub fn new() -> Self {
-        Self::with_scoring(PinyinWeights::default(), crate::scoring::ScoringConfig::default())
+        Self::with_scoring(
+            PinyinWeights::default(),
+            crate::scoring::ScoringConfig::default(),
+        )
     }
 
     pub fn with_weights(weights: PinyinWeights) -> Self {
@@ -94,10 +104,7 @@ impl PinyinFamily {
 
     /// Full construction: pinyin weights + the unified scoring config (recency
     /// boosts, bigram ceiling, freq→score scale) from `swift-ime.yaml`.
-    pub fn with_scoring(
-        weights: PinyinWeights,
-        scoring: crate::scoring::ScoringConfig,
-    ) -> Self {
+    pub fn with_scoring(weights: PinyinWeights, scoring: crate::scoring::ScoringConfig) -> Self {
         PinyinFamily {
             engine: inputx_pinyin::PinyinEngine::with_fuzzy(
                 inputx_pinyin::FuzzyConfig::permissive(),
@@ -115,7 +122,9 @@ impl PinyinFamily {
         }
     }
 
-    pub fn set_weights(&mut self, w: PinyinWeights) { self.weights = w; }
+    pub fn set_weights(&mut self, w: PinyinWeights) {
+        self.weights = w;
+    }
 
     pub fn with_phrase_book(phrase_book: PhraseBook) -> Self {
         Self::with_scoring_and_phrase_book(
@@ -167,12 +176,17 @@ impl PinyinFamily {
                     }
                     book.insert_with_order_count(pinyin, word, *priority, *count);
                 }
-                eprintln!("[ime-core] pinyin: warmed {} phrases from store", entries.len());
+                eprintln!(
+                    "[ime-core] pinyin: warmed {} phrases from store",
+                    entries.len()
+                );
             }
         }
     }
 
-    pub fn set_enabled(&mut self, enabled: bool) { self.enabled = enabled; }
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
 
     /// Record a committed word for the recent member: stamps the current
     /// wall-clock time and double-writes the table to SQLite (full-snapshot
@@ -189,9 +203,15 @@ impl PinyinFamily {
         self.engine.dict().record_pick(pinyin, word);
     }
 
-    pub fn engine(&self) -> &inputx_pinyin::PinyinEngine { &self.engine }
-    pub fn phrase_count(&self) -> usize { self.phrase_book.lock().unwrap().len() }
-    pub fn large_dict_len(&self) -> usize { self.large_dict.lock().unwrap().len() }
+    pub fn engine(&self) -> &inputx_pinyin::PinyinEngine {
+        &self.engine
+    }
+    pub fn phrase_count(&self) -> usize {
+        self.phrase_book.lock().unwrap().len()
+    }
+    pub fn large_dict_len(&self) -> usize {
+        self.large_dict.lock().unwrap().len()
+    }
 
     /// 该词是否已存在于词典(inputx 嵌入大词典或 rime-ice lattice)?
     fn in_dictionary(&self, pinyin: &str, word: &str) -> bool {
@@ -234,8 +254,7 @@ impl PinyinFamily {
     /// (默认 0.88)—— 高频自造词随使用逐步靠前,而不是所有 phrase 词
     /// 共享一个固定高分。
     fn phrase_score(&self, count: u32) -> f64 {
-        (0.70 + 0.02 * count.saturating_sub(1) as f64)
-            .min(self.weights.phrase_book)
+        (0.70 + 0.02 * count.saturating_sub(1) as f64).min(self.weights.phrase_book)
     }
 }
 
@@ -244,20 +263,26 @@ impl PinyinFamily {
 pub fn initials_from_pinyin(raw: &str) -> String {
     let segs = inputx_pinyin::segment(raw);
     segs.first()
-        .map(|seg| seg.syllables.iter().filter_map(|s| s.chars().next()).collect())
+        .map(|seg| {
+            seg.syllables
+                .iter()
+                .filter_map(|s| s.chars().next())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 impl Default for PinyinFamily {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// 单词本只收**含汉字**的词(纯汉字或汉字+ASCII 混合,如 "Bevy引擎");
 /// 纯 ASCII 英文词(name/cd)走英文自生词体系(en_user),emoji / 符号
 /// 一律不学 —— 都不是拼音自造词。
 fn is_learnable_word(word: &str) -> bool {
-    word.chars().any(is_cjk)
-        && word.chars().all(|c| is_cjk(c) || c.is_ascii_alphanumeric())
+    word.chars().any(is_cjk) && word.chars().all(|c| is_cjk(c) || c.is_ascii_alphanumeric())
 }
 
 /// CJK 统一表意文字(含扩展A)。
@@ -275,10 +300,18 @@ fn now_ms() -> i64 {
 }
 
 impl CandidateFamily for PinyinFamily {
-    fn name(&self) -> &'static str { "pinyin" }
-    fn priority(&self) -> u32 { 100 }
-    fn enabled(&self) -> bool { self.enabled }
-    fn top_n(&self) -> usize { 128 }
+    fn name(&self) -> &'static str {
+        "pinyin"
+    }
+    fn priority(&self) -> u32 {
+        100
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn top_n(&self) -> usize {
+        128
+    }
 
     fn record_pick(&self, pinyin: &str, word: &str) {
         self.engine.dict().record_pick(pinyin, word);
@@ -314,13 +347,18 @@ impl CandidateFamily for PinyinFamily {
         let snap = self.engine.dict().export_l0();
         let mut json = String::from("{\"pins\":[");
         for (i, (py, w)) in snap.pins.iter().enumerate() {
-            if i > 0 { json.push(','); }
+            if i > 0 {
+                json.push(',');
+            }
             json.push_str(&format!("[\"{py}\",\"{w}\"]"));
         }
         json.push_str("],\"picks\":[");
         let mut first = true;
         for (py, w, c) in &snap.pick_counts {
-            if !first { json.push(','); } first = false;
+            if !first {
+                json.push(',');
+            }
+            first = false;
             json.push_str(&format!("[\"{py}\",\"{w}\",{c}]"));
         }
         json.push_str("]}");
@@ -329,11 +367,20 @@ impl CandidateFamily for PinyinFamily {
 
     fn import_l0_json(&self, json: &str) -> usize {
         #[derive(serde::Deserialize)]
-        struct L0Json { pins: Vec<(String, String)>, #[serde(default)] picks: Vec<(String, String, u32)> }
+        struct L0Json {
+            pins: Vec<(String, String)>,
+            #[serde(default)]
+            picks: Vec<(String, String, u32)>,
+        }
         if let Ok(data) = serde_json::from_str::<L0Json>(json) {
-            let snap = inputx_pinyin::L0Snapshot { pins: data.pins, pick_counts: data.picks };
+            let snap = inputx_pinyin::L0Snapshot {
+                pins: data.pins,
+                pick_counts: data.picks,
+            };
             self.engine.dict().import_l0(snap)
-        } else { 0 }
+        } else {
+            0
+        }
     }
 
     fn warm_recencies(&self, entries: Vec<(String, i64)>) {
@@ -383,8 +430,9 @@ impl CandidateFamily for PinyinFamily {
         } else if path.ends_with(".fst") {
             // FST: load and build LatticeDecoder, passing path for .idx cache.
             let data = std::fs::read(path)?;
-            let dict = inputx_fsa::Dict::new(data)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
+            let dict = inputx_fsa::Dict::new(data).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
+            })?;
             *self.lattice.lock().unwrap() = Some(lattice::LatticeDecoder::new(dict, path));
             Ok(0) // size not tracked for FST
         } else {
@@ -398,7 +446,9 @@ impl CandidateFamily for PinyinFamily {
     }
 
     fn predict(&self, input: &str) -> Vec<ScoredCandidate> {
-        if input.is_empty() { return Vec::new(); }
+        if input.is_empty() {
+            return Vec::new();
+        }
 
         let dict = self.engine.dict();
         let mut out = Vec::new();
@@ -411,8 +461,12 @@ impl CandidateFamily for PinyinFamily {
             let total = words.len().max(1) as f64;
             for (i, word) in words.into_iter().enumerate() {
                 out.push(ScoredCandidate {
-                    text: word, family: "pinyin", source: "single",
-                    raw_score: (self.weights.large_dict - (i as f64 / total) * self.weights.single_syl_decay).clamp(0.0, 1.0),
+                    text: word,
+                    family: "pinyin",
+                    source: "single",
+                    raw_score: (self.weights.large_dict
+                        - (i as f64 / total) * self.weights.single_syl_decay)
+                        .clamp(0.0, 1.0),
                 });
             }
         } else {
@@ -427,14 +481,22 @@ impl CandidateFamily for PinyinFamily {
                     let base_score = lat.freq_to_score(&self.freq_scale, r.freq_score as u64);
                     let (source, score) = match r.match_type {
                         lattice::MatchType::Full => ("lattice", base_score),
-                        lattice::MatchType::Mixed => ("lattice_mix", base_score * self.weights.jianpin),
-                        lattice::MatchType::Initials => ("lattice_jp", base_score * self.weights.jianpin),
+                        lattice::MatchType::Mixed => {
+                            ("lattice_mix", base_score * self.weights.jianpin)
+                        }
+                        lattice::MatchType::Initials => {
+                            ("lattice_jp", base_score * self.weights.jianpin)
+                        }
                         // predict() 不产 Prefix(前缀联想走单独的 predict_prefix
                         // 合并分支);此处不可达,防御性兜底。
-                        lattice::MatchType::Prefix => ("lattice_prefix", base_score * self.weights.prefix_lookup),
+                        lattice::MatchType::Prefix => {
+                            ("lattice_prefix", base_score * self.weights.prefix_lookup)
+                        }
                     };
                     out.push(ScoredCandidate {
-                        text: r.text, family: "pinyin", source,
+                        text: r.text,
+                        family: "pinyin",
+                        source,
                         raw_score: score,
                     });
                 }
@@ -456,7 +518,10 @@ impl CandidateFamily for PinyinFamily {
                         // 与到 naozhe 同权,拼词频,高频的闹钟胜;超出部分按
                         // 0.85^超出 衰减 —— jix→jixiaokao(差 6,超出 3)这类
                         // 宽前缀捞到的高频长词沉底,不淹没目标短词。
-                        let diff = r.pinyin.chars().count()
+                        let diff = r
+                            .pinyin
+                            .chars()
+                            .count()
                             .saturating_sub(input.chars().count());
                         let decay = crate::scoring::prefix_decay(diff);
                         base_score * self.weights.prefix_lookup * decay
@@ -468,7 +533,9 @@ impl CandidateFamily for PinyinFamily {
                         }
                         Some(_) => {}
                         None => out.push(ScoredCandidate {
-                            text: r.text, family: "pinyin", source: "lattice_prefix",
+                            text: r.text,
+                            family: "pinyin",
+                            source: "lattice_prefix",
                             raw_score: prefix_score,
                         }),
                     }
@@ -481,7 +548,9 @@ impl CandidateFamily for PinyinFamily {
             for (_s, word) in comps.iter().take(16) {
                 if !out.iter().any(|c| c.text == *word) {
                     out.push(ScoredCandidate {
-                        text: word.clone(), family: "pinyin", source: "decomp",
+                        text: word.clone(),
+                        family: "pinyin",
+                        source: "decomp",
                         raw_score: 0.4,
                     });
                 }
@@ -507,7 +576,12 @@ impl CandidateFamily for PinyinFamily {
                     }
                     _ => {
                         out.retain(|c| c.text != w);
-                        out.push(ScoredCandidate { text: w, family: "pinyin", source: "phrase", raw_score: score });
+                        out.push(ScoredCandidate {
+                            text: w,
+                            family: "pinyin",
+                            source: "phrase",
+                            raw_score: score,
+                        });
                     }
                 }
             }
@@ -515,7 +589,9 @@ impl CandidateFamily for PinyinFamily {
             for w in book.by_initials(input) {
                 if !out.iter().any(|c| c.text == w) {
                     out.push(ScoredCandidate {
-                        text: w.clone(), family: "pinyin", source: "phrase_sp",
+                        text: w.clone(),
+                        family: "pinyin",
+                        source: "phrase_sp",
                         raw_score: self.phrase_score(book.count(input, &w)) * 0.95,
                     });
                 }
@@ -545,7 +621,9 @@ impl CandidateFamily for PinyinFamily {
             return self.predict(input);
         }
         let mut candidates = self.predict(input);
-        if candidates.is_empty() { return candidates; }
+        if candidates.is_empty() {
+            return candidates;
+        }
 
         // ── Layer 1: Recent member boost (近期指数 → 权重合成) ──
         // b = 近期指数(1-5,按距上次使用时间分档;>3d 条目在查询时被移出)。
@@ -631,17 +709,27 @@ mod tests {
         let fam = PinyinFamily::new();
         fam.learn_phrase("lizhengming", "李正明");
         let cands = fam.predict("lizhengming");
-        let p = cands.iter().find(|c| c.text == "李正明")
+        let p = cands
+            .iter()
+            .find(|c| c.text == "李正明")
             .expect("learned phrase recallable");
         // 首次 0.70 —— 低于词典精确分,自造词不再强制置顶。
-        assert!((p.raw_score - 0.70).abs() < 1e-9, "first use = 0.70: {}", p.raw_score);
+        assert!(
+            (p.raw_score - 0.70).abs() < 1e-9,
+            "first use = 0.70: {}",
+            p.raw_score
+        );
 
         // 多次使用 → count 递增 → 分数随使用频率上升(0.70 + 0.02×2 = 0.74)。
         fam.learn_phrase("lizhengming", "李正明");
         fam.learn_phrase("lizhengming", "李正明");
         let cands = fam.predict("lizhengming");
         let p = cands.iter().find(|c| c.text == "李正明").unwrap();
-        assert!((p.raw_score - 0.74).abs() < 1e-9, "count 3 → 0.74: {}", p.raw_score);
+        assert!(
+            (p.raw_score - 0.74).abs() < 1e-9,
+            "count 3 → 0.74: {}",
+            p.raw_score
+        );
     }
 
     #[test]
@@ -692,13 +780,25 @@ mod tests {
         let before = fam.phrase_count();
         use crate::family::CandidateFamily;
         CandidateFamily::record_pick(&fam, "cd", "📀");
-        assert_eq!(fam.phrase_count(), before, "emoji must not enter the phrase book");
+        assert_eq!(
+            fam.phrase_count(),
+            before,
+            "emoji must not enter the phrase book"
+        );
         // 自生词路径同样拒收。
         fam.learn_composed_phrase("cd", "📀");
-        assert_eq!(fam.phrase_count(), before, "composed path also rejects emoji");
+        assert_eq!(
+            fam.phrase_count(),
+            before,
+            "composed path also rejects emoji"
+        );
         // 汉字 + ASCII 混合词正常学习。
         fam.learn_composed_phrase("bevyyinqing", "Bevy引擎");
-        assert_eq!(fam.phrase_count(), before + 1, "mixed CJK+ASCII word is learnable");
+        assert_eq!(
+            fam.phrase_count(),
+            before + 1,
+            "mixed CJK+ASCII word is learnable"
+        );
     }
 
     #[test]
@@ -708,8 +808,11 @@ mod tests {
         let fam = PinyinFamily::new();
         let before = fam.phrase_count(); // 含 default_phrases 预置
         fam.learn_phrase("de", "的");
-        assert_eq!(fam.phrase_count(), before,
-            "dictionary word must not enter the phrase book");
+        assert_eq!(
+            fam.phrase_count(),
+            before,
+            "dictionary word must not enter the phrase book"
+        );
     }
 
     #[test]

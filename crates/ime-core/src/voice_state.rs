@@ -86,7 +86,9 @@ impl WindowState {
     /// 未关闭 → `SegmentCalibration` 优先于逐段拼接,识别中段用 `StreamFragment`。
     fn calc_preview(&self) -> String {
         if self.closed {
-            return self.calibrated.clone()
+            return self
+                .calibrated
+                .clone()
                 .or_else(|| self.batch_window.clone())
                 .unwrap_or_default();
         }
@@ -100,12 +102,12 @@ impl WindowState {
 #[derive(Default)]
 struct Inner {
     /// 当前流式文本(`StreamFragment` raw / `SegmentCalibration`)。`WindowCalibration`
-  /// 后清空,等待下一窗口。
+    /// 后清空,等待下一窗口。
     live: String,
     /// 已定稿的句子,最新在前。`WindowCalibration` 时插入头部。
     finals: Vec<String>,
     /// 当前活动窗口的组装预览(`plain` / `calc`)。`live_window` 被设置时刷新,
-  /// `live_window = None` 时清空。
+    /// `live_window = None` 时清空。
     preview: Option<AsrPreview>,
     /// per-window 识别状态(`#asr/calc` 折叠源)。
     windows: HashMap<u64, WindowState>,
@@ -151,7 +153,9 @@ impl SharedVoiceState {
     /// 头部插入 + 截断,不等同于真实 `WindowCalibration` 的窗口关闭流程。
     pub fn seed_final(&self, text: &str) {
         let mut g = self.inner.lock().unwrap();
-        if text.is_empty() { return; }
+        if text.is_empty() {
+            return;
+        }
         g.finals.insert(0, text.to_string());
         if g.finals.len() > MAX_FINALS {
             g.finals.truncate(MAX_FINALS);
@@ -189,7 +193,9 @@ impl SharedVoiceState {
     /// 旧的 `__ASR_BUFFER__` 展开用:最新 final > live > ""。
     pub fn snapshot(&self) -> String {
         let g = self.inner.lock().unwrap();
-        g.finals.first().cloned()
+        g.finals
+            .first()
+            .cloned()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| g.live.clone())
     }
@@ -201,7 +207,10 @@ impl SharedVoiceState {
         let mut g = self.inner.lock().unwrap();
         match seg {
             audio_aura_agent::view::AsrSegment::StreamFragment {
-                window_id, segment_id, text, ..
+                window_id,
+                segment_id,
+                text,
+                ..
             } => {
                 g.live = text.clone();
                 g.live_window = Some((*window_id, text.clone()));
@@ -214,7 +223,9 @@ impl SharedVoiceState {
                 Self::refresh_preview_locked(&mut g);
             }
             audio_aura_agent::view::AsrSegment::BatchSegment {
-                window_id, segment_id, text,
+                window_id,
+                segment_id,
+                text,
             } => {
                 let entry = g.windows.entry(*window_id).or_default();
                 upsert_segment(&mut entry.segments, *segment_id, |s| {
@@ -229,7 +240,8 @@ impl SharedVoiceState {
                 Self::refresh_preview_locked(&mut g);
             }
             audio_aura_agent::view::AsrSegment::SegmentCalibration {
-                window_id, calibrated,
+                window_id,
+                calibrated,
             } => {
                 g.live = calibrated.clone();
                 g.live_window = Some((*window_id, calibrated.clone()));
@@ -238,7 +250,8 @@ impl SharedVoiceState {
                 Self::refresh_preview_locked(&mut g);
             }
             audio_aura_agent::view::AsrSegment::WindowCalibration {
-                window_id, calibrated,
+                window_id,
+                calibrated,
             } => {
                 if !calibrated.is_empty() {
                     g.finals.insert(0, calibrated.clone());
@@ -256,7 +269,11 @@ impl SharedVoiceState {
                 entry.calibrated = Some(calibrated.clone());
                 let plain = entry.plain_preview();
                 let calc = entry.calc_preview();
-                g.preview = Some(AsrPreview { window_id: *window_id, plain, calc });
+                g.preview = Some(AsrPreview {
+                    window_id: *window_id,
+                    plain,
+                    calc,
+                });
             }
             audio_aura_agent::view::AsrSegment::Correction { .. } => {
                 // Stage2 correction feedback 暂不处理(后续通过 AuraClient::correct 单独触发)。
@@ -327,7 +344,10 @@ mod tests {
     }
 
     fn batch_window(wid: u64, text: &str) -> AsrSegment {
-        AsrSegment::BatchWindow { window_id: wid, text: text.into() }
+        AsrSegment::BatchWindow {
+            window_id: wid,
+            text: text.into(),
+        }
     }
 
     fn seg_cal(wid: u64, text: &str) -> AsrSegment {

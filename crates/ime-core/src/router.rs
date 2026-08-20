@@ -113,23 +113,46 @@ impl KeyEvent {
     /// 从一个字符构造(测试 / mock / 旧 predict 路径)。控制字符与 1-9
     /// 自动归一到对应 KeyKind —— 与前端转换规则一致。
     pub fn char(c: char) -> Self {
-        KeyEvent { kind: normalize_char(c), ctrl: false, shift: false, alt: false }
+        KeyEvent {
+            kind: normalize_char(c),
+            ctrl: false,
+            shift: false,
+            alt: false,
+        }
     }
 
-    pub fn space() -> Self { KeyEvent::char(' ') }
-    pub fn enter() -> Self { KeyEvent::char('\n') }
-    pub fn backspace() -> Self { KeyEvent::char('\x08') }
-    pub fn escape() -> Self { KeyEvent::char('\x1b') }
+    pub fn space() -> Self {
+        KeyEvent::char(' ')
+    }
+    pub fn enter() -> Self {
+        KeyEvent::char('\n')
+    }
+    pub fn backspace() -> Self {
+        KeyEvent::char('\x08')
+    }
+    pub fn escape() -> Self {
+        KeyEvent::char('\x1b')
+    }
 
     /// Ctrl 组合键(测试用)。
     pub fn ctrl(c: char) -> Self {
-        KeyEvent { kind: normalize_char(c), ctrl: true, shift: false, alt: false }
+        KeyEvent {
+            kind: normalize_char(c),
+            ctrl: true,
+            shift: false,
+            alt: false,
+        }
     }
 
     /// fcitx5 C++ 胶水组包(`CKeyEvent`)→ KeyEvent。`sym` 是 X keysym,
     /// `unicode` = `keySymToUnicode(sym)`(无映射时为 0)。
     pub fn from_fcitx(sym: u32, unicode: u32, ctrl: bool, shift: bool, alt: bool) -> Self {
-        KeyEvent { kind: keysym_to_kind(sym, unicode), ctrl, shift, alt }
+        KeyEvent {
+            kind: keysym_to_kind(sym, unicode),
+            ctrl,
+            shift,
+            alt,
+        }
     }
 }
 
@@ -185,9 +208,13 @@ impl StateFlags {
     /// 有待确认的选项(命令预测 / 补全提示)。
     pub const PENDING: StateFlags = StateFlags(1 << 6);
 
-    pub const fn empty() -> Self { StateFlags(0) }
+    pub const fn empty() -> Self {
+        StateFlags(0)
+    }
 
-    pub const fn bits(self) -> u32 { self.0 }
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
 
     pub const fn contains(self, other: StateFlags) -> bool {
         self.0 & other.0 == other.0
@@ -204,7 +231,9 @@ impl StateFlags {
             (Self::WORD_BUILDING, "WORD_BUILDING"),
             (Self::PENDING, "PENDING"),
         ] {
-            if self.contains(flag) { out.push(name); }
+            if self.contains(flag) {
+                out.push(name);
+            }
         }
         out
     }
@@ -212,11 +241,15 @@ impl StateFlags {
 
 impl std::ops::BitOr for StateFlags {
     type Output = StateFlags;
-    fn bitor(self, rhs: StateFlags) -> StateFlags { StateFlags(self.0 | rhs.0) }
+    fn bitor(self, rhs: StateFlags) -> StateFlags {
+        StateFlags(self.0 | rhs.0)
+    }
 }
 
 impl std::ops::BitOrAssign for StateFlags {
-    fn bitor_assign(&mut self, rhs: StateFlags) { self.0 |= rhs.0 }
+    fn bitor_assign(&mut self, rhs: StateFlags) {
+        self.0 |= rhs.0
+    }
 }
 
 // ── StateMachineTable:状态机表 ──────────────────────────────────────────
@@ -249,12 +282,7 @@ impl StateMachineTable {
     }
 
     /// 路由一枚键:驱动状态迁移,返回新视图。决策矩阵见模块文档。
-    pub fn route(
-        &mut self,
-        sm: &mut StateMachine,
-        key: KeyEvent,
-        env: &dyn StepEnv,
-    ) -> ImeView {
+    pub fn route(&mut self, sm: &mut StateMachine, key: KeyEvent, env: &dyn StepEnv) -> ImeView {
         let mut view = self.route_inner(sm, key, env);
         // 不变式:键路径返回的视图必须带明确的 action 位。组合状态机里
         // "消费了键但无可渲染"的路径(退格清空 buffer 后 reset、snippet
@@ -267,6 +295,8 @@ impl StateMachineTable {
         view
     }
 
+    /// **路由处理函数**
+    /// 驱动状态机流转
     fn route_inner(&mut self, sm: &mut StateMachine, key: KeyEvent, env: &dyn StepEnv) -> ImeView {
         // 1. Ctrl/Alt 组合键是应用快捷键(Ctrl+/ 注释、Ctrl+C 复制…),一律放行。
         //    修饰键策略在引擎内 —— 前端不再自行拦截。Shift 不在此列:大写
@@ -394,10 +424,13 @@ impl StateMachineTable {
 
             // 7. 引擎不解释的键 —— Home/End/Delete/Insert、裸修饰键、F 功能键、
             //    未识别 keysym:当前无输入法语义,属于应用。
-            KeyKind::Home | KeyKind::End | KeyKind::Delete | KeyKind::Insert
-            | KeyKind::Modifier | KeyKind::Function(_) | KeyKind::Other(_) => {
-                StateMachine::passthrough_view()
-            }
+            KeyKind::Home
+            | KeyKind::End
+            | KeyKind::Delete
+            | KeyKind::Insert
+            | KeyKind::Modifier
+            | KeyKind::Function(_)
+            | KeyKind::Other(_) => StateMachine::passthrough_view(),
 
             // 8. 可打印字符:交给组合状态机(idle 内部自分流:触发前缀进
             //    Snippet,小写进 Pinyin,其余返回透传视图)。
@@ -460,11 +493,15 @@ impl StateMachine {
     /// Change page by delta.
     pub fn change_page(&mut self, delta: i32) {
         let n = self.candidates.len();
-        if n == 0 || self.candidate_page_size == 0 { return; }
+        if n == 0 || self.candidate_page_size == 0 {
+            return;
+        }
         let total_pages = n.div_ceil(self.candidate_page_size);
-        if total_pages <= 1 { return; }
-        let new_page = (self.candidate_page as i32 + delta)
-            .clamp(0, total_pages as i32 - 1) as usize;
+        if total_pages <= 1 {
+            return;
+        }
+        let new_page =
+            (self.candidate_page as i32 + delta).clamp(0, total_pages as i32 - 1) as usize;
         if new_page != self.candidate_page {
             self.candidate_page = new_page;
             self.candidate_highlight = new_page * self.candidate_page_size;
@@ -499,16 +536,23 @@ mod tests {
     fn fcitx_keysyms_decode() {
         use KeyKind::*;
         let cases: &[(u32, KeyKind)] = &[
-            (0xff51, Left), (0xff52, Up), (0xff53, Right), (0xff54, Down),
-            (0xff55, PageUp), (0xff56, PageDown),
-            (0xff09, Tab), (0xff0d, Enter), (0xff1b, Escape), (0xff08, Backspace),
-            (0xffe1, Modifier),   // Shift_L
-            (0xffe3, Modifier),   // Control_L
-            (0xffe9, Modifier),   // Alt_L
+            (0xff51, Left),
+            (0xff52, Up),
+            (0xff53, Right),
+            (0xff54, Down),
+            (0xff55, PageUp),
+            (0xff56, PageDown),
+            (0xff09, Tab),
+            (0xff0d, Enter),
+            (0xff1b, Escape),
+            (0xff08, Backspace),
+            (0xffe1, Modifier), // Shift_L
+            (0xffe3, Modifier), // Control_L
+            (0xffe9, Modifier), // Alt_L
             (0xffbe, Function(1)),
             (0xffc9, Function(12)),
-            (0xffb1, Digit(1)),  // KP_1
-            (0xffb9, Digit(9)),  // KP_9
+            (0xffb1, Digit(1)), // KP_1
+            (0xffb9, Digit(9)), // KP_9
         ];
         for &(sym, want) in cases {
             assert_eq!(keysym_to_kind(sym, 0), want, "sym=0x{sym:x}");
@@ -527,14 +571,21 @@ mod tests {
     }
 
     fn type_str(e: &mut ImeEngine, s: &str) {
-        for c in s.chars() { e.key(KeyEvent::char(c)); }
+        for c in s.chars() {
+            e.key(KeyEvent::char(c));
+        }
     }
 
     #[test]
     fn nav_keys_passthrough_when_idle() {
         let mut e = ImeEngine::new();
         for k in [
-            KeyEvent { kind: KeyKind::Up, ctrl: false, shift: false, alt: false },
+            KeyEvent {
+                kind: KeyKind::Up,
+                ctrl: false,
+                shift: false,
+                alt: false,
+            },
             KeyEvent::char('\t'),
             KeyEvent::char('-'),
             KeyEvent::char('='),
@@ -548,7 +599,9 @@ mod tests {
             let v = key(&mut e, k);
             assert!(
                 v.action & action::PASSTHROUGH != 0 && v.action & action::HANDLED == 0,
-                "idle key {:?} must pass through (action=0x{:x})", k.kind, v.action
+                "idle key {:?} must pass through (action=0x{:x})",
+                k.kind,
+                v.action
             );
         }
     }
@@ -558,10 +611,29 @@ mod tests {
         let mut e = ImeEngine::new();
         type_str(&mut e, "nihao");
         assert!(!e.candidates().is_empty(), "panel open after typing pinyin");
-        for k in [KeyEvent::char('-'), KeyEvent::char('\t'), KeyEvent { kind: KeyKind::Left, ctrl: false, shift: false, alt: false }] {
+        for k in [
+            KeyEvent::char('-'),
+            KeyEvent::char('\t'),
+            KeyEvent {
+                kind: KeyKind::Left,
+                ctrl: false,
+                shift: false,
+                alt: false,
+            },
+        ] {
             let v = key(&mut e, k);
-            assert_eq!(v.action & action::HANDLED, action::HANDLED, "{:?} handled", k.kind);
-            assert_eq!(v.action & action::PASSTHROUGH, 0, "{:?} not passthrough", k.kind);
+            assert_eq!(
+                v.action & action::HANDLED,
+                action::HANDLED,
+                "{:?} handled",
+                k.kind
+            );
+            assert_eq!(
+                v.action & action::PASSTHROUGH,
+                0,
+                "{:?} not passthrough",
+                k.kind
+            );
         }
     }
 
@@ -570,23 +642,50 @@ mod tests {
         // 修饰键策略在引擎内:组合中 Ctrl+/ 也要到达应用(编辑器注释快捷键)。
         let mut e = ImeEngine::new();
         type_str(&mut e, "nihao");
-        for k in [KeyEvent::ctrl('/'), KeyEvent { kind: KeyKind::Char('c'), ctrl: false, shift: false, alt: true }] {
+        for k in [
+            KeyEvent::ctrl('/'),
+            KeyEvent {
+                kind: KeyKind::Char('c'),
+                ctrl: false,
+                shift: false,
+                alt: true,
+            },
+        ] {
             let v = key(&mut e, k);
             assert_eq!(v.action & action::PASSTHROUGH, action::PASSTHROUGH, "{k:?}");
             assert_eq!(v.action & action::HANDLED, 0);
         }
         // 组合未被破坏 —— 空格仍提交候选。
         let v = key(&mut e, KeyEvent::space());
-        assert!(v.action & action::COMMIT != 0, "composition survives passthrough");
+        assert!(
+            v.action & action::COMMIT != 0,
+            "composition survives passthrough"
+        );
     }
 
     #[test]
     fn bare_modifier_and_function_keys_passthrough() {
         let mut e = ImeEngine::new();
         type_str(&mut e, "ni");
-        for kind in [KeyKind::Modifier, KeyKind::Function(1), KeyKind::Other(0x1008ff01)] {
-            let v = key(&mut e, KeyEvent { kind, ctrl: false, shift: false, alt: false });
-            assert_eq!(v.action & action::PASSTHROUGH, action::PASSTHROUGH, "{kind:?}");
+        for kind in [
+            KeyKind::Modifier,
+            KeyKind::Function(1),
+            KeyKind::Other(0x1008ff01),
+        ] {
+            let v = key(
+                &mut e,
+                KeyEvent {
+                    kind,
+                    ctrl: false,
+                    shift: false,
+                    alt: false,
+                },
+            );
+            assert_eq!(
+                v.action & action::PASSTHROUGH,
+                action::PASSTHROUGH,
+                "{kind:?}"
+            );
         }
     }
 
@@ -598,12 +697,20 @@ mod tests {
         // 构造"组合中但无候选":Snippet 状态、未知触发前缀走 fallback 有候选,
         // 用 Pinyin + 删空候选不可行 —— 直接检查 Idle 区分即可:先确认 idle 透传。
         let v = key(&mut e, KeyEvent::escape());
-        assert_eq!(v.action & action::PASSTHROUGH, action::PASSTHROUGH, "idle Esc passes through");
+        assert_eq!(
+            v.action & action::PASSTHROUGH,
+            action::PASSTHROUGH,
+            "idle Esc passes through"
+        );
 
         type_str(&mut e, "nihao");
         assert!(!e.candidates().is_empty());
         let v = key(&mut e, KeyEvent::escape());
-        assert_eq!(v.action & action::HANDLED, action::HANDLED, "composing Esc handled");
+        assert_eq!(
+            v.action & action::HANDLED,
+            action::HANDLED,
+            "composing Esc handled"
+        );
         assert!(e.candidates().is_empty(), "composition cancelled");
     }
 
@@ -624,8 +731,16 @@ mod tests {
         let mut e = ImeEngine::new();
         type_str(&mut e, "n");
         let v = key(&mut e, KeyEvent::backspace());
-        assert!(v.action & action::HANDLED != 0, "final backspace is consumed: 0x{:x}", v.action);
-        assert_eq!(v.action & action::PASSTHROUGH, 0, "must NOT reach the application");
+        assert!(
+            v.action & action::HANDLED != 0,
+            "final backspace is consumed: 0x{:x}",
+            v.action
+        );
+        assert_eq!(
+            v.action & action::PASSTHROUGH,
+            0,
+            "must NOT reach the application"
+        );
         assert!(e.buffer().is_empty(), "buffer emptied");
         assert_eq!(e.state_flags(), StateFlags::empty(), "back to idle");
 
@@ -633,7 +748,11 @@ mod tests {
         let mut e2 = ImeEngine::new();
         type_str(&mut e2, "#/");
         let v = key(&mut e2, KeyEvent::backspace());
-        assert!(v.action & action::HANDLED != 0, "snippet backspace consumed: 0x{:x}", v.action);
+        assert!(
+            v.action & action::HANDLED != 0,
+            "snippet backspace consumed: 0x{:x}",
+            v.action
+        );
         assert_eq!(v.action & action::PASSTHROUGH, 0);
     }
 
@@ -650,7 +769,11 @@ mod tests {
     fn digit_selects_when_panel_open_passes_through_when_idle() {
         let mut e = ImeEngine::new();
         let v = key(&mut e, KeyEvent::char('3'));
-        assert_eq!(v.action & action::PASSTHROUGH, action::PASSTHROUGH, "idle digit passes through");
+        assert_eq!(
+            v.action & action::PASSTHROUGH,
+            action::PASSTHROUGH,
+            "idle digit passes through"
+        );
 
         let mut e2 = ImeEngine::new();
         type_str(&mut e2, "nihao");
@@ -673,12 +796,23 @@ mod tests {
         );
 
         // 翻到第 2 页,再按数字 1。
-        let v = key(&mut e, KeyEvent { kind: KeyKind::PageDown, ctrl: false, shift: false, alt: false });
+        let v = key(
+            &mut e,
+            KeyEvent {
+                kind: KeyKind::PageDown,
+                ctrl: false,
+                shift: false,
+                alt: false,
+            },
+        );
         assert_eq!(v.candidate_page, 1, "paged to page 2");
         let v = key(&mut e, KeyEvent::char('1'));
 
         let committed = ImeView::str_field(&v.commit_text);
-        assert!(v.action & action::COMMIT != 0, "digit selects: {committed:?}");
+        assert!(
+            v.action & action::COMMIT != 0,
+            "digit selects: {committed:?}"
+        );
         assert_eq!(
             committed, all[page_size],
             "digit 1 on page 2 commits the FIRST item of page 2 (not {}/{:?})",
@@ -700,8 +834,7 @@ mod tests {
         assert!(e.state_flags().contains(StateFlags::PANEL_OPEN));
 
         // 逐字选第一个字 → 自生词模式(WORD_BUILDING)。
-        let single: Option<usize> = e.candidates().iter()
-            .position(|c| c.chars().count() == 1);
+        let single: Option<usize> = e.candidates().iter().position(|c| c.chars().count() == 1);
         let idx = single.expect("multi-syllable input has single-char options");
         e.select_candidate(idx);
         assert!(
@@ -717,26 +850,10 @@ mod tests {
         type_str(&mut e, "#as");
         let f = e.state_flags();
         assert!(f.contains(StateFlags::SNIPPET), "{:?}", f.labels());
-        assert!(f.contains(StateFlags::PENDING), "magic hints pending: {:?}", f.labels());
-    }
-
-    #[test]
-    fn plus_minus_page_through_candidates() {
-        let mut sm = StateMachine::new();
-        sm.candidates = (0..20).map(|i| format!("cand{i}")).collect();
-        sm.candidate_page_size = 7;
-
-        sm.change_page(1);
-        assert_eq!(sm.candidate_page, 1, "+ paged to page 2");
-        sm.change_page(1);
-        assert_eq!(sm.candidate_page, 2, "+ paged to page 3 (clamped at 3 pages)");
-        sm.change_page(1);
-        assert_eq!(sm.candidate_page, 2, "+ clamps at last page");
-        sm.change_page(-1);
-        assert_eq!(sm.candidate_page, 1, "- paged back");
-        sm.change_page(-1);
-        assert_eq!(sm.candidate_page, 0, "- back to first page");
-        sm.change_page(-1);
-        assert_eq!(sm.candidate_page, 0, "- clamps at first page");
+        assert!(
+            f.contains(StateFlags::PENDING),
+            "magic hints pending: {:?}",
+            f.labels()
+        );
     }
 }

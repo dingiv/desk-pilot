@@ -113,7 +113,11 @@ impl IoThread {
                                     // 触发 runtime 调度刚 spawn 的 task。
                                     tokio::task::yield_now().await;
                                 }
-                                IoEvent::SpawnVoiceListener { base, state, frontend } => {
+                                IoEvent::SpawnVoiceListener {
+                                    base,
+                                    state,
+                                    frontend,
+                                } => {
                                     tokio::spawn(voice_listener_task(base, state, frontend));
                                 }
                                 IoEvent::Shutdown => break,
@@ -154,7 +158,11 @@ impl IoThread {
         state: Arc<SharedVoiceState>,
         frontend: Weak<dyn FrontEndHandle>,
     ) {
-        self.send(IoEvent::SpawnVoiceListener { base, state, frontend });
+        self.send(IoEvent::SpawnVoiceListener {
+            base,
+            state,
+            frontend,
+        });
     }
 }
 
@@ -213,7 +221,11 @@ async fn voice_listener_task(
     state.set_connected(false);
 }
 
-fn apply_and_notify(state: &Arc<SharedVoiceState>, frontend: &Weak<dyn FrontEndHandle>, seg: AsrSegment) {
+fn apply_and_notify(
+    state: &Arc<SharedVoiceState>,
+    frontend: &Weak<dyn FrontEndHandle>,
+    seg: AsrSegment,
+) {
     state.fold_segment(&seg);
     if let Some(f) = frontend.upgrade() {
         f.refresh_ui(StateView { ctx: 0 });
@@ -268,9 +280,15 @@ mod tests {
                 let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
                 let mut req = [0u8; 4096];
                 let _ = s.read(&mut req);
-                let path = std::str::from_utf8(&req).unwrap_or("")
-                    .lines().next().unwrap_or("")
-                    .split_whitespace().nth(1).unwrap_or("/").to_string();
+                let path = std::str::from_utf8(&req)
+                    .unwrap_or("")
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
                 if path.starts_with("/api/asr_stream") {
                     let hdr = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
                     s.write_all(hdr).unwrap();
@@ -279,10 +297,18 @@ mod tests {
                     thread::sleep(Duration::from_secs(1));
                 } else if path.starts_with("/api/state") {
                     let body = r#"{"connected":true,"stage3_on":false,"config":{"asr_backend":"","asr_kind":"","asr_provider":"","llm_kind":"","model":"","vad":{"threshold":0.5,"min_silence":0.3,"merge_gap":1.0}},"hotwords":[],"corrections":[]}"#;
-                    let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                    let _ = write!(
+                        s,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
                     s.flush().unwrap();
                 } else {
-                    s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    s.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
                     s.flush().unwrap();
                 }
             }
@@ -307,7 +333,9 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let (_, live) = state.voice_candidates();
-            if live == "你好" { break; }
+            if live == "你好" {
+                break;
+            }
             if Instant::now() >= deadline {
                 panic!("listener 未在 3s 内折叠 SSE 段,live={live:?}");
             }
@@ -315,6 +343,9 @@ mod tests {
         }
 
         // 至少触发了一次 refresh(可以 > 1 因为 health tick 也调)。
-        assert!(refresh_count.load(Ordering::Relaxed) >= 1, "listener 应至少推一次 refresh");
+        assert!(
+            refresh_count.load(Ordering::Relaxed) >= 1,
+            "listener 应至少推一次 refresh"
+        );
     }
 }

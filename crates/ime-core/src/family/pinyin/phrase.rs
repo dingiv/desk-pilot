@@ -24,8 +24,7 @@ struct Phrase {
     count: u32,
 }
 
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PhraseBook {
     /// pinyin (no spaces) → list of hanzi phrases
     entries: HashMap<String, Vec<Phrase>>,
@@ -34,7 +33,6 @@ pub struct PhraseBook {
     /// All pinyin keys, longest first — for prefix matching during typing.
     keys_by_len: Vec<String>,
 }
-
 
 impl PhraseBook {
     pub fn new() -> Self {
@@ -74,7 +72,11 @@ impl PhraseBook {
     /// Add one phrase with a specific priority order (0 = highest).
     /// `count` = 已有使用次数(从持久化恢复时为历史值,新词为 0)。
     pub fn insert_with_order_count(&mut self, pinyin: &str, text: &str, order: i32, count: u32) {
-        let phrase = Phrase { text: text.to_string(), order, count };
+        let phrase = Phrase {
+            text: text.to_string(),
+            order,
+            count,
+        };
         // Full pinyin index.
         let list = self.entries.entry(pinyin.to_string()).or_default();
         list.retain(|p| p.text != text);
@@ -104,7 +106,9 @@ impl PhraseBook {
                 bumped = true;
             }
         }
-        if !bumped { return; }
+        if !bumped {
+            return;
+        }
         // Initials 索引同步。
         let initials = initials_from_pinyin(pinyin);
         if initials.len() >= 2 {
@@ -118,7 +122,8 @@ impl PhraseBook {
 
     /// 某个 phrase 的使用次数(0 = 不在词本)。
     pub fn count(&self, pinyin: &str, text: &str) -> u32 {
-        self.entries.get(pinyin)
+        self.entries
+            .get(pinyin)
             .and_then(|list| list.iter().find(|p| p.text == text))
             .map(|p| p.count)
             .unwrap_or(0)
@@ -126,8 +131,11 @@ impl PhraseBook {
 
     /// Exact match — candidates sorted by order (0 = highest first).
     pub fn exact(&self, pinyin: &str) -> Vec<String> {
-        let mut list: Vec<&Phrase> = self.entries.get(pinyin)
-            .map(|v| v.iter().collect()).unwrap_or_default();
+        let mut list: Vec<&Phrase> = self
+            .entries
+            .get(pinyin)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
         list.sort_by_key(|p| p.order);
         list.into_iter().map(|p| p.text.clone()).collect()
     }
@@ -135,16 +143,23 @@ impl PhraseBook {
     /// Initials (jianpin) match — candidates sorted by order.
     /// "lzm" → ["李正明", ...] (from previously learned lizhengming→李正明).
     pub fn by_initials(&self, initials: &str) -> Vec<String> {
-        if initials.is_empty() || initials.len() < 2 { return Vec::new(); }
-        let mut list: Vec<&Phrase> = self.initials_index.get(initials)
-            .map(|v| v.iter().collect()).unwrap_or_default();
+        if initials.is_empty() || initials.len() < 2 {
+            return Vec::new();
+        }
+        let mut list: Vec<&Phrase> = self
+            .initials_index
+            .get(initials)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
         list.sort_by_key(|p| p.order);
         list.into_iter().map(|p| p.text.clone()).collect()
     }
 
     /// Prefix match — candidates sorted by order (0 = highest first).
     pub fn prefix(&self, prefix: &str) -> Vec<String> {
-        if prefix.is_empty() { return Vec::new(); }
+        if prefix.is_empty() {
+            return Vec::new();
+        }
         let mut all: Vec<&Phrase> = Vec::new();
         for (py, texts) in &self.entries {
             if py.starts_with(prefix) {
@@ -154,7 +169,9 @@ impl PhraseBook {
         all.sort_by_key(|p| p.order);
         let mut out = Vec::new();
         for p in all {
-            if !out.contains(&p.text) { out.push(p.text.clone()); }
+            if !out.contains(&p.text) {
+                out.push(p.text.clone());
+            }
         }
         out
     }
@@ -213,7 +230,9 @@ impl PhraseBook {
         if let Ok(s) = std::str::from_utf8(data) {
             for line in s.lines() {
                 let line = line.trim();
-                if line.is_empty() || line.starts_with('#') { continue; }
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
                 if let Some((pinyin, word)) = line.split_once('\t') {
                     if !pinyin.is_empty() && !word.is_empty() {
                         self.insert(pinyin, word);
@@ -269,9 +288,13 @@ mod tests {
         let mut book = PhraseBook::new();
         book.insert("xiayige", "下一个");
         book.insert("xiayig", "下一个"); // also match intermediate state
-        // During typing "xiayig", should find "下一个"
+                                         // During typing "xiayig", should find "下一个"
         let r = book.prefix("xiayig");
-        assert!(r.contains(&"下一个".to_string()), "expected 下一个 in {:?}", r);
+        assert!(
+            r.contains(&"下一个".to_string()),
+            "expected 下一个 in {:?}",
+            r
+        );
     }
 
     #[test]
@@ -300,8 +323,11 @@ mod tests {
         assert_eq!(book.exact("lizhengming"), vec!["李正明"]);
         // Initials match: lzm → 李正明.
         let r = book.by_initials("lzm");
-        assert!(r.contains(&"李正明".to_string()),
-            "lzm should find 李正明, got {:?}", r);
+        assert!(
+            r.contains(&"李正明".to_string()),
+            "lzm should find 李正明, got {:?}",
+            r
+        );
     }
 
     #[test]
@@ -310,6 +336,11 @@ mod tests {
         book.insert("lizhengming", "李正明");
         book.insert("lizhongming", "李中明");
         let r = book.by_initials("lzm");
-        assert_eq!(r.len(), 2, "lzm should find both 李正明 and 李中明, got {:?}", r);
+        assert_eq!(
+            r.len(),
+            2,
+            "lzm should find both 李正明 and 李中明, got {:?}",
+            r
+        );
     }
 }

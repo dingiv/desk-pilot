@@ -13,7 +13,7 @@
 //! - `en_user`: 英文自生词 word → 使用次数(Enter 强选 raw 文本时学习)
 //! - `l0`:      inputx-pinyin L0 user model (single-row JSON)
 
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use std::sync::Mutex;
 
 pub struct WeightStore {
@@ -30,13 +30,17 @@ impl WeightStore {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         // 迁移 1:老库的 phrases 表没有 count 列(SQLite 的 ADD COLUMN 无
         // IF NOT EXISTS —— 已存在时报错,忽略即可)。
-        let _ = conn.execute("ALTER TABLE phrases ADD COLUMN count INTEGER NOT NULL DEFAULT 1", []);
+        let _ = conn.execute(
+            "ALTER TABLE phrases ADD COLUMN count INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
         // 迁移 2:老格式的 recency (pos, word) 无时间戳 → 重建为 (word, used_at)。
         // 只在旧结构存在时 DROP —— 每次 open 都删会清掉刚写入的数据。
         let has_used_at: bool = conn
             .prepare("PRAGMA table_info(recency)")
             .map(|mut stmt| {
-                let cols: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(1))
+                let cols: Vec<String> = stmt
+                    .query_map([], |r| r.get::<_, String>(1))
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
                     .unwrap_or_default();
                 cols.iter().any(|c| c == "used_at")
@@ -75,23 +79,29 @@ impl WeightStore {
             CREATE TABLE IF NOT EXISTS l0 (
                 id   INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
                 json TEXT NOT NULL
-            );"
+            );",
         )?;
-        Ok(WeightStore { conn: Mutex::new(conn) })
+        Ok(WeightStore {
+            conn: Mutex::new(conn),
+        })
     }
 
     // ── 计数(启动日志)────────────────────────────────────────────────
 
     /// 学习词条数。
     pub fn phrase_count(&self) -> usize {
-        self.conn.lock().unwrap()
+        self.conn
+            .lock()
+            .unwrap()
             .query_row("SELECT COUNT(*) FROM phrases", [], |r| r.get(0))
             .unwrap_or(0)
     }
 
     /// 英文自生词数。
     pub fn en_user_count(&self) -> usize {
-        self.conn.lock().unwrap()
+        self.conn
+            .lock()
+            .unwrap()
             .query_row("SELECT COUNT(*) FROM en_user", [], |r| r.get(0))
             .unwrap_or(0)
     }
@@ -120,26 +130,38 @@ impl WeightStore {
     /// 删除一条自生词(污染清理用)。
     pub fn delete_phrase(&self, pinyin: &str, word: &str) -> usize {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM phrases WHERE pinyin = ?1 AND word = ?2", params![pinyin, word])
-            .unwrap_or(0)
+        conn.execute(
+            "DELETE FROM phrases WHERE pinyin = ?1 AND word = ?2",
+            params![pinyin, word],
+        )
+        .unwrap_or(0)
     }
 
     /// Get phrases for a pinyin, sorted by priority ascending (0 first).
     pub fn phrases_for(&self, pinyin: &str) -> Vec<(String, i32)> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT word, priority FROM phrases WHERE pinyin = ?1 ORDER BY priority, word"
-        ).ok();
-        stmt.as_mut().map(|s| {
-            s.query_map(params![pinyin], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i32>(1)?)))
-                .ok().into_iter().flat_map(|rows| rows.filter_map(|r| r.ok())).collect()
-        }).unwrap_or_default()
+        let mut stmt = conn
+            .prepare("SELECT word, priority FROM phrases WHERE pinyin = ?1 ORDER BY priority, word")
+            .ok();
+        stmt.as_mut()
+            .map(|s| {
+                s.query_map(params![pinyin], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i32>(1)?))
+                })
+                .ok()
+                .into_iter()
+                .flat_map(|rows| rows.filter_map(|r| r.ok()))
+                .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Load all user-learned phrases for startup warm — (pinyin, word, priority, count).
     pub fn load_all_phrases(&self) -> Vec<(String, String, i32, u32)> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare("SELECT pinyin, word, priority, count FROM phrases ORDER BY pinyin, priority") {
+        let mut stmt = match conn
+            .prepare("SELECT pinyin, word, priority, count FROM phrases ORDER BY pinyin, priority")
+        {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
@@ -185,11 +207,13 @@ impl WeightStore {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
-            .ok()
-            .into_iter()
-            .flat_map(|rows| rows.filter_map(|r| r.ok()))
-            .collect()
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .ok()
+        .into_iter()
+        .flat_map(|rows| rows.filter_map(|r| r.ok()))
+        .collect()
     }
 
     /// Drop the table (used when the in-memory store is empty).
@@ -201,7 +225,9 @@ impl WeightStore {
 
     /// 学习/递增一个英文自生词(Enter 强制提交 raw 文本,如 cd)。
     pub fn record_en_user(&self, word: &str) {
-        if word.is_empty() { return; }
+        if word.is_empty() {
+            return;
+        }
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
             "INSERT INTO en_user (word, count) VALUES (?1, 1)
@@ -217,11 +243,13 @@ impl WeightStore {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)))
-            .ok()
-            .into_iter()
-            .flat_map(|rows| rows.filter_map(|r| r.ok()))
-            .collect()
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+        })
+        .ok()
+        .into_iter()
+        .flat_map(|rows| rows.filter_map(|r| r.ok()))
+        .collect()
     }
 
     // ── L0 user model ───────────────────────────────────────────────────
@@ -229,7 +257,9 @@ impl WeightStore {
     /// Persist the inputx-pinyin L0 user model (pins + pick counters) as JSON.
     /// Single-row table, upserted on every pick.
     pub fn save_l0(&self, json: &str) {
-        if json.is_empty() { return; }
+        if json.is_empty() {
+            return;
+        }
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
             "INSERT INTO l0 (id, json) VALUES (1, ?1)
@@ -240,7 +270,9 @@ impl WeightStore {
 
     /// Load the persisted L0 model JSON, if any.
     pub fn load_l0(&self) -> Option<String> {
-        self.conn.lock().unwrap()
+        self.conn
+            .lock()
+            .unwrap()
             .query_row("SELECT json FROM l0 WHERE id = 1", [], |r| r.get(0))
             .ok()
     }
@@ -270,8 +302,11 @@ mod tests {
     #[test]
     fn recency_snapshot_roundtrip_preserves_timestamps() {
         let s = temp_store();
-        let entries: Vec<(String, i64)> =
-            vec![("最新".into(), 1000), ("次新".into(), 2000), ("旧".into(), 3000)];
+        let entries: Vec<(String, i64)> = vec![
+            ("最新".into(), 1000),
+            ("次新".into(), 2000),
+            ("旧".into(), 3000),
+        ];
         s.save_recency(&entries);
         assert_eq!(s.load_recency(), entries, "word + timestamp preserved");
 
@@ -279,7 +314,10 @@ mod tests {
         s.save_recency(&[("另一个".into(), 4000)]);
         assert_eq!(s.load_recency(), vec![("另一个".to_string(), 4000)]);
         s.save_recency(&[]);
-        assert!(s.load_recency().is_empty(), "empty snapshot clears the table");
+        assert!(
+            s.load_recency().is_empty(),
+            "empty snapshot clears the table"
+        );
     }
 
     #[test]
