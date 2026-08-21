@@ -15,7 +15,17 @@ magic:
   addons:
     - name: example_addon
       url: http://127.0.0.1:9788
-      cmd: eg,eg1,eg2
+      cmds:
+        - eg?param1=&param2=2   # eg 路径支持 param1 和 param2 参数, 第一个必选, 第二个可选, 默认参数为 2
+        - eg/name?nick=1&len=10 # eg1/name 路径支持 nick, 可选; len 可选
+        - eg1
+
+    - name: example2_addon
+      url: http://127.0.0.1:9789
+      cmds:
+        - eg?param1=&param2=2
+        - eg1/name?nick=1&len=10
+        - eg2/age
 
 # ── Snippets ────────────────────────────────────────────────────────────
 # User-defined text expansions, merged over the engine's built-ins (a config

@@ -55,3 +55,8 @@ install(FILES assets/dict/emoji.tsv
 # ── Install default config ────────────────────────────────────────────────────
 install(FILES swift-ime.yaml
         DESTINATION "${CMAKE_INSTALL_DATADIR}/swift-ime")
+
+# ── Install SNIP snippet markdown 模板(FileLoader::SNIP prod 命名空间种子) ──
+# demo.md 装到 /usr/share/swift-ime/demo.md,首次运行 seed_snippets_dir 播种。
+install(FILES assets/snippets/demo.md
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/swift-ime")

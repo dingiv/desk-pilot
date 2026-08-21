@@ -433,10 +433,12 @@ impl DaemonState {
 
     /// 进入 idle 深度睡眠:running=false(Stage1 消费循环退出) + active=false(断开 scout)。
     fn enter_idle(&self) {
-        info!("entering idle — no subscribers, disconnecting scout");
-        self.running.store(false, Ordering::Release);
-        self.active.store(false, Ordering::Release);
-        self.idle.store(true, Ordering::Release);
+        if self.running.load(Ordering::Acquire) == true {
+            info!("entering idle — no subscribers, disconnecting scout");
+            self.running.store(false, Ordering::Release);
+            self.active.store(false, Ordering::Release);
+            self.idle.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -651,7 +653,7 @@ fn main() -> Result<()> {
             rt.spawn(async move {
                 let mut since: Option<Instant> = None;
                 loop {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
                     if mon.subscribers.load(Ordering::Relaxed) == 0 {
                         match since {
                             None => since = Some(Instant::now()),

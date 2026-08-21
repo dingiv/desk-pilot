@@ -188,6 +188,13 @@ impl Expander {
                     // Marker handled by the expander itself (not the provider):
                     // record where it lands in the expanded text, contribute nothing.
                     cursor = Some(result.len());
+                } else if let Some(inner) = name.strip_prefix("ENV:") {
+                    // `${ENV:<expr>}`:先把 `<expr>` 作为子模板展开(可为变量引用,
+                    // 如 `${ENV:$PATH_VAR}` → 先展开 PATH_VAR 得环境变量名),再读
+                    // 进程环境变量。缺失 → 空串。
+                    let (env_name, _) = self.expand_impl(inner, vars)?;
+                    let value = std::env::var(&env_name).unwrap_or_default();
+                    result.push_str(&value);
                 } else {
                     // Query params shadow the provider; then fall back to it.
                     let value = vars
@@ -201,7 +208,7 @@ impl Expander {
                         Some(value) => result.push_str(&value),
                         // 查询参数作用域下,未提供的 `$var` 渲染为空(片段命令
                         // 的 `?name=` 是逐键注入的,键入中途不报错)。
-                        None if vars.is_some() => {}
+                        None if vars.is_some() => result.push_str(&format!("${}{}{}", "{", name, "}")),
                         None => return Err(ExpandError::UnknownVariable(name)),
                     }
                 }

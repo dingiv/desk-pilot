@@ -1,11 +1,19 @@
 //! SnippetMember — 片段作为「空名魔法命令」的预测提供者。
 //!
-//! 触发名是空串 `''`:语法 `#/<name>?<params>`,即 `#` 紧跟 `/` 进入本命令,
+//! 触发名是空串 `''`:语法 `#/<name><path>?<params>`,即 `#` 紧跟 `/` 进入本命令,
 //! `/hello` 是路径(首段 = 片段名),`?name=Mike` 是查询(注入模板变量)。
 //!
 //! ```text
 //! #/hello?name=Mike  →  模板 "Hello, my name is $name." 展开 → "Hello, my name is Mike."
+//! #/angle/O          →  模板里的 ${PATH_VAR} 用路径参数 `O` 填充
+//! #/env/HOME         →  ${ENV:USERNAME} 读环境变量;${ENV:$PATH_VAR} 先展开
+//!                        PATH_VAR 得变量名再读对应环境变量
 //! ```
+//!
+//! 路径段:
+//! - 首段 = 片段名(`/hello`);
+//! - 其余路径段拼接为 `${PATH_VAR}`(用 `/` 连接);
+//! - `?name=Mike` 查询参数作为同名模板变量。
 //!
 //! `predict` 解析整段输入,查片段注册表 + 展开,返回 [展开结果](选中即上屏,
 //! `$CURSOR` 落点由 prediction.cursor 携带)。未知片段/展开失败返回交互式
@@ -46,14 +54,25 @@ impl MagicMember for SnippetMember {
         let raw = input.strip_prefix('#').unwrap_or(input);
         let args = CommandArgs::parse(raw);
         let name = args.path.first().cloned().unwrap_or_default();
-        let template = self.resources.snippets.lock().unwrap().get(&name).cloned();
+        let entry = self.resources.snippets.lock().unwrap().get(&name).cloned();
 
-        match template {
-            Some(tpl) => {
-                let vars: Vec<(String, String)> = args.query.clone();
-                match env.expander().expand_with_vars(&tpl, &vars) {
+        match entry {
+            Some(entry) => {
+                // 查询参数作为模板变量;路径剩余段拼接成 PATH_VAR(用 `/`)。
+                let mut vars: Vec<(String, String)> = args.query.clone();
+                if args.path.len() > 1 {
+                    let path_var = args.path[1..].join("/");
+                    vars.push(("PATH_VAR".to_string(), path_var));
+                }
+                match env.expander().expand_with_vars(&entry.template, &vars) {
                     Ok((text, cursor)) => {
-                        let mut p = Prediction::commit(text);
+                        // 候选行显示 `comment`(缺省显示展开文本);上屏用展开结果。
+                        let display = if entry.comment.is_empty() {
+                            text.clone()
+                        } else {
+                            entry.comment.clone()
+                        };
+                        let mut p = Prediction::commit_triple(display, text.clone(), text);
                         p.cursor = cursor;
                         vec![p]
                     }

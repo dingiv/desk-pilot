@@ -23,6 +23,7 @@
 
 mod manager;
 mod sqlite;
+pub mod snippet_md;
 
 pub use manager::PersistenceManager;
 pub use sqlite::WeightStore;

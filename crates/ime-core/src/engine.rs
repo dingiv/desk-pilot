@@ -35,6 +35,7 @@ use crate::platform::ImeView;
 pub use crate::router::KeyEvent;
 use crate::state::{StateMachine, StepEnv};
 use crate::store::PersistenceManager;
+use crate::store::snippet_md::*;
 
 // ── PerContext ──────────────────────────────────────────────────────────
 
@@ -139,7 +140,7 @@ impl ImeEngine {
         pinyin_weights: crate::family::pinyin::PinyinWeights,
         english_weights: crate::family::english::EnglishWeights,
         provider: Box<dyn crate::expander::VariableProvider>,
-        extra_snippets: Vec<(String, String)>,
+        extra_snippets: Vec<crate::store::snippet_md::SnippetEntry>,
         scoring: crate::scoring::ScoringConfig,
         frontend: Arc<dyn crate::frontend::FrontEndHandle>,
         voice_aura_base: String,
@@ -155,19 +156,23 @@ impl ImeEngine {
             m.register_addons(&addons);
         }
         let matcher = crate::Matcher::new(magic.matcher_entries());
-        // 片段注册表:内置 + 配置片段;名字去掉前导 `/`(触发名 `/sig` → `sig`,
+        // 片段注册表:内置 + 外部注入(SNIP md / 配置);名字为片段名(如 `sig`,
         // 调用 `#/sig`)。
-        let mut snippets: Vec<(String, String)> = vec![
-            (
-                "greet".into(),
-                "你好，我是 AI 秘书，请问有什么可以帮你的？".into(),
-            ),
-            ("sig".into(), "Best regards,\nAlice".into()),
+        let mut snippets: Vec<SnippetEntry> = vec![
+            SnippetEntry {
+                name: "greet".into(),
+                comment: String::new(),
+                params: Vec::new(),
+                template: "你好，我是 AI 秘书，请问有什么可以帮你的？".into(),
+            },
+            SnippetEntry {
+                name: "sig".into(),
+                comment: String::new(),
+                params: Vec::new(),
+                template: "Best regards,\nAlice".into(),
+            },
         ];
-        for (trigger, expand) in extra_snippets {
-            let name = trigger.strip_prefix('/').unwrap_or(&trigger).to_string();
-            snippets.push((name, expand));
-        }
+        snippets.extend(extra_snippets);
         magic.set_snippets(snippets);
         // Shared with the dispatcher's expander — `set_variable` writes through the same Arc.
         let provider: Arc<dyn crate::expander::VariableProvider> = Arc::from(provider);
@@ -1005,7 +1010,12 @@ mod tests {
             crate::family::pinyin::PinyinWeights::default(),
             crate::family::english::EnglishWeights::default(),
             Box::new(NoVars),
-            vec![("/hello".into(), "Hello, my name is $name.".into())],
+            vec![SnippetEntry {
+                name: "hello".into(),
+                comment: String::new(),
+                params: Vec::new(),
+                template: "Hello, my name is $name.".into(),
+            }],
             crate::scoring::ScoringConfig::default(),
             Arc::new(crate::frontend::NoopFrontend::default()),
             DEFAULT_VOICE_AURA_BASE.to_string(),

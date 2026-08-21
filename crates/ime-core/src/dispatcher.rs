@@ -281,7 +281,12 @@ mod tests {
         );
         // 片段经 magic 注册表(`#/greet`),而非 matcher trie。
         d.magic()
-            .set_snippets(vec![("greet".into(), "你好,我是 AI 秘书".into())]);
+            .set_snippets(vec![crate::store::snippet_md::SnippetEntry {
+                name: "greet".into(),
+                comment: String::new(),
+                params: Vec::new(),
+                template: "你好,我是 AI 秘书".into(),
+            }]);
         d
     }
 
@@ -418,7 +423,12 @@ mod tests {
             Box::new(StubPinyin),
         );
         d.magic()
-            .set_snippets(vec![("note".into(), "$DATE 完成: $CURSOR 记得检查".into())]);
+            .set_snippets(vec![crate::store::snippet_md::SnippetEntry {
+                name: "note".into(),
+                comment: String::new(),
+                params: Vec::new(),
+                template: "$DATE 完成: $CURSOR 记得检查".into(),
+            }]);
         let mut s = sm();
         for c in "#/note".chars() {
             d.process_key(c, &mut s);

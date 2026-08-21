@@ -87,9 +87,9 @@ pub struct MagicAddonConfig {
     /// addon 服务地址(`http://127.0.0.1:9788`)。
     #[serde(default)]
     pub url: String,
-    /// 逗号分隔的命令名列表(`eg,eg1,eg2` → 各生成 `#eg` `#eg1` `#eg2`)。
+    /// 命令**路径模板**列表(`eg?param1=&param2=2`、`eg/name?nick=1&len=10`)。
     #[serde(default)]
-    pub cmd: String,
+    pub cmds: Vec<String>,
 }
 
 fn default_req_base() -> String {
@@ -405,6 +405,31 @@ fn seed_from_template(user_path: &Path, template: &Path) -> SeedOutcome {
         Ok(_) => SeedOutcome::Copied,
         Err(e) => SeedOutcome::CopyFailed(e),
     }
+}
+
+/// SNIP 片段模板(由 .deb 装到 `/usr/share/swift-ime/demo.md`)。
+const SNIP_TEMPLATE: &str = "/usr/share/swift-ime/demo.md";
+
+/// 首次运行时把系统 SNIP 模板(`/usr/share/swift-ime/demo.md`)拷到用户的
+/// `~/.desk-pilot/snippets/demo.md`(CONF 命名空间的种子逻辑同上:模板更新不覆盖
+/// 用户已有片段)。返回用户 SNIP 目录。
+/// 开发模式 dev 用 `assets/snippets`,不需要播种。
+pub fn seed_snippets_dir() -> std::path::PathBuf {
+    let loader = shared::loader!(".");
+    let user_dir = loader.resolve("SNIP::").unwrap_or_default();
+    // 仅生产模式(user 目录与模板不同)且用户目录不存在时播种。
+    if !user_dir.exists() && Path::new(SNIP_TEMPLATE).exists() {
+        let _ = std::fs::create_dir_all(&user_dir);
+        let dst = user_dir.join("demo.md");
+        match std::fs::copy(SNIP_TEMPLATE, &dst) {
+            Ok(_) => eprintln!(
+                "[swift-ime] seeded user snippets from template → {}",
+                dst.display()
+            ),
+            Err(e) => eprintln!("[swift-ime] seed snippets failed: {e}"),
+        }
+    }
+    user_dir
 }
 
 #[cfg(test)]

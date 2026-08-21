@@ -173,10 +173,18 @@ pub extern "C" fn swift_ime_create(
         prefix_ratio: cfg.weights.english.prefix_ratio,
         user_boost: cfg.weights.english.user_boost,
     };
-    let snippets: Vec<(String, String)> = cfg.snippets
-        .iter()
-        .map(|s| (s.trigger.clone(), s.expand.clone()))
-        .collect();
+    // 片段:SNIP 目录里的 md 片段 + 配置(yaml)片段;两者合并(重名后者覆盖)。
+    use ime_core::store::snippet_md::SnippetEntry;
+    let mut snippets: Vec<SnippetEntry> = {
+        let dir = crate::config::seed_snippets_dir();
+        ime_core::store::snippet_md::load_dir(&dir)
+    };
+    snippets.extend(cfg.snippets.iter().map(|s| SnippetEntry {
+        name: s.trigger.strip_prefix('/').unwrap_or(&s.trigger).to_string(),
+        comment: String::new(),
+        params: Vec::new(),
+        template: s.expand.clone(),
+    }));
     // 回调打包在 FcitxHandle 里由 C++ 传入 —— 无全局注册表、无 set_ui_cbs。
     let h = unsafe { handle.as_ref() };
     let ud = h.map(|h| h.instance as usize).unwrap_or(0);
@@ -192,12 +200,7 @@ pub extern "C" fn swift_ime_create(
         .map(|a| ime_core::family::magic::AddonConfig {
             name: a.name.clone(),
             url: a.url.clone(),
-            cmds: a
-                .cmd
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
+            cmds: a.cmds.clone(),
         })
         .collect();
     let mut engine = Arc::new(ImeEngine::with_config(

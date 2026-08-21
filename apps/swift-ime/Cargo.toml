@@ -42,3 +42,4 @@ shared = { path = "../../crates/shared" }
 DICT = { dev = "assets/dict", prod = "/usr/share/swift-ime/dict" }
 CONF = { dev = ".", prod = "~/.desk-pilot" }
 DATA = { dev = "data", prod = "~/.desk-pilot"}
+SNIP = { dev = "assets/snippets", prod = "~/.desk-pilot/snippets"}

@@ -99,11 +99,19 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<ime_core::voice_state::
         prefix_ratio: sw_cfg.weights.english.prefix_ratio,
         user_boost: sw_cfg.weights.english.user_boost,
     };
-    // Mock/TUI: default provider (live $DATE, empty clipboard) + config snippets.
-    let snippets: Vec<(String, String)> = sw_cfg.snippets
-        .iter()
-        .map(|s| (s.trigger.clone(), s.expand.clone()))
-        .collect();
+    // Mock/TUI: default provider (live $DATE, empty clipboard) + SNIP md 片段
+    // + 配置片段(重名后者覆盖)。
+    use ime_core::store::snippet_md::SnippetEntry;
+    let mut snippets: Vec<SnippetEntry> = {
+        let dir = crate::config::seed_snippets_dir();
+        ime_core::store::snippet_md::load_dir(&dir)
+    };
+    snippets.extend(sw_cfg.snippets.iter().map(|s| SnippetEntry {
+        name: s.trigger.strip_prefix('/').unwrap_or(&s.trigger).to_string(),
+        comment: String::new(),
+        params: Vec::new(),
+        template: s.expand.clone(),
+    }));
     // 配置化 addon 插件命令(`magic.addons`):`#eg/name` → GET {url}/eg/name。
     let addons: Vec<ime_core::family::magic::AddonConfig> = sw_cfg
         .magic
@@ -112,12 +120,7 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<ime_core::voice_state::
         .map(|a| ime_core::family::magic::AddonConfig {
             name: a.name.clone(),
             url: a.url.clone(),
-            cmds: a
-                .cmd
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
+            cmds: a.cmds.clone(),
         })
         .collect();
     let mut engine = ImeEngine::with_config(
