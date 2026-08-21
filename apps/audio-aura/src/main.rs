@@ -21,9 +21,9 @@
 //! which overrides the `log_level` setting as the standard tracing escape hatch.
 
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use axum::extract::{Path, Query, State};
@@ -181,6 +181,9 @@ struct AuraConf {
     /// N-ms 的 HTTP chunk 再推(不能快过 scout 的 node.quantum)。None = 不传,scout
     /// 按自身 quantum 速率推。纯网络层优化——消费侧照样重切 32ms 窗喂 VAD。
     scout_chunk_ms: Option<u64>,
+    /// idle 深度睡眠(秒): 无客户端订阅 SSE 长连接持续此秒数 → Stage1 停止 + 断开 scout,
+    /// 深度睡眠(CPU≈0); 下一个客户端连接时自动恢复。0/缺省 = 关闭。
+    idle_timeout: Option<u64>,
     /// Daemon socket 监听地址 (default `127.0.0.1`)。
     bind_addr: Option<String>,
     /// Daemon socket port (default 9091)。
@@ -286,12 +289,14 @@ struct Settings {
     /// `shared::init_tracing_with_filter`).
     log_level: String,
     spec: PipelineSpec,
+    /// idle 深度睡眠超时(秒); None = 关闭。
+    idle_timeout: Option<u64>,
 }
 
 /// Pure merge: CLI > `aura.yaml` > built-in default. (`--no-stage3` wins over the file;
 /// model / hotwords / web_dist / vad are config-file-only — low-frequency knobs.)
 fn resolve(cli: Cli, conf: AuraConf) -> Settings {
-    let AuraConf { scout_addr, scout_chunk_ms, bind_addr, port, stage3, log_level, web_dist, hotwords, asr, llm, storage } = conf;
+    let AuraConf { scout_addr, scout_chunk_ms, idle_timeout, bind_addr, port, stage3, log_level, web_dist, hotwords, asr, llm, storage } = conf;
     // VAD: each field is the config value or the pipeline's built-in default
     // (`VadSpec::default` — pinned equal to Stage1Config's defaults by a core unit test,
     // so this can't drift from what the recognizer would use anyway).
@@ -335,6 +340,7 @@ fn resolve(cli: Cli, conf: AuraConf) -> Settings {
         recordings_dir: storage.recordings_dir,
         recordings_retention_days: storage.retention_days.unwrap_or(7),
         log_level: log_level.unwrap_or_else(|| "info".to_string()),
+        idle_timeout,
         spec: PipelineSpec {
             scout_addr: cli
                 .scout_addr
@@ -365,6 +371,16 @@ struct DaemonState {
     corrections: Arc<Mutex<Vec<(String, String)>>>,
     /// Scout-connection toggle (shared with the Stage1 recognizer's ingest + run loop).
     active: Arc<AtomicBool>,
+    /// idle 深度睡眠信号: false → Stage1 退出 + 断开 scout; 恢复时置回 true。
+    running: Arc<AtomicBool>,
+    /// 当前是否处于 idle 深度睡眠。
+    idle: Arc<AtomicBool>,
+    /// 活跃的 SSE 长连接订阅数(数据面 + 控制面)。idle 监控据此判断"无客户端"。
+    subscribers: Arc<std::sync::atomic::AtomicUsize>,
+    /// 恢复唤醒:pipeline 线程在 idle 后 park 在这里; 下一个客户端连接时 notify。
+    resume_cv: Arc<(Mutex<()>, Condvar)>,
+    /// idle 深度睡眠超时; None = 关闭。
+    idle_timeout: Option<Duration>,
     /// Bumped on ANY SETTINGS change (connected / hotword / correction). Recognition events do
     /// NOT bump — they're pushed via `asr_events` (the data plane). The SSE handler ticks at the
     /// client's rate and pings only when this advances.
@@ -404,6 +420,58 @@ impl DaemonState {
     fn bump(&self) {
         self.version.fetch_add(1, Ordering::Release);
     }
+
+    /// 恢复识别:置 running=true + active=true(重连 scout), 唤醒 pipeline 线程重跑消费循环。
+    fn resume(&self) {
+        self.active.store(true, Ordering::Release);
+        self.idle.store(false, Ordering::Release);
+        if self.running.swap(true, Ordering::Release) == false {
+            info!("client connected — resuming recognition");
+        }
+        self.resume_cv.1.notify_one();
+    }
+
+    /// 进入 idle 深度睡眠:running=false(Stage1 消费循环退出) + active=false(断开 scout)。
+    fn enter_idle(&self) {
+        info!("entering idle — no subscribers, disconnecting scout");
+        self.running.store(false, Ordering::Release);
+        self.active.store(false, Ordering::Release);
+        self.idle.store(true, Ordering::Release);
+    }
+}
+
+/// 订阅守卫:连接时 subscriber +1(0→1 且 idle 时自动恢复); 断开(Drop)时 -1。
+struct SubGuard {
+    state: DaemonState,
+}
+impl SubGuard {
+    fn subscribe(state: DaemonState) -> SubGuard {
+        let was_zero = state.subscribers.fetch_add(1, Ordering::SeqCst) == 0;
+        if was_zero && state.idle.load(Ordering::Relaxed) {
+            state.resume(); // 首个客户端连上 → 从深度睡眠恢复
+        }
+        SubGuard { state }
+    }
+}
+impl Drop for SubGuard {
+    fn drop(&mut self) {
+        self.state.subscribers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// 持有订阅守卫的流:守卫随流一起 drop, 保证断开时 subscriber 减一。
+struct Guarded<S> {
+    inner: S,
+    _guard: SubGuard,
+}
+impl<S: tokio_stream::Stream + Unpin> tokio_stream::Stream for Guarded<S> {
+    type Item = S::Item;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
 }
 
 fn main() -> Result<()> {
@@ -427,11 +495,15 @@ fn main() -> Result<()> {
             warn!(what, log_level = %effective_level, "conf parse error — fallback in effect")
         }
     }
-    let Settings { bind_addr, port, stage3_on, web_dist, recordings_dir, recordings_retention_days, log_level, spec } = s;
+    let Settings { bind_addr, port, stage3_on, web_dist, recordings_dir, recordings_retention_days, log_level, spec, idle_timeout } = s;
 
     // Connection toggle + shared snapshot state, shared across the Pipeline thread + socket
     // handlers. (No event bus — SSE pings off the `version` counter; data lives in the snapshot.)
     let active = Arc::new(AtomicBool::new(true));
+    // idle 深度睡眠信号: false → Stage1 消费循环退出 + 断开 scout; 恢复时置回 true。
+    let running = Arc::new(AtomicBool::new(true));
+    // idle 恢复唤醒: daemon 在下一个客户端连接时置 running=true + notify pipeline 线程。
+    let resume_cv: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
     let version = Arc::new(AtomicU64::new(0));
     // Data-plane channel: recognition segments pushed to /api/asr_stream subscribers.
     let (asr_events, _) = broadcast::channel::<AsrSegment>(1024);
@@ -501,6 +573,7 @@ fn main() -> Result<()> {
     let pipeline = Pipeline::assemble(
         &spec,
         Arc::clone(&active),
+        Arc::clone(&running),
         Arc::clone(&hotwords),
         Arc::clone(&corrections),
         Some(Arc::clone(&storage)), // WindowCalibration 时自动 record_final(archive+day log+ring)
@@ -512,7 +585,7 @@ fn main() -> Result<()> {
         let tool = tool.clone();
         let version = Arc::clone(&version);
         let asr_events = asr_events.clone();
-        pipeline.spawn(move |ev| {
+        pipeline.spawn(Arc::clone(&running), Arc::clone(&resume_cv), move |ev| {
             // Recognition events → DATA plane only (broadcast the segment). The control
             // plane (version/snapshot) is NOT bumped here — only settings changes bump it.
             // (识别日志与窗口归档在 core 的 run() 内部——这里只做线协议映射。)
@@ -556,6 +629,11 @@ fn main() -> Result<()> {
         hotwords: Arc::clone(&hotwords),
         corrections: Arc::clone(&corrections),
         active: Arc::clone(&active),
+        running: Arc::clone(&running),
+        idle: Arc::new(AtomicBool::new(false)),
+        subscribers: Arc::new(AtomicUsize::new(0)),
+        resume_cv: Arc::clone(&resume_cv),
+        idle_timeout: idle_timeout.map(Duration::from_secs),
         version: Arc::clone(&version),
         asr_events: asr_events.clone(),
         config,
@@ -566,8 +644,32 @@ fn main() -> Result<()> {
         .enable_all()
         .thread_name("aura-socket")
         .build()?;
+    // idle 深度睡眠监控:无 SSE 订阅持续 idle_timeout → 进入 idle(Stage1 退出 + 断开 scout)。
+    if let Some(timeout) = state.idle_timeout {
+        if timeout > Duration::ZERO {
+            let mon = state.clone();
+            rt.spawn(async move {
+                let mut since: Option<Instant> = None;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if mon.subscribers.load(Ordering::Relaxed) == 0 {
+                        match since {
+                            None => since = Some(Instant::now()),
+                            Some(t) if t.elapsed() >= timeout => {
+                                mon.enter_idle();
+                                since = None;
+                            }
+                            Some(_) => {}
+                        }
+                    } else {
+                        since = None;
+                    }
+                }
+            });
+        }
+    }
     info!(port, "socket: http://{bind_addr}:{port}  (/api/state /api/stream /api/control/scout /api/correct /api/audio)");
-    info!(scout = %spec.scout_addr, stage3 = stage3_on, log_level = %log_level, "pipeline running on bg thread — Ctrl-C 结束");
+    info!(scout = %spec.scout_addr, stage3 = stage3_on, log_level = %log_level, idle_timeout = ?idle_timeout, "pipeline running on bg thread — Ctrl-C 结束");
     rt.block_on(serve_socket(state, bind_addr, port, web_dist));
     Ok(())
 }
@@ -645,6 +747,8 @@ async fn stream_asr(
     State(s): State<DaemonState>,
     Query(q): Query<StreamParams>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    // 长连接订阅登记(首个客户端连上且 idle → 恢复识别; 断开时 -1)。
+    let guard = SubGuard::subscribe(s.clone());
     let freq_ms = q.state_changed_frequency.unwrap_or(400).max(250);
     let version = Arc::clone(&s.version);
     let last_seen = Arc::new(AtomicU64::new(version.load(Ordering::Acquire)));
@@ -668,7 +772,7 @@ async fn stream_asr(
             }
         },
     );
-    Sse::new(hello.chain(pings)).keep_alive(KeepAlive::default())
+    Sse::new(Guarded { inner: hello.chain(pings), _guard: guard }).keep_alive(KeepAlive::default())
 }
 
 /// `GET /api/asr_stream` — the DATA plane: pushes each recognition segment directly to the
@@ -677,6 +781,8 @@ async fn stream_asr(
 /// / BatchWindow / SegmentCalibration / WindowCalibration). Late/lagged subscribers get a
 /// `lagged` comment (broadcast backlog overflowed) and keep going.
 async fn asr_stream(State(s): State<DaemonState>) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    // 长连接订阅登记(首个客户端连上且 idle → 恢复识别; 断开时 -1)。
+    let guard = SubGuard::subscribe(s.clone());
     let rx = s.asr_events.subscribe();
     let hello = tokio_stream::once(Ok::<_, Infallible>(
         Event::default().data(json!({ "type": "hello" }).to_string()),
@@ -687,7 +793,7 @@ async fn asr_stream(State(s): State<DaemonState>) -> Sse<impl tokio_stream::Stre
         )),
         Err(_) => Ok(Event::default().comment("lagged")),
     });
-    Sse::new(hello.chain(live)).keep_alive(KeepAlive::default())
+    Sse::new(Guarded { inner: hello.chain(live), _guard: guard }).keep_alive(KeepAlive::default())
 }
 
 /// `GET /api/audio/:window_id` — serve the settled window's WAV for playback. The archive

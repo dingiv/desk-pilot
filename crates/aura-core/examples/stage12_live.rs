@@ -9,7 +9,8 @@
 
 use std::fs;
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use audio_aura_core::recognizer::{OnnxStage1Recognizer, Stage1Config};
@@ -58,7 +59,10 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     println!("\n● Pipeline 就绪 (scout {scout_addr}/audio). Ctrl-C 结束.\n");
-    Pipeline::new(s1, Box::new(s2)).run(move |ev| match ev {
+    Pipeline::new(s1, Box::new(s2)).run(
+        Arc::new(AtomicBool::new(true)),
+        Arc::new((Mutex::new(()), Condvar::new())),
+        move |ev| match ev {
         TurnEvent::Interim { window_id, segment_id: _, partial, at_s } => {
             println!("  …流式 w{window_id} @{at_s:.1}s: {partial}")
         }

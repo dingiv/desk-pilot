@@ -96,6 +96,9 @@ impl ScoutAudioSource {
         let mut buf: Vec<u8> = Vec::with_capacity(READ_BUF);
         let mut tmp = [0u8; READ_BUF];
         let hdr_end = loop {
+            if !self.active.load(Ordering::Relaxed) {
+                anyhow::bail!("inactive — closing scout connection"); // idle 断开
+            }
             if let Some(pos) = find_subseq(&buf, b"\r\n\r\n") {
                 break pos + 4; // body starts after the blank line
             }
@@ -121,6 +124,10 @@ impl ScoutAudioSource {
         let mut odd_byte: Option<u8> = None; // carry a lone byte across reads (odd PCM length)
 
         loop {
+            // idle 深度睡眠: active 被置 false → 立即关闭 scout 连接(断开), 让 scout 停麦。
+            if !self.active.load(Ordering::Relaxed) {
+                break;
+            }
             // If body doesn't have what we need, refill from the socket.
             match state {
                 State::SizeLine => {

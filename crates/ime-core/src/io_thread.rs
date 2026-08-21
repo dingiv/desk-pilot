@@ -16,6 +16,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use audio_aura_agent::client::AuraClient;
 use audio_aura_agent::view::AsrSegment;
@@ -88,6 +89,10 @@ pub struct IoThread {
 
 /// aura SSE 数据流(owned —— 由 `subscribe_segments_owned` 产生,可自由移动)。
 type Sse = Pin<Box<dyn futures::Stream<Item = AsrSegment>>>;
+
+/// 语音连接空闲超时:退出 `#asr` 后,若长时间没有新的 ASR 使用(Attach),
+/// voice server 主动断开 aura,释放连接。
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 对 SSE 流的一次 poll:拿到一个段,并**把流原样还回**,让循环决定续传还是放弃。
 /// 所有权进出,future 无借用,可放进 `FuturesUnordered`。
@@ -164,6 +169,8 @@ async fn voice_server_main(
     let mut active_ctx: i64 = -1;
     // 是否持有 aura SSE 源(连接中)。
     let mut connected = false;
+    // 最近一次 ASR 使用(Attach)时刻 —— 空闲超时据此断开 aura。
+    let mut last_activity = tokio::time::Instant::now();
 
     loop {
         select! {
@@ -176,6 +183,7 @@ async fn voice_server_main(
                         // Attach → refresh 会乒乓循环。
                         let is_new = active_ctx != ctx as i64;
                         active_ctx = ctx as i64;
+                        last_activity = tokio::time::Instant::now();
                         tracing::info!(ctx, is_new, connected, "voice Attach");
                         if !connected {
                             // 断裂/未连 → 触发重连:一次性 health 探针种 is_connected
@@ -260,6 +268,17 @@ async fn voice_server_main(
                     }
                     None => {} // sources 空(带 guard 不应发生)
                 }
+            }
+            // 臂 3:空闲超时 —— 无活跃 #asr 会话、仍持连接,且超过 IDLE_TIMEOUT
+            // 没有新 Attach → 主动断开 aura,释放连接(长连接不常驻)。
+            // guard 带 `connected`:断开后臂禁用,避免 deadline 已过导致空转。
+            _ = tokio::time::sleep_until(last_activity + IDLE_TIMEOUT),
+                if active_ctx < 0 && connected =>
+            {
+                tracing::info!("voice 空闲超过 {IDLE_TIMEOUT:?} → 主动断开 aura");
+                sources.clear(); // drop SSE 源 → reqwest 连接关闭。
+                connected = false;
+                state.set_connected(false);
             }
         }
     }

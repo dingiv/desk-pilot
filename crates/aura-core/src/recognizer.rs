@@ -105,6 +105,9 @@ pub struct Stage1Config {
     /// Shared connection toggle (see [`ScoutAudioSource::with_active`]). Flip to false to stop
     /// ingesting from scout (does NOT kill scout). Defaults to true.
     pub active: Arc<AtomicBool>,
+    /// 运行信号(idle 深度睡眠):false → `run` 退出消费循环, 断开 scout; daemon 在下一个客户端
+    /// 连接时置回 true 唤醒。与 `active`(scout 开关, 用户可单独控制) 独立。默认 true。
+    pub running: Arc<AtomicBool>,
 }
 
 impl Stage1Config {
@@ -151,6 +154,7 @@ impl Stage1Config {
             merge_gap_s: 5.0,
             batch_enabled: true,
             active: Arc::new(AtomicBool::new(true)),
+            running: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -198,7 +202,8 @@ impl Stage1Config {
 /// ingest+consume loop) and invokes `on_event` for each interim partial / settled segment /
 /// closed window.
 pub trait Stage1Recognizer {
-    fn run(&self, on_event: &mut dyn FnMut(Stage1Event)) -> !;
+    /// 跑消费循环直到 `running` 被置 false(idle 深度睡眠)→ 返回。daemon 恢复时重新调用。
+    fn run(&self, on_event: &mut dyn FnMut(Stage1Event)) -> ();
 }
 
 /// Batch ASR turned off (`asr.backend: disable`): every pass yields empty text, which the
@@ -226,6 +231,8 @@ pub struct OnnxStage1Recognizer {
     /// Merge-window gap (s) — see [`Stage1Config::merge_gap_s`].
     merge_gap_s: f64,
     active: Arc<AtomicBool>,
+    /// idle 运行信号:false → run 退出循环(深度睡眠)。
+    running: Arc<AtomicBool>,
     /// The PCM store: segments' clips live here by id until their window settles.
     audio_store: Arc<AudioStore>,
 }
@@ -274,6 +281,7 @@ impl OnnxStage1Recognizer {
             ring_cv,
             merge_gap_s: cfg.merge_gap_s,
             active: cfg.active,
+            running: cfg.running,
             audio_store: Arc::new(AudioStore::new(DEFAULT_CAP_SAMPLES)),
             batch_asr,
         })
@@ -304,6 +312,7 @@ impl OnnxStage1Recognizer {
             ring_cv,
             merge_gap_s: cfg.merge_gap_s,
             active: cfg.active,
+            running: cfg.running,
             audio_store: Arc::new(AudioStore::new(DEFAULT_CAP_SAMPLES)),
             batch_asr,
         })
@@ -811,7 +820,7 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
     // TODO(R5 残余): 轮询已除(2026-08-18 —— ring 挂 Condvar,无帧时挂起等 ingest notify,
     // 仅真实截止时间唤醒,空闲零唤醒);仍待整改:batch 调用还在消费线程内同步执行
     // (远程 ~3.5s/次会暂停流式),以及 run 仍占用整线程的阻塞模型。
-    fn run(&self, on_event: &mut dyn FnMut(Stage1Event)) -> ! {
+    fn run(&self, on_event: &mut dyn FnMut(Stage1Event)) {
         let sr = 16000u32;
         let start = Instant::now();
         let mut last_diag = Instant::now();
@@ -829,6 +838,11 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
         let mut speech_active = false; // 上一帧 detected()——翻转时补喂 lead_in
 
         loop {
+            // ⓪ idle 深度睡眠:running=false → 退出消费循环。daemon 断开 scout,下一个客户端
+            //   连接时置回 true 并重新调用 run() 恢复识别。
+            if !self.running.load(Ordering::Relaxed) {
+                return;
+            }
             // ① 连接开关:scout 暂停时挂起等音频,不做 VAD/ASR
             if !self.active.load(Ordering::Relaxed) {
                 let _ = wait_frame(&self.ring, &self.ring_cv, WINDOW, None);
