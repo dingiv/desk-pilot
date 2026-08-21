@@ -190,13 +190,13 @@ void SwiftImeEngine::apply_view(fcitx::InputContext *ic, const ImeView &v) {
 
     // After refresh: log the candidate area when in voice (#asr) mode. Debug-level (gated by
     // FCITX_DEBUG) so it doesn't spam by default — enable when diagnosing the live-refresh path.
-    if (std::strstr(v.preedit_text, "asr") != nullptr) {
-        FCITX_DEBUG() << "[voice] apply_view ic=" << ic << " count=" << v.candidate_count
-                      << " preedit='" << v.preedit_text << "'";
-        for (unsigned int i = 0; i < v.candidate_count && i < CANDIDATE_SLOTS; i++) {
-            FCITX_DEBUG() << "[voice]   [" << i << "] " << v.candidates[i].text;
-        }
-    }
+    // if (std::strstr(v.preedit_text, "asr") != nullptr) {
+    //     FCITX_DEBUG() << "[voice] apply_view ic=" << ic << " count=" << v.candidate_count
+    //                   << " preedit='" << v.preedit_text << "'";
+    //     for (unsigned int i = 0; i < v.candidate_count && i < CANDIDATE_SLOTS; i++) {
+    //         FCITX_DEBUG() << "[voice]   [" << i << "] " << v.candidates[i].text;
+    //     }
+    // }
 
     prev = v;
 }
@@ -211,7 +211,7 @@ void SwiftImeEngine::apply_view(fcitx::InputContext *ic, const ImeView &v) {
 void SwiftImeEngine::onRefresh(uintptr_t ctx) {
     // 诊断:voice Attach 的定向 ctx(#asr)/ req / clip 推真实 ic 指针;
     // ctx=0 广播分支留作后备(当前无源会发 0)。
-    FCITX_INFO() << "[refresh] onRefresh ctx=" << (void *)ctx;
+    // FCITX_INFO() << "[refresh] onRefresh ctx=" << (void *)ctx;
     {
         std::lock_guard<std::mutex> lk(refreshMutex_);
         pendingRefreshes_.insert(ctx);
@@ -237,8 +237,8 @@ void SwiftImeEngine::drainRefresh() {
         // ctx 0 = 引擎级广播:遍历所有活动上下文逐出一次 magic_tick —— 只有
         // 处于 live 魔法会话(#asr)的 context 返回新视图,其余返回 0 跳过。
         if (c == 0) {
-            FCITX_DEBUG() << "[refresh] broadcast ctx=0 → activeContexts_="
-                         << activeContexts_.size();
+            // FCITX_DEBUG() << "[refresh] broadcast ctx=0 → activeContexts_="
+            //              << activeContexts_.size();
             std::vector<fcitx::InputContext *> all(activeContexts_.begin(),
                                                    activeContexts_.end());
             for (auto *ic : all) {
@@ -254,8 +254,8 @@ void SwiftImeEngine::drainRefresh() {
         auto *ic = reinterpret_cast<fcitx::InputContext *>(c);
         ImeView view;
         int r = swift_ime_magic_tick(handle_, (void *)ic, &view);
-        FCITX_INFO() << "[refresh] directed ctx=" << (void *)ic
-                     << " magic_tick=" << r;
+        // FCITX_INFO() << "[refresh] directed ctx=" << (void *)ic
+        //              << " magic_tick=" << r;
         if (r) {
             apply_view(ic, view);
         }

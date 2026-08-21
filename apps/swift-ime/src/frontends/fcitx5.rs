@@ -108,7 +108,7 @@ impl FrontEndHandle for FcitxFrontend {
             .and_then(|w| w.upgrade())
             .map(|e| e.is_voice_ctx_alive(sv.ctx))
             .unwrap_or(true);
-        tracing::info!(ctx = sv.ctx, alive, "FcitxFrontend::refresh_ui → C cb");
+        // tracing::info!(ctx = sv.ctx, alive, "FcitxFrontend::refresh_ui → C cb");
         alive
     }
 }

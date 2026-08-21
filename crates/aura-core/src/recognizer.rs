@@ -20,6 +20,7 @@
 //! });
 //! ```
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -599,6 +600,168 @@ impl ActiveSession {
     }
 }
 
+impl OnnxStage1Recognizer {
+    /// 喂流式会话(VAD 门控):`detected()` 为 true 时 accept+解码,起音翻转(false→true)补喂
+    /// 最近 ~0.5s 的 lead-in(soft onset 进会话)。空闲 park,只累积有界 lead-in。
+    /// `accept_waveform` 与 `pcm` 喂**完全相同**的帧 → 流式与 batch 共享同一段音频。
+    fn feed_streaming(
+        &self,
+        sess: &mut Option<ActiveSession>,
+        tracker: &mut WindowTracker,
+        lead_in: &mut VecDeque<Vec<i16>>,
+        speech_active: &mut bool,
+        frame: &[i16],
+        sr: u32,
+        at_s: f64,
+        v_detected: bool,
+        on_event: &mut dyn FnMut(Stage1Event),
+    ) {
+        let (Some(asr), Some(a)) = (self.mgr.streaming_asr(), sess.as_mut()) else { return };
+        if v_detected {
+            if !*speech_active {
+                // 起音:补喂 lead-in,让流式/batch 都听到 soft onset
+                for chunk in lead_in.drain(..) {
+                    a.stream.accept_waveform(sr as i32, &chunk);
+                    a.pcm.extend_from_slice(&chunk);
+                    a.fed += 1;
+                }
+                a.frames_since_partial = 0; // 补喂后重新起解码节拍
+            }
+            a.stream.accept_waveform(sr as i32, frame);
+            a.pcm.extend_from_slice(frame); // 流式与 batch 共用同一段音频
+            a.fed += 1;
+            a.frames_since_partial += 1;
+            if a.frames_since_partial >= PARTIAL_EVERY_FRAMES {
+                let partial = asr.decode_and_result(&a.stream);
+                if !partial.is_empty() && partial != a.last_partial {
+                    let (window_id, segment_id) = tracker.prospective();
+                    on_event(Stage1Event::StreamFragment {
+                        window_id,
+                        segment_id,
+                        text: partial.clone(),
+                        at_s,
+                    });
+                    a.last_partial = partial;
+                    a.last_change = Instant::now();
+                }
+                a.frames_since_partial = 0;
+            }
+        } else {
+            // 空闲:流式会话 park;只累积有界 lead-in(供下次起音补喂)
+            lead_in.push_back(frame.to_vec());
+            if lead_in.len() > LEAD_IN_FRAMES {
+                lead_in.pop_front();
+            }
+        }
+        *speech_active = v_detected;
+    }
+
+    /// 定稿一个 VAD 段(EOS 臂):finalize 流式会话 → streaming_text,段 PCM 跑 batch,
+    /// emit `Batch`(及可能的 `WindowEdge`)。`fallback_pcm` = 流式未配置时的 VAD
+    /// edge-extended 段。返回 true = 段被丢弃(双路文本都空,噪声段)。
+    fn finalize_segment(
+        &self,
+        sess: Option<ActiveSession>,
+        tracker: &mut WindowTracker,
+        cur_seg: &mut SegmentId,
+        sr: u32,
+        end_s: f64,
+        fallback_pcm: Vec<i16>,
+        fed: u32,
+        on_event: &mut dyn FnMut(Stage1Event),
+    ) -> bool {
+        // 段 PCM = 流式 session 累积的完整音频(含段首 soft onset)——与流式听到的完全一致,
+        // 区别只在 batch 一次整段听(大块)vs 流式逐帧听(小块)。流式未配置时 fallback VAD 段。
+        let seg_pcm = sess.as_ref().map(|a| a.pcm.clone()).unwrap_or(fallback_pcm);
+        let streaming_text = match (self.mgr.streaming_asr(), sess.as_ref()) {
+            (Some(asr), Some(a)) => asr.finalize_and_result(&a.stream),
+            _ => String::new(),
+        };
+        // One batch pass over the segment's PCM. Err (remote network) and empty text → None.
+        let batch_text = self
+            .batch_asr
+            .recognize(&seg_pcm, sr)
+            .ok()
+            .filter(|t| !t.trim().is_empty());
+        // Neither pass produced text → noise segment: discard entirely.
+        if streaming_text.trim().is_empty() && batch_text.is_none() {
+            debug!("segment discarded — neither streaming nor batch produced text");
+            tracker.drop_active();
+            return true;
+        }
+        // Speech onset back-derived from the PCM duration (SOS was retroactive, so its
+        // wall-clock IS the EOS instant).
+        let start_s = (end_s - seg_pcm.len() as f64 / sr as f64).max(0.0);
+        let seg = VadSegment {
+            id: *cur_seg,
+            audio_id: self.audio_store.insert(seg_pcm),
+            start_s,
+            end_s,
+            streaming_text,
+            batch_text,
+        };
+        let (settled, window_id, segments) = tracker.on_eos(seg);
+        // A big gap settled the previous window FIRST — emit it before this segment's Batch.
+        if let Some(s) = settled {
+            emit_window_edge(s, &self.audio_store, &*self.batch_asr, sr, on_event);
+        }
+        // 段级日志(debug):窗口/段 id、时长、两路文本、会话喂帧数。
+        if let Some(s) = segments.last() {
+            debug!(
+                window = window_id,
+                segment = s.id,
+                dur_ms = ((s.end_s - s.start_s) * 1000.0).round() as u64,
+                fed,
+                batch = s.batch_text.as_deref().unwrap_or("(none)"),
+                streaming = %s.streaming_text,
+                "段定稿(VadSegment)"
+            );
+        }
+        // Final stream fragment: the segment's DEFINITIVE streaming text (live partials only
+        // decode up to the last throttle frame; finalize is authoritative).
+        if let Some(s) = segments.last().filter(|s| !s.streaming_text.is_empty()) {
+            on_event(Stage1Event::StreamFragment {
+                window_id,
+                segment_id: s.id,
+                text: s.streaming_text.clone(),
+                at_s: end_s,
+            });
+        }
+        on_event(Stage1Event::Batch { window_id, segments });
+        false
+    }
+}
+
+/// 下一次唤醒截止:最早的真实定时器,或 None(无定时 → 无限期挂起等音频)。
+fn next_wake_at(
+    tracker: &WindowTracker,
+    sess: &Option<ActiveSession>,
+    ring_empty_since: Option<Instant>,
+    now_s: f64,
+    speaking: bool,
+) -> Option<Duration> {
+    let mut wake_at: Option<Duration> = None;
+    if let Some(d) = tracker.settle_deadline(now_s, speaking) {
+        let d = Duration::from_secs_f64(d.max(0.05));
+        wake_at = Some(wake_at.map_or(d, |w| w.min(d)));
+    }
+    if let Some(a) = sess.as_ref() {
+        if !a.last_partial.is_empty() {
+            let d = STALE_SESSION_RESET.saturating_sub(a.last_change.elapsed());
+            wake_at = Some(wake_at.map_or(d, |w| w.min(d)));
+        }
+    }
+    if let Some(since) = ring_empty_since {
+        let has_partial = sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
+        if has_partial {
+            // Silence-feed deadline: force VAD EOS if the source dropped mid-utterance.
+            let d = Duration::from_secs(2).saturating_sub(since.elapsed());
+            wake_at = Some(wake_at.map_or(d, |w| w.min(d)));
+        }
+    }
+    wake_at
+}
+
 impl Stage1Recognizer for OnnxStage1Recognizer {
     // TODO(R5 残余): 轮询已除(2026-08-18 —— ring 挂 Condvar,无帧时挂起等 ingest notify,
     // 仅真实截止时间唤醒,空闲零唤醒);仍待整改:batch 调用还在消费线程内同步执行
@@ -675,25 +838,7 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
             // Next wake deadline: the earliest REAL timer, or None = nothing time-based is
             // pending → park indefinitely (wake only on incoming audio). This is what
             // replaces polling — no heartbeat, no idle wakeups.
-            let mut wake_at: Option<Duration> = None;
-            if let Some(d) = tracker.settle_deadline(now_s, speaking) {
-                let d = Duration::from_secs_f64(d.max(0.05));
-                wake_at = Some(wake_at.map_or(d, |w| w.min(d)));
-            }
-            if let Some(a) = sess.as_ref() {
-                if !a.last_partial.is_empty() {
-                    let d = STALE_SESSION_RESET.saturating_sub(a.last_change.elapsed());
-                    wake_at = Some(wake_at.map_or(d, |w| w.min(d)));
-                }
-            }
-            if let Some(since) = ring_empty_since {
-                let has_partial = sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
-                if has_partial {
-                    // Silence-feed deadline: force VAD EOS if the source dropped mid-utterance.
-                    let d = Duration::from_secs(2).saturating_sub(since.elapsed());
-                    wake_at = Some(wake_at.map_or(d, |w| w.min(d)));
-                }
-            }
+            let wake_at = next_wake_at(&tracker, &sess, ring_empty_since, now_s, speaking);
 
             // drain one Silero window (512 samples = 32ms) when available
             let frame = {
@@ -750,50 +895,19 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
             let events = vad.push_frame(&frame);
             let v_detected = vad.detected();
 
-            // (1) 流式:只在 VAD 检测到语音时喂帧/解码(空闲零喂帧、零解码、零 CPU)。
-            //     · 起音翻转(detected 由 false→true)时补喂最近 ~0.5s 的 lead-in——Silero 要
-            //       几帧过阈值,detected 翻转晚于真实起音,lead-in 把 soft onset 补进会话;
-            //     · accept_waveform 与 pcm 喂的是**完全相同**的帧 → 流式与 batch 听到同一段
-            //       音频(共享 PCM 不变式);段边界会话 reset。
-            if let (Some(asr), Some(a)) = (sasr, sess.as_mut()) {
-                if v_detected {
-                    if !speech_active {
-                        // 起音:补喂 lead-in,让流式/batch 都听到 soft onset
-                        for chunk in lead_in.drain(..) {
-                            a.stream.accept_waveform(sr as i32, &chunk);
-                            a.pcm.extend_from_slice(&chunk);
-                            a.fed += 1;
-                        }
-                        a.frames_since_partial = 0; // 补喂后重新起解码节拍
-                    }
-                    a.stream.accept_waveform(sr as i32, &frame);
-                    a.pcm.extend_from_slice(&frame); // 流式与 batch 共用同一段音频
-                    a.fed += 1;
-                    a.frames_since_partial += 1;
-                    if a.frames_since_partial >= PARTIAL_EVERY_FRAMES {
-                        let partial = asr.decode_and_result(&a.stream);
-                        if !partial.is_empty() && partial != a.last_partial {
-                            let (window_id, segment_id) = tracker.prospective();
-                            on_event(Stage1Event::StreamFragment {
-                                window_id,
-                                segment_id,
-                                text: partial.clone(),
-                                at_s: start.elapsed().as_secs_f64(),
-                            });
-                            a.last_partial = partial;
-                            a.last_change = Instant::now();
-                        }
-                        a.frames_since_partial = 0;
-                    }
-                } else {
-                    // 空闲:流式会话 park;只累积有界 lead-in(供下次起音补喂)
-                    lead_in.push_back(frame.clone());
-                    if lead_in.len() > LEAD_IN_FRAMES {
-                        lead_in.pop_front();
-                    }
-                }
-            }
-            speech_active = v_detected;
+            // (1) 流式:只在 VAD detected() 时喂帧/解码(空闲零喂帧、零解码、零 CPU);
+            //     起音翻转补喂 lead-in(soft onset);accept 与 pcm 喂相同帧 → 流式/batch 共享音频。
+            self.feed_streaming(
+                &mut sess,
+                &mut tracker,
+                &mut lead_in,
+                &mut speech_active,
+                &frame,
+                sr,
+                start.elapsed().as_secs_f64(),
+                v_detected,
+                on_event,
+            );
 
             // (2b) VAD 事件 → WindowTracker → Batch (per segment) / WindowEdge (settle)。
             //     NOTE: this VAD emits SOS RETROACTIVELY — SOS+EOS arrive together in one
@@ -809,77 +923,16 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                     }
                     VadEventKind::EndOfSpeech => {
                         let end_s = start.elapsed().as_secs_f64();
-                        // Finalize the CURRENT streaming session → this segment's
-                        // streaming_text, then reset it (the next session covers exactly the
-                        // next segment). `fed` is diagnostic.
+                        // Finalize the CURRENT streaming session → this segment's streaming_text,
+                        // then reset it (the next session covers the next segment). `fed` 诊断。
                         let a = sess.take();
                         let fed = a.as_ref().map(|a| a.fed).unwrap_or(0);
-                        let streaming_text = match (sasr, a.as_ref()) {
-                            (Some(asr), Some(a)) => asr.finalize_and_result(&a.stream),
-                            _ => String::new(),
-                        };
                         sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
-                        // 段 PCM = 流式 session 累积的完整音频(含段首 soft onset)——与流式
-                        // 听到的完全一致,区别只在 batch 一次整段听(大块)vs 流式逐帧听(小块)。
-                        // 流式未配置(sess 为 None)时 fallback VAD 的 edge-extended 段。
-                        let seg_pcm = a.map(|a| a.pcm).unwrap_or_else(|| ev.pcm.clone());
-                        // One batch pass over the segment's PCM. Err (remote network) and
-                        // empty text both map to None.
-                        let batch_text = self
-                            .batch_asr
-                            .recognize(&seg_pcm, sr)
-                            .ok()
-                            .filter(|t| !t.trim().is_empty());
-                        // Neither pass produced text → noise segment: discard entirely.
-                        if streaming_text.trim().is_empty() && batch_text.is_none() {
-                            debug!("segment discarded — neither streaming nor batch produced text");
-                            tracker.drop_active();
-                            continue;
+                        if self.finalize_segment(
+                            a, &mut tracker, &mut cur_seg, sr, end_s, ev.pcm.clone(), fed, on_event,
+                        ) {
+                            continue; // 噪声段(双路文本都空)——丢弃
                         }
-                        // Speech onset back-derived from the PCM duration (SOS was
-                        // retroactive, so its wall-clock IS the EOS instant).
-                        let start_s = (end_s - seg_pcm.len() as f64 / sr as f64).max(0.0);
-                        let seg = VadSegment {
-                            id: cur_seg,
-                            audio_id: self.audio_store.insert(seg_pcm),
-                            start_s,
-                            end_s,
-                            streaming_text,
-                            batch_text,
-                        };
-                        let (settled, window_id, segments) = tracker.on_eos(seg);
-                        // A big gap settled the previous window FIRST — emit it before this
-                        // segment's Batch (its authoritative grouping).
-                        if let Some(s) = settled {
-                            emit_window_edge(s, &self.audio_store, &*self.batch_asr, sr, on_event);
-                        }
-                        // 段级日志(debug):每个 VadSegment 定稿时打印——窗口/段 id、
-                        // 时长、两路文本(batch 失败显式标出)、会话喂帧数(诊断)。
-                        // 刚定稿的段就是 segments 的最后一个(字符串已 move,从这借)。
-                        if let Some(s) = segments.last() {
-                            debug!(
-                                window = window_id,
-                                segment = s.id,
-                                dur_ms = ((s.end_s - s.start_s) * 1000.0).round() as u64,
-                                fed,
-                                batch = s.batch_text.as_deref().unwrap_or("(none)"),
-                                streaming = %s.streaming_text,
-                                "段定稿(VadSegment)"
-                            );
-                        }
-                        // Final stream fragment: the segment's DEFINITIVE streaming text
-                        // (live partials only decode up to the last throttle frame; finalize
-                        // is authoritative). Real ids now assigned by on_eos. Skipped when
-                        // streaming produced nothing (batch-only segment).
-                        if let Some(s) = segments.last().filter(|s| !s.streaming_text.is_empty()) {
-                            on_event(Stage1Event::StreamFragment {
-                                window_id,
-                                segment_id: s.id,
-                                text: s.streaming_text.clone(),
-                                at_s: end_s,
-                            });
-                        }
-                        on_event(Stage1Event::Batch { window_id, segments });
                     }
                 }
             }
