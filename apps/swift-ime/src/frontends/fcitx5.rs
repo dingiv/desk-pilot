@@ -184,6 +184,22 @@ pub extern "C" fn swift_ime_create(
         h.and_then(|h| h.refresh_ui).map(|cb| (cb, ud)),
         h.and_then(|h| h.get_clip_board).map(|cb| (cb, ud)),
     ));
+    // 配置化 addon 插件命令(`magic.addons`):`#eg/name` → GET {url}/eg/name。
+    let addons: Vec<ime_core::family::magic::AddonConfig> = cfg
+        .magic
+        .addons
+        .iter()
+        .map(|a| ime_core::family::magic::AddonConfig {
+            name: a.name.clone(),
+            url: a.url.clone(),
+            cmds: a
+                .cmd
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        })
+        .collect();
     let mut engine = Arc::new(ImeEngine::with_config(
         weights,
         eng_weights,
@@ -192,6 +208,7 @@ pub extern "C" fn swift_ime_create(
         cfg.weights.to_scoring(),
         frontend.clone() as Arc<dyn FrontEndHandle>,
         cfg.voice.aura_base.clone(),
+        addons,
     ));
     // &mut 配置 —— 必须在 attach_engine(建 Weak)之前:Arc::get_mut 要求
     // strong_count==1 且 weak_count==0。先配置完,再 attach。万一不变量被破坏,

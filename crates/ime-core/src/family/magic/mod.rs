@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 pub use clip::{ClipMember, CLIP_HISTORY_CAP};
 pub use member::{preview_text, CommandArgs, MagicMember, Prediction, CANDIDATE_PREVIEW_MAX};
-pub use req::{ReqFetcher, DEFAULT_REQ_BASE};
+pub use req::{AddonConfig, ReqFetcher, DEFAULT_REQ_BASE};
 pub use snippet::SnippetMember;
 pub use voice::VoiceMember;
 
@@ -213,7 +213,7 @@ impl MagicFamily {
         let resources = Arc::new(MagicResources::default());
         let members: Vec<Arc<dyn MagicMember>> = vec![
             Arc::new(VoiceMember::new(Arc::clone(&resources))),
-            Arc::new(ReqMember::new(Arc::clone(&resources))),
+            Arc::new(ReqMember::new_req(Arc::clone(&resources))),
             Arc::new(ClipMember::new(Arc::clone(&resources))),
             // 片段命令:空名魔法命令(`#/hello?name=Mike`),经 `#` + `/` 路由。
             Arc::new(SnippetMember::new(Arc::clone(&resources))),
@@ -439,6 +439,29 @@ impl MagicFamily {
     /// 注入 voice server 命令 sender(`#asr` 家族发 Attach/Detach)。
     pub fn set_voice_tx(&self, tx: crate::io_thread::VoiceCmdSender) {
         *self.resources.voice_tx.lock().unwrap() = Some(tx);
+    }
+
+    /// 注册配置化 addon 插件命令(`magic.addons`)。每条命令成为 `#<cmd>`,
+    /// `#<cmd><path?query>` → `GET {url}/{cmd}<path?query>`。**必须在 matcher
+    /// 构建前调用**(引擎 `with_config` 里做,此时 magic refcount=1)。
+    pub fn register_addons(&mut self, addons: &[AddonConfig]) {
+        for a in addons {
+            if a.cmds.is_empty() {
+                continue;
+            }
+            let primary = a.cmds[0].clone();
+            let aliases = a.cmds[1..].to_vec();
+            let member: Arc<dyn MagicMember> = Arc::new(req::ReqMember::new_addon(
+                Arc::clone(&self.resources),
+                primary,
+                aliases,
+                a.url.clone(),
+            ));
+            if let Some(token) = member.activation_token() {
+                self.token_map.insert(token, self.members.len());
+            }
+            self.members.push(member);
+        }
     }
 
     /// 取 voice server 命令 sender(未注入时 None —— 测试 / 未接线场景)。

@@ -104,6 +104,22 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<ime_core::voice_state::
         .iter()
         .map(|s| (s.trigger.clone(), s.expand.clone()))
         .collect();
+    // 配置化 addon 插件命令(`magic.addons`):`#eg/name` → GET {url}/eg/name。
+    let addons: Vec<ime_core::family::magic::AddonConfig> = sw_cfg
+        .magic
+        .addons
+        .iter()
+        .map(|a| ime_core::family::magic::AddonConfig {
+            name: a.name.clone(),
+            url: a.url.clone(),
+            cmds: a
+                .cmd
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        })
+        .collect();
     let mut engine = ImeEngine::with_config(
         weights,
         eng_weights,
@@ -112,6 +128,7 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<ime_core::voice_state::
         sw_cfg.weights.to_scoring(),
         cfg.frontend.clone().unwrap_or_else(|| Arc::new(ime_core::frontend::NoopFrontend::default())),
         cfg.voice_aura_base.clone(),
+        addons,
     );
     engine.set_page_size(sw_cfg.input.page_size);
     engine.set_context_aware(sw_cfg.input.context_aware);

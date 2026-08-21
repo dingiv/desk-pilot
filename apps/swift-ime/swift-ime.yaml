@@ -10,7 +10,12 @@ dicts:
 
 # ── Magic commands ──────────────────────────────────────────────────────
 magic:
-  req_base: http://127.0.0.1:14555/api   # #req backend base URL (CLI --req-base overrides)
+  # req_base: http://127.0.0.1:14555/api   # #req backend base URL (CLI --req-base overrides)
+
+  addons:
+    - name: example_addon
+      url: http://127.0.0.1:9788
+      cmd: eg,eg1,eg2
 
 # ── Snippets ────────────────────────────────────────────────────────────
 # User-defined text expansions, merged over the engine's built-ins (a config

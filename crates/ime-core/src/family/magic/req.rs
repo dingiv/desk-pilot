@@ -1,18 +1,25 @@
-//! ReqMember — `#req`: request the local magic HTTP backend and surface the
-//! response as a single candidate.
+//! ReqMember — 本地 magic HTTP 后端的**通用请求成员**:既承载内置 `#req`,
+//! 也支持配置化 addon 插件命令(`#eg/name?nickname=1` → 请求 addon 服务)。
 //!
-//! Syntax: `#req` (default endpoint) or `#req<path?query>` — everything typed
-//! after the trigger is appended to the configured base URL:
+//! ## 命令 → URL 映射
 //!
-//! ```text
-//! #req/news?query=soccer  →  GET http://127.0.0.1:14555/api/news?query=soccer
+//! - 内置 `#req`: `#req<path?query>` → `GET {req_base}<path?query>`(不拼命令名)。
+//! - addon `#<cmd><path?query>` → `GET {addon.url}/{cmd}<path?query>`(命令名即
+//!   URL 第一段)。
+//!
+//! ## 触发
+//!
+//! 完全匹配(输入是 `#<cmd>` 且后缀任意)即**自动发请求**(无需回车);后缀变化
+//! 重新请求,version 门控(参照 `#req` 的 `last_version`)。
+//!
+//! ## 响应
+//!
+//! 服务器返回 JSON 候选列表;非 JSON 的纯文本回退为单个可提交候选:
+//! ```json
+//! { "candidates": [ { "text": "候选文本", "interactive": false, "commit_value": "提交文本" } ] }
 //! ```
-//!
-//! Enter / Space fires the request (Space commits the result once it has
-//! arrived). The whole response body is ONE candidate — the backend is expected
-//! to serve plain text. Esc cancels; Backspace edits the suffix. The fetch runs
-//! on a worker thread so the engine never blocks; `tick` picks the result up by
-//! version counter, exactly like the voice member picks up aura segments.
+//! `interactive: true` 的候选被选中时,把该文本作为 `pick=<urlencoded>` 参数
+//! 拼回 URL 重新请求,服务器据此继续预测。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,12 +32,25 @@ use crate::state::{StateMachine, StepEnv};
 /// frontend's config: `magic.req_base`).
 pub const DEFAULT_REQ_BASE: &str = "http://127.0.0.1:14555/api";
 
-/// Synchronous HTTP GET provider, injected into the family. The production impl
-/// (reqwest, behind the `http` cargo feature) runs on a worker thread; tests
-/// inject a fake.
+/// 配置化 addon 插件:一条 `magic.addons` 项。
+#[derive(Debug, Clone, Default)]
+pub struct AddonConfig {
+    /// addon 标识(日志/诊断用)。
+    pub name: String,
+    /// addon 服务地址(`http://127.0.0.1:9788`)。
+    pub url: String,
+    /// 注册的魔法命令名列表(`eg,eg1,eg2` → 各生成 `#eg` `#eg1` `#eg2`)。
+    pub cmds: Vec<String>,
+}
+
+/// Synchronous HTTP POST provider, injected into the family. The production impl
+/// (reqwest, behind the `http` cargo feature) runs on the blocking pool; tests
+/// inject a fake. POST 的 JSON body 携带结构化参数(`cmd`/`path`/`query`/`pick`),
+/// 便于扩展更多参数。
 pub trait ReqFetcher: Send + Sync {
-    /// GET `url` and return the response body (plain text) or an error message.
-    fn get(&self, url: &str) -> Result<String, String>;
+    /// POST `url` with a JSON `body`; return the response body (plain text) or an
+    /// error message.
+    fn post(&self, url: &str, body: &str) -> Result<String, String>;
 }
 
 /// Always-failing fetcher — active when ime-core is built without the `http`
@@ -40,7 +60,7 @@ pub struct NoopFetcher;
 
 #[cfg(not(feature = "http"))]
 impl ReqFetcher for NoopFetcher {
-    fn get(&self, _url: &str) -> Result<String, String> {
+    fn post(&self, _url: &str, _body: &str) -> Result<String, String> {
         Err("HTTP 未启用（ime-core 需开启 http feature）".into())
     }
 }
@@ -64,8 +84,14 @@ impl ReqwestFetcher {
 
 #[cfg(feature = "http")]
 impl ReqFetcher for ReqwestFetcher {
-    fn get(&self, url: &str) -> Result<String, String> {
-        let resp = self.client.get(url).send().map_err(|e| e.to_string())?;
+    fn post(&self, url: &str, body: &str) -> Result<String, String> {
+        let resp = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .map_err(|e| e.to_string())?;
         let status = resp.status();
         if !status.is_success() {
             return Err(format!("HTTP {}", status.as_u16()));
@@ -74,17 +100,79 @@ impl ReqFetcher for ReqwestFetcher {
     }
 }
 
-/// Async status of one `#req` session. The worker thread writes it; `tick` reads
+/// 响应 JSON:`{ "candidates": [{ "text", "interactive", "commit_value" }] }`。
+#[derive(serde::Deserialize)]
+struct AddonResponse {
+    #[serde(default)]
+    candidates: Vec<AddonCandidate>,
+}
+
+#[derive(serde::Deserialize)]
+struct AddonCandidate {
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    interactive: bool,
+    #[serde(default)]
+    commit_value: Option<String>,
+}
+
+/// 把服务器响应体解析为预测候选列表。JSON 候选优先;非 JSON 纯文本回退为
+/// 单个可提交候选(兼容旧 `#req` 后端返回 body 文本)。
+fn parse_response(body: &str) -> Vec<Prediction> {
+    if let Ok(resp) = serde_json::from_str::<AddonResponse>(body) {
+        return resp
+            .candidates
+            .into_iter()
+            .map(|c| {
+                if c.interactive {
+                    Prediction::interactive(c.text)
+                } else {
+                    let commit = c.commit_value.unwrap_or_else(|| c.text.clone());
+                    Prediction::commit_raw(c.text, commit)
+                }
+            })
+            .collect();
+    }
+    let t = body.trim();
+    if t.is_empty() {
+        Vec::new()
+    } else {
+        vec![Prediction::commit(t.to_string())]
+    }
+}
+
+/// 把后缀(`/name?nickname=1`)拆成 (path, query 对象)。
+fn split_suffix(suffix: &str) -> (String, serde_json::Value) {
+    let (path, q) = match suffix.split_once('?') {
+        Some((p, q)) => (p.to_string(), q),
+        None => (suffix.to_string(), ""),
+    };
+    let mut query = serde_json::Map::new();
+    for pair in q.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (pair, ""),
+        };
+        query.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+    }
+    (path, serde_json::Value::Object(query))
+}
+
+/// Async status of one request session. The worker thread writes it; `tick` reads
 /// it; `version` gates view rebuilds.
 #[derive(Debug, Default)]
 enum ReqStatus {
-    /// Not fired yet — the user is still typing the suffix.
+    /// Not fired yet.
     #[default]
     Idle,
     /// Worker thread in flight.
     InFlight,
-    /// Response body — the single committable candidate.
-    Done(String),
+    /// Response candidates.
+    Done(Vec<Prediction>),
     /// Fetch failed — error message shown as a non-committable candidate.
     Failed(String),
 }
@@ -97,43 +185,106 @@ struct ReqAsync {
 
 pub struct ReqMember {
     resources: Arc<MagicResources>,
-    /// Suffix after the trigger — derived fresh from the input each predict
-    /// (path + query, e.g. "/news?query=soccer").
-    arg: String,
-    /// Last `version` seen — `tick` compares to detect the worker thread landing.
+    /// 主命令名(`#eg` 的 eg)。addon 场景泄漏为 `&'static str`(注册一次,
+    /// spawn 共享同一指针)。
+    name: &'static str,
+    /// 其它命令名(`#eg1`/`#eg2`)。
+    aliases: Vec<&'static str>,
+    /// 唯一激活 token(addon 按 addon名+cmd 生成)。
+    token: &'static str,
+    /// addon 服务地址;`None` = 内置 `#req`,用共享 `resources.req_base`。
+    base_url: Option<String>,
+    /// 是否把命令名拼进 URL 路径(addon=true;内置 #req=false)。
+    prepend_cmd: bool,
+    /// 当前后缀(path+query)。`None` = 尚未发过请求。
+    arg: Option<String>,
+    /// Last `version` seen — `tick` compares to detect the worker landing.
     last_version: u64,
     async_state: Arc<ReqAsync>,
 }
 
+/// 泄漏一个 String 为 `&'static str`(addon 命令名/别名/token 注册一次、进程内
+/// 常驻,泄漏量级为每条命令几个字符串,可接受)。
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
 impl ReqMember {
-    pub fn new(resources: Arc<MagicResources>) -> Self {
+    /// 内置 `#req`:URL 不拼命令名,base 用共享 `req_base`。
+    pub fn new_req(resources: Arc<MagicResources>) -> Self {
         ReqMember {
             resources,
-            arg: String::new(),
+            name: "req",
+            aliases: Vec::new(),
+            token: "__REQ__",
+            base_url: None,
+            prepend_cmd: false,
+            arg: None,
             last_version: 0,
             async_state: Arc::new(ReqAsync::default()),
         }
     }
 
-    /// The URL this member would request: configured base + typed suffix.
-    fn url(&self) -> String {
-        let base = self.resources.req_base.lock().unwrap().clone();
-        format!("{base}{}", self.arg)
+    /// addon 命令成员:`#<cmd><path?query>` → `{base_url}/{cmd}<path?query>`。
+    /// `cmd` 为第一条命令名,其余进 `aliases`。
+    pub fn new_addon(
+        resources: Arc<MagicResources>,
+        cmd: String,
+        aliases: Vec<String>,
+        base_url: String,
+    ) -> Self {
+        let aliases: Vec<&'static str> = aliases.into_iter().map(|a| leak(a)).collect();
+        let token = leak(format!("__ADDON_{cmd}__"));
+        ReqMember {
+            resources,
+            name: leak(cmd),
+            aliases,
+            token,
+            base_url: Some(base_url),
+            prepend_cmd: true,
+            arg: None,
+            last_version: 0,
+            async_state: Arc::new(ReqAsync::default()),
+        }
     }
 
-    /// 预测:一个选项 —— 未发:交互式"回车请求 <url>"(选中触发);in-flight:
-    /// 交互式"请求中…";done:提交完整 body(展示截断由前端做);fail:不可提交错误。
+    /// 输入里命令名之后的后缀(path+query,如 `/name?nickname=1`)。
+    fn args_of(&self, input: &str) -> String {
+        for cmd in std::iter::once(self.name).chain(self.aliases.iter().copied()) {
+            if let Some(rest) = input.strip_prefix(&format!("#{cmd}")) {
+                return rest.to_string();
+            }
+        }
+        String::new()
+    }
+
+    /// 本次请求的完整 URL。
+    fn url(&self) -> String {
+        let base = self
+            .base_url
+            .clone()
+            .unwrap_or_else(|| self.resources.req_base.lock().unwrap().clone());
+        let suffix = self.arg.as_deref().unwrap_or("");
+        if self.prepend_cmd {
+            format!("{base}/{}{suffix}", self.name)
+        } else {
+            format!("{base}{suffix}")
+        }
+    }
+
+    /// 预测:未发/请求中 → 交互占位;done → 服务器候选;fail → 不可提交错误。
     fn predictions(&mut self) -> Vec<Prediction> {
         let status = &*self.async_state.status.lock().unwrap();
         match status {
-            ReqStatus::Idle => vec![Prediction::interactive(format!("回车请求 {}", self.url()))],
-            ReqStatus::InFlight => vec![Prediction::interactive(String::from("请求中…"))],
-            ReqStatus::Done(body) => vec![Prediction::commit(body.clone())],
+            ReqStatus::Idle | ReqStatus::InFlight => {
+                vec![Prediction::interactive("请求中…")]
+            }
+            ReqStatus::Done(preds) => preds.clone(),
             ReqStatus::Failed(err) => vec![Prediction::interactive(format!("请求失败: {err}"))],
         }
     }
 
-    /// 输入的 URL 后缀变了 → 之前的 Done 结果不再适用,复位为 Idle。
+    /// 输入后缀变了 → 之前的 Done 结果不再适用,复位为 Idle。
     fn invalidate_result(&self) {
         if let Ok(mut st) = self.async_state.status.lock() {
             if matches!(&*st, ReqStatus::Done(_)) {
@@ -142,23 +293,47 @@ impl ReqMember {
         }
     }
 
-    /// 触发 GET:把任务发给引擎的 I/O 线程(事件响应模型,预测主路径不建
-    /// 线程)。任务在 I/O 线程跑,结果落 `async_state` + 版本号,I/O 线程随后
-    /// `refresh_ui(ctx)` 推送前端重渲染。
+    /// 结构化请求体:`{cmd, path, query, pick?}`。POST 时带上,方便扩展参数。
+    fn request_body(&self, pick: Option<&str>) -> String {
+        let suffix = self.arg.as_deref().unwrap_or("");
+        let (path, query) = split_suffix(suffix);
+        let mut obj = serde_json::json!({
+            "cmd": self.name,
+            "path": path,
+            "query": query,
+        });
+        if let Some(p) = pick {
+            obj["pick"] = serde_json::Value::String(p.to_string());
+        }
+        obj.to_string()
+    }
+
+    /// 触发 POST:任务发到引擎 I/O 线程(阻塞池执行,不卡事件循环)。结果落
+    /// `async_state` + 版本号,I/O 线程随后 `refresh_ui(ctx)` 推送重渲染。
     fn fire(&self, ctx: usize) {
         let url = self.url();
+        let body = self.request_body(None);
+        self.fire_url(ctx, url, body);
+    }
+
+    /// 用指定 URL + body 触发(interactive 候选重发带 `pick=` 时用)。
+    fn fire_url(&self, ctx: usize, url: String, body: String) {
         let fetcher = self.resources.req_fetcher.lock().unwrap().clone();
         let shared = Arc::clone(&self.async_state);
         *shared.status.lock().unwrap() = ReqStatus::InFlight;
         shared.version.fetch_add(1, Ordering::Release);
-        tracing::debug!(url, "req fire");
+        tracing::debug!(url, ?body, "req fire");
         match self.resources.io() {
             Some(io) => io.send(crate::io_thread::IoEvent::Run {
                 ctx,
                 task: Box::new(move || {
-                    let result = fetcher.get(&url);
+                    let result = fetcher.post(&url, &body);
                     let st = match result {
-                        Ok(body) => ReqStatus::Done(body),
+                        Ok(body) => {
+                            let preds = parse_response(&body);
+                            tracing::debug!(url, count = preds.len(), "req response parsed");
+                            ReqStatus::Done(preds)
+                        }
                         Err(e) => ReqStatus::Failed(e),
                     };
                     tracing::debug!(url, ok = matches!(st, ReqStatus::Done(_)), "req done");
@@ -168,9 +343,9 @@ impl ReqMember {
             }),
             // 无 I/O 线程(未接线的测试场景)→ 就地执行。
             None => {
-                let result = fetcher.get(&url);
+                let result = fetcher.post(&url, &body);
                 let st = match result {
-                    Ok(body) => ReqStatus::Done(body),
+                    Ok(body) => ReqStatus::Done(parse_response(&body)),
                     Err(e) => ReqStatus::Failed(e),
                 };
                 *shared.status.lock().unwrap() = st;
@@ -182,34 +357,51 @@ impl ReqMember {
 
 impl MagicMember for ReqMember {
     fn name(&self) -> &'static str {
-        "req"
+        self.name
+    }
+
+    fn aliases(&self) -> &[&'static str] {
+        &self.aliases
     }
 
     fn activation_token(&self) -> Option<&'static str> {
-        Some("__REQ__")
+        Some(self.token)
     }
 
     fn spawn(&self) -> Box<dyn MagicMember> {
-        Box::new(ReqMember::new(Arc::clone(&self.resources)))
+        Box::new(ReqMember {
+            resources: Arc::clone(&self.resources),
+            name: self.name,
+            aliases: self.aliases.clone(),
+            token: self.token,
+            base_url: self.base_url.clone(),
+            prepend_cmd: self.prepend_cmd,
+            arg: None,
+            last_version: 0,
+            async_state: Arc::new(ReqAsync::default()),
+        })
     }
 
-    fn predict(&mut self, _ctx: usize, input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
-        // 后缀从输入派生;变了 → 旧结果失效。
-        let arg = input.strip_prefix("#req").unwrap_or("").to_string();
-        if arg != self.arg {
-            self.arg = arg;
+    fn predict(&mut self, ctx: usize, input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
+        // 后缀从输入派生;变化(含首次)→ 自动发请求(完全匹配即触发)。
+        let arg = self.args_of(input);
+        if self.arg.as_deref() != Some(&arg) {
+            self.arg = Some(arg);
             self.invalidate_result();
+            self.fire(ctx);
         }
         // 消费当前版本 —— tick 只对之后的异步落地触发重建。
         self.last_version = self.async_state.version.load(Ordering::Acquire);
         self.predictions()
     }
 
-    fn pick(&mut self, _index: usize, _text: &str, sm: &mut StateMachine, _env: &dyn StepEnv) {
-        // 交互式选项:Idle 的"回车请求 <url>" → 触发;InFlight/Failed 无副作用。
-        let idle = matches!(&*self.async_state.status.lock().unwrap(), ReqStatus::Idle);
-        if idle {
-            self.fire(sm.ctx);
+    fn pick(&mut self, _index: usize, text: &str, sm: &mut StateMachine, _env: &dyn StepEnv) {
+        // 只有服务器返回的交互候选才把文本传回重发;请求中/失败等状态占位不重发。
+        let is_done = matches!(&*self.async_state.status.lock().unwrap(), ReqStatus::Done(_));
+        if is_done {
+            let url = self.url();
+            let body = self.request_body(Some(text));
+            self.fire_url(sm.ctx, url, body);
         }
     }
 
@@ -221,53 +413,5 @@ impl MagicMember for ReqMember {
         self.last_version = cur;
         let input = sm.buffer.clone();
         Some(self.predict(sm.ctx, &input, env))
-    }
-}
-
-// ── Real-HTTP e2e (feature `http` only) ─────────────────────────────────
-
-#[cfg(all(test, feature = "http"))]
-mod http_tests {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::time::Duration;
-
-    use super::*;
-
-    /// One-shot HTTP server on an ephemeral port: serves one response, then closes.
-    fn serve_once(body: &'static str, status: u16) -> (String, std::thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let body = body.to_owned();
-        let handle = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 8192];
-            let _ = sock.read(&mut buf); // consume the request
-            let reason = if status == 200 { "OK" } else { "Not Found" };
-            let head = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n", body.len());
-            let _ = sock.write_all(head.as_bytes());
-            let _ = sock.write_all(body.as_bytes());
-        });
-        (format!("http://{addr}/"), handle)
-    }
-
-    #[test]
-    fn reqwest_fetcher_gets_utf8_body() {
-        let (base, server) = serve_once("你好, reqwest!", 200);
-        let fetcher = ReqwestFetcher::new(Duration::from_secs(5));
-        let out = fetcher
-            .get(&format!("{base}api/news?query=soccer"))
-            .unwrap();
-        assert_eq!(out, "你好, reqwest!");
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn reqwest_fetcher_surfaces_http_error() {
-        let (base, server) = serve_once("nope", 404);
-        let fetcher = ReqwestFetcher::new(Duration::from_secs(5));
-        let err = fetcher.get(&base).unwrap_err();
-        assert!(err.contains("404"), "{err}");
-        server.join().unwrap();
     }
 }

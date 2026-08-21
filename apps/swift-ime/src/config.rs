@@ -65,6 +65,24 @@ pub struct MagicConfig {
     /// (e.g. `#req/news?query=soccer` → `GET {req_base}/news?query=soccer`).
     #[serde(default = "default_req_base")]
     pub req_base: String,
+    /// 配置化 addon 插件命令(见 [`MagicAddonConfig`])。
+    #[serde(default)]
+    pub addons: Vec<MagicAddonConfig>,
+}
+
+/// 一条 addon 插件配置:本地起一个 HTTP 服务,注册若干魔法命令。
+#[derive(Debug, Clone, Deserialize)]
+#[derive(Default)]
+pub struct MagicAddonConfig {
+    /// addon 标识(诊断用)。
+    #[serde(default)]
+    pub name: String,
+    /// addon 服务地址(`http://127.0.0.1:9788`)。
+    #[serde(default)]
+    pub url: String,
+    /// 逗号分隔的命令名列表(`eg,eg1,eg2` → 各生成 `#eg` `#eg1` `#eg2`)。
+    #[serde(default)]
+    pub cmd: String,
 }
 
 fn default_req_base() -> String {
@@ -92,7 +110,10 @@ impl Default for VoiceConfig {
 
 impl Default for MagicConfig {
     fn default() -> Self {
-        MagicConfig { req_base: default_req_base() }
+        MagicConfig {
+            req_base: default_req_base(),
+            addons: Vec::new(),
+        }
     }
 }
 

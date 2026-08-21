@@ -54,6 +54,7 @@ fn eng_with_aura(base: &str) -> ImeEngine {
         ime_core::scoring::ScoringConfig::default(),
         std::sync::Arc::new(ime_core::frontend::NoopFrontend::default()),
         base.to_string(),
+        Vec::new(),
     )
 }
 
@@ -485,8 +486,8 @@ fn asr_magic_tick_refreshes_real_ctx_after_voice_advance() {
         .map(|i| ImeView::str_field(&before.candidates[i].text).to_string())
         .collect();
     assert!(
-        before_rows.iter().any(|c| c.contains("语音识别中")),
-        "初始应是占位提示: {before_rows:?}"
+        before_rows.iter().any(|c| c.contains("🎙")),
+        "初始应是 🎙 占位提示: {before_rows:?}"
     );
 
     // voice 推进:模拟 listener 收到 StreamFragment → 折叠进 shared state。

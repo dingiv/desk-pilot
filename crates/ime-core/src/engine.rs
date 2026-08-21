@@ -112,6 +112,7 @@ impl ImeEngine {
             crate::scoring::ScoringConfig::default(),
             Arc::new(crate::frontend::NoopFrontend::default()),
             DEFAULT_VOICE_AURA_BASE.to_string(),
+            Vec::new(),
         )
     }
 
@@ -142,11 +143,17 @@ impl ImeEngine {
         scoring: crate::scoring::ScoringConfig,
         frontend: Arc<dyn crate::frontend::FrontEndHandle>,
         voice_aura_base: String,
+        addons: Vec<crate::family::magic::AddonConfig>,
     ) -> Self {
         // Magic command entries are generated from the member registry (#asr, #flush,
         // #submit, #req, #date, #password …) — adding a command = one member, nothing
         // here. `/`-snippets are now the empty-name snippet magic command (`#/sig`).
-        let magic = Arc::new(MagicFamily::new());
+        let mut magic = Arc::new(MagicFamily::new());
+        // 注册配置化 addon 插件命令 —— 必须在 matcher 构建前(magic 此刻
+        // refcount=1,Arc::get_mut 安全)。
+        if let Some(m) = Arc::get_mut(&mut magic) {
+            m.register_addons(&addons);
+        }
         let matcher = crate::Matcher::new(magic.matcher_entries());
         // 片段注册表:内置 + 配置片段;名字去掉前导 `/`(触发名 `/sig` → `sig`,
         // 调用 `#/sig`)。
@@ -983,6 +990,7 @@ mod tests {
             crate::scoring::ScoringConfig::default(),
             Arc::new(crate::frontend::NoopFrontend::default()),
             DEFAULT_VOICE_AURA_BASE.to_string(),
+            Vec::new(),
         );
         let mut e = e;
         for c in "#/hello?name=Mike".chars() {
@@ -1049,7 +1057,7 @@ mod tests {
     }
 
     impl ReqFetcher for FakeFetcher {
-        fn get(&self, url: &str) -> Result<String, String> {
+        fn post(&self, url: &str, _body: &str) -> Result<String, String> {
             self.urls.lock().unwrap().push(url.to_string());
             self.result.clone()
         }

@@ -209,7 +209,13 @@ async fn voice_server_main(
                         }
                     }
                     Some(IoEvent::Run { ctx, task }) => {
-                        task();
+                        // 阻塞任务(HTTP 拉取等)放 tokio 阻塞池执行:既不让 current_thread
+                        // 事件循环被卡住(否则语音段会停摆),也避免在 async 上下文里做阻塞
+                        // 调用(后者在 runtime drop 时会 panic "Cannot drop a runtime in a
+                        // context where blocking is not allowed")。
+                        if tokio::task::spawn_blocking(move || task()).await.is_err() {
+                            tracing::warn!("io Run blocking task panicked");
+                        }
                         if let Some(f) = frontend.upgrade() {
                             f.refresh_ui(StateView { ctx });
                         }
