@@ -249,16 +249,17 @@ async fn voice_server_main(
                         state.fold_segment(&seg);
                         // 收到段 = 已连上(即使 Attach 时 health 误判为断,段也证活)。
                         state.set_connected(true);
-                        // 排查 UI 延迟:看每个段(带文本)何时到达,与说话时刻对表。
+                        // 后台语音也算活动 —— 空闲超时只在"无 #asr 且无语音"时断开。
+                        last_activity = tokio::time::Instant::now();
                         tracing::info!(?seg, "voice segment folded");
-                        if try_refresh(&mut active_ctx, &frontend) {
-                            // 仍有效 → 续传源。
-                            sources.push(Box::pin(poll_seg(s)));
-                        } else {
-                            // 失败一次即放弃:s 被 drop(断连),不重连。
-                            connected = false;
-                            state.set_connected(false);
+                        // 有活跃 #asr 会话 → 顺带刷新 UI;无会话(后台监听)→
+                        // 只折叠不刷新。
+                        if active_ctx >= 0 {
+                            try_refresh(&mut active_ctx, &frontend);
                         }
+                        // **始终续传源**:后台监听也要保持连接、持续折叠数据 ——
+                        // 不因"无会话/刷新失败"丢源(否则后台识别只收 1~3 字就断)。
+                        sources.push(Box::pin(poll_seg(s)));
                     }
                     Some(None) => {
                         // SSE 流结束 → 丢源,不再 select。

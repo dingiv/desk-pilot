@@ -311,6 +311,10 @@ impl StateMachine {
             }
             self.clear_active_command();
             self.reset();
+            // `#del` 等删除选项:不提交文本,只让前端删 N 个字符。
+            if pred.delete_count > 0 {
+                return Self::delete_view(pred.delete_count);
+            }
             // 提交用 commit_text(展示转义时原文提交),光标针对展示文本。
             let commit = pred.commit_value().to_string();
             return match pred.cursor {
@@ -545,6 +549,15 @@ impl StateMachine {
     pub(crate) fn passthrough_view() -> ImeView {
         let mut v = ImeView::empty();
         v.action = crate::platform::action::PASSTHROUGH;
+        v
+    }
+
+    /// 删除视图:不提交文本,只让前端删掉文本框中 `count` 个字符(`#del`)。
+    pub(crate) fn delete_view(count: u32) -> ImeView {
+        tracing::debug!(count, "delete_view → ImeView.delete_count");
+        let mut v = ImeView::empty();
+        v.delete_count = count;
+        v.action = crate::platform::action::HANDLED;
         v
     }
 

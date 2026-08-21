@@ -37,6 +37,7 @@ struct CandidateSlot {
 struct ImeView {
     char           commit_text[512];
     uint32_t       commit_cursor;      // caret offset in commit_text ($CURSOR marker; else = len)
+    uint32_t       delete_count;       // delete N chars before commit (#del); 0 = none
     char           preedit_text[512];  // expanded magic anchor (e.g. "🎙 #asr <voice>")
     uint32_t       preedit_cursor;
     CandidateSlot  candidates[CANDIDATE_SLOTS];
@@ -104,6 +105,9 @@ extern "C" {
     int  swift_ime_set_req_base(ImeHandle *handle, const char *base);
     /// Push the current clipboard text — `$CLIPBOARD` snippet templates resolve to it.
     int  swift_ime_set_clipboard(ImeHandle *handle, const char *text);
+    /// `#del`:`POST {scout_inject_url}/inject/backspace?count=N` 让 scout 用 uinput
+    /// 注入 N 个 Backspace(硬件级,绕过 Wayland 虚拟键盘协议)。返回 1 成功 / 0 失败。
+    int  swift_ime_inject_backspaces(ImeHandle *handle, unsigned int count);
     void swift_ime_reset(ImeHandle *handle, void *ctx);
     void swift_ime_activate(ImeHandle *handle, void *ctx);
     void swift_ime_deactivate(ImeHandle *handle, void *ctx);

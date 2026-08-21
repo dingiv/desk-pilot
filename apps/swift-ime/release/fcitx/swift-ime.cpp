@@ -84,6 +84,22 @@ SwiftImeEngine::~SwiftImeEngine() {
 void SwiftImeEngine::apply_view(fcitx::InputContext *ic, const ImeView &v) {
     auto &prev = lastViews_[ic];
 
+    // Delete: `#del` —— 先清 preedit/候选,让应用光标回到已提交文本之后,再
+    // 让 scout 用 uinput 注入 count 个 Backspace(硬件级,绕过 Wayland 虚拟键盘
+    // 协议 / surrounding-text 依赖)。scout 没起/失败 → 回退 deleteSurroundingText。
+    if (v.delete_count > 0) {
+        FCITX_INFO() << "#del delete " << v.delete_count;
+        ic->inputPanel().reset();
+        ic->updatePreedit();
+        ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+        if (swift_ime_inject_backspaces(handle_, v.delete_count) != 1) {
+            FCITX_INFO() << "#del scout inject failed, fallback deleteSurroundingText";
+            ic->deleteSurroundingText(-(int)v.delete_count, v.delete_count);
+        }
+        prev = v;
+        return;
+    }
+
     // Commit
     if (v.commit_text[0] != 0) {
         ic->inputPanel().reset();

@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use scout_drivers::audio::AudioSource;
-use scout_drivers::CaptureSource;
+use scout_drivers::{CaptureSource, InputSink, Key, UinputSink, UinputSinkBuilder};
 
 /// Screen source: a (mockable) frame producer behind a mutex (capture is `&mut`).
 type Screen = Arc<Mutex<Box<dyn CaptureSource + Send>>>;
@@ -51,6 +51,9 @@ pub struct HttpServer {
     /// Optional audio. `None` if audio capture failed at boot → screen-only mode.
     audio: Option<Audio>,
     demand: Arc<Mutex<Demand>>,
+    /// 懒创建的内核虚拟键盘(uinput)—— `#del` 等经 `/inject/backspace` 注入退格。
+    /// 首次注入时才 open /dev/uinput。
+    inject: Arc<Mutex<Option<UinputSink>>>,
 }
 
 impl HttpServer {
@@ -60,7 +63,12 @@ impl HttpServer {
             screen_active: true,
             audio_active: true,
         }));
-        Self { src, audio, demand }
+        Self {
+            src,
+            audio,
+            demand,
+            inject: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// Bind + accept loop. Blocks for the daemon's lifetime; also starts the idle
@@ -80,8 +88,9 @@ impl HttpServer {
             let src = Arc::clone(&self.src);
             let audio = self.audio.clone();
             let demand = Arc::clone(&self.demand);
+            let inject = Arc::clone(&self.inject);
             std::thread::spawn(move || {
-                let _ = handle(stream, &src, &audio, &demand);
+                let _ = handle(stream, &src, &audio, &demand, &inject);
             });
         }
         Ok(())
@@ -148,6 +157,7 @@ fn handle(
     src: &Screen,
     audio: &Option<Audio>,
     demand: &Arc<Mutex<Demand>>,
+    inject: &Arc<Mutex<Option<UinputSink>>>,
 ) -> std::io::Result<()> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut buf = [0u8; 8192];
@@ -180,7 +190,7 @@ fn handle(
         return serve_audio(stream, audio, demand, chunk_ms);
     }
 
-    let (status, ctype, body) = route(path, src, audio, demand);
+    let (status, ctype, body) = route(path, query, src, audio, demand, inject);
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {len}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\n\r\n",
         len = body.len()
@@ -340,9 +350,11 @@ mod tests {
 
 fn route(
     path: &str,
+    query: Option<&str>,
     src: &Screen,
     audio: &Option<Audio>,
     demand: &Arc<Mutex<Demand>>,
+    inject: &Arc<Mutex<Option<UinputSink>>>,
 ) -> (&'static str, &'static str, Vec<u8>) {
     match path {
         "/health" => {
@@ -378,6 +390,39 @@ fn route(
                 "{\"ok\":false,\"error\":\"frame not ready (timed out)\"}".to_string(),
             ),
         },
+        // `#del`:注入 N 个 Backspace。用 uinput 内核虚拟键盘(硬件级,绕过
+        // 输入法框架 —— Wayland 下 forwardKey 依赖 compositor 虚拟键盘协议)。
+        "/inject/backspace" => {
+            let count = query
+                .and_then(|q| {
+                    q.split('&').find_map(|kv| {
+                        let (k, v) = kv.split_once('=')?;
+                        (k == "count").then(|| v.parse::<usize>().ok()).flatten()
+                    })
+                })
+                .unwrap_or(1);
+            let mut sink = inject.lock().unwrap();
+            if sink.is_none() {
+                match UinputSinkBuilder::new().build() {
+                    Ok(s) => *sink = Some(s),
+                    Err(e) => {
+                        return json(
+                            500,
+                            format!("{{\"ok\":false,\"error\":\"uinput open failed: {e}\"}}"),
+                        );
+                    }
+                }
+            }
+            for _ in 0..count {
+                if let Err(e) = sink.as_mut().unwrap().tap_key(Key::Backspace) {
+                    return json(
+                        500,
+                        format!("{{\"ok\":false,\"error\":\"inject failed: {e}\"}}"),
+                    );
+                }
+            }
+            json(200, format!("{{\"ok\":true,\"injected\":{count}}}"))
+        }
         _ => json(404, "{\"ok\":false,\"error\":\"not found\"}".to_string()),
     }
 }

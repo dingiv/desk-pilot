@@ -12,7 +12,7 @@ name = "omni-scout"
 path = "src/main.rs"
 
 [dependencies]
-scout-drivers = { path = "../../crates/scout-drivers", features = ["pipewire"] }
+scout-drivers = { path = "../../crates/scout-drivers", features = ["pipewire", "uinput"] }
 shared = { path = "../../crates/shared", features = ["log"] }
 tracing = { workspace = true }
 libc = "0.2"

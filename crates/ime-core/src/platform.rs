@@ -77,6 +77,9 @@ pub struct ImeView {
     /// end). Frontends move the caret accordingly — e.g. fcitx5 commits then
     /// forwards `Left` keys back by `len - commit_cursor`.
     pub commit_cursor: u32,
+    /// 提交前删除文本框中 N 个字符(0 = 不删)。`#del` 魔法命令用:前端(如
+    /// fcitx5)对每个字符 forwardKey(BackSpace) 或 deleteSurroundingText。
+    pub delete_count: u32,
     /// Preedit slot: 512 bytes so a magic anchor can expand into the recognized
     /// text (e.g. `🎙 #asr 今天天气真不错…`) — long voice sentences fit whole.
     pub preedit_text: [u8; 512],
@@ -100,6 +103,7 @@ impl ImeView {
         ImeView {
             commit_text: [0u8; 512],
             commit_cursor: 0,
+            delete_count: 0,
             preedit_text: [0u8; 512],
             preedit_cursor: 0,
             candidates: [CandidateSlot::default(); CANDIDATE_SLOTS],

@@ -11,6 +11,7 @@
 //! engine / FSM special-casing.
 
 mod clip;
+mod del;
 mod member;
 mod req;
 mod snippet;
@@ -20,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub use clip::{ClipMember, CLIP_HISTORY_CAP};
+pub use del::DelMember;
 pub use member::{preview_text, CommandArgs, MagicMember, Prediction, CANDIDATE_PREVIEW_MAX};
 pub use req::{AddonConfig, ReqFetcher, DEFAULT_REQ_BASE};
 pub use snippet::SnippetMember;
@@ -83,6 +85,10 @@ pub struct MagicResources {
     /// voice server 命令 sender —— `#asr` 家族经它发 `Attach`/`Detach`。
     /// 与 io thread 的 `tx` 是同一个通道(typed 包装)。引擎构造后注入。
     pub voice_tx: Mutex<Option<crate::io_thread::VoiceCmdSender>>,
+    /// 最近一次输入法提交文本的 UTF-8 字符数(`#del` 的 `del_len` 选项用)。
+    pub last_commit_len: Mutex<u32>,
+    /// scout(omni-scout)HTTP 注入服务地址 —— `#del` 用它注入退格。
+    pub scout_inject_url: Mutex<String>,
 }
 
 impl MagicResources {
@@ -130,6 +136,8 @@ impl Default for MagicResources {
             io: Mutex::new(None),
             frontend: Mutex::new(None),
             voice_tx: Mutex::new(None),
+            last_commit_len: Mutex::new(0),
+            scout_inject_url: Mutex::new("http://127.0.0.1:7878".to_string()),
         }
     }
 }
@@ -213,6 +221,7 @@ impl MagicFamily {
         let resources = Arc::new(MagicResources::default());
         let members: Vec<Arc<dyn MagicMember>> = vec![
             Arc::new(VoiceMember::new(Arc::clone(&resources))),
+            Arc::new(DelMember::new(Arc::clone(&resources))),
             Arc::new(ReqMember::new_req(Arc::clone(&resources))),
             Arc::new(ClipMember::new(Arc::clone(&resources))),
             // 片段命令:空名魔法命令(`#/hello?name=Mike`),经 `#` + `/` 路由。
@@ -407,6 +416,16 @@ impl MagicFamily {
     /// `#req` backend base URL (default `http://127.0.0.1:14555/api`).
     pub fn set_req_base(&self, base: &str) {
         *self.resources.req_base.lock().unwrap() = base.to_string();
+    }
+
+    /// scout(omni-scout)HTTP 注入服务地址 —— `#del` 用它注入退格。
+    pub fn set_scout_inject_url(&self, url: &str) {
+        *self.resources.scout_inject_url.lock().unwrap() = url.to_string();
+    }
+
+    /// scout 注入服务地址(默认 `http://127.0.0.1:7878`)。
+    pub fn scout_inject_url(&self) -> String {
+        self.resources.scout_inject_url.lock().unwrap().clone()
     }
 
     /// Inject an HTTP fetcher (tests use a fake; production default is reqwest

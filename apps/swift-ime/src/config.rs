@@ -68,6 +68,13 @@ pub struct MagicConfig {
     /// 配置化 addon 插件命令(见 [`MagicAddonConfig`])。
     #[serde(default)]
     pub addons: Vec<MagicAddonConfig>,
+    /// scout(omni-scout)HTTP 注入服务地址 —— `#del` 用它注入退格(uinput)。
+    #[serde(default = "default_scout_inject_url")]
+    pub scout_inject_url: String,
+}
+
+fn default_scout_inject_url() -> String {
+    "http://127.0.0.1:7878".to_string()
 }
 
 /// 一条 addon 插件配置:本地起一个 HTTP 服务,注册若干魔法命令。
@@ -113,6 +120,7 @@ impl Default for MagicConfig {
         MagicConfig {
             req_base: default_req_base(),
             addons: Vec::new(),
+            scout_inject_url: default_scout_inject_url(),
         }
     }
 }

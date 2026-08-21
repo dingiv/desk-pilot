@@ -320,6 +320,8 @@ impl ImeEngine {
                 pc.text_context.update(committed);
                 // Record bigram: prev_word → committed_word (both SQLite + in-memory).
                 self.dispatcher.record_commit(committed);
+                // `#del` 的 del_len 选项用:记录本次提交的字符数。
+                self.record_last_commit_len(committed);
                 // 提交来源是英文候选 → 已是在词典中的词,不学成自生词
                 // (空格/数字提交英文候选的陈旧 bug)。
                 if pc.sm.take_last_commit_family() != Some("english") {
@@ -355,6 +357,8 @@ impl ImeEngine {
             if !committed.is_empty() {
                 pc.text_context.update(committed);
                 self.dispatcher.record_commit(committed);
+                // `#del` 的 del_len 选项用:记录本次提交的字符数。
+                self.record_last_commit_len(committed);
                 // 英文候选提交 → 不学成自生词(空格/数字提交的陈旧 bug)。
                 if pc.sm.take_last_commit_family() != Some("english") {
                     self.learn_english_if_ascii(committed);
@@ -564,6 +568,11 @@ impl ImeEngine {
         }
     }
 
+    /// 记录最近一次提交文本的 UTF-8 字符数(`#del` 的 `del_len` 选项读它)。
+    fn record_last_commit_len(&self, committed: &str) {
+        *self.magic.resources().last_commit_len.lock().unwrap() = committed.chars().count() as u32;
+    }
+
     /// 提交文本是纯 ASCII 字母数字(如 cd)时,学入英文家族 user 层
     /// (英文自生词)。汉字/emoji/符号不触发。Enter 强选 raw 的主路径。
     fn learn_english_if_ascii(&self, committed: &str) {
@@ -584,6 +593,16 @@ impl ImeEngine {
     /// `#req/news?query=soccer` → `GET {base}/news?query=soccer`.
     pub fn set_req_base(&self, base: &str) {
         self.magic.set_req_base(base);
+    }
+
+    /// scout(omni-scout)HTTP 注入服务地址 —— `#del` 用它注入退格。
+    pub fn set_scout_inject_url(&self, url: &str) {
+        self.magic.set_scout_inject_url(url);
+    }
+
+    /// scout 注入服务地址(默认 `http://127.0.0.1:7878`)。
+    pub fn scout_inject_url(&self) -> String {
+        self.magic.scout_inject_url()
     }
 
     /// Inject an HTTP fetcher for `#req` (tests use a fake; the production default

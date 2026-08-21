@@ -218,6 +218,7 @@ pub extern "C" fn swift_ime_create(
         eng.set_context_aware(cfg.input.context_aware);
         eng.set_candidate_meta(cfg.debug.candidate_meta);
         eng.set_req_base(&cfg.magic.req_base);
+        eng.set_scout_inject_url(&cfg.magic.scout_inject_url);
     } else {
         tracing::error!(target: "swift_ime", "engine not sole owner at config time — 应用默认配置");
     }
@@ -424,6 +425,51 @@ pub extern "C" fn swift_ime_set_clipboard(
     let s = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy();
     unsafe { &*engine }.set_variable("CLIPBOARD", &s);
     1
+}
+
+/// `#del`:让 scout 用 uinput 注入 `count` 个 Backspace。POST 到
+/// `{scout_inject_url}/inject/backspace?count=N`(硬件级注入,绕过 Wayland
+/// 虚拟键盘协议 / surrounding-text 依赖)。返回 1 成功 / 0 失败。
+#[no_mangle]
+pub extern "C" fn swift_ime_inject_backspaces(engine: *mut ImeEngine, count: u32) -> i32 {
+    if engine.is_null() { return 0; }
+    let url = unsafe { &*engine }.scout_inject_url();
+    let target = format!("{url}/inject/backspace?count={count}");
+    match http_post(&target) {
+        Ok(_) => {
+            tracing::debug!(%target, count, "scout inject backspace");
+            1
+        }
+        Err(e) => {
+            tracing::error!(error = %e, %target, "scout inject backspace failed");
+            0
+        }
+    }
+}
+
+/// 极简 HTTP POST(std `TcpStream`,本地 scout 足够)。
+fn http_post(url: &str) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    // url = http://host:port/path
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad url"))?;
+    let (hostport, path) = match rest.split_once('/') {
+        Some((h, p)) => (h, format!("/{p}")),
+        None => (rest, "/".to_string()),
+    };
+    let (host, port) = hostport
+        .rsplit_once(':')
+        .map(|(h, p)| (h, p.parse::<u16>().unwrap_or(80)))
+        .unwrap_or((hostport, 80));
+    let mut stream = TcpStream::connect((host, port))?;
+    let req = format!("POST {path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes())?;
+    stream.flush()?;
+    let mut buf = [0u8; 1024];
+    let _ = stream.read(&mut buf)?;
+    Ok(())
 }
 
 #[cfg(test)]

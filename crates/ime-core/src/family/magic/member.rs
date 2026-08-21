@@ -23,7 +23,8 @@ use crate::state::{StateMachine, StepEnv};
 /// - [`preedit`](Prediction::preedit):应用文本框里的预览(`None` = 用 `text`);
 /// - [`commit_text`](Prediction::commit_text):实际提交的文本(`None` = 用 `text`)。
 ///
-/// 典型场景(addon 候选):候选行展示精简结果,preedit 给完整预览,提交原文。
+/// 另可携带 [`delete_count`](Prediction::delete_count):选中时先删除文本框中
+/// 该数量的字符(再提交 —— `#del` 用)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prediction {
     /// 候选行里展示的文本。可能做转义(`#clip` 把换行显示成 `\n`)。
@@ -39,6 +40,9 @@ pub struct Prediction {
     /// 交互式:选中不上屏,结果传给命令重新预测(替换选项);
     /// false = 选中即上屏。
     pub interactive: bool,
+
+    /// 选中时先删除文本框中该数量的字符(0 = 不删)。
+    pub delete_count: u32,
 }
 
 impl Prediction {
@@ -49,6 +53,7 @@ impl Prediction {
             interactive: false,
             cursor: None,
             commit_text: None,
+            delete_count: 0,
         }
     }
 
@@ -60,6 +65,7 @@ impl Prediction {
             interactive: false,
             cursor: None,
             commit_text: Some(raw.into()),
+            delete_count: 0,
         }
     }
 
@@ -75,6 +81,19 @@ impl Prediction {
             interactive: false,
             cursor: None,
             commit_text: Some(raw.into()),
+            delete_count: 0,
+        }
+    }
+
+    /// 删除选项:选中后删掉文本框中 `count` 个字符(不提交文本)。
+    pub fn delete(count: u32, label: impl Into<String>) -> Self {
+        Prediction {
+            text: label.into(),
+            preedit: None,
+            interactive: false,
+            cursor: None,
+            commit_text: None,
+            delete_count: count,
         }
     }
 
@@ -85,6 +104,7 @@ impl Prediction {
             interactive: true,
             cursor: None,
             commit_text: None,
+            delete_count: 0,
         }
     }
 
@@ -95,6 +115,7 @@ impl Prediction {
             interactive: false,
             cursor: Some(cursor),
             commit_text: None,
+            delete_count: 0,
         }
     }
 
