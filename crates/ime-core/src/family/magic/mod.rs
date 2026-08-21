@@ -23,13 +23,14 @@ use std::sync::{Arc, Mutex};
 pub use clip::{ClipMember, CLIP_HISTORY_CAP};
 pub use del::DelMember;
 pub use member::{preview_text, CommandArgs, MagicMember, Prediction, CANDIDATE_PREVIEW_MAX};
-pub use req::{AddonConfig, ReqFetcher, DEFAULT_REQ_BASE};
+pub use req::{AddonCmdSpec, AddonConfig, ReqFetcher, DEFAULT_REQ_BASE};
 pub use snippet::SnippetMember;
 pub use voice::VoiceMember;
 
 use req::ReqMember;
 
 use crate::expander::today_str;
+use crate::store::snippet_md::SnippetEntry;
 
 /// Shared voice-session slot — written by the aura SSE client (via
 /// [`MagicFamily::set_asr_buffer`], late after engine construction), read by the
@@ -71,9 +72,9 @@ pub struct MagicResources {
     pub voice_state: Arc<VoiceStateSlot>,
     pub req_base: Mutex<String>,
     pub req_fetcher: Mutex<Arc<dyn ReqFetcher>>,
-    /// 片段注册表:名字(无前导 `/`)→ 模板。`#/hello?name=Mike` 的 `hello`
-    /// 在此查表;`?name=Mike` 作为模板变量注入。
-    pub snippets: Mutex<HashMap<String, String>>,
+    /// 片段注册表:名字(无前导 `/`)→ 片段条目(模板 + 候选区注释 + 声明参数)。
+    /// `#/hello?name=Mike` 的 `hello` 在此查表;`?name=Mike` 作为模板变量注入。
+    pub snippets: Mutex<HashMap<String, SnippetEntry>>,
     /// 剪贴板历史(最近在前,`#clip/N` 读)。由前端按需回填(fcitx5 clipboard
     /// 公开接口只给当前值)。
     pub clipboard_history: Mutex<Vec<String>>,
@@ -157,10 +158,13 @@ pub enum MagicCommand {
 /// 输入匹配结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MagicMatch {
-    /// 精确匹配某命令(可带参数,如 `#asr?num=2`)。
+    /// 精确匹配某命令(完整路径,可带查询参数,如 `#asr?num=2`、`#eg/name?nick=5`)。
     Exact(MagicCommand),
-    /// 输入是某命令触发串的严格前缀 → 补全提示(选中改写输入)。
+    /// 输入是某注册完整路径的严格前缀 → 补全提示(选中改写输入)。
     Prefix(Vec<String>),
+    /// **参数输入态**:输入是某注册命令路径 + `/` 或 `?` 参数(如 `#del/15`)。
+    /// 框架展示裸输入提交候选,不自动触发;提交时解析前缀并强制触发。
+    Args(MagicCommand),
     /// 片段命令(`#/…`)精确匹配。
     Snippet,
     /// 无匹配。
@@ -247,8 +251,7 @@ impl MagicFamily {
     }
 
     /// All matcher entries: static triggers → their trigger itself as a SENTINEL;
-    /// live triggers → the activation token (plus aliases, e.g. `#flush` → voice
-    /// token).
+    /// live triggers → the activation token (per registered full path).
     ///
     /// Statics are NOT frozen into the matcher: `expansion()` is time-varying
     /// (`#date`), and calling it here would commit the ENGINE-STARTUP date when
@@ -269,9 +272,8 @@ impl MagicFamily {
             let token = m
                 .activation_token()
                 .expect("live member needs an activation token");
-            out.push((format!("#{}", m.name()), token.to_string()));
-            for alias in m.aliases() {
-                out.push((format!("#{alias}"), token.to_string()));
+            for path in m.registered_paths() {
+                out.push((format!("#{path}"), token.to_string()));
             }
         }
         out
@@ -284,9 +286,9 @@ impl MagicFamily {
         Some(self.members[idx].spawn())
     }
 
-    /// All magic commands whose trigger is a strict extension of `prefix` — the completion
-    /// hints shown while typing `#…`. Selecting a hint rewrites the input to that trigger.
-    /// The raw buffer stays a rollback candidate.
+    /// All magic commands whose full trigger is a strict extension of `prefix` — the
+    /// completion hints shown while typing `#…`. Selecting a hint rewrites the input
+    /// to that trigger. The raw buffer stays a rollback candidate.
     pub fn hints(&self, prefix: &str) -> Vec<String> {
         if prefix.is_empty() || !prefix.starts_with('#') {
             return Vec::new();
@@ -301,14 +303,10 @@ impl MagicFamily {
             if m.name().is_empty() {
                 continue;
             } // 片段命令不作为 `#…` 提示
-            let t = format!("#{}", m.name());
-            if t.starts_with(prefix) && t != prefix {
-                out.push(t.clone());
-            }
-            for alias in m.aliases() {
-                let ta = format!("#{alias}");
-                if ta.starts_with(prefix) && ta != prefix {
-                    out.push(ta.clone());
+            for path in m.registered_paths() {
+                let t = format!("#{path}");
+                if t.starts_with(prefix) && t != prefix {
+                    out.push(t);
                 }
             }
         }
@@ -316,8 +314,16 @@ impl MagicFamily {
     }
 
     /// **魔法家族匹配核心逻辑**
-    /// 输入 → 匹配结果。名字段 = `#` + 字母数字(遇 `/` 或 `?` 截止);找最长
-    /// **精确**命令。见 [`MagicMatch`]。
+    ///
+    /// 按**注册的完整命令路径**(`eg`、`eg/name`、`eg1`…)做匹配:
+    /// - **完整路径精确匹配** → `Exact`,立即执行(带 `?` 查询参数也算精确,查询
+    ///   不参与匹配/预测);
+    /// - **严格前缀** → `Prefix`,给出完整路径补全提示(选中改写输入);
+    /// - 输入以某注册路径为前缀、后接 `/` 参数段(如 `#del/1`)→ `Args`,
+    ///   参数输入态(裸输入,提交时再解析触发);
+    /// - 其余 → `Unknown`。
+    ///
+    /// 见 [`MagicMatch`]。
     pub fn match_command(&self, input: &str) -> MagicMatch {
         // 片段命令:`#/hello?name=Mike` → 空名命令。
         if input.starts_with("#/") {
@@ -326,42 +332,22 @@ impl MagicFamily {
         if input.len() < 2 || !input.starts_with('#') {
             return MagicMatch::Unknown;
         }
-        // 名字段:`#` + 字母数字;遇 `/` 或 `?` 或非字母数字截止。
-        let rest = &input[1..];
-        let name_len = rest
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric())
-            .count();
-        if name_len == 0 {
+        // 路径部分:去掉 `?` 查询参数(查询不参与匹配/预测)。
+        let path = input.split('?').next().unwrap();
+        let rest = &path[1..]; // 去掉 `#`
+        if rest.is_empty() {
             return MagicMatch::Unknown;
         }
-        let name = &rest[..name_len];
-        // 名字段之后必须是 `/`、`?` 或空(否则是别的命令的前缀 / 未知)。
-        let name_is_exact = name_len == rest.len()
-            || rest[name_len..].starts_with('/')
-            || rest[name_len..].starts_with('?');
 
-        if name_is_exact {
-            // 精确:先 live 成员(含 alias),后静态。
-            for m in &self.members {
-                if m.name() == name || m.aliases().contains(&name) {
-                    if let Some(token) = m.activation_token() {
-                        return MagicMatch::Exact(MagicCommand::Live {
-                            token,
-                            name: m.name(),
-                        });
-                    }
-                }
-            }
-            if self.statics.iter().any(|s| s.trigger == format!("#{name}")) {
-                return MagicMatch::Exact(MagicCommand::Static);
-            }
+        // 1. 完整路径精确匹配 → 执行。
+        if let Some(cmd) = self.command_for_path(rest) {
+            return MagicMatch::Exact(cmd);
         }
 
-        // 前缀:输入(整个)是某命令触发串的严格前缀。
+        // 2. 前缀匹配:rest 是某注册完整路径的严格前缀 → 补全提示。
         let mut hints = Vec::new();
         for s in &self.statics {
-            if s.trigger.starts_with(input) && s.trigger != input {
+            if s.trigger.starts_with(path) && s.trigger != path {
                 hints.push(s.trigger.to_string());
             }
         }
@@ -369,21 +355,67 @@ impl MagicFamily {
             if m.name().is_empty() {
                 continue;
             }
-            let t = format!("#{}", m.name());
-            if t.starts_with(input) && t != input {
-                hints.push(t.clone());
-            }
-            for alias in m.aliases() {
-                let ta = format!("#{alias}");
-                if ta.starts_with(input) && ta != input {
-                    hints.push(ta.clone());
+            for rp in m.registered_paths() {
+                let t = format!("#{rp}");
+                if t.starts_with(path) && t != path {
+                    hints.push(t);
                 }
             }
         }
         if !hints.is_empty() {
             return MagicMatch::Prefix(hints);
         }
+
+        // 3. 参数输入态:rest 以某注册完整路径为前缀,后接 `/` 参数段。
+        if let Some(cmd) = self.command_for_arg_prefix(rest) {
+            return MagicMatch::Args(cmd);
+        }
         MagicMatch::Unknown
+    }
+
+    /// 完整路径 → 命令:静态触发串 or live 成员的已注册路径。
+    fn command_for_path(&self, path: &str) -> Option<MagicCommand> {
+        for s in &self.statics {
+            if s.trigger == format!("#{path}") {
+                return Some(MagicCommand::Static);
+            }
+        }
+        for m in &self.members {
+            if m.registered_paths().iter().any(|rp| rp == path) {
+                if let Some(token) = m.activation_token() {
+                    return Some(MagicCommand::Live {
+                        token,
+                        name: m.name(),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// 参数输入态:找**最长**注册完整路径 `P` 使 `path` 以 `P + "/"` 开头
+    /// (即 `path` 是某命令的路径参数扩展,如 `del/1` → `del`)。静态命令无参数。
+    fn command_for_arg_prefix(&self, path: &str) -> Option<MagicCommand> {
+        let mut best: Option<(usize, MagicCommand)> = None;
+        for m in &self.members {
+            let Some(token) = m.activation_token() else {
+                continue;
+            };
+            for rp in m.registered_paths() {
+                if path.len() > rp.len()
+                    && path.starts_with(rp.as_str())
+                    && path.as_bytes()[rp.len()] == b'/'
+                {
+                    if best.as_ref().map_or(true, |(bl, _)| rp.len() > *bl) {
+                        best = Some((rp.len(), MagicCommand::Live {
+                            token,
+                            name: m.name(),
+                        }));
+                    }
+                }
+            }
+        }
+        best.map(|(_, cmd)| cmd)
     }
 
     /// Static expansion text for a full trigger (e.g. `#date` → today's date).
@@ -434,13 +466,13 @@ impl MagicFamily {
         *self.resources.req_fetcher.lock().unwrap() = fetcher;
     }
 
-    /// 填充片段注册表(名字 → 模板)。名字不应带前导 `/`(`#/hello` 的 `hello`)。
+    /// 填充片段注册表(名字 → 条目)。名字不应带前导 `/`(`#/hello` 的 `hello`)。
     /// 供 SnippetMember 在 `#/name?params` 时查表展开。
-    pub fn set_snippets(&self, snippets: Vec<(String, String)>) {
+    pub fn set_snippets(&self, snippets: Vec<SnippetEntry>) {
         let mut map = self.resources.snippets.lock().unwrap();
         map.clear();
-        for (name, tpl) in snippets {
-            map.insert(name, tpl);
+        for s in snippets {
+            map.insert(s.name.clone(), s);
         }
     }
 
@@ -460,20 +492,30 @@ impl MagicFamily {
         *self.resources.voice_tx.lock().unwrap() = Some(tx);
     }
 
-    /// 注册配置化 addon 插件命令(`magic.addons`)。每条命令成为 `#<cmd>`,
-    /// `#<cmd><path?query>` → `GET {url}/{cmd}<path?query>`。**必须在 matcher
+    /// 注册配置化 addon 插件命令(`magic.addons`)。每条 cmds 是**完整路径模板**
+    /// (如 `eg/name?nick=1&len=10`):路径部分注册为独立命令路径(`#eg/name`),
+    /// `?` 后的参数模板存于成员(执行时构造请求,不参与预测)。**必须在 matcher
     /// 构建前调用**(引擎 `with_config` 里做,此时 magic refcount=1)。
     pub fn register_addons(&mut self, addons: &[AddonConfig]) {
         for a in addons {
             if a.cmds.is_empty() {
                 continue;
             }
-            let primary = a.cmds[0].clone();
-            let aliases = a.cmds[1..].to_vec();
+            let specs: Vec<AddonCmdSpec> = a
+                .cmds
+                .iter()
+                .map(|c| AddonCmdSpec::parse(c))
+                .filter(|s| !s.path.is_empty())
+                .collect();
+            if specs.is_empty() {
+                continue;
+            }
+            let name = specs[0].path.clone();
             let member: Arc<dyn MagicMember> = Arc::new(req::ReqMember::new_addon(
                 Arc::clone(&self.resources),
-                primary,
-                aliases,
+                a.name.clone(),
+                name,
+                specs,
                 a.url.clone(),
             ));
             if let Some(token) = member.activation_token() {

@@ -1,16 +1,20 @@
 //! ReqMember — 本地 magic HTTP 后端的**通用请求成员**:既承载内置 `#req`,
-//! 也支持配置化 addon 插件命令(`#eg/name?nickname=1` → 请求 addon 服务)。
+//! 也支持配置化 addon 插件命令。
 //!
-//! ## 命令 → URL 映射
+//! ## 命令路径 → URL 映射
 //!
-//! - 内置 `#req`: `#req<path?query>` → `GET {req_base}<path?query>`(不拼命令名)。
-//! - addon `#<cmd><path?query>` → `GET {addon.url}/{cmd}<path?query>`(命令名即
-//!   URL 第一段)。
+//! 每个 addon 在配置里声明若干**完整命令路径**(`eg`、`eg/name`、`eg1`),每条
+//! 独立参与匹配与预测;`?` 后的查询参数模板(`eg/name?nick=1&len=10`)存于成员,
+//! 供执行时构造请求,不参与预测。
+//!
+//! - 内置 `#req`: `#req<path?query>` → `POST {req_base}<path?query>`(不拼命令名)。
+//! - addon `#eg/name?nick=5` → `POST {addon.url}/eg/name?nick=5`(匹配到的完整路径)。
 //!
 //! ## 触发
 //!
-//! 完全匹配(输入是 `#<cmd>` 且后缀任意)即**自动发请求**(无需回车);后缀变化
-//! 重新请求,version 门控(参照 `#req` 的 `last_version`)。
+//! 完整路径精确匹配即**自动发请求**(无需回车);后缀变化重新请求,version 门控
+//! (参照 `#req` 的 `last_version`)。参数输入态(`#eg/1` 这类非注册路径)由框架
+//! 展示裸输入提交候选,提交时才经 `predict` 触发。
 //!
 //! ## 响应
 //!
@@ -39,8 +43,58 @@ pub struct AddonConfig {
     pub name: String,
     /// addon 服务地址(`http://127.0.0.1:9788`)。
     pub url: String,
-    /// 注册的魔法命令名列表(`eg,eg1,eg2` → 各生成 `#eg` `#eg1` `#eg2`)。
+    /// 注册的命令**路径模板**列表。每条形如 `eg/name?nick=1&len=10`:
+    /// 路径部分(`eg/name`)参与匹配/预测;`?` 后的查询参数模板(键=默认值,
+    /// 空默认 = 必填)参与执行时的请求构造,不参与预测。
+    /// `eg?param1=&param2=2` → 路径 `eg`,param1 必填、param2 默认 "2"。
     pub cmds: Vec<String>,
+}
+
+/// 一条 addon 命令路径模板的查询参数。
+#[derive(Debug, Clone)]
+pub struct AddonParam {
+    pub key: String,
+    /// 默认值;`None` = 必填(配置里写成 `key=` 空值)。
+    pub default: Option<String>,
+}
+
+/// 解析后的 addon 命令路径模板。
+#[derive(Debug, Clone)]
+pub struct AddonCmdSpec {
+    /// 完整命令路径(不含 `#`,如 `eg/name`)。
+    pub path: String,
+    /// 该路径的查询参数模板。
+    pub params: Vec<AddonParam>,
+}
+
+impl AddonCmdSpec {
+    /// 解析 `eg/name?nick=1&len=10` → 路径 `eg/name`,参数 nick(默认 "1")/len(默认 "10")。
+    pub fn parse(s: &str) -> AddonCmdSpec {
+        let (path, q) = match s.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (s, None),
+        };
+        let mut params = Vec::new();
+        if let Some(q) = q {
+            for pair in q.split('&') {
+                if pair.is_empty() {
+                    continue;
+                }
+                let (k, v) = match pair.split_once('=') {
+                    Some((k, v)) => (k, v),
+                    None => (pair, ""),
+                };
+                params.push(AddonParam {
+                    key: k.to_string(),
+                    default: if v.is_empty() { None } else { Some(v.to_string()) },
+                });
+            }
+        }
+        AddonCmdSpec {
+            path: path.to_string(),
+            params,
+        }
+    }
 }
 
 /// Synchronous HTTP POST provider, injected into the family. The production impl
@@ -205,15 +259,17 @@ pub struct ReqMember {
     /// 主命令名(`#eg` 的 eg)。addon 场景泄漏为 `&'static str`(注册一次,
     /// spawn 共享同一指针)。
     name: &'static str,
-    /// 其它命令名(`#eg1`/`#eg2`)。
-    aliases: Vec<&'static str>,
     /// 唯一激活 token(addon 按 addon名+cmd 生成)。
     token: &'static str,
     /// addon 服务地址;`None` = 内置 `#req`,用共享 `resources.req_base`。
     base_url: Option<String>,
     /// 是否把命令名拼进 URL 路径(addon=true;内置 #req=false)。
     prepend_cmd: bool,
-    /// 当前后缀(path+query)。`None` = 尚未发过请求。
+    /// addon 注册的命令**路径模板**(`eg`、`eg/name`、`eg1`…)。空 = 内置 `#req`。
+    specs: Vec<AddonCmdSpec>,
+    /// 本次输入匹配到的注册路径(如 `eg/name`)。URL 用它作命令路径。
+    cur_path: Option<String>,
+    /// 当前后缀(匹配路径之后的部分,path+query)。`None` = 尚未发过请求。
     arg: Option<String>,
     /// Last `version` seen — `tick` compares to detect the worker landing.
     last_version: u64,
@@ -232,50 +288,70 @@ impl ReqMember {
         ReqMember {
             resources,
             name: "req",
-            aliases: Vec::new(),
             token: "__REQ__",
             base_url: None,
             prepend_cmd: false,
+            specs: Vec::new(),
+            cur_path: None,
             arg: None,
             last_version: 0,
             async_state: Arc::new(ReqAsync::default()),
         }
     }
 
-    /// addon 命令成员:`#<cmd><path?query>` → `{base_url}/{cmd}<path?query>`。
-    /// `cmd` 为第一条命令名,其余进 `aliases`。
+    /// addon 命令成员:`#<path><suffix>` → `{base_url}/{path}<suffix>`。
+    /// 一个 addon 注册**多条完整路径**(`eg`、`eg/name`、`eg1`),每条独立参与
+    /// 精确匹配与前缀预测;`name` 为主路径(如 `eg`),token 按 addon 名区分。
     pub fn new_addon(
         resources: Arc<MagicResources>,
-        cmd: String,
-        aliases: Vec<String>,
+        addon_name: String,
+        name: String,
+        specs: Vec<AddonCmdSpec>,
         base_url: String,
     ) -> Self {
-        let aliases: Vec<&'static str> = aliases.into_iter().map(|a| leak(a)).collect();
-        let token = leak(format!("__ADDON_{cmd}__"));
+        let token = leak(format!("__ADDON_{addon_name}_{name}__"));
         ReqMember {
             resources,
-            name: leak(cmd),
-            aliases,
+            name: leak(name),
             token,
             base_url: Some(base_url),
             prepend_cmd: true,
+            specs,
+            cur_path: None,
             arg: None,
             last_version: 0,
             async_state: Arc::new(ReqAsync::default()),
         }
     }
 
-    /// 输入里命令名之后的后缀(path+query,如 `/name?nickname=1`)。
-    fn args_of(&self, input: &str) -> String {
-        for cmd in std::iter::once(self.name).chain(self.aliases.iter().copied()) {
-            if let Some(rest) = input.strip_prefix(&format!("#{cmd}")) {
-                return rest.to_string();
+    /// 输入里**匹配到的注册路径**之后的后缀(path+query,如 `/name?nickname=1`)。
+    /// 内置 `#req` 无注册路径,退化为 strip `#req`。
+    fn args_of(&mut self, input: &str) -> String {
+        let base = format!("#{}", self.name);
+        if !self.prepend_cmd || self.specs.is_empty() {
+            self.cur_path = None;
+            return input.strip_prefix(&base).unwrap_or("").to_string();
+        }
+        // 找最长匹配的注册路径(如 `#eg/name`),剩余部分作后缀。
+        let mut best: Option<&str> = None;
+        for spec in &self.specs {
+            let t = format!("#{}", spec.path);
+            if input.starts_with(&t)
+                && best.map(|b| spec.path.len() > b.len()).unwrap_or(true)
+            {
+                best = Some(&spec.path);
             }
         }
-        String::new()
+        if let Some(p) = best {
+            self.cur_path = Some(p.to_string());
+            input.strip_prefix(&format!("#{p}")).unwrap_or("").to_string()
+        } else {
+            self.cur_path = None;
+            input.strip_prefix(&base).unwrap_or("").to_string()
+        }
     }
 
-    /// 本次请求的完整 URL。
+    /// 本次请求的完整 URL。addon 用匹配到的完整路径(`eg/name`)+ 后缀。
     fn url(&self) -> String {
         let base = self
             .base_url
@@ -283,7 +359,8 @@ impl ReqMember {
             .unwrap_or_else(|| self.resources.req_base.lock().unwrap().clone());
         let suffix = self.arg.as_deref().unwrap_or("");
         if self.prepend_cmd {
-            format!("{base}/{}{suffix}", self.name)
+            let path = self.cur_path.as_deref().unwrap_or(self.name);
+            format!("{base}/{path}{suffix}")
         } else {
             format!("{base}{suffix}")
         }
@@ -321,11 +398,13 @@ impl ReqMember {
     }
 
     /// 结构化请求体:`{cmd, path, query, pick?}`。POST 时带上,方便扩展参数。
+    /// `cmd` 用匹配到的完整路径(`eg/name`),后端据此知道命中了哪条命令路径。
     fn request_body(&self, pick: Option<&str>) -> String {
         let suffix = self.arg.as_deref().unwrap_or("");
         let (path, query) = split_suffix(suffix);
+        let cmd = self.cur_path.as_deref().unwrap_or(self.name);
         let mut obj = serde_json::json!({
-            "cmd": self.name,
+            "cmd": cmd,
             "path": path,
             "query": query,
         });
@@ -387,22 +466,29 @@ impl MagicMember for ReqMember {
         self.name
     }
 
-    fn aliases(&self) -> &[&'static str] {
-        &self.aliases
-    }
-
     fn activation_token(&self) -> Option<&'static str> {
         Some(self.token)
+    }
+
+    /// addon 注册的全部命令完整路径(`eg`、`eg/name`、`eg1`…);内置 `#req`
+    /// 只有命令名自身。
+    fn registered_paths(&self) -> Vec<String> {
+        if self.specs.is_empty() {
+            vec![self.name.to_string()]
+        } else {
+            self.specs.iter().map(|s| s.path.clone()).collect()
+        }
     }
 
     fn spawn(&self) -> Box<dyn MagicMember> {
         Box::new(ReqMember {
             resources: Arc::clone(&self.resources),
             name: self.name,
-            aliases: self.aliases.clone(),
             token: self.token,
             base_url: self.base_url.clone(),
             prepend_cmd: self.prepend_cmd,
+            specs: self.specs.clone(),
+            cur_path: None,
             arg: None,
             last_version: 0,
             async_state: Arc::new(ReqAsync::default()),
@@ -410,9 +496,10 @@ impl MagicMember for ReqMember {
     }
 
     fn predict(&mut self, ctx: usize, input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
-        // 后缀从输入派生;变化(含首次)→ 自动发请求(完全匹配即触发)。
+        // 后缀从输入派生;匹配路径/后缀任一变化(含首次)→ 自动发请求。
+        let prev_path = self.cur_path.clone();
         let arg = self.args_of(input);
-        if self.arg.as_deref() != Some(&arg) {
+        if self.arg.as_deref() != Some(&arg) || prev_path != self.cur_path {
             self.arg = Some(arg);
             self.invalidate_result();
             self.fire(ctx);

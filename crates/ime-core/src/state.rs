@@ -30,7 +30,7 @@
 //! the PhraseBook for future sessions.
 
 use crate::expander::Expander;
-use crate::family::magic::{MagicCommand, MagicMatch, MagicMember};
+use crate::family::magic::{MagicCommand, MagicMatch, MagicMember, Prediction};
 use crate::matcher::Matcher;
 use crate::platform::{ImeView, CANDIDATE_SLOTS};
 use crate::PinyinEngine;
@@ -213,6 +213,21 @@ impl StateMachine {
                     self.magic_selectable = input == trigger;
                 }
             },
+            // 参数输入态(`#del/1`):不调 member.predict(不自动触发),展示裸输入
+            // 提交候选;数字是参数文本。提交时 force-fire 解析前缀再触发。
+            // (匹配逻辑只对 live 成员产生 Args,静态命令不会带参数。)
+            MagicMatch::Args(MagicCommand::Live { token, name }) => {
+                self.ensure_command(name, Some(token), env);
+                self.magic_predictions = vec![Prediction::submit(input.clone())];
+                self.magic_hints.clear();
+                self.magic_selectable = false;
+            }
+            MagicMatch::Args(MagicCommand::Static) => {
+                self.clear_active_command();
+                self.magic_predictions.clear();
+                self.magic_hints.clear();
+                self.magic_selectable = false;
+            }
             MagicMatch::Prefix(hints) => {
                 self.clear_active_command();
                 self.magic_predictions.clear();
@@ -276,7 +291,11 @@ impl StateMachine {
         for h in &self.magic_hints {
             cands.push(h.clone());
         }
-        cands.push(self.buffer.clone()); // rollback — 最后一项
+        // 参数输入态的裸提交候选文本 == 缓冲,不重复追加 rollback。
+        let is_submit = self.magic_predictions.first().map(|p| p.submit).unwrap_or(false);
+        if !is_submit {
+            cands.push(self.buffer.clone()); // rollback — 最后一项
+        }
         self.candidates = cands;
         self.candidates_fresh = true;
         self.candidate_highlight = 0;
@@ -301,6 +320,11 @@ impl StateMachine {
         // 1. 精确匹配的预测选项。
         if index < n_preds {
             let pred = self.magic_predictions[index].clone();
+            // 参数输入态的裸输入提交 → 用完整输入重新解析,忽略 `/…` 参数,
+            // 前缀匹配命令并**强制触发**(predict 会用完整输入解析删除/请求)。
+            if pred.submit {
+                return self.force_fire(env);
+            }
             if pred.interactive {
                 // 交互式:传给命令 → 重新预测,替换选项(不上屏)。
                 if let Some(mut m) = self.active_command.take() {
@@ -330,6 +354,41 @@ impl StateMachine {
             return self.query_magic(env);
         }
         // 3. rollback:提交原始缓冲。
+        let raw = std::mem::take(&mut self.buffer);
+        self.reset();
+        Self::commit_view(&raw)
+    }
+
+    /// 参数输入态的**裸输入提交**(`#del/15` + Space):用完整输入重新调用成员
+    /// `predict` —— 成员解析参数后决定动作(删除 / 提交 / 交互请求)。取首条
+    /// 预测执行;无预测则提交原始缓冲。
+    fn force_fire(&mut self, env: &dyn StepEnv) -> ImeView {
+        let input = self.buffer.clone();
+        let preds = self
+            .active_command
+            .as_mut()
+            .map(|m| m.predict(self.ctx, &input, env))
+            .unwrap_or_default();
+        if let Some(head) = preds.first().cloned() {
+            if head.interactive {
+                // 交互(如 addon 请求中…):展示为候选,等待异步落地。
+                self.magic_predictions = preds;
+                self.magic_hints.clear();
+                self.magic_selectable = false;
+                return self.rebuild_magic_view();
+            }
+            self.clear_active_command();
+            self.reset();
+            if head.delete_count > 0 {
+                return Self::delete_view(head.delete_count);
+            }
+            let commit = head.commit_value().to_string();
+            return match head.cursor {
+                Some(c) => Self::commit_view_at(&commit, c),
+                None => Self::commit_view(&commit),
+            };
+        }
+        // 无预测 → 提交原始输入。
         let raw = std::mem::take(&mut self.buffer);
         self.reset();
         Self::commit_view(&raw)
@@ -480,11 +539,37 @@ impl StateMachine {
         self.committed_pinyin_buf.clone()
     }
 
+    /// 把 preedit 里的字面换行转义成 `\n` 文本(展示用),并同步调整光标字节偏移:
+    /// 每个**光标之前**的 `\n`(1 字节)→ `\n` 两字符(2 字节),光标后移 1 字节。
+    /// 提交/拼写等不含 `\n` 的场景原样返回,零开销。
+    fn escape_preedit(text: &str, cursor: usize) -> (String, usize) {
+        if !text.contains('\n') {
+            return (text.to_string(), cursor);
+        }
+        let mut escaped = String::with_capacity(text.len() + 4);
+        let mut out_cursor = cursor;
+        for (i, ch) in text.char_indices() {
+            if ch == '\n' {
+                escaped.push_str("\\n");
+                if i < cursor {
+                    out_cursor += 1; // 光标前的 `\n` 扩成两字节,光标后移 1
+                }
+            } else {
+                escaped.push(ch);
+            }
+        }
+        (escaped, out_cursor)
+    }
+
     // ── view helpers ────────────────────────────────────────────────────
 
     fn fill_view(&self, view: &mut ImeView) {
-        ImeView::set_str(&mut view.preedit_text, &self.preedit);
-        view.preedit_cursor = self.cursor as u32;
+        // preedit 是应用文本框里显示的内容;多行片段(如 #/angle 三角形)含
+        // 字面 `\n`,直接显示会破坏应用排版 → 转义成 `\n` 文本。光标字节偏移
+        // 同步调整(每个光标前的 `\n` 多占 1 字节)。
+        let (escaped, display_cursor) = Self::escape_preedit(&self.preedit, self.cursor);
+        ImeView::set_str(&mut view.preedit_text, &escaped);
+        view.preedit_cursor = display_cursor as u32;
         let n = self.candidates.len().min(CANDIDATE_SLOTS);
         for i in 0..n {
             ImeView::set_str(&mut view.candidates[i].text, &self.candidates[i]);

@@ -43,6 +43,10 @@ pub struct Prediction {
 
     /// 选中时先删除文本框中该数量的字符(0 = 不删)。
     pub delete_count: u32,
+
+    /// 参数输入态的"裸输入"候选:展示文本即输入本身;选中时框架**不提交文本**,
+    /// 而是用完整输入重新调用成员 `predict` 强制触发(`#del/15` → 提交 → 解析删除)。
+    pub submit: bool,
 }
 
 impl Prediction {
@@ -54,6 +58,7 @@ impl Prediction {
             cursor: None,
             commit_text: None,
             delete_count: 0,
+            submit: false,
         }
     }
 
@@ -66,6 +71,7 @@ impl Prediction {
             cursor: None,
             commit_text: Some(raw.into()),
             delete_count: 0,
+            submit: false,
         }
     }
 
@@ -82,6 +88,7 @@ impl Prediction {
             cursor: None,
             commit_text: Some(raw.into()),
             delete_count: 0,
+            submit: false,
         }
     }
 
@@ -94,6 +101,7 @@ impl Prediction {
             cursor: None,
             commit_text: None,
             delete_count: count,
+            submit: false,
         }
     }
 
@@ -105,6 +113,21 @@ impl Prediction {
             cursor: None,
             commit_text: None,
             delete_count: 0,
+            submit: false,
+        }
+    }
+
+    /// 参数输入态候选:展示文本 = 完整输入(`#del/15`);选中后框架不提交文本,
+    /// 而是用完整输入调用成员 `predict` 强制触发(见 [`select_magic`](crate::state::StateMachine::select_magic))。
+    pub fn submit(text: impl Into<String>) -> Self {
+        Prediction {
+            text: text.into(),
+            preedit: None,
+            interactive: false,
+            cursor: None,
+            commit_text: None,
+            delete_count: 0,
+            submit: true,
         }
     }
 
@@ -116,6 +139,7 @@ impl Prediction {
             cursor: Some(cursor),
             commit_text: None,
             delete_count: 0,
+            submit: false,
         }
     }
 
@@ -224,6 +248,15 @@ pub trait MagicMember: Send + Sync {
     /// 重新查询 `predict` 替换选项(不上屏)。非交互预测不经过这里。
     fn pick(&mut self, index: usize, text: &str, sm: &mut StateMachine, env: &dyn StepEnv) {
         let _ = (index, text, sm, env); // 默认:无交互副作用
+    }
+
+    /// 该命令注册的**全部完整触发路径**(不含 `#`)。默认 = 命令名 + 别名;
+    /// addon 成员覆盖为配置里的所有路径(`eg`、`eg/name`、`eg1`…)。
+    /// 框架据此做完整路径精确匹配(执行)与前缀预测(补全)。
+    fn registered_paths(&self) -> Vec<String> {
+        let mut v = vec![self.name().to_string()];
+        v.extend(self.aliases().iter().map(|a| a.to_string()));
+        v
     }
 
     /// 异步刷新预测(live 成员:voice 版本 / req 结果落地)。返回 `Some(新预测)`
