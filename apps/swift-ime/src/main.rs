@@ -36,7 +36,7 @@ struct Args {
     /// aura daemon origin(默认 http://127.0.0.1:9091)。voice listener 在引擎构造时启动,
     /// 跟随引擎 drop 自动清理 —— 这里只是配置 URL。
     #[arg(long)]
-    voice_aura_base: Option<String>,
+    aura_addr: Option<String>,
     #[arg(long)]
     en_user_dict: Option<String>,
     #[arg(long)]
@@ -53,11 +53,12 @@ fn main() {
         top_n: args.top_n, verbose: args.verbose,
         config: args.config, asr_text: args.asr_text,
         commit: args.commit, async_wait: args.async_wait,
-        voice_aura_base: args.voice_aura_base
+        voice_aura_base: args.aura_addr
             .unwrap_or_else(|| ime_core::engine::DEFAULT_VOICE_AURA_BASE.to_string()),
         en_user_dict: args.en_user_dict, en_dicts: args.en_dicts,
         req_base: args.req_base,
         frontend: None,
+        tee_stderr: true,
     };
 
     if let Some(ref cases_path) = cfg.cases {

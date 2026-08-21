@@ -178,18 +178,19 @@ async fn voice_server_main(
                         active_ctx = ctx as i64;
                         tracing::info!(ctx, is_new, connected, "voice Attach");
                         if !connected {
-                            // 断裂/未连 → 此刻才连(一次性 health 探针,非轮询)。
+                            // 断裂/未连 → 触发重连:一次性 health 探针种 is_connected
+                            // (UI 显示"未连接"还是"语音识别中"),然后**总是**建流 ——
+                            // 断连由流内部指数退避重试,连续失败超上限流结束(→ None →
+                            // connected=false),下次 #asr Attach 重建流 = 手动重连。
                             match AuraClient::new(&base) {
                                 Ok(client) => {
                                     let ok = client.health().await.unwrap_or(false);
                                     state.set_connected(ok);
-                                    tracing::info!(connected = ok, "voice connect probe");
-                                    if ok {
-                                        sources.push(Box::pin(poll_seg(Box::pin(
-                                            client.subscribe_segments_owned(),
-                                        ))));
-                                        connected = true;
-                                    }
+                                    tracing::info!(connected = ok, "voice attach → spawn stream");
+                                    sources.push(Box::pin(poll_seg(Box::pin(
+                                        client.subscribe_segments_owned(),
+                                    ))));
+                                    connected = true;
                                 }
                                 Err(e) => {
                                     tracing::error!(error = %e, base = %base, "voice: AuraClient::new failed");
@@ -232,6 +233,8 @@ async fn voice_server_main(
                 match seg {
                     Some(Some((seg, s))) => {
                         state.fold_segment(&seg);
+                        // 收到段 = 已连上(即使 Attach 时 health 误判为断,段也证活)。
+                        state.set_connected(true);
                         // 排查 UI 延迟:看每个段(带文本)何时到达,与说话时刻对表。
                         tracing::info!(?seg, "voice segment folded");
                         if try_refresh(&mut active_ctx, &frontend) {

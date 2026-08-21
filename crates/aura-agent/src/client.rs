@@ -31,8 +31,14 @@ use futures::{Stream, StreamExt};
 
 use crate::view::{AsrSegment, AuraStateView};
 
-/// Reconnect backoff when an SSE stream drops or the daemon is unreachable.
-const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
+/// SSE 重连的指数退避基准(1s → 2s → 4s → …,封顶 [`RECONNECT_MAX_DELAY`])。
+const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(1);
+/// 连续连接失败的上限:超过即**放弃**,流结束(返回 `None`)—— 上层(voice
+/// server)据此丢源、不再 select;下次 `#asr` 重新 `subscribe_segments_owned()`
+/// 即"手动重连"(计数清零,重新走一遍退避)。
+const RECONNECT_MAX_ATTEMPTS: u32 = 10;
+/// 单次退避 sleep 的上限。
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 
 /// Async client for the aura-daemon HTTP socket. Cheap to clone (shares the reqwest pool).
 #[derive(Clone)]
@@ -132,9 +138,12 @@ impl AuraClient {
     /// [`subscribe_segments`]. Yields one owned String per `data:` line (a frame may carry ≥1).
     fn sse_data(&self, url: String) -> impl Stream<Item = String> + '_ {
         async_stream::stream! {
+            let mut attempts: u32 = 0;
             loop {
                 match self.http.get(&url).send().await {
                     Ok(resp) if resp.status().is_success() => {
+                        // 连上过 → 计数清零,之后的断线重连从头退避。
+                        attempts = 0;
                         let mut bytes = resp.bytes_stream();
                         let mut buf = String::new();
                         // Drive this connection until it ends/errors, then fall through to reconnect.
@@ -150,10 +159,26 @@ impl AuraClient {
                             }
                         }
                     }
-                    Ok(resp) => tracing::warn!(status = %resp.status(), "aura SSE bad status; reconnecting"),
-                    Err(e) => tracing::warn!(error = %e, "aura SSE connect failed; retrying"),
+                    Ok(resp) => {
+                        tracing::warn!(status = %resp.status(), attempts, "aura SSE bad status");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, attempts, "aura SSE connect failed");
+                    }
                 }
-                tokio::time::sleep(RECONNECT_BACKOFF).await;
+                // 指数退避 + 上限:连续失败超过 RECONNECT_MAX_ATTEMPTS 次 → 放弃,
+                // 流结束(返回 None)。下次 #asr 重新 subscribe = 手动重连。
+                attempts += 1;
+                if attempts >= RECONNECT_MAX_ATTEMPTS {
+                    tracing::warn!(attempts, "aura SSE reconnect giving up (manual reconnect on next #asr)");
+                    break;
+                }
+                let exp = 1u32 << attempts.min(6); // 2^attempts,封顶 64
+                let delay = RECONNECT_BASE_DELAY
+                    .saturating_mul(exp)
+                    .min(RECONNECT_MAX_DELAY);
+                tracing::debug!(attempts, ?delay, "aura SSE reconnect backoff");
+                tokio::time::sleep(delay).await;
             }
         }
     }

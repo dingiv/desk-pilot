@@ -169,7 +169,7 @@ pub extern "C" fn swift_ime_create(
     // 先读配置(拿 debug.log_level),再装进程级 tracing subscriber —— 之后
     // 的 ime_log! / 引擎 tracing 事件统一写进 swift-ime.log。
     let cfg = crate::config::SwiftImeConfig::load();
-    crate::logger::init_with_log_level(cfg.debug.log_level.as_deref());
+    crate::logger::init_with_log_level(cfg.debug.log_level.as_deref(), true);
     crate::ime_log!("swift-ime cdylib loaded");
     let weights = cfg.weights.pinyin.to_engine();
     let eng_weights = ime_core::family::english::EnglishWeights {

@@ -18,13 +18,13 @@ stage3: true                    # 运行进程内 Stage3 规则触发器
 # "audio_aura_core=debug,info")。RUST_LOG 环境变量优先于此处 (逃生舱)。
 # 注意: 高频识别日志 (流式 partial ~0.5s/条、纠偏碎片 ~1s/条) 只在 debug 可见;
 # info 只出 final (每定稿一句一条, 含 batch/streaming/calibrated 三层文本)。
-log_level: "info"               # 调试语音管线时改 "debug"
+log_level: "debug"               # 调试语音管线时改 "debug"
 
 # ── Stage1 语音前端 (asr) ─────────────────────────────────────────────────────
 # stream = 流式 ASR (恒本地, 实时 partial 要低延迟); backend 选批式 ASR 部署。
 asr:
   stream:                       # 流式引擎 (未知值启动报错, 不静默回退)
-    model: x-asr            # zipformer (2023 双语) | x-asr (2026, 100万小时 zh-en, assets/models/x-asr)
+    model: zipformer            # zipformer (2023 双语) | x-asr (2026, 100万小时 zh-en, assets/models/x-asr)
   backend: remote               # local | remote | disable
   local:                        # backend=local 时生效
     model: sensevoice           # 本地批式引擎: sensevoice (唯一本地; whisper/qwen3-asr 本地模型

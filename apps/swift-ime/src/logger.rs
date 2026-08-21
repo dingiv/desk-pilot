@@ -85,9 +85,10 @@ fn open_log_file(path: &str) -> Option<Mutex<std::fs::File>> {
 ///
 /// - 每条事件写 `path`(文件 —— fcitx5 daemon 下 stderr 不连终端,文件是
 ///   唯一可靠信道);
-/// - dev 双写 stderr(人类可读),release 只写 JSON 行到文件;
+/// - dev 下 `tee_stderr=true` 双写 stderr(人类可读),`false` 只写文件
+///   (TUI 用 alternate screen,stderr 会打坏界面);release 只写 JSON 行到文件;
 /// - 级别:`RUST_LOG` 环境变量 > `default_filter`(裸级别或 per-target 指令)。
-pub fn init_tracing(path: &str, default_filter: &str) {
+pub fn init_tracing(path: &str, default_filter: &str, tee_stderr: bool) {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         if let Some(f) = open_log_file(path) {
@@ -101,7 +102,7 @@ pub fn init_tracing(path: &str, default_filter: &str) {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
         let registry = tracing_subscriber::registry().with(filter);
-        if cfg!(debug_assertions) {
+        if cfg!(debug_assertions) && tee_stderr {
             // 文件 + stderr 双写。std::io::stderr 是 `fn() -> Stderr`,
             // 满足 `MakeWriter` 的 `F: Fn() -> W, W: Write` 实现。
             registry
@@ -115,10 +116,10 @@ pub fn init_tracing(path: &str, default_filter: &str) {
                 )
                 .init();
         } else {
+            // 文件 only(release 恒走这;dev 的 TUI 也走这,避免打坏 alternate screen)。
             registry
                 .with(
                     tracing_subscriber::fmt::layer()
-                        .json()
                         .with_target(true)
                         .with_writer(FileWriter),
                 )
@@ -129,22 +130,28 @@ pub fn init_tracing(path: &str, default_filter: &str) {
 
 /// Init with default path (`DATA::swift-ime.log`) and level `"info"`。
 pub fn init_default() {
-    init_resolved("info");
+    init_with_log_level(None, true);
 }
 
 /// Init with a config-provided level(`debug.log_level`,默认 `"info"`)。
-/// `RUST_LOG` 环境变量仍然优先。
-pub fn init_with_log_level(level: Option<&str>) {
-    init_resolved(level.unwrap_or("info"));
+/// `RUST_LOG` 环境变量仍然优先。`tee_stderr`: dev 下是否同时打到 stderr
+/// (CLI/mock/fcitx 可;TUI 必须 `false`,否则日志破坏 alternate screen)。
+pub fn init_with_log_level(level: Option<&str>, tee_stderr: bool) {
+    init_resolved(level.unwrap_or("info"), tee_stderr);
 }
 
-fn init_resolved(default_filter: &str) {
+/// TUI 专用:日志只写文件,不 tee stderr。
+pub fn init_tui(level: Option<&str>) {
+    init_with_log_level(level, false);
+}
+
+fn init_resolved(default_filter: &str, tee_stderr: bool) {
     let loader = shared::loader!(".");
     let path = loader
         .resolve("DATA::swift-ime.log")
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "/tmp/swift-ime.log".into());
-    init_tracing(&path, default_filter);
+    init_tracing(&path, default_filter, tee_stderr);
 }
 
 /// `ime_log!` —— 兼容旧调用点,统一走 `tracing::info!`(target `swift_ime`)。

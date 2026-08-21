@@ -31,6 +31,9 @@ pub struct MockConfig {
     pub req_base: Option<String>,
     /// 前端句柄(引擎 I/O 线程推送刷新)。None → NoopFrontend。
     pub frontend: Option<Arc<dyn ime_core::frontend::FrontEndHandle>>,
+    /// dev 构建下日志是否 tee 到 stderr。CLI/mock 可以;TUI 必须 false
+    /// (stderr 会打坏 alternate screen 界面)。
+    pub tee_stderr: bool,
 }
 
 impl Default for MockConfig {
@@ -44,6 +47,7 @@ impl Default for MockConfig {
             voice_aura_base: ime_core::engine::DEFAULT_VOICE_AURA_BASE.to_string(),
             en_user_dict: None, en_dicts: Vec::new(),
             frontend: None,
+            tee_stderr: true,
         }
     }
 }
@@ -86,7 +90,8 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<ime_core::voice_state::
     // 装进程级 tracing subscriber —— mock/TUI 的唯一初始化点(Once 幂等,
     // fcitx5 cdylib 在 swift_ime_create 里各自初始化)。引擎与前端日志统一
     // 写进 swift-ime.log,级别取 debug.log_level(默认 info;RUST_LOG 优先)。
-    crate::logger::init_with_log_level(sw_cfg.debug.log_level.as_deref());
+    // tee_stderr: CLI 可;TUI 必须 false(否则日志打坏 alternate screen)。
+    crate::logger::init_with_log_level(sw_cfg.debug.log_level.as_deref(), cfg.tee_stderr);
 
     let weights = sw_cfg.weights.pinyin.to_engine();
     let eng_weights = ime_core::family::english::EnglishWeights {

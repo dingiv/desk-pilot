@@ -14,6 +14,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::ExecutableCommand;
 use ime_core::engine::ImeEngine;
+use ime_core::family::magic::preview_text;
 use ime_core::frontend::{FrontEndHandle, StateView};
 use ime_core::router::{KeyKind, KeyEvent};
 use ime_core::voice_state::SharedVoiceState;
@@ -43,11 +44,13 @@ use ratatui::{Frame, Terminal};
 
 use swift_ime::frontends::mock::MockConfig;
 
-const POLL_MS: u64 = 100; // voice live-refresh cadence (was 200)
+const POLL_MS: u64 = 50; // 键盘事件轮询节拍(voice 推送到达 ≤50ms 内被感知)
 
 // ── Entry point ────────────────────────────────────────────────────────
 
 pub fn run(mut cfg: MockConfig) -> io::Result<()> {
+    // TUI 用 alternate screen 渲染,stderr 打日志会破坏界面 → 只写文件。
+    cfg.tee_stderr = false;
     // 前端句柄:引擎 I/O 线程推送刷新 → TUI 渲染循环 drain。
     // (进程级 tracing subscriber 在 build_engine 里按 debug.log_level 初始化。)
     let frontend = Arc::new(TuiFrontend::default());
@@ -79,41 +82,55 @@ fn run_loop(
     let mut last_view = ImeView::empty();
     let mut should_quit = false;
 
+    // 首帧先渲染一次。
+    terminal.draw(|f| {
+        // 当前预测项的提供者(family/source)与权重(score)。
+        let detailed = engine.candidates_detailed();
+        let flags = engine.state_flags();
+        render(f, &last_view, history, voice_state, &detailed, flags)
+    })?;
+
     while !should_quit {
-        terminal.draw(|f| {
-            // 当前预测项的提供者(family/source)与权重(score)。
-            let detailed = engine.candidates_detailed();
-            let flags = engine.state_flags();
-            render(f, &last_view, history, voice_state, &detailed, flags)
-        })?;
+        let mut dirty = false;
+
+        // 键盘(最多等 POLL_MS,兼作渲染节拍)。
+        if event::poll(Duration::from_millis(POLL_MS))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    // ── 忠实转换:键 + 修饰状态 → 统一键事件,交给路由层 ──
+                    let ev = crossterm_to_key(&key);
+
+                    // TUI 自身是"应用":引擎对 Ctrl 组合返回 PASSTHROUGH,
+                    // Ctrl+Q / Ctrl+C 在此退出。
+                    if ev.ctrl && matches!(ev.kind, KeyKind::Char('q') | KeyKind::Char('c')) {
+                        should_quit = true;
+                    } else {
+                        last_view = engine.key(ev);
+                        let committed = ImeView::str_field(&last_view.commit_text);
+                        if !committed.is_empty() {
+                            history.push(committed.to_string());
+                        }
+                        dirty = true;
+                    }
+                }
+            }
+        }
 
         // 引擎 I/O 线程推送过刷新(voice/req 异步推进)→ 拉最新 live 视图。
         if frontend.pending.swap(0, Ordering::AcqRel) > 0 {
             if let Some(v) = engine.magic_tick() {
                 last_view = v;
             }
+            dirty = true;
         }
 
-        if event::poll(Duration::from_millis(POLL_MS))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press { continue; }
-
-                // ── 忠实转换:键 + 修饰状态 → 统一键事件,交给路由层 ──
-                let ev = crossterm_to_key(&key);
-
-                // TUI 自身是"应用":引擎对 Ctrl 组合返回 PASSTHROUGH,
-                // Ctrl+Q / Ctrl+C 在此退出。
-                if ev.ctrl && matches!(ev.kind, KeyKind::Char('q') | KeyKind::Char('c')) {
-                    should_quit = true;
-                    continue;
-                }
-
-                last_view = engine.key(ev);
-                let committed = ImeView::str_field(&last_view.commit_text);
-                if !committed.is_empty() {
-                    history.push(committed.to_string());
-                }
-            }
+        // 只在"有输入 或 有推送"时重绘 —— 不空转。
+        if dirty {
+            terminal.draw(|f| {
+                let detailed = engine.candidates_detailed();
+                let flags = engine.state_flags();
+                render(f, &last_view, history, voice_state, &detailed, flags)
+            })?;
         }
     }
 
@@ -266,7 +283,12 @@ fn render_status(
     flags: ime_core::router::StateFlags,
 ) {
     let voice = voice_state.snapshot();
-    let vs = if voice.is_empty() { "ASR: idle".into() } else { format!("ASR: {}", &voice[..voice.len().min(30)]) };
+    // 按字节截断会切进多字节字符(如 '以' 3 字节)→ 用 char-boundary 安全的 preview_text。
+    let vs = if voice.is_empty() {
+        "ASR: idle".into()
+    } else {
+        format!("ASR: {}", preview_text(&voice, 30))
+    };
     let aura = if voice_state.is_connected() {
         Span::styled(" aura:✓ ", Style::new().fg(Color::Green).add_modifier(Modifier::BOLD))
     } else {
