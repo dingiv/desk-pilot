@@ -86,7 +86,7 @@ impl VoiceMember {
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| live.clone());
         if !composed.is_empty() {
-            out.push(Prediction::commit(composed));
+            out.push(Prediction::commit_raw(format!("🎙 {}", composed), composed));
         }
         for f in finals.iter().take(MAX_SUBMIT - out.len()) {
             out.push(Prediction::commit(f.clone()));
@@ -155,8 +155,9 @@ impl MagicMember for VoiceMember {
 
         let out = self.voice_predictions(&state);
         if out.is_empty() {
-            // 连接但暂无语音:占位(选中不上屏)。
-            vec![Prediction::interactive("语音识别中...")]
+            // 连接但暂无语音:🎙 占位(选中不上屏)。正常到不了(voice_predictions
+            // 已含 🎙),兜底用。
+            vec![Prediction::interactive("🎙")]
         } else {
             out
         }

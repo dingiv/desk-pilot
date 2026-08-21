@@ -116,7 +116,7 @@ impl Stage2Calibrator for Stage2CalibratorImpl {
                     .iter()
                     .map(|s| s.streaming_text.as_str())
                     .collect::<Vec<_>>()
-                    .join("\n");
+                    .join("");
                 self.joint_calibrate(&texts, Some(&streaming))
             }
         };
@@ -162,7 +162,7 @@ impl Stage2CalibratorImpl {
         tracing::debug!(target: "stage2::prompt", system = %system, user = %user, "calibrate prompt");
 
         // LLM returns plain text — no JSON parsing. Failure → the raw text, unchanged.
-        self.llm.complete(&system, &user).unwrap_or_else(|_| texts.join("\n"))
+        self.llm.complete(&system, &user).unwrap_or_else(|_| texts.join(""))
     }
 }
 

@@ -113,13 +113,9 @@ impl FrontEndHandle for FcitxFrontend {
     }
 }
 
-/// Max displayed bytes for one candidate row in the fcitx5 panel.
-///
-/// 语音(`#asr`)候选是整句话,截断会让用户只看到半句 —— 候选槽 buffer 是
-/// `CANDIDATE_SLOTS` 的 `char[128]`,这里设为 128 即"不额外截断",整句(最多
-/// 127 字节 ≈ 42 汉字)都显示。面板宽度随最长行自适应。提交始终用引擎的完整
-/// 文本,截断纯展示。
-const FCITX_CANDIDATE_TEXT_MAX: usize = 128;
+/// 非语音候选行的显示字节上限(候选槽 buffer 是 `char[128]`,取 128 即不
+/// 额外截断)。语音(`#asr`)候选在 [`truncate_candidate_rows`] 里单独截到 ≤8 字。
+const FCITX_CANDIDATE_TEXT_MAX: usize = 8 * 3;
 
 /// Real variable provider for the fcitx5 environment: a live `$DATE` and the
 /// clipboard text pushed by the C++ glue (fcitx5 clipboard events) via
