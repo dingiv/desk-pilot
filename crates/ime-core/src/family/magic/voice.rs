@@ -86,7 +86,13 @@ impl VoiceMember {
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| live.clone());
         if !composed.is_empty() {
-            out.push(Prediction::commit_raw(format!("🎙 {}", composed), composed));
+            // 三文本独立:候选行展示 🎙+文本,preedit 显示纯文本(不带图标),
+            // 提交纯文本。
+            out.push(Prediction::commit_triple(
+                format!("🎙 {composed}"),
+                composed.clone(),
+                composed,
+            ));
         }
         for f in finals.iter().take(MAX_SUBMIT - out.len()) {
             out.push(Prediction::commit(f.clone()));

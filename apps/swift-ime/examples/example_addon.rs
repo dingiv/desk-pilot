@@ -39,10 +39,15 @@ fn handle(stream: &mut TcpStream) {
         eprintln!("[example_addon]   body: {req_body}");
     }
 
-    // 回显请求信息 + 一条交互候选(选中后 swift-ime 会带 pick 字段重发)。
+    // 演示三种独立文本:候选展示精简、preedit 给完整预览、commit 提交原文;
+    // 加一条交互候选(选中后 swift-ime 会带 pick 字段重发)。
     let body = serde_json::json!({
         "candidates": [
-            { "text": req_line, "interactive": false, "commit_value": format!("你请求了: {req_line}") },
+            {
+                "text": "查询结果",
+                "preedit": format!("正在查询: {req_line}"),
+                "commit_value": format!("你请求了: {req_line}")
+            },
             { "text": "再预测一下", "interactive": true }
         ]
     })

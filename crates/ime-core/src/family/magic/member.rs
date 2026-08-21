@@ -17,10 +17,19 @@
 use crate::state::{StateMachine, StepEnv};
 
 /// 命令的一条预测选项。
+///
+/// 一个选项携带**三种文本**,各自独立:
+/// - [`text`](Prediction::text):候选行里展示的文本;
+/// - [`preedit`](Prediction::preedit):应用文本框里的预览(`None` = 用 `text`);
+/// - [`commit_text`](Prediction::commit_text):实际提交的文本(`None` = 用 `text`)。
+///
+/// 典型场景(addon 候选):候选行展示精简结果,preedit 给完整预览,提交原文。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prediction {
-    /// 展示文本(候选行 + preedit)。可能做转义(`#clip` 把换行显示成 `\n`)。
+    /// 候选行里展示的文本。可能做转义(`#clip` 把换行显示成 `\n`)。
     pub text: String,
+    /// 应用文本框里的预览(preedit);`None` = 与展示文本相同。
+    pub preedit: Option<String>,
     /// 提交文本;None = 与展示文本相同。展示转义/截断时,提交用原始文本。
     pub commit_text: Option<String>,
 
@@ -36,6 +45,7 @@ impl Prediction {
     pub fn commit(text: impl Into<String>) -> Self {
         Prediction {
             text: text.into(),
+            preedit: None,
             interactive: false,
             cursor: None,
             commit_text: None,
@@ -46,6 +56,22 @@ impl Prediction {
     pub fn commit_raw(display: impl Into<String>, raw: impl Into<String>) -> Self {
         Prediction {
             text: display.into(),
+            preedit: None,
+            interactive: false,
+            cursor: None,
+            commit_text: Some(raw.into()),
+        }
+    }
+
+    /// 三文本完全区分:候选展示 `display`,preedit 预览 `preedit`,提交 `raw`。
+    pub fn commit_triple(
+        display: impl Into<String>,
+        preedit: impl Into<String>,
+        raw: impl Into<String>,
+    ) -> Self {
+        Prediction {
+            text: display.into(),
+            preedit: Some(preedit.into()),
             interactive: false,
             cursor: None,
             commit_text: Some(raw.into()),
@@ -55,6 +81,7 @@ impl Prediction {
     pub fn interactive(text: impl Into<String>) -> Self {
         Prediction {
             text: text.into(),
+            preedit: None,
             interactive: true,
             cursor: None,
             commit_text: None,
@@ -64,6 +91,7 @@ impl Prediction {
     pub fn with_cursor(text: impl Into<String>, cursor: usize) -> Self {
         Prediction {
             text: text.into(),
+            preedit: None,
             interactive: false,
             cursor: Some(cursor),
             commit_text: None,
@@ -73,6 +101,11 @@ impl Prediction {
     /// 实际提交文本(展示 ≠ 提交时用 commit_text)。
     pub fn commit_value(&self) -> &str {
         self.commit_text.as_deref().unwrap_or(&self.text)
+    }
+
+    /// preedit 预览文本(未单独指定时用展示文本)。
+    pub fn preedit_value(&self) -> &str {
+        self.preedit.as_deref().unwrap_or(&self.text)
     }
 }
 

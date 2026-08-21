@@ -284,7 +284,9 @@ impl StateMachine {
         self.full_comp_count = self.candidates.len();
         self.partial_commit_indices = vec![false; self.candidates.len()];
         if let Some(head) = self.magic_predictions.first() {
-            self.preedit = head.text.clone();
+            // preedit 用选项独立的预览文本(默认=展示文本)—— 允许候选行展示
+            // 精简结果、文本框给完整预览。
+            self.preedit = head.preedit_value().to_string();
         } else {
             self.preedit = self.buffer.clone();
         }

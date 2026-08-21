@@ -109,10 +109,15 @@ struct AddonResponse {
 
 #[derive(serde::Deserialize)]
 struct AddonCandidate {
+    /// 候选行展示文本。
     #[serde(default)]
     text: String,
+    /// 应用文本框的 preedit 预览(可选;缺省用 `text`)。
+    #[serde(default)]
+    preedit: Option<String>,
     #[serde(default)]
     interactive: bool,
+    /// 实际提交文本(可选;缺省用 `text`)。
     #[serde(default)]
     commit_value: Option<String>,
 }
@@ -121,7 +126,7 @@ struct AddonCandidate {
 /// 单个可提交候选(兼容旧 `#req` 后端返回 body 文本)。
 fn parse_response(body: &str) -> Vec<Prediction> {
     if let Ok(resp) = serde_json::from_str::<AddonResponse>(body) {
-        return resp
+        let preds: Vec<Prediction> = resp
             .candidates
             .into_iter()
             .map(|c| {
@@ -129,10 +134,22 @@ fn parse_response(body: &str) -> Vec<Prediction> {
                     Prediction::interactive(c.text)
                 } else {
                     let commit = c.commit_value.unwrap_or_else(|| c.text.clone());
-                    Prediction::commit_raw(c.text, commit)
+                    match c.preedit {
+                        Some(p) => Prediction::commit_triple(c.text, p, commit),
+                        None => Prediction::commit_raw(c.text, commit),
+                    }
                 }
             })
             .collect();
+        if let Some(h) = preds.first() {
+            tracing::debug!(
+                text = %h.text,
+                preedit = %h.preedit_value(),
+                commit = %h.commit_value(),
+                "req parsed (text/preedit/commit)"
+            );
+        }
+        return preds;
     }
     let t = body.trim();
     if t.is_empty() {
@@ -279,7 +296,17 @@ impl ReqMember {
             ReqStatus::Idle | ReqStatus::InFlight => {
                 vec![Prediction::interactive("请求中…")]
             }
-            ReqStatus::Done(preds) => preds.clone(),
+            ReqStatus::Done(preds) => {
+                if let Some(h) = preds.first() {
+                    tracing::debug!(
+                        text = %h.text,
+                        preedit = %h.preedit_value(),
+                        commit = %h.commit_value(),
+                        "req predictions (text/preedit/commit)"
+                    );
+                }
+                preds.clone()
+            }
             ReqStatus::Failed(err) => vec![Prediction::interactive(format!("请求失败: {err}"))],
         }
     }
