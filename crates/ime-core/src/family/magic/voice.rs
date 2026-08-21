@@ -1,25 +1,30 @@
 //! VoiceMember — `#asr`: voice prediction provider.
 //!
-//! 纯读路径:voice listener 在引擎 I/O 线程上后台拉 SSE,折叠 AsrSegment 到
+//! 纯读路径:voice server 在引擎 I/O 线程上后台拉 SSE,折叠 AsrSegment 到
 //! [`SharedVoiceState`](crate::voice_state::SharedVoiceState)。本成员只读这个
 //! shared state 来产生候选 —— 不再有任何轮询 / 异步状态。
 //!
 //! 预测模型下,`#asr` 精确匹配时提供语音结果预测(最多 4 条:流式 live +
 //! 已定稿 finals),放候选列表最前,`#asr` 本身是末尾 rollback。
 //!
+//! ## 与 voice server 的协作(懒惰,按需)
+//!
+//! **每次 `predict` 都发 [`VoiceCmd::Attach`]** 把当前 ctx 推给 IoThread 上的
+//! voice server —— 它此刻才去检查/建立 aura 连接,并立即刷一次 UI;之后每收
+//! 到一个 SSE 段就顺带刷新(目标 ctx)。会话结束由 `deactivate` 发
+//! [`VoiceCmd::Detach`],而 voice server 自己也会在 `refresh_ui` 失败时"轻易
+//! 放弃"。成员**不维护任何停止状态**。
+//!
 //! 参数(路径/查询)调整预测:
 //! - `?num=N` → 预测 = [语音队列最新 N 条定稿拼接](选中即上屏);
 //! - `/calc` → 预测 = [校准优先预览](由 listener 折叠)
 //! - 其余路径(/en 翻译等)留白,预测仍是语音结果。
-//!
-//! `tick` 由 frontend 的 `magic_tick_ctx` 拉取时调用,但返回 `None` 让前端
-//! 走 `predict` 重新算 —— 真正的"数据变化 → 重建"由 listener 主动调
-//! `frontend.refresh_ui` 触发(参 [crate::io_thread])。
 
 use std::sync::Arc;
 
 use super::member::{CommandArgs, MagicMember, Prediction};
 use super::MagicResources;
+use crate::io_thread::{VoiceCmd, VoiceCmdSender};
 use crate::state::{StateMachine, StepEnv};
 use crate::voice_state::SharedVoiceState;
 
@@ -38,6 +43,11 @@ impl VoiceMember {
     /// 取共享 voice state(未注入时 None —— 测试场景)。
     fn state(&self) -> Option<Arc<SharedVoiceState>> {
         self.resources.voice_state()
+    }
+
+    /// 取 voice server 命令 sender。
+    fn tx(&self) -> Option<VoiceCmdSender> {
+        self.resources.voice_tx()
     }
 
     /// 触发名之后的参数串(`#asr/en?num=2` → `/en?num=2`)。
@@ -102,7 +112,17 @@ impl MagicMember for VoiceMember {
         Box::new(VoiceMember::new(Arc::clone(&self.resources)))
     }
 
-    fn predict(&mut self, _ctx: usize, input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
+    fn predict(&mut self, ctx: usize, input: &str, env: &dyn StepEnv) -> Vec<Prediction> {
+        // 每次预测都通知 voice server 这个 ctx —— 幂等,懒 server 借此重瞄
+        // 目标 / 重连 / 立即刷一次 UI。发不到(未接线)就静默,预测照常。
+        match env.voice_cmd_tx().or_else(|| self.tx()) {
+            Some(tx) => {
+                tx.send(VoiceCmd::Attach { ctx });
+                tracing::info!(ctx, "asr predict → Attach{ctx}");
+            }
+            None => tracing::warn!(ctx, "asr predict: 无 voice_tx(未接线?)"),
+        }
+
         let Some(state) = self.state() else {
             return vec![Prediction::interactive("voice listener 未启动")];
         };
@@ -143,50 +163,15 @@ impl MagicMember for VoiceMember {
     }
 
     fn tick(&mut self, _sm: &mut StateMachine, _env: &dyn StepEnv) -> Option<Vec<Prediction>> {
-        // 数据变化由 voice listener 主动调 `frontend.refresh_ui` 触发 —— 我们的
+        // 数据变化由 voice server 主动调 `frontend.refresh_ui` 触发 —— 我们的
         // predict 已经把最新 state 算成 candidates,无需 tick 路径重建。
         None
     }
 
-    fn deactivate(&mut self, _ctx: usize) {
-        // voice listener 由引擎生命周期管理 —— #asr 退出不影响它。
-    }
-}
-
-/// `#submit` — one-shot voice snapshot. 预测 = [最新定稿或提示](选中即上屏)。
-pub struct SubmitMember {
-    resources: Arc<MagicResources>,
-}
-
-impl SubmitMember {
-    pub fn new(resources: Arc<MagicResources>) -> Self {
-        SubmitMember { resources }
-    }
-}
-
-impl MagicMember for SubmitMember {
-    fn name(&self) -> &'static str {
-        "submit"
-    }
-
-    fn activation_token(&self) -> Option<&'static str> {
-        Some("__ASR_SUBMIT__")
-    }
-
-    fn spawn(&self) -> Box<dyn MagicMember> {
-        Box::new(SubmitMember::new(Arc::clone(&self.resources)))
-    }
-
-    fn predict(&mut self, _ctx: usize, _input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
-        let text = self
-            .resources
-            .voice_state()
-            .map(|s| s.snapshot())
-            .unwrap_or_default();
-        if text.is_empty() {
-            vec![Prediction::interactive("无语音内容")]
-        } else {
-            vec![Prediction::commit(text)]
+    fn deactivate(&mut self, ctx: usize) {
+        // 让 voice server 尽早放弃(它也会在 refresh 失败时自愈)。
+        if let Some(tx) = self.tx() {
+            tx.send(VoiceCmd::Detach { ctx });
         }
     }
 }

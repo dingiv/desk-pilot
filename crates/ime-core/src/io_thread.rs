@@ -1,29 +1,30 @@
-//! IoThread —— 引擎的单条 tokio I/O 线程(事件响应模型)。
+//! IoThread —— 引擎的单条 tokio I/O 线程,一个**多事件源 server**。
 //!
-//! 预测主路径**不创建线程**;所有异步 I/O(HTTP 请求、剪贴板请求、voice
-//! listener)由这一条 tokio 事件循环完成。魔法命令通过
-//! [`mpsc::Sender<IoEvent>`](IoEvent) 发事件要求它做事;I/O 完成/变化后经
-//! [`FrontEndHandle`](crate::frontend::FrontEndHandle) 推送 `refresh_ui` ——
-//! 前端只在收到推送时才拉取视图,不再连续轮询。
+//! 预测主路径**不创建线程**;所有异步 I/O(HTTP 请求、剪贴板请求、voice)
+//! 由这一条 tokio 事件循环完成。主循环用 `tokio::select!` 同时监听:
+//! - `rx`(主线程经 [`mpsc::Sender<IoEvent>`](IoEvent) 发来的通用事件 + voice 命令);
+//! - `FuturesUnordered`(动态数据源,当前只有 voice 的 aura SSE)。
 //!
-//! ## voice listener
+//! ## voice server(懒惰的)
 //!
-//! `SpawnVoiceListener` 事件让事件循环在 IoThread 的 runtime 上 spawn 一个
-//! 长生命周期 task,该 task 持有 [`AuraClient`](audio_aura_agent::AuraClient)
-//! 与 [`SharedVoiceState`](crate::voice_state::SharedVoiceState),通过
-//! `tokio::select!` await SSE 数据面 与 健康探针,把 AsrSegment 折叠进
-//! shared state 并触发 `frontend.refresh_ui`。engine drop 时 task 自动 abort,
-//! AuraClient 随之 drop —— 整个生命周期是 Arc 引用管理,**无显式 cancel**。
+//! `#asr` 每次预测经 [`VoiceCmd::Attach`] 把 ctx 推给 voice server —— 它此刻才
+//! 一次性 `health()` 探针 + 建 SSE 连接;连接后每收到一个 `AsrSegment`,就"顺带"
+//! 检查 ctx 是否可用(`refresh_ui` 返回 bool),可用就顺带刷新 UI。失败一次即
+//! **放弃**:`active_ctx` 置 -1、丢 SSE 源、不再重连 —— 之后只继续等 `rx`。
+//! aura 断联由 `AuraClient` 内部重连兜底,我们不在乎。
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 
 use audio_aura_agent::client::AuraClient;
 use audio_aura_agent::view::AsrSegment;
+use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use tokio::select;
 use tokio::sync::mpsc;
 
-use crate::frontend::{BROADCAST_CTX, FrontEndHandle, StateView};
+use crate::frontend::{FrontEndHandle, StateView};
 use crate::voice_state::SharedVoiceState;
 
 /// 魔法命令发给 I/O 线程的异步工作请求。
@@ -42,39 +43,67 @@ pub enum IoEvent {
     /// 把 spawn intent 推到 channel,main future 收到后调 `tokio::spawn` 直接
     /// 加入本地 ready queue。
     SpawnAux(Box<dyn FnOnce() + Send + 'static>),
-    /// 启动 voice listener(引擎构造时一次性发)。listener 拥有 AuraClient,
-    /// 通过 SSE 把 AsrSegment 折叠进 `state` 并触发 `frontend.refresh_ui`。
-    /// 跟随 IoThread drop 自动 abort。
-    SpawnVoiceListener {
-        base: String,
-        state: Arc<SharedVoiceState>,
-        frontend: Weak<dyn FrontEndHandle>,
-    },
+    /// voice server 命令(`#asr` 家族发)。复用同一个 rx。
+    Voice(VoiceCmd),
     /// 停止事件循环。
     Shutdown,
+}
+
+/// magic family → voice server 的命令(主线程发,IoThread 收)。
+#[derive(Debug, Clone, Copy)]
+pub enum VoiceCmd {
+    /// `#asr` 每次预测都发:记录 ctx、若断连则此刻重连、立即刷一次 UI。
+    Attach { ctx: usize },
+    /// `#asr` 会话退出(deactivate):清掉 ctx。懒惰的 server 也会在下次
+    /// `try_refresh` 失败时自行放弃,Detach 只是让它放弃得更早。
+    Detach { ctx: usize },
+}
+
+/// 向 voice server 发命令的 typed sender(包装 io thread 的 `tx`)。
+#[derive(Clone)]
+pub struct VoiceCmdSender(mpsc::Sender<IoEvent>);
+
+impl VoiceCmdSender {
+    /// 非阻塞发送;通道满时静默丢弃(命令低频率,64 深足够)。
+    pub fn send(&self, cmd: VoiceCmd) {
+        let _ = self.0.try_send(IoEvent::Voice(cmd));
+    }
 }
 
 /// 引擎 I/O 线程句柄。随引擎创建,引擎 drop 时 runtime drop 自动停止。
 #[derive(Clone)]
 pub struct IoThread {
     tx: mpsc::Sender<IoEvent>,
+    /// voice 命令 sender(与 `tx` 同一通道,typed 包装)。
+    voice_tx: VoiceCmdSender,
     /// 事件循环驻留在这个 runtime 上。字段未被直接读 —— 生命周期管理靠
     /// 它 drop 时停止。
     #[allow(dead_code)]
     rt: Arc<tokio::runtime::Runtime>,
-    /// 辅助 task 列表(voice listener 等),让调用方挂自己的长任务,确保随 IoThread
+    /// 辅助 task 列表(voice 等),让调用方挂自己的长任务,确保随 IoThread
     /// drop 而 abort。空时无开销。`Arc<Mutex<…>>` 是为了让 `IoThread: Clone` 仍成立。
+    #[allow(dead_code)]
     aux_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
-/// 健康探针间隔(秒)—— listener 在此间隔上检测 aura daemon 连通性。
-const HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(3);
+/// aura SSE 数据流(owned —— 由 `subscribe_segments_owned` 产生,可自由移动)。
+type Sse = Pin<Box<dyn futures::Stream<Item = AsrSegment>>>;
+
+/// 对 SSE 流的一次 poll:拿到一个段,并**把流原样还回**,让循环决定续传还是放弃。
+/// 所有权进出,future 无借用,可放进 `FuturesUnordered`。
+async fn poll_seg(mut s: Sse) -> Option<(AsrSegment, Sse)> {
+    let seg = s.next().await?;
+    Some((seg, s))
+}
 
 impl IoThread {
-    /// 创建并启动 I/O 线程。`frontend` 以 weak 持有,不延长前端生命周期:
-    /// 引擎 drop 时,flush 阶段 `upgrade()` 失败 → no-op,不再触达已析构的
-    /// C++ 回调。
-    pub fn spawn(frontend: Weak<dyn FrontEndHandle>) -> Self {
+    /// 创建并启动 I/O 线程。`voice_base` / `voice_state` 交给 voice server 用。
+    /// `frontend` 以 weak 持有,不延长前端生命周期。
+    pub fn spawn(
+        frontend: Weak<dyn FrontEndHandle>,
+        voice_base: String,
+        voice_state: Arc<SharedVoiceState>,
+    ) -> Self {
         let rt = Arc::new(
             tokio::runtime::Builder::new_current_thread()
                 .enable_time()
@@ -82,60 +111,18 @@ impl IoThread {
                 .build()
                 .expect("tokio runtime"),
         );
-        let (tx, mut rx) = mpsc::channel::<IoEvent>(64);
+        let (tx, rx) = mpsc::channel::<IoEvent>(64);
+        let voice_tx = VoiceCmdSender(tx.clone());
         let rt2 = Arc::clone(&rt);
         std::thread::Builder::new()
             .name("ime-io".into())
             .spawn(move || {
-                rt2.block_on(async move {
-                    // FIXME: 使用 tokio::select! 同时监听 rx 和 其他需要处理的 IO 事件, 而不是使用 tokio::spawn
-
-                    // 事件分发任务。**关键:必须独立 spawn 在 local queue 里,**
-                    // 才能被 current_thread runtime 在 main future 让出时 poll 到。
-                    // 如果写在 main future 内部 loop,它阻塞在 rx.recv().await 时.
-                    // 没人 poll 其他 task(包括 SpawnAux / SpawnVoiceListener)。
-                    tokio::spawn(async move {
-                        loop {
-                            let Some(ev) = rx.recv().await else { break };
-                            match ev {
-                                IoEvent::Run { ctx, task } => {
-                                    task();
-                                    if let Some(f) = frontend.upgrade() {
-                                        f.refresh_ui(StateView { ctx });
-                                    }
-                                }
-                                IoEvent::RequestClipboard { ctx, count } => {
-                                    if let Some(f) = frontend.upgrade() {
-                                        f.get_clipboard_item(count);
-                                        f.refresh_ui(StateView { ctx });
-                                    }
-                                }
-                                IoEvent::SpawnAux(spawn) => {
-                                    spawn();
-                                    // 触发 runtime 调度刚 spawn 的 task。
-                                    tokio::task::yield_now().await;
-                                }
-                                IoEvent::SpawnVoiceListener {
-                                    base,
-                                    state,
-                                    frontend,
-                                } => {
-                                    tokio::spawn(voice_listener_task(base, state, frontend));
-                                }
-                                IoEvent::Shutdown => break,
-                            }
-                        }
-                    });
-
-                    // Main future 仅做"等待 shutdown" —— 它不阻塞 channel,
-                    // 因为 channel 已由上面的独立 task 消费。Main future 自己
-                    // 永远不 Ready,block_on 永不返回,线程持续运行。
-                    std::future::pending::<()>().await;
-                });
+                rt2.block_on(voice_server_main(rx, frontend, voice_base, voice_state));
             })
             .expect("spawn ime io thread");
         IoThread {
             tx,
+            voice_tx,
             rt,
             aux_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
@@ -153,92 +140,142 @@ impl IoThread {
         let _ = self.tx.try_send(ev);
     }
 
-    /// 启动 voice listener(便捷方法,内部发 `SpawnVoiceListener` 事件)。
-    pub fn start_voice_listener(
-        &self,
-        base: String,
-        state: Arc<SharedVoiceState>,
-        frontend: Weak<dyn FrontEndHandle>,
-    ) {
-        self.send(IoEvent::SpawnVoiceListener {
-            base,
-            state,
-            frontend,
-        });
+    /// voice 命令 sender(与 `tx` 同一通道)—— `#asr` 家族经它发 Attach/Detach。
+    pub fn voice_tx(&self) -> VoiceCmdSender {
+        self.voice_tx.clone()
     }
 }
 
-/// Voice listener task body。在 IoThread 的 current_thread runtime 上运行。
+/// IoThread 主循环:多事件源 server。
 ///
-/// 通过 `tokio::select!` 同时等待:
-/// - SSE 数据面(`AuraClient::subscribe_segments`)
-/// - 健康探针(`tokio::time::interval`)
-///
-/// 二者任一唤醒 → 写 shared state → `frontend.refresh_ui(DEFAULT_CTX)`。
-///
-/// Task 结束(任一 select 分支失败 / abort):
-/// - AuraClient drop,reqwest 连接关闭,SSE stream `next()` 返回 None。
-/// - shared state 的 `is_connected()` 保持其最后值(不再变化)。
-async fn voice_listener_task(
+/// 两个 select 臂:
+/// 1. `rx` —— 主线程事件(含 voice 命令),永远在听;
+/// 2. `sources`(`FuturesUnordered`)—— 动态数据源(aura SSE),空时该臂禁用,
+///    零轮询。
+async fn voice_server_main(
+    mut rx: mpsc::Receiver<IoEvent>,
+    frontend: Weak<dyn FrontEndHandle>,
     base: String,
     state: Arc<SharedVoiceState>,
-    frontend: Weak<dyn FrontEndHandle>,
 ) {
-    let client = match AuraClient::new(&base) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %e, base = %base, "voice listener: AuraClient::new failed");
-            return;
-        }
-    };
-    let health_client = client.clone();
-    let mut health_tick = tokio::time::interval(HEALTH_PROBE_INTERVAL);
-    health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut sources: FuturesUnordered<Pin<Box<dyn Future<Output = Option<(AsrSegment, Sse)>>>>> =
+        FuturesUnordered::new();
+    // 开关变量:当前有活 #asr 会话的 ctx;-1 = 无。
+    let mut active_ctx: i64 = -1;
+    // 是否持有 aura SSE 源(连接中)。
+    let mut connected = false;
 
-    let mut segs = Box::pin(client.subscribe_segments());
     loop {
-        tokio::select! {
-            seg = segs.next() => {
-                match seg {
-                    Some(seg) => {
-                        apply_and_notify(&state, &frontend, seg);
+        select! {
+            // 臂 1:主线程发来的事件(含 voice 命令)。
+            ev = rx.recv() => {
+                match ev {
+                    Some(IoEvent::Voice(VoiceCmd::Attach { ctx })) => {
+                        // 新 ctx 才立即刷一次;同 ctx 的重复 Attach(来自刷新驱动的
+                        // 重预测)是 no-op —— 否则 refresh → magic_tick → predict →
+                        // Attach → refresh 会乒乓循环。
+                        let is_new = active_ctx != ctx as i64;
+                        active_ctx = ctx as i64;
+                        tracing::info!(ctx, is_new, connected, "voice Attach");
+                        if !connected {
+                            // 断裂/未连 → 此刻才连(一次性 health 探针,非轮询)。
+                            match AuraClient::new(&base) {
+                                Ok(client) => {
+                                    let ok = client.health().await.unwrap_or(false);
+                                    state.set_connected(ok);
+                                    tracing::info!(connected = ok, "voice connect probe");
+                                    if ok {
+                                        sources.push(Box::pin(poll_seg(Box::pin(
+                                            client.subscribe_segments_owned(),
+                                        ))));
+                                        connected = true;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, base = %base, "voice: AuraClient::new failed");
+                                    state.set_connected(false);
+                                }
+                            }
+                        }
+                        if is_new {
+                            // 立即刷一次(即使未连上,predict 也会显示"未连接")。
+                            try_refresh(&mut active_ctx, &frontend);
+                        }
                     }
-                    None => {
-                        // SSE stream ended (reqwest reconnect loop has internal backoff;
-                        // returning None shouldn't normally happen — but if it does we
-                        // break and let engine drop clean us up).
-                        break;
+                    Some(IoEvent::Voice(VoiceCmd::Detach { ctx })) => {
+                        if active_ctx == ctx as i64 {
+                            active_ctx = -1;
+                        }
                     }
+                    Some(IoEvent::Run { ctx, task }) => {
+                        task();
+                        if let Some(f) = frontend.upgrade() {
+                            f.refresh_ui(StateView { ctx });
+                        }
+                    }
+                    Some(IoEvent::RequestClipboard { ctx, count }) => {
+                        if let Some(f) = frontend.upgrade() {
+                            f.get_clipboard_item(count);
+                            f.refresh_ui(StateView { ctx });
+                        }
+                    }
+                    Some(IoEvent::SpawnAux(spawn)) => {
+                        spawn();
+                        // 触发 runtime 调度刚 spawn 的 task。
+                        tokio::task::yield_now().await;
+                    }
+                    Some(IoEvent::Shutdown) | None => break,
                 }
             }
-            _ = health_tick.tick() => {
-                let ok = health_client.health().await.unwrap_or(false);
-                state.set_connected(ok);
-                tracing::debug!(connected = ok, "health probe → refresh_ui(BROADCAST_CTX)");
-                if let Some(f) = frontend.upgrade() {
-                    f.refresh_ui(StateView { ctx: BROADCAST_CTX });
+            // 臂 2:动态数据源 —— aura SSE 段。空源时禁用(零轮询)。
+            seg = sources.next(), if !sources.is_empty() => {
+                match seg {
+                    Some(Some((seg, s))) => {
+                        state.fold_segment(&seg);
+                        // 排查 UI 延迟:看每个段(带文本)何时到达,与说话时刻对表。
+                        tracing::info!(?seg, "voice segment folded");
+                        if try_refresh(&mut active_ctx, &frontend) {
+                            // 仍有效 → 续传源。
+                            sources.push(Box::pin(poll_seg(s)));
+                        } else {
+                            // 失败一次即放弃:s 被 drop(断连),不重连。
+                            connected = false;
+                            state.set_connected(false);
+                        }
+                    }
+                    Some(None) => {
+                        // SSE 流结束 → 丢源,不再 select。
+                        tracing::warn!("voice SSE stream ended → 丢源,不重连");
+                        connected = false;
+                        state.set_connected(false);
+                    }
+                    None => {} // sources 空(带 guard 不应发生)
                 }
             }
         }
     }
-    state.set_connected(false);
 }
 
-fn apply_and_notify(
-    state: &Arc<SharedVoiceState>,
-    frontend: &Weak<dyn FrontEndHandle>,
-    seg: AsrSegment,
-) {
-    state.fold_segment(&seg);
-    tracing::debug!(
-        ?seg,
-        "voice segment folded → refresh_ui(BROADCAST_CTX)"
-    );
-    if let Some(f) = frontend.upgrade() {
-        // voice listener 是引擎级全局 SSE —— 不绑定某个输入上下文,用
-        // BROADCAST_CTX 让前端刷新所有活动上下文(见 crate::frontend)。
-        f.refresh_ui(StateView { ctx: BROADCAST_CTX });
+/// 顺带刷新 UI,并裁决"是否继续"。
+///
+/// 返回 true = ctx 有效、刷新已触发,源应续传;false = 放弃(`active_ctx` 置 -1)。
+fn try_refresh(active_ctx: &mut i64, frontend: &Weak<dyn FrontEndHandle>) -> bool {
+    if *active_ctx < 0 {
+        tracing::debug!(active_ctx = *active_ctx, "voice try_refresh: 无 ctx,跳过");
+        return false;
     }
+    if let Some(f) = frontend.upgrade() {
+        let ok = f.refresh_ui(StateView { ctx: *active_ctx as usize });
+        tracing::info!(active_ctx = *active_ctx, ok, "voice try_refresh");
+        if ok {
+            return true;
+        }
+    } else {
+        tracing::debug!(active_ctx = *active_ctx, "voice try_refresh: 前端已销毁");
+    }
+    *active_ctx = -1;
+    tracing::info!("voice try_refresh → 放弃(active_ctx=-1)");
+    false
 }
 
 impl Drop for IoThread {
@@ -259,20 +296,67 @@ mod tests {
 
     #[test]
     fn attach_drain_stores_handle() {
-        // smoke: spawn_into 不 panic,持有 JoinHandle。
+        // smoke: spawn 不 panic。
         let front: Arc<dyn FrontEndHandle> = Arc::new(crate::frontend::NoopFrontend::default());
-        let io = IoThread::spawn(Arc::downgrade(&front));
+        let state = Arc::new(SharedVoiceState::new());
+        let io = IoThread::spawn(Arc::downgrade(&front), "http://127.0.0.1:1".into(), state);
         io.send(IoEvent::SpawnAux(Box::new(|| {
             // do nothing — event loop spawned an empty closure and yielded.
         })));
         drop(io);
     }
 
-    /// voice listener 把 SSE 段折叠进 SharedVoiceState。每次 segment 到达
-    /// `frontend.refresh_ui` 应被调一次。测试用本地 TCP mock 推送 1 条
-    /// stream_fragment 后关闭 —— listener 在 200ms 内应当折叠并刷新。
+    /// `try_refresh` 语义:ctx 有效且前端接受 → true 续传;前端拒绝 → 自愈置 -1。
+    #[test]
+    fn try_refresh_gives_up_when_frontend_rejects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        struct Reject(StdArc<AtomicUsize>);
+        impl FrontEndHandle for Reject {
+            fn get_clipboard_item(&self, _count: u32) {}
+            fn refresh_ui(&self, _: StateView) -> bool {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let front: Arc<dyn FrontEndHandle> = Arc::new(Reject(calls.clone()));
+
+        let mut ctx = 0xCAFEi64;
+        assert!(!try_refresh(&mut ctx, &Arc::downgrade(&front)), "reject → give up");
+        assert_eq!(ctx, -1, "active_ctx 自愈置 -1");
+        // ctx 已 -1 → 直接放弃,不再触达前端。
+        assert!(!try_refresh(&mut ctx, &Arc::downgrade(&front)));
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "放弃后不再 refresh");
+    }
+
+    #[test]
+    fn try_refresh_accepts_when_ctx_valid() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        struct Accept(StdArc<AtomicUsize>);
+        impl FrontEndHandle for Accept {
+            fn get_clipboard_item(&self, _count: u32) {}
+            fn refresh_ui(&self, sv: StateView) -> bool {
+                self.0.store(sv.ctx, Ordering::Relaxed);
+                true
+            }
+        }
+        let seen = StdArc::new(AtomicUsize::new(0));
+        let front: Arc<dyn FrontEndHandle> = Arc::new(Accept(seen.clone()));
+
+        let mut ctx = 0xBEEFi64;
+        assert!(try_refresh(&mut ctx, &Arc::downgrade(&front)));
+        assert_eq!(ctx, 0xBEEFi64, "有效 ctx 不变");
+        assert_eq!(seen.load(Ordering::Relaxed), 0xBEEF, "refresh 带上 ctx");
+    }
+
+    /// 集成:Attach{ctx} → voice server 连 aura(mock SSE)→ 折叠段 → refresh_ui
+    /// 收到**该 ctx**。这是 #asr 候选刷新的核心路径。
     #[tokio::test(flavor = "current_thread", start_paused = false)]
-    async fn voice_listener_folds_sse_into_state_and_notifies() {
+    async fn attach_connects_and_refreshes_target_ctx() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -280,7 +364,7 @@ mod tests {
         use std::thread;
         use std::time::{Duration, Instant};
 
-        // mock aura SSE server:返回 1 条 stream_fragment 后 hold 连接。
+        // mock aura:GET /health → 200;GET /api/asr_stream → 推 1 条 stream_fragment。
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         thread::spawn(move || {
@@ -304,47 +388,38 @@ mod tests {
                     s.write_all(b"data: {\"type\":\"stream_fragment\",\"window_id\":1,\"segment_id\":1,\"text\":\"\\u4f60\\u597d\",\"at_s\":0}\n\n").unwrap();
                     s.flush().unwrap();
                     thread::sleep(Duration::from_secs(1));
-                } else if path.starts_with("/api/state") {
-                    let body = r#"{"connected":true,"stage3_on":false,"config":{"asr_backend":"","asr_kind":"","asr_provider":"","llm_kind":"","model":"","vad":{"threshold":0.5,"min_silence":0.3,"merge_gap":1.0}},"hotwords":[],"corrections":[]}"#;
-                    let _ = write!(
-                        s,
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    s.flush().unwrap();
                 } else {
-                    s.write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    )
-                    .unwrap();
+                    // /health 等一律 200。
+                    s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .unwrap();
                     s.flush().unwrap();
                 }
             }
         });
 
-        struct CountingFrontend(
-            StdArc<AtomicUsize>,
-            StdArc<std::sync::Mutex<Vec<usize>>>,
-        );
+        struct CountingFrontend(StdArc<AtomicUsize>, StdArc<std::sync::Mutex<Vec<usize>>>);
         impl FrontEndHandle for CountingFrontend {
             fn get_clipboard_item(&self, _count: u32) {}
-            fn refresh_ui(&self, sv: StateView) {
+            fn refresh_ui(&self, sv: StateView) -> bool {
                 self.0.fetch_add(1, Ordering::Relaxed);
                 self.1.lock().unwrap().push(sv.ctx);
+                true
             }
         }
         let refresh_count = StdArc::new(AtomicUsize::new(0));
         let refresh_ctxs = StdArc::new(std::sync::Mutex::new(Vec::new()));
-        let front: Arc<dyn FrontEndHandle> =
-            Arc::new(CountingFrontend(refresh_count.clone(), refresh_ctxs.clone()));
-
+        let front: Arc<dyn FrontEndHandle> = Arc::new(CountingFrontend(
+            refresh_count.clone(),
+            refresh_ctxs.clone(),
+        ));
         let state = Arc::new(SharedVoiceState::new());
         let base = format!("http://127.0.0.1:{port}");
-        let io = IoThread::spawn(Arc::downgrade(&front));
-        io.start_voice_listener(base.clone(), Arc::clone(&state), Arc::downgrade(&front));
+        let io = IoThread::spawn(Arc::downgrade(&front), base, Arc::clone(&state));
 
-        // 等 listener 折叠 stream_fragment → "你好"
+        // #asr 家族发 Attach{ctx} —— 指向真实输入上下文指针,不是广播。
+        io.send(IoEvent::Voice(VoiceCmd::Attach { ctx: 0xCAFE }));
+
+        // 等 voice server 连上并折叠 stream_fragment → "你好"。
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let (_, live) = state.voice_candidates();
@@ -352,23 +427,20 @@ mod tests {
                 break;
             }
             if Instant::now() >= deadline {
-                panic!("listener 未在 3s 内折叠 SSE 段,live={live:?}");
+                panic!("voice server 未在 3s 内折叠 SSE 段,live={live:?}");
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        // 至少触发了一次 refresh(可以 > 1 因为 health tick 也调)。
+        // refresh 至少一次,且全部指向 Attach 的 ctx(非广播)。
         assert!(
             refresh_count.load(Ordering::Relaxed) >= 1,
-            "listener 应至少推一次 refresh"
+            "voice server 应至少推一次 refresh"
         );
-        // 回归:voice listener 是引擎级全局事件,refresh 必须用 BROADCAST_CTX
-        // (0)—— 曾写死 ctx=0 但被 C++ 当作真实输入上下文指针,导致 #asr
-        // 候选永远不刷新。前端(含单上下文)据此广播到所有活动上下文。
         let ctxs = refresh_ctxs.lock().unwrap();
         assert!(
-            !ctxs.is_empty() && ctxs.iter().all(|c| *c == BROADCAST_CTX),
-            "voice refresh 应全部带 BROADCAST_CTX: {ctxs:?}"
+            ctxs.iter().all(|c| *c == 0xCAFE),
+            "voice refresh 应全部带 Attach 的 ctx: {ctxs:?}"
         );
     }
 }

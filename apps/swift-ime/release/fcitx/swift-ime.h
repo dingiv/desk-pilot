@@ -67,10 +67,23 @@ struct SwiftKeyPacket {
     uint8_t  alt;
 };
 
+// ── Frontend handle: callback bundle passed to swift_ime_create ─────────────
+// The C++ side fills one per SwiftImeEngine; `instance` is `this` and is passed
+// as userdata to both callbacks (which run on the engine I/O thread).
+
+struct FcitxHandle {
+    void *instance;                                         // SwiftImeEngine*
+    void (*refresh_ui)(uintptr_t ctx, void *userdata);      // async UI refresh
+    void (*get_clip_board)(uint32_t count, void *userdata); // clipboard request
+};
+
 // ── C ABI — every function takes the ImeHandle* as first argument ──────────
 
 extern "C" {
-    ImeHandle *swift_ime_create(const char *config_path);
+    /// Create the engine. The frontend UI callbacks are bundled in `handle`
+    /// (see FcitxHandle) — no global state; the callbacks live in the returned
+    /// handle for its lifetime.
+    ImeHandle *swift_ime_create(const char *config_path, const FcitxHandle *handle);
     void       swift_ime_destroy(ImeHandle *handle);
 
     /// Unified key entry: EVERY key (special keys and Ctrl/Shift/Alt states
@@ -82,13 +95,6 @@ extern "C" {
                                     unsigned int index, ImeView *out_view);
     int  swift_ime_commit_pending(ImeHandle *handle, void *ctx,
                                   ImeView *out_view);
-    /// Register the frontend UI callbacks (engine I/O thread → fcitx main loop):
-    /// refresh_cb(ctx, userdata) on async advance; clipboard_cb(count, userdata)
-    /// on clipboard request. Called once at engine construction.
-    int  swift_ime_set_ui_cbs(ImeHandle *handle,
-                              void (*refresh_cb)(uintptr_t ctx, void *userdata),
-                              void (*clipboard_cb)(uint32_t count, void *userdata),
-                              void *userdata);
     /// Pull the current live view (async state advanced — the refresh callback
     /// schedules a main-loop call to this). Returns 1 + fills out_view when the
     /// ctx has a live command whose async state advanced; 0 otherwise.
@@ -125,6 +131,9 @@ public:
     void apply_view(fcitx::InputContext *ic, const ImeView &v);
 
 private:
+    /// 传给 `swift_ime_create` 的前端句柄(`instance` = this,含两个回调)。
+    /// 必须先于 `handle_` 声明/初始化(create 要读它)。
+    FcitxHandle    frontend_;
     ImeHandle      *handle_;
     fcitx::KeyList  selectionKeys_;
     fcitx::Instance *instance_;
@@ -137,22 +146,24 @@ private:
 
     // ── 按需 UI 刷新(引擎 I/O 线程推送,替代旧的 100ms 轮询)───────────
     /// 引擎 I/O 线程异步推进时经 C 回调进入(marshal 到主循环)。
-    /// `ctx == 0` 是引擎级广播哨兵(voice listener 的全局 SSE 段不绑定某个
-    /// 输入上下文)—— 遍历所有活动上下文逐出一次 magic_tick;只有处于 live
-    /// 魔法会话(`#asr`)的 context 产生新视图,其余返回 0 天然跳过。
+    /// `ctx == 0` 是引擎级广播哨兵 —— 遍历所有活动上下文逐出一次 magic_tick;
+    /// 只有处于 live 魔法会话(`#asr`)的 context 产生新视图,其余返回 0 跳过。
     void onRefresh(uintptr_t ctx);
     void onClipboardRequest(uint32_t count);
     static void uiRefreshCb(uintptr_t ctx, void *userdata);
     static void uiClipboardCb(uint32_t count, void *userdata);
 
+    /// 主循环 drain:清 pending,逐 ctx magic_tick + apply_view。
+    void drainRefresh();
+
     /// 待刷新的 ctx 集合(跨线程,I/O 线程写、主循环 drain)。
     std::mutex refreshMutex_;
     std::set<uintptr_t> pendingRefreshes_;
-    /// 单发 drain 定时器(有 pending 才排,空闲零轮询)。原子:被 I/O 线程
-    /// (onRefresh 的 exchange)与主循环 drain 并发读写,非原子 bool 会让
-    /// "刚 drain 完、旧 true 还没被看到"的刷新漏排定时器而丢失。
-    std::atomic<bool> refreshArmed_ = false;
-    std::unique_ptr<fcitx::EventSourceTime> refreshTimer_;
+    /// 跨线程唤醒管道:I/O 线程(onRefresh)写一字节,主循环的 fd 就绪事件
+    /// 立即触发 drain。比跨线程 addTimeEvent 可靠 —— 后者主循环在 poll 睡眠
+    /// 时注意不到新 timer,会延迟数秒(流式刷新被攒批)。
+    int wakePipe_ = -1;
+    std::unique_ptr<fcitx::EventSourceIO> wakeSource_;
 };
 
 // ── Candidate word ──────────────────────────────────────────────────────────

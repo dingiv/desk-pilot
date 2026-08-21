@@ -23,7 +23,7 @@ pub use clip::{ClipMember, CLIP_HISTORY_CAP};
 pub use member::{preview_text, CommandArgs, MagicMember, Prediction, CANDIDATE_PREVIEW_MAX};
 pub use req::{ReqFetcher, DEFAULT_REQ_BASE};
 pub use snippet::SnippetMember;
-pub use voice::{SubmitMember, VoiceMember};
+pub use voice::VoiceMember;
 
 use req::ReqMember;
 
@@ -80,6 +80,9 @@ pub struct MagicResources {
     pub io: Mutex<Option<Arc<crate::io_thread::IoThread>>>,
     /// 前端句柄 —— I/O 线程经它推送 UI 刷新 / 请求剪贴板。
     pub frontend: Mutex<Option<Arc<dyn crate::frontend::FrontEndHandle>>>,
+    /// voice server 命令 sender —— `#asr` 家族经它发 `Attach`/`Detach`。
+    /// 与 io thread 的 `tx` 是同一个通道(typed 包装)。引擎构造后注入。
+    pub voice_tx: Mutex<Option<crate::io_thread::VoiceCmdSender>>,
 }
 
 impl MagicResources {
@@ -96,6 +99,11 @@ impl MagicResources {
     /// 取 shared voice state(未注入时 None —— 测试 / 未接线场景)。
     pub fn voice_state(&self) -> Option<Arc<crate::voice_state::SharedVoiceState>> {
         self.voice_state.get()
+    }
+
+    /// 取 voice server 命令 sender(未注入时 None)。
+    pub fn voice_tx(&self) -> Option<crate::io_thread::VoiceCmdSender> {
+        self.voice_tx.lock().unwrap().clone()
     }
 }
 
@@ -121,6 +129,7 @@ impl Default for MagicResources {
             clipboard_history: Mutex::new(Vec::new()),
             io: Mutex::new(None),
             frontend: Mutex::new(None),
+            voice_tx: Mutex::new(None),
         }
     }
 }
@@ -204,7 +213,6 @@ impl MagicFamily {
         let resources = Arc::new(MagicResources::default());
         let members: Vec<Arc<dyn MagicMember>> = vec![
             Arc::new(VoiceMember::new(Arc::clone(&resources))),
-            Arc::new(SubmitMember::new(Arc::clone(&resources))),
             Arc::new(ReqMember::new(Arc::clone(&resources))),
             Arc::new(ClipMember::new(Arc::clone(&resources))),
             // 片段命令:空名魔法命令(`#/hello?name=Mike`),经 `#` + `/` 路由。
@@ -428,6 +436,16 @@ impl MagicFamily {
         *self.resources.frontend.lock().unwrap() = Some(frontend);
     }
 
+    /// 注入 voice server 命令 sender(`#asr` 家族发 Attach/Detach)。
+    pub fn set_voice_tx(&self, tx: crate::io_thread::VoiceCmdSender) {
+        *self.resources.voice_tx.lock().unwrap() = Some(tx);
+    }
+
+    /// 取 voice server 命令 sender(未注入时 None —— 测试 / 未接线场景)。
+    pub fn voice_cmd_tx(&self) -> Option<crate::io_thread::VoiceCmdSender> {
+        self.resources.voice_tx()
+    }
+
     /// 前端按需回填剪贴板历史(`#clip` 触发 RequestClipboard → 前端取到后
     /// 调这里替换整个历史)。
     pub fn set_clipboard_history(&self, items: Vec<String>) {
@@ -501,7 +519,10 @@ mod tests {
             !entries.iter().any(|(t, _)| t == "#flush"),
             "#flush alias removed"
         );
-        assert!(entries.contains(&("#submit".into(), "__ASR_SUBMIT__".into())));
+        assert!(
+            !entries.iter().any(|(t, _)| t == "#submit"),
+            "#submit 已删除(遗留命令)"
+        );
         assert!(entries.contains(&("#req".into(), "__REQ__".into())));
     }
 
@@ -511,7 +532,6 @@ mod tests {
         assert!(fam.spawn("__ASR_BUFFER__").is_some());
         assert!(fam.spawn("__REQ__").is_some());
         // Static commands and unknown tokens are not live commands.
-        assert!(fam.spawn("__ASR_SUBMIT__").is_some());
         assert!(fam.spawn("__NOPE__").is_none());
     }
 

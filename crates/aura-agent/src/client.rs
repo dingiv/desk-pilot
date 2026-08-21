@@ -194,6 +194,22 @@ impl AuraClient {
             }
         }
     }
+
+    /// Same as [`subscribe_segments`], but consumes `self` so the returned stream **owns** its
+    /// client and is `'static` — usable across scopes, e.g. moved into a `FuturesUnordered` in
+    /// the IoThread's voice server. Reconnect / resilient behavior is unchanged.
+    pub fn subscribe_segments_owned(self) -> impl Stream<Item = AsrSegment> + 'static {
+        let url = format!("{}/api/asr_stream", self.base);
+        async_stream::stream! {
+            let data = self.sse_data(url);
+            tokio::pin!(data);
+            while let Some(payload) = data.next().await {
+                if let Ok(seg) = serde_json::from_str::<AsrSegment>(&payload) {
+                    yield seg;
+                }
+            }
+        }
+    }
 }
 
 /// The `data:` payloads of one SSE frame (the text between two blank lines). Each `data:` line's

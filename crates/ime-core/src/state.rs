@@ -903,6 +903,12 @@ pub trait StepEnv {
     /// The magic command registry — spawns live member instances on trigger
     /// completion, holds the shared resources (voice slot, req config).
     fn magic(&self) -> &crate::family::magic::MagicFamily;
+
+    /// 向 IoThread 上的 voice server 发命令(`#asr` 用它发 `Attach`/`Detach`)。
+    /// 默认委托 `magic()` 的共享槽 —— `Dispatcher` 无需额外字段。
+    fn voice_cmd_tx(&self) -> Option<crate::io_thread::VoiceCmdSender> {
+        self.magic().voice_cmd_tx()
+    }
 }
 
 #[cfg(test)]

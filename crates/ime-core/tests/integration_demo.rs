@@ -9,6 +9,54 @@ fn commit(view: &ImeView) -> &str {
     ImeView::str_field(&view.commit_text)
 }
 
+/// 起一个"健康"的 mock aura: `/health` 回 200,`/api/asr_stream` 回 200 并
+/// **保持连接**(不回 body),让 `subscribe_segments_owned` 的流活着、不触发
+/// voice server 的"断联即放弃"。测试结束后进程退出,线程随之丢弃。
+fn mock_aura() -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut s) = conn else { break };
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut req = [0u8; 4096];
+            let _ = s.read(&mut req);
+            if req.windows(4).any(|w| w == b"asr_") {
+                // SSE 长连接:写 header 后 hold(不回 body,连接不关)。
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+                );
+                let _ = s.flush();
+                std::thread::sleep(Duration::from_secs(30));
+            } else {
+                // /health 等 → 200 close。
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = s.flush();
+            }
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+/// 用 `voice_aura_base` 构造引擎(而非默认 127.0.0.1:9091)—— 让 `#asr` 的
+/// Attach 探针打到 mock,`is_connected` 保持 true,测试确定不竞态。
+fn eng_with_aura(base: &str) -> ImeEngine {
+    ImeEngine::with_config(
+        ime_core::family::pinyin::PinyinWeights::default(),
+        ime_core::family::english::EnglishWeights::default(),
+        Box::new(ime_core::expander::DefaultProvider),
+        Vec::new(),
+        ime_core::scoring::ScoringConfig::default(),
+        std::sync::Arc::new(ime_core::frontend::NoopFrontend::default()),
+        base.to_string(),
+    )
+}
+
 #[test]
 fn predict_nihao_top_is_hello() {
     let mut eng = ImeEngine::new();
@@ -395,9 +443,10 @@ fn asr_command_with_no_buffer_commits_empty() {
 
 #[test]
 fn asr_command_with_buffer_commits_voice_text() {
-    let mut eng = ImeEngine::new();
-    // 模拟 aura 已连接 + 推一条 final —— 直接写 shared voice state(新架构下
-    // 真实 SSE 流由 IoThread 上的 voice listener 折叠;这里是测试 mock)。
+    // mock aura:Attach 的健康探针能打成功,`is_connected` 保持 true(确定不竞态)。
+    let base = mock_aura();
+    let mut eng = eng_with_aura(&base);
+    // 直接写 shared voice state(真实 SSE 由 voice server 折叠;这里是测试 mock)。
     eng.voice_state().set_connected(true);
     eng.voice_state().seed_final("今天天气不错");
 
@@ -421,9 +470,10 @@ fn asr_command_with_buffer_commits_voice_text() {
 /// 活动上下文;这里验证真实 ctx 的 magic_tick 能重建出语音文本候选。
 #[test]
 fn asr_magic_tick_refreshes_real_ctx_after_voice_advance() {
-    let eng = ImeEngine::new();
+    // mock aura:Attach 探针成功,`is_connected` 保持 true。
+    let base = mock_aura();
+    let eng = eng_with_aura(&base);
     let ctx: usize = 0xCAFE; // fcitx 下 = 真实 InputContext 指针,非 0
-    // 模拟 voice listener 健康探针已把 connected 置真(尚未有语音文本)。
     eng.voice_state().set_connected(true);
 
     // 在真实 ctx 输入 #asr → Snippet 态,VoiceMember 激活,候选是占位提示。
@@ -448,12 +498,12 @@ fn asr_magic_tick_refreshes_real_ctx_after_voice_advance() {
         .magic_tick_ctx(ctx)
         .expect("真实 ctx 的 #asr 会话应返回新视图");
     let top = ImeView::str_field(&after.candidates[0].text);
-    assert!(
-        top.contains("你好"),
-        "候选应更新为语音文本,got top={top:?}"
-    );
+    assert!(top.contains("你好"), "候选应更新为语音文本,got top={top:?}");
     // 对不存在的 ctx(0,未输入过任何命令)应返回 None —— 广播的其余上下文天然跳过。
-    assert!(eng.magic_tick_ctx(0).is_none(), "ctx 0 无 #asr 会话,应返回 None");
+    assert!(
+        eng.magic_tick_ctx(0).is_none(),
+        "ctx 0 无 #asr 会话,应返回 None"
+    );
 }
 
 #[test]

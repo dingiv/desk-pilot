@@ -29,8 +29,9 @@ struct TuiFrontend {
 
 impl FrontEndHandle for TuiFrontend {
     fn get_clipboard_item(&self, _count: u32) {}
-    fn refresh_ui(&self, _sv: StateView) {
+    fn refresh_ui(&self, _sv: StateView) -> bool {
         self.pending.fetch_add(1, Ordering::Release);
+        true // 单上下文,恒"接受"
     }
 }
 use ratatui::backend::CrosstermBackend;

@@ -21,10 +21,9 @@
 //! 该 lint 只对**Rust 调用方**有保护价值,而这里没有 Rust 调用方。
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::raw::c_char;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use ime_core::engine::ImeEngine;
 use ime_core::expander::{today_str, VariableProvider};
@@ -40,49 +39,87 @@ type RefreshCb = extern "C" fn(ctx: usize, userdata: *mut c_void);
 /// C++ 注册的剪贴板请求回调:引擎要 count 条历史。
 type ClipboardCb = extern "C" fn(count: u32, userdata: *mut c_void);
 
-/// 共享的 C 回调槽 —— 引擎持有 FrontEndHandle,注册表持有同一 Arc,`set_ui_cbs`
-/// 之后 C++ 回调生效。
+/// C++ 传入的前端句柄(与 `swift-ime.h` 的 `FcitxHandle` 布局一致)。
 ///
-/// `userdata` 以 `usize` 位模式存储(`*mut c_void` 在 LP64 上位宽等同);
-/// 调用前 cast 回 `*mut c_void` 即可。这样 `Mutex` 的内容是 `Send`(`extern fn`
-/// + `usize` 都是),便于跨线程锁。
-struct FcitxCbs {
-    refresh: Mutex<Option<(RefreshCb, usize)>>,
-    clipboard: Mutex<Option<(ClipboardCb, usize)>>,
+/// `instance` 即 userdata(C++ `SwiftImeEngine::this`),两个回调由引擎 I/O
+/// 线程调用、以 `instance` 作 userdata。函数指针可为空(`None` = 不注册,
+/// 对应 C 侧 null)。
+#[repr(C)]
+pub struct FcitxHandle {
+    pub instance: *mut c_void,
+    pub refresh_ui: Option<RefreshCb>,
+    pub get_clip_board: Option<ClipboardCb>,
 }
 
 /// 前端句柄实现:I/O 线程推送经 C 回调转到 fcitx 主循环。
+///
+/// `engine` 是引擎的 `Weak` 引用 —— `refresh_ui` 用它同步判断某个 ctx 是否
+/// 仍有活跃的 #asr 会话(voice server 据此决定是否放弃)。
+///
+/// 引擎以泄漏的 `Arc`(`Arc::into_raw`)交给 C++ 持有,`swift_ime_destroy` 用
+/// `Arc::from_raw` 回收。弱引用保证:即使 voice server 握着前端的强引用、
+/// 引擎已先被销毁,`upgrade()` 也只会得到 `None` —— 不会解引用悬垂内存。
+///
+/// 两个回调由 `swift_ime_create` 一次性传入、构造后不可变 —— 直接存字段,
+/// 无需 `Mutex`/`Arc` 间接(`extern "C" fn` + `usize` 都是 `Send + Sync`)。
 struct FcitxFrontend {
-    cbs: Arc<FcitxCbs>,
+    /// C++ 传入的刷新回调 + userdata(C 侧 `this`)。
+    refresh: Option<(RefreshCb, usize)>,
+    /// C++ 传入的剪贴板请求回调 + userdata。
+    clipboard: Option<(ClipboardCb, usize)>,
+    engine: OnceLock<Weak<ImeEngine>>,
+}
+
+impl FcitxFrontend {
+    fn new(
+        refresh: Option<(RefreshCb, usize)>,
+        clipboard: Option<(ClipboardCb, usize)>,
+    ) -> Self {
+        FcitxFrontend {
+            refresh,
+            clipboard,
+            engine: OnceLock::new(),
+        }
+    }
+
+    /// 引擎完全构造后调用一次:把弱引用交给前端。
+    fn attach_engine(&self, engine: &Arc<ImeEngine>) {
+        let _ = self.engine.set(Arc::downgrade(engine));
+    }
 }
 
 impl FrontEndHandle for FcitxFrontend {
     fn get_clipboard_item(&self, count: u32) {
-        if let Some((cb, ud)) = *self.cbs.clipboard.lock().unwrap() {
+        if let Some((cb, ud)) = self.clipboard {
             // userdata 在 LP64 上位宽等同 `void*` —— 位模式转换为裸指针传给 C ABI。
             cb(count, ud as *mut c_void);
         }
     }
 
-    fn refresh_ui(&self, sv: StateView) {
-        tracing::debug!(ctx = sv.ctx, "FcitxFrontend::refresh_ui → C cb");
-        if let Some((cb, ud)) = *self.cbs.refresh.lock().unwrap() {
+    fn refresh_ui(&self, sv: StateView) -> bool {
+        if let Some((cb, ud)) = self.refresh {
             cb(sv.ctx, ud as *mut c_void);
         }
+        // 同步判定:该 ctx 是否还有活跃的 #asr 会话。voice server 收到 false
+        // 即放弃、不重连。引擎未接上 / 已销毁 → 保守"接受",不误杀。
+        let alive = self
+            .engine
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|e| e.is_voice_ctx_alive(sv.ctx))
+            .unwrap_or(true);
+        tracing::info!(ctx = sv.ctx, alive, "FcitxFrontend::refresh_ui → C cb");
+        alive
     }
 }
 
-/// 引擎指针 → C 回调槽(供 `swift_ime_set_ui_cbs` 设置)。
-static FRONTS: std::sync::OnceLock<Mutex<HashMap<usize, Arc<FcitxCbs>>>> = std::sync::OnceLock::new();
-
-fn front_registry() -> &'static Mutex<HashMap<usize, Arc<FcitxCbs>>> {
-    FRONTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Max displayed bytes for one candidate row in the fcitx5 panel (≈8 CJK
-/// chars). The panel adapts its width to the longest row — truncating here
-/// keeps the box compact while the full text stays committable.
-const FCITX_CANDIDATE_TEXT_MAX: usize = 8 * 3;
+/// Max displayed bytes for one candidate row in the fcitx5 panel.
+///
+/// 语音(`#asr`)候选是整句话,截断会让用户只看到半句 —— 候选槽 buffer 是
+/// `CANDIDATE_SLOTS` 的 `char[128]`,这里设为 128 即"不额外截断",整句(最多
+/// 127 字节 ≈ 42 汉字)都显示。面板宽度随最长行自适应。提交始终用引擎的完整
+/// 文本,截断纯展示。
+const FCITX_CANDIDATE_TEXT_MAX: usize = 128;
 
 /// Real variable provider for the fcitx5 environment: a live `$DATE` and the
 /// clipboard text pushed by the C++ glue (fcitx5 clipboard events) via
@@ -125,7 +162,10 @@ fn truncate_candidate_rows(view: &mut ImeView) {
 // ── C ABI — all functions take the engine pointer ──────────────────────
 
 #[no_mangle]
-pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngine {
+pub extern "C" fn swift_ime_create(
+    _config_path: *const c_char,
+    handle: *const FcitxHandle,
+) -> *mut ImeEngine {
     // 先读配置(拿 debug.log_level),再装进程级 tracing subscriber —— 之后
     // 的 ime_log! / 引擎 tracing 事件统一写进 swift-ime.log。
     let cfg = crate::config::SwiftImeConfig::load();
@@ -141,30 +181,35 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
         .iter()
         .map(|s| (s.trigger.clone(), s.expand.clone()))
         .collect();
-    // 前端句柄:C 回调槽,稍后由 `swift_ime_set_ui_cbs` 注入。
-    let cbs = Arc::new(FcitxCbs {
-        refresh: Mutex::new(None),
-        clipboard: Mutex::new(None),
-    });
-    let mut engine = ImeEngine::with_config(
+    // 回调打包在 FcitxHandle 里由 C++ 传入 —— 无全局注册表、无 set_ui_cbs。
+    let h = unsafe { handle.as_ref() };
+    let ud = h.map(|h| h.instance as usize).unwrap_or(0);
+    let frontend = Arc::new(FcitxFrontend::new(
+        h.and_then(|h| h.refresh_ui).map(|cb| (cb, ud)),
+        h.and_then(|h| h.get_clip_board).map(|cb| (cb, ud)),
+    ));
+    let mut engine = Arc::new(ImeEngine::with_config(
         weights,
         eng_weights,
         Box::new(FcitxProvider::default()),
         snippets,
         cfg.weights.to_scoring(),
-        Arc::new(FcitxFrontend { cbs: Arc::clone(&cbs) }),
+        frontend.clone() as Arc<dyn FrontEndHandle>,
         cfg.voice.aura_base.clone(),
-    );
-    // 候选每页条数(swift-ime.yaml → input.page_size)。
-    engine.set_page_size(cfg.input.page_size);
-    // 上下文感知开关(swift-ime.yaml → input.context_aware)。
-    engine.set_context_aware(cfg.input.context_aware);
-    // 调试模式:候选词显示提供者与权重。
-    engine.set_candidate_meta(cfg.debug.candidate_meta);
-
-    // `#req` backend base URL (config `magic.req_base`, default
-    // http://127.0.0.1:14555/api).
-    engine.set_req_base(&cfg.magic.req_base);
+    ));
+    // &mut 配置 —— 必须在 attach_engine(建 Weak)之前:Arc::get_mut 要求
+    // strong_count==1 且 weak_count==0。先配置完,再 attach。万一不变量被破坏,
+    // 降级用默认配置(不 panic,IME 里 panic 会拖垮整个 fcitx5)。
+    if let Some(eng) = Arc::get_mut(&mut engine) {
+        eng.set_page_size(cfg.input.page_size);
+        eng.set_context_aware(cfg.input.context_aware);
+        eng.set_candidate_meta(cfg.debug.candidate_meta);
+        eng.set_req_base(&cfg.magic.req_base);
+    } else {
+        tracing::error!(target: "swift_ime", "engine not sole owner at config time — 应用默认配置");
+    }
+    // 引擎已完全构造,再把弱引用交给前端做 is_voice_ctx_alive。
+    frontend.attach_engine(&engine);
 
     // Load rime-ice FST if enabled in config.
     if cfg.dicts.rime_ice {
@@ -223,17 +268,16 @@ pub extern "C" fn swift_ime_create(_config_path: *const c_char) -> *mut ImeEngin
         }
     }
 
-    // 注册 C 回调槽(引擎指针 → cbs),`swift_ime_set_ui_cbs` 据此设置。
-    let engine_ptr = Box::into_raw(Box::new(engine));
-    front_registry().lock().unwrap().insert(engine_ptr as usize, cbs);
-    engine_ptr
+    // 泄漏的 Arc 交给 C++ 持有;`swift_ime_destroy` 用 Arc::from_raw 回收。
+    Arc::into_raw(engine) as *mut ImeEngine
 }
 
 #[no_mangle]
 pub extern "C" fn swift_ime_destroy(engine: *mut ImeEngine) {
     if engine.is_null() { return; }
-    front_registry().lock().unwrap().remove(&(engine as usize));
-    unsafe { drop(Box::from_raw(engine)); }
+    // 回收 into_raw 泄漏的强引用 → 若无其它强引用则释放引擎(前端随之 drop)。
+    // 与 voice server 并发时由 Arc 引用计数兜底,不会 UAF。
+    unsafe { drop(Arc::from_raw(engine as *const ImeEngine)); }
 }
 
 /// C ABI 的键事件包 —— C++ 胶水**忠实组包**(keysym + unicode + 修饰键
@@ -317,31 +361,6 @@ pub extern "C" fn swift_ime_commit_pending(
     1
 }
 
-/// 注册前端 UI 回调(C++ 在引擎创建后调用一次):
-/// - `refresh_cb(ctx, userdata)`:引擎 I/O 线程异步状态推进 → 前端主循环拉视图;
-/// - `clipboard_cb(count, userdata)`:引擎请求剪贴板历史 → 前端取到回填。
-///
-/// `userdata` 是 C++ 侧 `SwiftImeEngine::this`,指针宽(64-bit on LP64),
-/// 回调在引擎 I/O 线程执行,但 C++ 内部仅用它定位 `this` + marshal 到
-/// fcitx 主循环,不直接触碰 Rust 状态。
-#[no_mangle]
-pub extern "C" fn swift_ime_set_ui_cbs(
-    engine: *mut ImeEngine,
-    refresh_cb: RefreshCb,
-    clipboard_cb: ClipboardCb,
-    userdata: *mut c_void,
-) -> i32 {
-    if engine.is_null() { return 0; }
-    let key = engine as usize;
-    let reg = front_registry().lock().unwrap();
-    let Some(cbs) = reg.get(&key).cloned() else { return 0; };
-    // userdata 以 usize 位模式存储(LP64 上等同 void*),便于跨线程锁。
-    let ud = userdata as usize;
-    *cbs.refresh.lock().unwrap() = Some((refresh_cb, ud));
-    *cbs.clipboard.lock().unwrap() = Some((clipboard_cb, ud));
-    1
-}
-
 /// 拉取当前 live 视图(异步状态推进后,前端主循环经 refresh 回调调这里)。
 /// 返回 1 + 填 `out_view` 若该 ctx 有 live 命令且状态推进;否则 0。
 #[no_mangle]
@@ -352,16 +371,17 @@ pub extern "C" fn swift_ime_magic_tick(
 ) -> i32 {
     if engine.is_null() || out_view.is_null() { return 0; }
     let c = ctx as usize;
-    tracing::debug!(ctx = c, "swift_ime_magic_tick");
+    // 排查流式不刷新:C++ drain 是否在调这里、结果如何(Some=重建视图 / None=跳过)。
+    tracing::info!(ctx = c, "swift_ime_magic_tick");
     match unsafe { &*engine }.magic_tick_ctx(c) {
         Some(mut view) => {
-            tracing::debug!(ctx = c, count = view.candidate_count, "magic_tick → Some");
+            tracing::info!(ctx = c, count = view.candidate_count, "magic_tick → Some");
             truncate_candidate_rows(&mut view);
             unsafe { *out_view = view; }
             1
         }
         None => {
-            tracing::debug!(ctx = c, "magic_tick → None");
+            tracing::info!(ctx = c, "magic_tick → None");
             0
         }
     }
@@ -396,20 +416,6 @@ pub extern "C" fn swift_ime_set_clipboard(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn long_rows_truncated_at_frontend_with_ellipsis() {
-        // 24 CJK chars = 72 bytes, well above the 24-byte panel cap.
-        let long = "今天天气真不错我们一起去公园散步顺便买个冰淇淋吃";
-        let mut view = ImeView::empty();
-        ImeView::set_str(&mut view.candidates[0].text, long);
-        view.candidate_count = 1;
-        truncate_candidate_rows(&mut view);
-        let shown = ImeView::str_field(&view.candidates[0].text);
-        assert!(shown.ends_with('…'), "row truncated with ellipsis: {shown}");
-        assert_eq!(shown.len(), FCITX_CANDIDATE_TEXT_MAX + 3, "FCITX_CANDIDATE_TEXT_MAX bytes + 3-byte …: {shown}");
-        assert!(shown.starts_with("今天天气真"), "head kept: {shown}");
-    }
 
     #[test]
     fn short_rows_untouched() {

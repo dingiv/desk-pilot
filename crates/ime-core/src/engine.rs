@@ -89,8 +89,8 @@ pub struct ImeEngine {
     frontend: Arc<dyn crate::frontend::FrontEndHandle>,
     /// 单条 tokio I/O 线程(事件响应模型),预测主路径不建线程。
     io_thread: Arc<crate::io_thread::IoThread>,
-    /// 共享语音会话状态 —— voice listener task 在 IoThread 上折叠 SSE 段,
-    /// VoiceMember / SubmitMember 在主线程同步读。
+    /// 共享语音会话状态 —— voice server(IoThread)折叠 SSE 段写入,
+    /// VoiceMember 在主线程同步读。
     voice_state: Arc<crate::voice_state::SharedVoiceState>,
 }
 
@@ -165,22 +165,20 @@ impl ImeEngine {
         // Shared with the dispatcher's expander — `set_variable` writes through the same Arc.
         let provider: Arc<dyn crate::expander::VariableProvider> = Arc::from(provider);
         let expander = crate::Expander::new(Arc::clone(&provider));
-        // 单条 tokio I/O 线程(事件响应模型)+ 前端句柄注入。
-        let io_thread = Arc::new(crate::io_thread::IoThread::spawn(
-            std::sync::Arc::downgrade(&frontend),
-        ));
-        magic.set_io(Arc::clone(&io_thread), Arc::clone(&frontend));
-        // 共享 voice state + voice listener。listener 在 IoThread 的 runtime 上
-        // 长期运行,通过 SSE 折叠 AsrSegment 到 `voice_state`,由它触发
-        // `frontend.refresh_ui`。engine drop → io_thread drop → runtime drop →
-        // listener task 自动 abort,AuraClient 随之 drop。
+        // 共享 voice state(voice server 折叠写入、#asr 成员同步读)。
         let voice_state = Arc::new(crate::voice_state::SharedVoiceState::new());
         magic.set_voice_state(Arc::clone(&voice_state));
-        io_thread.start_voice_listener(
+        // 单条 tokio I/O 线程 = 多事件源 server(通用 rx + voice server)。
+        // voice server 按需(#asr Attach)才连 aura,engine drop → io_thread
+        // drop → runtime drop,一切自动清理。
+        let io_thread = Arc::new(crate::io_thread::IoThread::spawn(
+            std::sync::Arc::downgrade(&frontend),
             voice_aura_base,
             Arc::clone(&voice_state),
-            std::sync::Arc::downgrade(&frontend),
-        );
+        ));
+        magic.set_io(Arc::clone(&io_thread), Arc::clone(&frontend));
+        // `#asr` 家族经同一 sender 发 Attach/Detach 给 voice server。
+        magic.set_voice_tx(io_thread.voice_tx());
         let engine = ImeEngine {
             dispatcher: Dispatcher::with_config(
                 matcher,
@@ -610,7 +608,8 @@ impl ImeEngine {
     pub fn magic_tick_ctx(&self, ctx: usize) -> Option<ImeView> {
         self.with_ctx(ctx, |disp, pc| {
             use crate::state::ComposeState;
-            tracing::debug!(
+            // 排查流式不刷新:每个 drain 是否到这里、state/has_member 是否正常。
+            tracing::info!(
                 ctx,
                 state = ?pc.sm.state,
                 has_member = pc.sm.active_command.is_some(),
@@ -638,9 +637,49 @@ impl ImeEngine {
             } else {
                 ""
             };
-            tracing::debug!(ctx, count = view.candidate_count, top, "magic_tick_ctx → view");
+            // 排查"只显示半句":top 是截断前的完整候选文本 —— 若 top 是整句而
+            // 面板只显示半句,就是前端截断;若 top 本身就半句,则是折叠/识别问题。
+            tracing::info!(ctx, count = view.candidate_count, top, "magic_tick_ctx → view");
             Some(view)
         })
+    }
+
+    /// ctx 上是否还有**活跃的 #asr 会话**。前端(`FcitxFrontend::refresh_ui`)
+    /// 同步查它来告诉 voice server"这次刷新会不会被主循环接受";voice server
+    /// 据此在失败时放弃(`active_ctx = -1`)。
+    ///
+    /// 线程安全:`contexts` 由 `Mutex` 保护,主线程写、I/O 线程读,无竞争。
+    pub fn is_voice_ctx_alive(&self, ctx: usize) -> bool {
+        use crate::state::ComposeState;
+        let map = self.contexts.lock().unwrap();
+        let alive = map.get(&ctx).is_some_and(|pc| {
+            pc.sm.state == ComposeState::Snippet
+                && pc.sm
+                    .active_command
+                    .as_ref()
+                    .is_some_and(|m| m.name() == "asr")
+        });
+        let detail = map.get(&ctx).map(|pc| {
+            let state = if pc.sm.state == ComposeState::Snippet {
+                "Snippet"
+            } else {
+                "other"
+            };
+            let member = pc
+                .sm
+                .active_command
+                .as_ref()
+                .map(|m| m.name().to_string())
+                .unwrap_or_else(|| "-".into());
+            format!("state={state} member={member}")
+        });
+        tracing::debug!(
+            ctx,
+            alive,
+            detail = detail.unwrap_or_else(|| "no-context".into()),
+            "is_voice_ctx_alive"
+        );
+        alive
     }
 
     /// Load an English user dictionary from a TSV file.

@@ -17,9 +17,11 @@
 #include <fcitx-utils/event.h>
 #include <fcitx-utils/log.h>
 #include <cstring>
+#include <fcntl.h>
 #include <memory>
 #include <string>
 #include <time.h>
+#include <unistd.h>
 #include <vector>
 
 // ── Helper ──────────────────────────────────────────────────────────────
@@ -31,7 +33,9 @@ static inline bool str_changed(const char *a, const char *b) {
 // ── Constructor / Destructor ────────────────────────────────────────────
 
 SwiftImeEngine::SwiftImeEngine(fcitx::Instance *instance)
-    : handle_(swift_ime_create(nullptr)), instance_(instance)
+    : frontend_{this, uiRefreshCb, uiClipboardCb},
+      handle_(swift_ime_create(nullptr, &frontend_)),
+      instance_(instance)
 {
     fcitx::KeySym syms[] = {
         FcitxKey_1, FcitxKey_2, FcitxKey_3, FcitxKey_4, FcitxKey_5,
@@ -39,11 +43,39 @@ SwiftImeEngine::SwiftImeEngine(fcitx::Instance *instance)
     for (auto sym : syms) {
         selectionKeys_.emplace_back(sym, fcitx::KeyStates());
     }
-    // 注册前端 UI 回调:引擎 I/O 线程推送刷新 / 请求剪贴板。
-    swift_ime_set_ui_cbs(handle_, uiRefreshCb, uiClipboardCb, this);
+    // 前端 UI 回调(刷新 / 剪贴板请求)打包在 frontend_ 里,已随 create 传入。
+    // 跨线程唤醒管道:引擎 I/O 线程写,主循环的 fd 就绪事件立即 drain。
+    // 这是 fcitx 标准的跨线程姿势 —— 比跨线程 addTimeEvent 可靠(后者主循环
+    // poll 睡眠时注意不到新 timer,会延迟数秒)。
+    int pipefd[2];
+    if (::pipe(pipefd) == 0) {
+        wakePipe_ = pipefd[1];
+        // 读写端都设非阻塞:
+        //  - 写端:管道满时 write 返回 EAGAIN,丢弃即可(下一条刷新会再写);
+        //  - 读端:drain 的 while(read) 读空时返回 EAGAIN 退出 —— 若保持阻塞,
+        //    写端未关时 read 会永远等数据,主循环卡死(整 fcitx 死锁)。
+        int flags = ::fcntl(wakePipe_, F_GETFL);
+        ::fcntl(wakePipe_, F_SETFL, flags | O_NONBLOCK);
+        ::fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
+        wakeSource_ = instance_->eventLoop().addIOEvent(
+            pipefd[0], fcitx::IOEventFlag::In,
+            [this](fcitx::EventSourceIO *, int fd, fcitx::IOEventFlags) {
+                // 清空管道字节(非阻塞,读空即停),然后 drain 所有 pending 刷新。
+                char buf[64];
+                while (::read(fd, buf, sizeof(buf)) > 0) {
+                }
+                drainRefresh();
+                return true;
+            });
+    }
 }
 
 SwiftImeEngine::~SwiftImeEngine() {
+    if (wakePipe_ >= 0) {
+        ::close(wakePipe_);
+        wakePipe_ = -1;
+    }
+    // wakeSource_ 随成员析构,fcitx 负责关闭读端 fd。
     swift_ime_destroy(handle_);
 }
 
@@ -177,57 +209,56 @@ void SwiftImeEngine::apply_view(fcitx::InputContext *ic, const ImeView &v) {
 // 拉最新视图 + apply_view。空闲(无 pending)时零轮询。
 
 void SwiftImeEngine::onRefresh(uintptr_t ctx) {
-    // 诊断:voice listener(引擎级)推 ctx=0 → 广播;req/clip 推真实 ic 指针。
-    FCITX_DEBUG() << "[refresh] onRefresh ctx=" << (void *)ctx;
+    // 诊断:voice Attach 的定向 ctx(#asr)/ req / clip 推真实 ic 指针;
+    // ctx=0 广播分支留作后备(当前无源会发 0)。
+    FCITX_INFO() << "[refresh] onRefresh ctx=" << (void *)ctx;
     {
         std::lock_guard<std::mutex> lk(refreshMutex_);
         pendingRefreshes_.insert(ctx);
     }
-    // 原子 test-and-set:refreshArmed_ 被 I/O 线程(onRefresh)与主循环 drain
-    // 并发读写 —— 非原子 bool 会让"刚 drain 完、旧 true 还没被看到"的刷新
-    // 漏排定时器而丢失。exchange 保证每次插入后至多一个 drain 定时器在途。
-    if (!refreshArmed_.exchange(true)) {
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        uint64_t now = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
-        refreshTimer_ = instance_->eventLoop().addTimeEvent(
-            CLOCK_MONOTONIC, now + 1000, 1,
-            [this](fcitx::EventSourceTime *, uint64_t) {
-                refreshArmed_.store(false);
-                std::set<uintptr_t> ctxs;
-                {
-                    std::lock_guard<std::mutex> lk2(refreshMutex_);
-                    ctxs.swap(pendingRefreshes_);
+    // 唤醒主循环:跨线程写管道字节 → 主循环 fd 就绪事件立即 drain。
+    // 管道满(极罕见)则丢弃本次唤醒 —— 下次写会再触发,pending 不丢。
+    if (wakePipe_ >= 0) {
+        char b = 1;
+        ssize_t r = ::write(wakePipe_, &b, 1);
+        (void)r;
+    }
+}
+
+/// 主循环 drain:清 pending,逐 ctx magic_tick + apply_view。
+/// 由管道 fd 就绪事件触发(主循环线程执行)。
+void SwiftImeEngine::drainRefresh() {
+    std::set<uintptr_t> ctxs;
+    {
+        std::lock_guard<std::mutex> lk(refreshMutex_);
+        ctxs.swap(pendingRefreshes_);
+    }
+    for (uintptr_t c : ctxs) {
+        // ctx 0 = 引擎级广播:遍历所有活动上下文逐出一次 magic_tick —— 只有
+        // 处于 live 魔法会话(#asr)的 context 返回新视图,其余返回 0 跳过。
+        if (c == 0) {
+            FCITX_DEBUG() << "[refresh] broadcast ctx=0 → activeContexts_="
+                         << activeContexts_.size();
+            std::vector<fcitx::InputContext *> all(activeContexts_.begin(),
+                                                   activeContexts_.end());
+            for (auto *ic : all) {
+                ImeView view;
+                int r = swift_ime_magic_tick(handle_, (void *)ic, &view);
+                FCITX_DEBUG() << "[refresh]   ic=" << ic << " magic_tick=" << r;
+                if (r) {
+                    apply_view(ic, view);
                 }
-                for (uintptr_t c : ctxs) {
-                    // ctx 0 = 引擎级广播:voice listener 的 SSE 段 / 健康探针
-                    // 是全局事件,不绑定某个输入上下文。遍历所有活动上下文逐
-                    // 出一次 magic_tick —— 只有处于 live 魔法会话(#asr)的
-                    // context 返回新视图,其余 magic_tick 返回 0 天然跳过。
-                    if (c == 0) {
-                        FCITX_DEBUG() << "[refresh] broadcast ctx=0 → activeContexts_="
-                                     << activeContexts_.size();
-                        std::vector<fcitx::InputContext *> all(
-                            activeContexts_.begin(), activeContexts_.end());
-                        for (auto *ic : all) {
-                            ImeView view;
-                            int r = swift_ime_magic_tick(handle_, (void *)ic, &view);
-                            FCITX_DEBUG() << "[refresh]   ic=" << ic << " magic_tick=" << r;
-                            if (r) {
-                                apply_view(ic, view);
-                            }
-                        }
-                        continue;
-                    }
-                    auto *ic = reinterpret_cast<fcitx::InputContext *>(c);
-                    FCITX_DEBUG() << "[refresh] directed ctx=" << (void *)ic;
-                    ImeView view;
-                    if (swift_ime_magic_tick(handle_, (void *)ic, &view)) {
-                        apply_view(ic, view);
-                    }
-                }
-                return false; // 单发:跑完即停,下次 onRefresh 再排
-            });
+            }
+            continue;
+        }
+        auto *ic = reinterpret_cast<fcitx::InputContext *>(c);
+        ImeView view;
+        int r = swift_ime_magic_tick(handle_, (void *)ic, &view);
+        FCITX_INFO() << "[refresh] directed ctx=" << (void *)ic
+                     << " magic_tick=" << r;
+        if (r) {
+            apply_view(ic, view);
+        }
     }
 }
 

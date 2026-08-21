@@ -10,7 +10,7 @@
 //! 与 `AuraClient`。SSE 数据面到达 → `fold_segment(seg)` → 可选 `refresh_ui`。
 //! **没有轮询**——所有变化都由 SSE 事件触发。
 //!
-//! ## 读取端:VoiceMember / SubmitMember
+//! ## 读取端:VoiceMember
 //!
 //! 魔法命令在主线程 (key event / tick) 同步读 `voice_state.voice_candidates()`
 //! 和 `voice_state.preview()`。锁很短(微秒级字符串 clone)。
