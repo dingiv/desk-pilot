@@ -600,7 +600,52 @@ impl ActiveSession {
     }
 }
 
+/// 取帧结果:拿到一帧去处理,或 park 后重跑循环(截止/节流触发)。
+enum FrameResult {
+    Frame(Vec<i16>),
+    Parked,
+}
+
 impl OnnxStage1Recognizer {
+    /// 取一帧(32ms)处理,或 park 后重跑循环。ring 有帧直接取;空则等音频/截止,
+    /// 断流>2s 且有 partial 时喂合成静音逼 VAD EOS(100ms 节流,避免 CPU 空转)。
+    fn drain_frame(
+        &self,
+        ring_empty_since: &mut Option<Instant>,
+        sess: &Option<ActiveSession>,
+        last_silence_feed: &mut Instant,
+        wake_at: Option<Duration>,
+    ) -> FrameResult {
+        let mut g = self.ring.lock().unwrap();
+        if g.has_frame(WINDOW) {
+            *ring_empty_since = None;
+            return FrameResult::Frame(g.drain(WINDOW));
+        }
+        drop(g);
+        ring_empty_since.get_or_insert_with(Instant::now);
+        let since = *ring_empty_since.as_ref().unwrap();
+        let has_partial = sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
+        if since.elapsed() > Duration::from_secs(2) && has_partial {
+            // 断流:喂合成静音让 VAD 发 EOS(每 100ms 至多一帧,~1s 静音约 3s 墙钟)
+            if last_silence_feed.elapsed() >= Duration::from_millis(100) {
+                *last_silence_feed = Instant::now();
+                debug!("ring empty > 2s during speech — feeding silence to force VAD EOS");
+                FrameResult::Frame(vec![0i16; WINDOW])
+            } else {
+                match wait_frame(&self.ring, &self.ring_cv, WINDOW, Some(Duration::from_millis(100))) {
+                    Some(f) => { *ring_empty_since = None; FrameResult::Frame(f) }
+                    None => FrameResult::Parked,
+                }
+            }
+        } else {
+            // Park until the ingest pushes or the next deadline — 无轮询,空闲零唤醒.
+            match wait_frame(&self.ring, &self.ring_cv, WINDOW, wake_at) {
+                Some(f) => { *ring_empty_since = None; FrameResult::Frame(f) }
+                None => FrameResult::Parked,
+            }
+        }
+    }
+
     /// 喂流式会话(VAD 门控):`detected()` 为 true 时 accept+解码,起音翻转(false→true)补喂
     /// 最近 ~0.5s 的 lead-in(soft onset 进会话)。空闲 park,只累积有界 lead-in。
     /// `accept_waveform` 与 `pcm` 喂**完全相同**的帧 → 流式与 batch 共享同一段音频。
@@ -773,158 +818,71 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
         let mut frames_in = 0u64;
 
         let sasr = self.mgr.streaming_asr();
-        // Continuously-fed streaming session (reset at every segment/window boundary — see
-        // [`ActiveSession`]). `cur_seg`/`cur_win` carry the retroactive SOS's ids to the EOS
-        // arm within the SAME push_frame batch (SOS+EOS always arrive together).
+        // 流式会话:段/窗口边界重置,由 VAD detected() 门控喂帧。`cur_seg` 由回溯式 SOS 分配
+        // (与 EOS 同批到达),EOS 臂用它建段。
         let mut sess: Option<ActiveSession> = sasr.map(|asr| ActiveSession::new(asr.create_session()));
         let mut ring_empty_since: Option<Instant> = None;
         let mut tracker = WindowTracker::new(self.merge_gap_s);
         let mut cur_seg: SegmentId = 0;
-        // silence-feed 的节流计时器:喂送静音逼 VAD EOS 时,每 100ms 至多喂一帧(避免 CPU 空转)。
-        let mut last_silence_feed = Instant::now();
-        // VAD 门控流式的 lead-in:最近 ~0.5s 的帧。detected() 翻转起音时补喂流式会话,
-        // 让 soft onset 进流式/batch(二者一致)。空闲时只累积这个有界缓冲,不喂会话。
-        let mut lead_in: std::collections::VecDeque<Vec<i16>> = std::collections::VecDeque::new();
-        // 上一帧的 detected() 状态——翻转 false→true 时触发 lead-in 补喂。
-        let mut speech_active = false;
+        let mut last_silence_feed = Instant::now(); // 断流喂静音的节流(100ms)
+        let mut lead_in: VecDeque<Vec<i16>> = VecDeque::new(); // 起音补喂缓冲(~0.5s)
+        let mut speech_active = false; // 上一帧 detected()——翻转时补喂 lead_in
 
         loop {
-            // Connection toggle: when the scout connection is paused, skip VAD/ASR (the ingest
-            // thread also stops feeding the ring, so it drains to empty shortly). Park on the
-            // condvar — the next pushed frame (or the resumed connection's first chunk) wakes
-            // us to re-check the toggle. No timer.
+            // ① 连接开关:scout 暂停时挂起等音频,不做 VAD/ASR
             if !self.active.load(Ordering::Relaxed) {
                 let _ = wait_frame(&self.ring, &self.ring_cv, WINDOW, None);
                 continue;
             }
-            // Settle the trailing window: no follow-up segment came for merge_gap — it's done.
-            // (Suppressed while speech is in progress inside the tracker.) The wait is
-            // unavoidable — you must observe the gap to know it ended — but the per-segment
-            // Batch results have been showing live text throughout, so it doesn't lag.
+
+            // ② 时间驱动检查:窗口定稿 / 停滞看门狗 / 诊断
             let now_s = start.elapsed().as_secs_f64();
-            // 回溯式 VAD:下一段的 SOS 要等它 EOS 才到。此刻若流式 session 仍在产出
-            // partial(有人正在说话),绝不能按墙钟超时定稿——否则下一段(其 SOS 尚未到达)
-            // 会被错划进新窗口,导致窗口永远只有 1 个 segment。真正的 gap 判断由下一段
-            // EOS 到达时的 settle_if_gap 完成。
+            // `speaking`(流式 partial 非空)抑制窗口按墙钟定稿——回溯式 VAD 的下一段 SOS
+            // 尚未到达,若定稿会把下一段错划进新窗口。
             let speaking = sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
             if let Some(settled) = tracker.check_settle(now_s, speaking) {
                 emit_window_edge(settled, &self.audio_store, &*self.batch_asr, sr, on_event);
-                // Window boundary ⇒ fresh streaming session (don't bleed encoder context
-                // across windows).
-                sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
+                sess = sasr.map(|asr| ActiveSession::new(asr.create_session())); // 窗口边界重置会话
             }
-            // Stale-session watchdog: VAD-unlatched audio is discard-by-design — its residue
-            // must not linger in the session until the next (loud) utterance swallows it.
-            // See [`STALE_SESSION_RESET`].
             if let Some(a) = sess.as_ref() {
                 if !a.last_partial.is_empty() && a.last_change.elapsed() >= STALE_SESSION_RESET {
-                    warn!(
-                        stale_s = a.last_change.elapsed().as_secs(),
-                        partial = %a.last_partial,
-                        "流式会话停滞重置——VAD 未定段的微弱音频不残留到下一句"
-                    );
+                    warn!(stale_s = a.last_change.elapsed().as_secs(), partial = %a.last_partial,
+                        "流式会话停滞重置——VAD 未定段的微弱音频不残留到下一句");
                     sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
                 }
             }
             if last_diag.elapsed() >= Duration::from_secs(3) {
-                let rlen = self.ring.lock().unwrap().len();
-                // NOTE: `is_speaking()` is useless with this retroactive VAD (only true for
-                // the instant a segment pops) — the meaningful live signal is the partial.
                 let has_partial = sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
-                debug!(frames = frames_in, ring = rlen, has_partial, "stage1 diag");
+                debug!(frames = frames_in, ring = self.ring.lock().unwrap().len(), has_partial, "stage1 diag");
                 last_diag = Instant::now();
             }
 
-            // Next wake deadline: the earliest REAL timer, or None = nothing time-based is
-            // pending → park indefinitely (wake only on incoming audio). This is what
-            // replaces polling — no heartbeat, no idle wakeups.
+            // ③ 取帧:ring 有帧直接取;空则 park 等音频/截止(断流>2s 且有 partial → 喂静音逼 EOS)
             let wake_at = next_wake_at(&tracker, &sess, ring_empty_since, now_s, speaking);
-
-            // drain one Silero window (512 samples = 32ms) when available
-            let frame = {
-                let mut g = self.ring.lock().unwrap();
-                if g.has_frame(WINDOW) {
-                    ring_empty_since = None;
-                    g.drain(WINDOW)
-                } else {
-                    drop(g);
-                    // Ring empty: if > 2s AND the active segment has partials (were speaking),
-                    // feed silence to VAD so it fires EOS naturally — prevents the scenario
-                    // where audio source drops mid-utterance and VAD never evaluates silence.
-                    ring_empty_since.get_or_insert_with(Instant::now);
-                    let since = ring_empty_since.unwrap();
-                    let has_partial =
-                        sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
-                    if since.elapsed() > Duration::from_secs(2) && has_partial {
-                        // Feed synthetic silence so VAD fires EOS when the source dropped
-                        // mid-utterance — but at a 100ms cadence, NOT a CPU burn: each feed is
-                        // one 32ms silence window, so ~1s of silence accumulates over ~3s wall.
-                        if last_silence_feed.elapsed() >= Duration::from_millis(100) {
-                            last_silence_feed = Instant::now();
-                            debug!("ring empty > 2s during speech — feeding silence to force VAD EOS");
-                            vec![0i16; WINDOW] // synthetic silence frame → VAD will fire EOS
-                        } else {
-                            // Park until the next feed tick (a real frame still wakes us early).
-                            match wait_frame(&self.ring, &self.ring_cv, WINDOW, Some(Duration::from_millis(100))) {
-                                Some(f) => {
-                                    ring_empty_since = None;
-                                    f
-                                }
-                                None => continue, // not a feed tick yet — re-run checks
-                            }
-                        }
-                    } else {
-                        // Park until the ingest thread pushes (condvar notify) or the next
-                        // deadline above fires — 无睡眠轮询,空闲时零唤醒.
-                        match wait_frame(&self.ring, &self.ring_cv, WINDOW, wake_at) {
-                            Some(f) => {
-                                ring_empty_since = None;
-                                f
-                            }
-                            None => continue, // deadline fired — re-run settle/watchdog checks
-                        }
-                    }
-                }
+            let frame = match self.drain_frame(&mut ring_empty_since, &sess, &mut last_silence_feed, wake_at) {
+                FrameResult::Frame(f) => f,
+                FrameResult::Parked => continue,
             };
             frames_in += 1;
 
-            // (2) VAD FIRST —— 每帧跑(便宜 ~1-2ms),提供实时 detected() 语音门控信号 + 分段事件。
-            //     sherpa 的 `VoiceActivityDetector::detected()` 是实时"正在检测到语音"(非回溯
-            //     事件);它是流式喂帧的唯一门卫——VAD 说没语音,流式就不喂、不解码。
+            // ④ VAD:每帧跑(便宜),得到 detected()(实时语音信号,门控流式) + 分段事件
             let vad = self.mgr.vad().unwrap();
             let events = vad.push_frame(&frame);
             let v_detected = vad.detected();
 
-            // (1) 流式:只在 VAD detected() 时喂帧/解码(空闲零喂帧、零解码、零 CPU);
-            //     起音翻转补喂 lead-in(soft onset);accept 与 pcm 喂相同帧 → 流式/batch 共享音频。
+            // ⑤ 流式:VAD 门控喂帧/解码(空闲 park);起音补喂 lead_in(soft onset);
+            //    accept 与 pcm 喂同一帧 → 流式/batch 共享音频
             self.feed_streaming(
-                &mut sess,
-                &mut tracker,
-                &mut lead_in,
-                &mut speech_active,
-                &frame,
-                sr,
-                start.elapsed().as_secs_f64(),
-                v_detected,
-                on_event,
+                &mut sess, &mut tracker, &mut lead_in, &mut speech_active,
+                &frame, sr, start.elapsed().as_secs_f64(), v_detected, on_event,
             );
 
-            // (2b) VAD 事件 → WindowTracker → Batch (per segment) / WindowEdge (settle)。
-            //     NOTE: this VAD emits SOS RETROACTIVELY — SOS+EOS arrive together in one
-            //     push_frame batch when the finished segment pops. The SOS arm records the
-            //     ids (for the segment the EOS arm in the same batch builds); the streaming
-            //     session lifecycle is boundary-driven instead (see [`ActiveSession`]).
+            // ⑥ 分段:SOS 分配段号;EOS 定稿成段(batch + WindowEdge)
             for ev in events {
                 match ev.kind {
-                    VadEventKind::StartOfSpeech => {
-                        // 回溯式 SOS:只分配段号 + 标记 active。merge/split 决策在 EOS
-                        // 臂(那里能回推真实语音起点)——见 on_eos。
-                        cur_seg = tracker.on_sos();
-                    }
+                    VadEventKind::StartOfSpeech => cur_seg = tracker.on_sos(),
                     VadEventKind::EndOfSpeech => {
                         let end_s = start.elapsed().as_secs_f64();
-                        // Finalize the CURRENT streaming session → this segment's streaming_text,
-                        // then reset it (the next session covers the next segment). `fed` 诊断。
                         let a = sess.take();
                         let fed = a.as_ref().map(|a| a.fed).unwrap_or(0);
                         sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
