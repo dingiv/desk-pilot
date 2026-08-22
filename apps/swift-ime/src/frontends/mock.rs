@@ -25,6 +25,8 @@ pub struct MockConfig {
     pub commit: bool,
     pub async_wait: u64,
     pub voice_aura_base: String,
+    /// 语音连接空闲自动断连时长(秒,0 = 永不主动断);默认 30。
+    pub voice_idle_time: u64,
     pub en_user_dict: Option<String>,
     pub en_dicts: Vec<String>,
     /// `#req` backend base URL — CLI override of `magic.req_base` config。
@@ -45,6 +47,7 @@ impl Default for MockConfig {
             config: None, asr_text: None,
             commit: false, async_wait: 0,
             voice_aura_base: ime_core::engine::DEFAULT_VOICE_AURA_BASE.to_string(),
+            voice_idle_time: ime_core::io_thread::DEFAULT_IDLE_TIMEOUT_SECS,
             en_user_dict: None, en_dicts: Vec::new(),
             frontend: None,
             tee_stderr: true,
@@ -131,6 +134,7 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<ime_core::voice_state::
         sw_cfg.weights.to_scoring(),
         cfg.frontend.clone().unwrap_or_else(|| Arc::new(ime_core::frontend::NoopFrontend::default())),
         cfg.voice_aura_base.clone(),
+        cfg.voice_idle_time,
         addons,
     );
     engine.set_page_size(sw_cfg.input.page_size);

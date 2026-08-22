@@ -96,22 +96,33 @@ fn default_req_base() -> String {
     ime_core::family::magic::DEFAULT_REQ_BASE.to_string()
 }
 
-/// voice pipeline(`#asr`)配置 —— aura daemon origin。
+/// voice pipeline(`#asr`)配置 —— aura daemon origin + 空闲自动断连。
 #[derive(Debug, Clone, Deserialize)]
 pub struct VoiceConfig {
     /// aura daemon 的 HTTP origin(`http://127.0.0.1:9091`)。引擎构造时启动
     /// voice listener 在 IoThread 上拉 SSE,跟随引擎 drop 自动清理。
     #[serde(default = "default_voice_aura_base")]
     pub aura_base: String,
+    /// 语音连接空闲自动断连时长(秒,0 = 永不主动断)。退出 `#asr` 后若长时间
+    /// 没有新的 ASR 使用,voice server 主动断开 aura 释放连接。
+    #[serde(default = "default_voice_idle_time")]
+    pub idle_time: u64,
 }
 
 fn default_voice_aura_base() -> String {
     ime_core::engine::DEFAULT_VOICE_AURA_BASE.to_string()
 }
 
+fn default_voice_idle_time() -> u64 {
+    ime_core::io_thread::DEFAULT_IDLE_TIMEOUT_SECS
+}
+
 impl Default for VoiceConfig {
     fn default() -> Self {
-        VoiceConfig { aura_base: default_voice_aura_base() }
+        VoiceConfig {
+            aura_base: default_voice_aura_base(),
+            idle_time: default_voice_idle_time(),
+        }
     }
 }
 

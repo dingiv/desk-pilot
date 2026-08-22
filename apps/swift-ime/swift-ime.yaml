@@ -40,6 +40,14 @@ snippets:
   - trigger: "/clip"
     expand: "Clip: $CLIPBOARD"
 
+# ── Voice (`#asr`) ──────────────────────────────────────────────────────
+voice:
+  # aura daemon origin。
+  # aura_base: http://127.0.0.1:9091
+  # 语音连接空闲自动断连时长(秒,0 = 永不主动断)。退出 #asr 后若长时间没有
+  # 新的 ASR 使用,主动断开 aura 释放连接。
+  idle_time: 300
+
 # ── Input ───────────────────────────────────────────────────────────────
 input:
   fuzzy: true         # fuzzy pinyin (z/zh, c/ch, s/sh, n/l, etc.)

@@ -211,6 +211,7 @@ pub extern "C" fn swift_ime_create(
         cfg.weights.to_scoring(),
         frontend.clone() as Arc<dyn FrontEndHandle>,
         cfg.voice.aura_base.clone(),
+        cfg.voice.idle_time,
         addons,
     ));
     // &mut 配置 —— 必须在 attach_engine(建 Weak)之前:Arc::get_mut 要求

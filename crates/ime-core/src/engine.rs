@@ -113,6 +113,7 @@ impl ImeEngine {
             crate::scoring::ScoringConfig::default(),
             Arc::new(crate::frontend::NoopFrontend::default()),
             DEFAULT_VOICE_AURA_BASE.to_string(),
+            crate::io_thread::DEFAULT_IDLE_TIMEOUT_SECS,
             Vec::new(),
         )
     }
@@ -136,6 +137,9 @@ impl ImeEngine {
     /// `voice_aura_base` 是 aura daemon origin(`http://127.0.0.1:9091`)。
     /// 引擎构造时立即启动 voice listener task(`#asr` 共享同一份 `AuraClient`),
     /// 整生命周期跟随 engine drop。
+    ///
+    /// `voice_idle_timeout_secs` 是语音连接空闲自动断连时长(秒,0 = 永不主动断),
+    /// 默认 [`DEFAULT_IDLE_TIMEOUT_SECS`](crate::io_thread::DEFAULT_IDLE_TIMEOUT_SECS)。
     pub fn with_config(
         pinyin_weights: crate::family::pinyin::PinyinWeights,
         english_weights: crate::family::english::EnglishWeights,
@@ -144,6 +148,7 @@ impl ImeEngine {
         scoring: crate::scoring::ScoringConfig,
         frontend: Arc<dyn crate::frontend::FrontEndHandle>,
         voice_aura_base: String,
+        voice_idle_timeout_secs: u64,
         addons: Vec<crate::family::magic::AddonConfig>,
     ) -> Self {
         // Magic command entries are generated from the member registry (#asr, #flush,
@@ -187,6 +192,7 @@ impl ImeEngine {
             std::sync::Arc::downgrade(&frontend),
             voice_aura_base,
             Arc::clone(&voice_state),
+            voice_idle_timeout_secs,
         ));
         magic.set_io(Arc::clone(&io_thread), Arc::clone(&frontend));
         // `#asr` 家族经同一 sender 发 Attach/Detach 给 voice server。
@@ -1019,6 +1025,7 @@ mod tests {
             crate::scoring::ScoringConfig::default(),
             Arc::new(crate::frontend::NoopFrontend::default()),
             DEFAULT_VOICE_AURA_BASE.to_string(),
+            crate::io_thread::DEFAULT_IDLE_TIMEOUT_SECS,
             Vec::new(),
         );
         let mut e = e;

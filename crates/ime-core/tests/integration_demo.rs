@@ -54,6 +54,7 @@ fn eng_with_aura(base: &str) -> ImeEngine {
         ime_core::scoring::ScoringConfig::default(),
         std::sync::Arc::new(ime_core::frontend::NoopFrontend::default()),
         base.to_string(),
+        ime_core::io_thread::DEFAULT_IDLE_TIMEOUT_SECS,
         Vec::new(),
     )
 }

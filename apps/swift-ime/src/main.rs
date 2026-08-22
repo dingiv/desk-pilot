@@ -55,6 +55,7 @@ fn main() {
         commit: args.commit, async_wait: args.async_wait,
         voice_aura_base: args.aura_addr
             .unwrap_or_else(|| ime_core::engine::DEFAULT_VOICE_AURA_BASE.to_string()),
+        voice_idle_time: ime_core::io_thread::DEFAULT_IDLE_TIMEOUT_SECS,
         en_user_dict: args.en_user_dict, en_dicts: args.en_dicts,
         req_base: args.req_base,
         frontend: None,

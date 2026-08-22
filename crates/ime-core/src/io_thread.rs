@@ -90,9 +90,10 @@ pub struct IoThread {
 /// aura SSE 数据流(owned —— 由 `subscribe_segments_owned` 产生,可自由移动)。
 type Sse = Pin<Box<dyn futures::Stream<Item = AsrSegment>>>;
 
-/// 语音连接空闲超时:退出 `#asr` 后,若长时间没有新的 ASR 使用(Attach),
-/// voice server 主动断开 aura,释放连接。
-const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 语音连接空闲超时默认值:退出 `#asr` 后,若长时间没有新的 ASR 使用(Attach),
+/// voice server 主动断开 aura,释放连接。可在 `swift-ime.yaml → voice.idle_time`
+/// 覆盖(单位:秒)。
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
 
 /// 对 SSE 流的一次 poll:拿到一个段,并**把流原样还回**,让循环决定续传还是放弃。
 /// 所有权进出,future 无借用,可放进 `FuturesUnordered`。
@@ -102,12 +103,14 @@ async fn poll_seg(mut s: Sse) -> Option<(AsrSegment, Sse)> {
 }
 
 impl IoThread {
-    /// 创建并启动 I/O 线程。`voice_base` / `voice_state` 交给 voice server 用。
+    /// 创建并启动 I/O 线程。`voice_base` / `voice_state` 交给 voice server 用;
+    /// `idle_timeout` 是语音连接空闲自动断连时长(秒,0 = 永不主动断)。
     /// `frontend` 以 weak 持有,不延长前端生命周期。
     pub fn spawn(
         frontend: Weak<dyn FrontEndHandle>,
         voice_base: String,
         voice_state: Arc<SharedVoiceState>,
+        idle_timeout_secs: u64,
     ) -> Self {
         let rt = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -122,7 +125,13 @@ impl IoThread {
         std::thread::Builder::new()
             .name("ime-io".into())
             .spawn(move || {
-                rt2.block_on(voice_server_main(rx, frontend, voice_base, voice_state));
+                rt2.block_on(voice_server_main(
+                    rx,
+                    frontend,
+                    voice_base,
+                    voice_state,
+                    idle_timeout_secs,
+                ));
             })
             .expect("spawn ime io thread");
         IoThread {
@@ -162,6 +171,7 @@ async fn voice_server_main(
     frontend: Weak<dyn FrontEndHandle>,
     base: String,
     state: Arc<SharedVoiceState>,
+    idle_timeout_secs: u64,
 ) {
     let mut sources: FuturesUnordered<Pin<Box<dyn Future<Output = Option<(AsrSegment, Sse)>>>>> =
         FuturesUnordered::new();
@@ -171,6 +181,8 @@ async fn voice_server_main(
     let mut connected = false;
     // 最近一次 ASR 使用(Attach)时刻 —— 空闲超时据此断开 aura。
     let mut last_activity = tokio::time::Instant::now();
+    // 空闲自动断连时长;0 = 永不主动断(配置 `voice.idle_time: 0`)。
+    let idle_timeout: Option<Duration> = (idle_timeout_secs > 0).then(|| Duration::from_secs(idle_timeout_secs));
 
     loop {
         select! {
@@ -270,13 +282,16 @@ async fn voice_server_main(
                     None => {} // sources 空(带 guard 不应发生)
                 }
             }
-            // 臂 3:空闲超时 —— 无活跃 #asr 会话、仍持连接,且超过 IDLE_TIMEOUT
-            // 没有新 Attach → 主动断开 aura,释放连接(长连接不常驻)。
+            // 臂 3:空闲超时 —— 无活跃 #asr 会话、仍持连接,且超过空闲时长没有
+            // 新 Attach → 主动断开 aura,释放连接(长连接不常驻)。
             // guard 带 `connected`:断开后臂禁用,避免 deadline 已过导致空转。
-            _ = tokio::time::sleep_until(last_activity + IDLE_TIMEOUT),
-                if active_ctx < 0 && connected =>
+            // `idle_timeout` 为 None(配置 `idle_time: 0`)→ 永不主动断。
+            _ = tokio::time::sleep_until(
+                idle_timeout.map(|t| last_activity + t).unwrap_or(tokio::time::Instant::now() + Duration::from_secs(86400 * 365)),
+            ),
+                if idle_timeout.is_some() && active_ctx < 0 && connected =>
             {
-                tracing::info!("voice 空闲超过 {IDLE_TIMEOUT:?} → 主动断开 aura");
+                tracing::info!("voice 空闲超过 {:?} → 主动断开 aura", idle_timeout);
                 sources.clear(); // drop SSE 源 → reqwest 连接关闭。
                 connected = false;
                 state.set_connected(false);
@@ -328,7 +343,12 @@ mod tests {
         // smoke: spawn 不 panic。
         let front: Arc<dyn FrontEndHandle> = Arc::new(crate::frontend::NoopFrontend::default());
         let state = Arc::new(SharedVoiceState::new());
-        let io = IoThread::spawn(Arc::downgrade(&front), "http://127.0.0.1:1".into(), state);
+        let io = IoThread::spawn(
+            Arc::downgrade(&front),
+            "http://127.0.0.1:1".into(),
+            state,
+            DEFAULT_IDLE_TIMEOUT_SECS,
+        );
         io.send(IoEvent::SpawnAux(Box::new(|| {
             // do nothing — event loop spawned an empty closure and yielded.
         })));
@@ -443,7 +463,12 @@ mod tests {
         ));
         let state = Arc::new(SharedVoiceState::new());
         let base = format!("http://127.0.0.1:{port}");
-        let io = IoThread::spawn(Arc::downgrade(&front), base, Arc::clone(&state));
+        let io = IoThread::spawn(
+            Arc::downgrade(&front),
+            base,
+            Arc::clone(&state),
+            DEFAULT_IDLE_TIMEOUT_SECS,
+        );
 
         // #asr 家族发 Attach{ctx} —— 指向真实输入上下文指针,不是广播。
         io.send(IoEvent::Voice(VoiceCmd::Attach { ctx: 0xCAFE }));
