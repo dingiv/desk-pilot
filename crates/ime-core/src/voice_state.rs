@@ -20,7 +20,7 @@
 //! 纯 `std::sync` —— `Mutex` + `AtomicBool`。不依赖 tokio runtime,任何线程可读可写。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
 
 /// Max retained settled utterances (candidate slots). 旧版本(`AsrBuffer`) 同值;
@@ -115,32 +115,86 @@ struct Inner {
     live_window: Option<(u64, String)>,
 }
 
+/// Aura 连接状态(三态):正在连接 / 已连接 / 失败。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum VoiceConn {
+    /// 正在连接 / 未连上:候选显示「正在连接语音服务」。
+    Connecting = 0,
+    /// 已连接:候选显示 🎙 麦克风图标。
+    Connected = 1,
+    /// 连接失败 / 流已断:候选显示「语音服务暂不可用」。
+    Failed = 2,
+}
+
 /// 共享的语音会话状态。`Arc<SharedVoiceState>` 在 listener task 与 engine 之间共享。
 pub struct SharedVoiceState {
     inner: Mutex<Inner>,
-    /// Aura daemon 连通性(listener 的 health 探针写入)。
-    connected: AtomicBool,
+    /// Aura daemon 连通性三态(listener 的 health 探针 / SSE 流事件写入)。
+    conn: AtomicU8,
 }
 
 impl SharedVoiceState {
     pub fn new() -> Self {
         SharedVoiceState {
             inner: Mutex::new(Inner::default()),
-            connected: AtomicBool::new(false),
+            conn: AtomicU8::new(VoiceConn::Connecting as u8),
         }
     }
 
-    // ── Connectivity ────────────────────────────────────────────────────
+    // ── Connectivity(三态)──────────────────────────────────────────────
 
-    pub fn set_connected(&self, on: bool) {
-        self.connected.store(on, Ordering::Relaxed);
+    pub fn set_conn(&self, c: VoiceConn) {
+        self.conn.store(c as u8, Ordering::Relaxed);
     }
 
+    pub fn conn(&self) -> VoiceConn {
+        match self.conn.load(Ordering::Relaxed) {
+            1 => VoiceConn::Connected,
+            2 => VoiceConn::Failed,
+            _ => VoiceConn::Connecting,
+        }
+    }
+
+    /// 兼容布尔判断:仅 `Connected` 视为"已连接"(TUI 等仍用)。
     pub fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
+        self.conn() == VoiceConn::Connected
     }
 
     // ── Sync setters(被 listener 与测试使用)──────────────────────────
+
+    /// **清空全部历史**(finals / live / preview / windows)—— 重连后调用,避免
+    /// 断连期间的旧句残留在候选里,导致 `#asr` 重新打开时首个候选不是当前句。
+    pub fn reset(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.live.clear();
+        g.finals.clear();
+        g.preview = None;
+        g.live_window = None;
+        g.windows.clear();
+    }
+
+    /// 重连后**全量同步 aura 历史定稿**(`GET /api/results`,最旧 → 最新):
+    /// 把每条非空 calibrated 灌入 finals(最新在前,截断 [`MAX_FINALS`])。
+    /// 数据面 SSE 是 append-only,重连收不到断连期间的历史 —— 靠这里补齐。
+    pub fn sync_history(&self, history: &[(u64, String)]) {
+        let mut g = self.inner.lock().unwrap();
+        g.finals.clear();
+        g.live.clear();
+        g.preview = None;
+        g.live_window = None;
+        g.windows.clear();
+        // history 是最旧 → 最新;逐个头插 → 最新落在 finals[0](与"最新在前"
+        // 语义一致)。
+        for (_, calibrated) in history.iter() {
+            if !calibrated.is_empty() {
+                g.finals.insert(0, calibrated.clone());
+                if g.finals.len() > MAX_FINALS {
+                    g.finals.truncate(MAX_FINALS);
+                }
+            }
+        }
+    }
 
     /// 测试 / mock 用的流式文本注入(不更新 segments / preview,因为没有 window id
     /// 上下文)。生产代码永远走 `fold_segment`。
@@ -449,11 +503,13 @@ mod tests {
     #[test]
     fn connectivity_isolated_from_data() {
         let s = SharedVoiceState::new();
-        assert!(!s.is_connected());
-        s.set_connected(true);
+        assert_eq!(s.conn(), VoiceConn::Connecting);
+        s.set_conn(VoiceConn::Connected);
         assert!(s.is_connected());
-        s.set_connected(false);
+        assert_eq!(s.conn(), VoiceConn::Connected);
+        s.set_conn(VoiceConn::Failed);
         assert!(!s.is_connected());
+        assert_eq!(s.conn(), VoiceConn::Failed);
     }
 
     #[test]

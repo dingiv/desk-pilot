@@ -198,6 +198,7 @@ impl StateMachine {
                     self.magic_predictions = self
                         .active_command
                         .as_mut()
+                        // TODO: magic 命令调用点
                         .map(|m| m.predict(self.ctx, &input, env))
                         .unwrap_or_default();
                     self.magic_hints.clear();

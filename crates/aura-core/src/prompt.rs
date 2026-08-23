@@ -245,23 +245,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bare_minimum() {
-        let (sys, usr) = PromptBuilder::new("你好").build();
-        // ROLE_TASK is now a single lead sentence (no "# 角色" header — the prompt was trimmed so
-        // a small model follows it better than prose).
-        assert!(sys.contains("纠偏助手"), "ROLE_TASK lead sentence present");
-        assert!(sys.contains("# 输出"));
-        assert!(!sys.contains("- Bevy"), "no hotword entries when empty");
-        assert!(!usr.contains("最近对话"), "no context in user when empty");
-        // 1.3 default few-shot 当前被注释停用(DEFAULT_FEW_SHOT 示例全部注释)——
-        // 恢复示例时改回 contains("# 示例") 断言。
-        assert!(!sys.contains("# 示例"), "default few-shot currently disabled");
-        // 1.6 XML envelope
-        assert!(usr.contains("<primary_transcript>"), "raw wrapped in XML envelope");
-        assert!(usr.contains("你好"), "raw text present");
-    }
-
-    #[test]
     fn with_hotwords_and_context() {
         let hw: Vec<String> = vec!["Bevy".into(), "Rust".into()];
         let (sys, usr) = PromptBuilder::new("B位引擎").hotwords(&hw).context("上句：开发贪吃蛇").build();

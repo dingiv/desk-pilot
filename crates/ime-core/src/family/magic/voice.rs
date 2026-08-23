@@ -134,9 +134,15 @@ impl MagicMember for VoiceMember {
         };
         let args = Self::args_of(input);
 
-        // 未连接:不可提交的解释(interactive = 选中不上屏)。
-        if !state.is_connected() {
-            return vec![Prediction::interactive("aura 未连接，语音不可用")];
+        // 连接三态:
+        // - Connecting → 正在连接语音服务(不可提交);
+        // - Failed     → 语音服务暂不可用(不可提交);
+        // - Connected  → 继续走语音结果预测。
+        use crate::voice_state::VoiceConn;
+        match state.conn() {
+            VoiceConn::Connecting => return vec![Prediction::interactive("正在连接语音服务")],
+            VoiceConn::Failed => return vec![Prediction::interactive("语音服务暂不可用")],
+            VoiceConn::Connected => {}
         }
 
         // `?num=N` → 预测 = 最近 N 条定稿拼接。

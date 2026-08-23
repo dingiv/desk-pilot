@@ -697,6 +697,9 @@ async fn serve_socket(state: DaemonState, bind_addr: String, port: u16, web_dist
         // ── binary / queries ──
         .route("/api/audio/{seq}", get(audio_handler))
         .route("/api/recordings", get(recordings_handler))
+        // 全量历史识别消息(最近定稿,最旧 → 最新)—— 重连后 swift-ime 拉一次
+        // 同步本地 voice_state,补齐断连期间 aura 侧已定稿的句子。
+        .route("/api/results", get(results_handler))
         .fallback_service(static_spa)
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -815,6 +818,26 @@ async fn audio_handler(
 /// `GET /api/recordings` — list all known clips (hot + flushed), ascending seq.
 async fn recordings_handler(State(s): State<DaemonState>) -> Json<Value> {
     Json(json!({ "recordings": s.storage.recordings() }))
+}
+
+/// `GET /api/results` — 最近定稿的识别文本(最旧 → 最新)。数据面(`/api/asr_stream`)
+/// 是 append-only broadcast,重连后的新订阅者**不会收到历史段**;本接口补足全量
+/// 历史,供客户端重连后同步本地状态。
+async fn results_handler(State(s): State<DaemonState>) -> Json<Value> {
+    let recs = s.storage.recent();
+    let texts: Vec<serde_json::Value> = recs
+        .iter()
+        .map(|r| {
+            json!({
+                "window_id": r.window_id,
+                "unix_ms": r.unix_ms,
+                "raw_text": r.raw_text,
+                "streaming_text": r.streaming_text,
+                "calibrated": r.calibrated,
+            })
+        })
+        .collect();
+    Json(json!({ "results": texts }))
 }
 
 /// `POST /api/correct {window_id, raw, corrected}` — record a user correction for a settled

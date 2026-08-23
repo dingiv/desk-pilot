@@ -40,6 +40,18 @@ const RECONNECT_MAX_ATTEMPTS: u32 = 10;
 /// 单次退避 sleep 的上限。
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 
+/// SSE 流的连接状态(供上层实时感知,及时汇报 UI)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SseConnState {
+    /// 正在尝试连接(退避重连中)。
+    Connecting,
+    /// 已连上(HTTP 200,数据流活着)。
+    Connected,
+    /// 本次连接尝试失败(bad status / 网络错误)—— 流内部仍在退避重试,
+    /// 但上层应**立即**把 UI 切到"不可用",而不是等流彻底结束。
+    Failed,
+}
+
 /// Async client for the aura-daemon HTTP socket. Cheap to clone (shares the reqwest pool).
 #[derive(Clone)]
 pub struct AuraClient {
@@ -134,16 +146,59 @@ impl AuraClient {
             .unwrap_or_default())
     }
 
+    /// `GET /api/results` — 最近定稿的识别文本(最旧 → 最新),重连后全量同步用。
+    /// 数据面 `/api/asr_stream` 是 append-only broadcast,新订阅者收不到历史段;
+    /// 此接口补足。返回 `(window_id, calibrated)` 对(可空校准文本)。
+    pub async fn results(&self) -> Result<Vec<(u64, String)>> {
+        let v: serde_json::Value = self
+            .http
+            .get(format!("{}/api/results", self.base))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(v.get("results")
+            .and_then(|r| r.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| {
+                        let id = x.get("window_id").and_then(|i| i.as_u64())?;
+                        let cal = x
+                            .get("calibrated")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        Some((id, cal))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// Raw `data:` payloads from an SSE endpoint, with reconnect. Shared by [`subscribe`] and
     /// [`subscribe_segments`]. Yields one owned String per `data:` line (a frame may carry ≥1).
-    fn sse_data(&self, url: String) -> impl Stream<Item = String> + '_ {
+    ///
+    /// `on_conn`(可选):每次连接状态变化时调用(Connecting / Connected / Failed),
+    /// 让上层**及时**感知"连不上"—— 即使流内部还在退避重试,UI 也该立刻切不可用。
+    fn sse_data(
+        &self,
+        url: String,
+        on_conn: Option<Box<dyn Fn(SseConnState) + Send + Sync>>,
+    ) -> impl Stream<Item = String> + '_ {
         async_stream::stream! {
             let mut attempts: u32 = 0;
             loop {
+                if let Some(cb) = &on_conn {
+                    cb(SseConnState::Connecting);
+                }
                 match self.http.get(&url).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         // 连上过 → 计数清零,之后的断线重连从头退避。
                         attempts = 0;
+                        if let Some(cb) = &on_conn {
+                            cb(SseConnState::Connected);
+                        }
                         let mut bytes = resp.bytes_stream();
                         let mut buf = String::new();
                         // Drive this connection until it ends/errors, then fall through to reconnect.
@@ -161,9 +216,15 @@ impl AuraClient {
                     }
                     Ok(resp) => {
                         tracing::warn!(status = %resp.status(), attempts, "aura SSE bad status");
+                        if let Some(cb) = &on_conn {
+                            cb(SseConnState::Failed);
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, attempts, "aura SSE connect failed");
+                        if let Some(cb) = &on_conn {
+                            cb(SseConnState::Failed);
+                        }
                     }
                 }
                 // 指数退避 + 上限:连续失败超过 RECONNECT_MAX_ATTEMPTS 次 → 放弃,
@@ -190,7 +251,7 @@ impl AuraClient {
     pub fn subscribe(&self, freq_ms: u64) -> impl Stream<Item = AuraStateView> + '_ {
         let url = format!("{}/api/stream?state_changed_frequency={}", self.base, freq_ms.max(250));
         async_stream::stream! {
-            let data = self.sse_data(url);
+            let data = self.sse_data(url, None);
             tokio::pin!(data); // sse_data's stream is !Unpin — pin before .next()
             while let Some(payload) = data.next().await {
                 if payload.contains("\"state_changed\"") {
@@ -210,7 +271,7 @@ impl AuraClient {
     pub fn subscribe_segments(&self) -> impl Stream<Item = AsrSegment> + '_ {
         let url = format!("{}/api/asr_stream", self.base);
         async_stream::stream! {
-            let data = self.sse_data(url);
+            let data = self.sse_data(url, None);
             tokio::pin!(data);
             while let Some(payload) = data.next().await {
                 if let Ok(seg) = serde_json::from_str::<AsrSegment>(&payload) {
@@ -224,9 +285,19 @@ impl AuraClient {
     /// client and is `'static` — usable across scopes, e.g. moved into a `FuturesUnordered` in
     /// the IoThread's voice server. Reconnect / resilient behavior is unchanged.
     pub fn subscribe_segments_owned(self) -> impl Stream<Item = AsrSegment> + 'static {
+        self.subscribe_segments_owned_with_conn(None)
+    }
+
+    /// Owned data-plane stream + 连接状态回调(`on_conn` 每次 Connecting /
+    /// Connected / Failed 时调用)—— voice server 用它把「连不上」及时汇报到
+    /// UI,不必等退避重连到上限、流彻底结束。
+    pub fn subscribe_segments_owned_with_conn(
+        self,
+        on_conn: Option<Box<dyn Fn(SseConnState) + Send + Sync>>,
+    ) -> impl Stream<Item = AsrSegment> + 'static {
         let url = format!("{}/api/asr_stream", self.base);
         async_stream::stream! {
-            let data = self.sse_data(url);
+            let data = self.sse_data(url, on_conn);
             tokio::pin!(data);
             while let Some(payload) = data.next().await {
                 if let Ok(seg) = serde_json::from_str::<AsrSegment>(&payload) {

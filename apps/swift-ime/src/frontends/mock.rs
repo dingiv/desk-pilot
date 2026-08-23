@@ -177,7 +177,7 @@ pub fn build_engine(cfg: &MockConfig) -> (ImeEngine, Arc<ime_core::voice_state::
 
     let voice_state = engine.voice_state();
     if let Some(ref text) = cfg.asr_text {
-        voice_state.set_connected(true);
+        voice_state.set_conn(ime_core::voice_state::VoiceConn::Connected);
         voice_state.seed_final(text);
         crate::ime_log!("asr mock text: {text}");
     }

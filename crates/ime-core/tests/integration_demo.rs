@@ -449,7 +449,7 @@ fn asr_command_with_buffer_commits_voice_text() {
     let base = mock_aura();
     let mut eng = eng_with_aura(&base);
     // 直接写 shared voice state(真实 SSE 由 voice server 折叠;这里是测试 mock)。
-    eng.voice_state().set_connected(true);
+    eng.voice_state().set_conn(ime_core::voice_state::VoiceConn::Connected);
     eng.voice_state().seed_final("今天天气不错");
 
     // Type #asr
@@ -476,7 +476,7 @@ fn asr_magic_tick_refreshes_real_ctx_after_voice_advance() {
     let base = mock_aura();
     let eng = eng_with_aura(&base);
     let ctx: usize = 0xCAFE; // fcitx 下 = 真实 InputContext 指针,非 0
-    eng.voice_state().set_connected(true);
+    eng.voice_state().set_conn(ime_core::voice_state::VoiceConn::Connected);
 
     // 在真实 ctx 输入 #asr → Snippet 态,VoiceMember 激活,候选是占位提示。
     let mut before = ImeView::empty();
@@ -506,6 +506,72 @@ fn asr_magic_tick_refreshes_real_ctx_after_voice_advance() {
         eng.magic_tick_ctx(0).is_none(),
         "ctx 0 无 #asr 会话,应返回 None"
     );
+}
+
+/// 重连后**全量同步历史**:mock aura 在 `/api/results` 返回断连期间已定稿的句子,
+/// 引擎重连(Attach 且未连)时应先清空旧历史、再拉 results 灌入 voice_state ——
+/// 这样 `#asr` 重新打开时首个候选是断连期间说的那句话,而非旧残留。
+#[test]
+fn voice_reconnect_syncs_aura_history() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // mock aura:/health 200;`/api/asr_stream` 保持连接;`/api/results` 返回
+    // 两条历史定稿(最旧 → 最新)。其它请求 200 close。
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut s) = conn else { break };
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut req = [0u8; 4096];
+            let _ = s.read(&mut req);
+            let line = String::from_utf8_lossy(&req);
+            let body = if line.contains("/api/results") {
+                r#"{"results":[{"window_id":1,"calibrated":"断连前的第一句"},{"window_id":2,"calibrated":"断连期间说的第二句"}]}"#.to_string()
+            } else if line.contains("asr_") {
+                // SSE 长连接:不回 body,保持连接。
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n");
+                let _ = s.flush();
+                std::thread::sleep(Duration::from_secs(30));
+                continue;
+            } else {
+                r#"{"ok":true}"#.to_string() // /health 等
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = s.write_all(resp.as_bytes());
+            let _ = s.flush();
+        }
+    });
+
+    let mut eng = eng_with_aura(&format!("http://127.0.0.1:{port}"));
+    // 先造一条"旧残留"(断连前的状态),验证重连会被清掉。
+    eng.voice_state().seed_final("旧残留");
+
+    // 触发 #asr → Attach → 未连 → 重连:reset + 拉 results 同步历史。
+    for c in "#asr".chars() {
+        eng.predict(KeyEvent::char(c));
+    }
+    // 给 io 线程时间处理 Attach / health / results。
+    std::thread::sleep(Duration::from_millis(300));
+
+    let (finals, _) = eng.voice_state().voice_candidates();
+    eprintln!("reconnect finals: {finals:?}");
+    assert!(
+        finals.iter().any(|f| f.contains("断连期间说的第二句")),
+        "重连后应同步到断连期间的新句, got {finals:?}"
+    );
+    assert!(
+        !finals.iter().any(|f| f.contains("旧残留")),
+        "旧残留应在重连时被清空, got {finals:?}"
+    );
+    let _ = Arc::new(());
 }
 
 #[test]

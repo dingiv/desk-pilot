@@ -412,13 +412,32 @@ struct SettledSpans {
 struct WindowTracker {
     merge_gap_s: f64,
     next_seg_id: SegmentId,
-    next_win_id: WindowId,
+    /// 最近分配的 window id(供 `prospective` 给未开窗口预生成;下一个随机 id)。
+    last_win_id: WindowId,
     open: Option<OpenWindow>,
 }
 
 impl WindowTracker {
     fn new(merge_gap_s: f64) -> Self {
-        Self { merge_gap_s, next_seg_id: 1, next_win_id: 1, open: None }
+        Self { merge_gap_s, next_seg_id: 1, last_win_id: 0, open: None }
+    }
+
+    /// 生成一个**随机** window id(基于系统时间亚微秒纳秒,无依赖、不可预测,
+    /// `u64` 足够宽不会快速碰撞)。用随机而非递增 —— 避免可预测性,也让重连后
+    /// 历史窗口 id 与新窗口不产生"连续/相邻"的假关联。
+    fn next_random_win_id(&mut self) -> WindowId {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        // 混入自增计数:同一纳秒内连续两次也会不同(仅作防碰撞,不是"递增 id")。
+        self.last_win_id += 1;
+        let mut id = nanos ^ (self.last_win_id.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        if id == 0 {
+            id = 1;
+        }
+        self.last_win_id = id;
+        id
     }
 
     /// VAD StartOfSpeech. NOTE: the SOS is RETROACTIVE — it fires at the segment's EOS instant
@@ -429,8 +448,7 @@ impl WindowTracker {
     /// moves to [`Self::on_eos`], which back-derives the true speech onset from the PCM.
     fn on_sos(&mut self) -> SegmentId {
         if self.open.is_none() {
-            let id = self.next_win_id;
-            self.next_win_id += 1;
+            let id = self.next_random_win_id();
             self.open = Some(OpenWindow { window_id: id, segments: Vec::new(), active: false });
         }
         let segment_id = self.next_seg_id;
@@ -463,8 +481,7 @@ impl WindowTracker {
         let settled = self.settle_if_gap(seg.start_s);
         if self.open.is_none() {
             // First segment, or the previous window just settled.
-            let id = self.next_win_id;
-            self.next_win_id += 1;
+            let id = self.next_random_win_id();
             self.open = Some(OpenWindow { window_id: id, segments: Vec::new(), active: false });
         }
         let w = self.open.as_mut().expect("window just ensured");
@@ -523,8 +540,15 @@ impl WindowTracker {
     /// partials —
     /// this VAD emits SOS RETROACTIVELY (with EOS), so the real assignment only exists at EOS.
     /// Authoritative grouping arrives with the `Batch`/`WindowEdge` events.
+    ///
+    /// window id 是随机的;未开窗时给一个"预测"随机值(仅用于给 partial 预分组,
+    /// 实际分配在 EOS 用 [`next_random_win_id`](Self::next_random_win_id))。
     fn prospective(&self) -> (WindowId, SegmentId) {
-        let w = self.open.as_ref().map(|w| w.window_id).unwrap_or(self.next_win_id);
+        let w = self
+            .open
+            .as_ref()
+            .map(|w| w.window_id)
+            .unwrap_or_else(|| self.last_win_id.wrapping_add(1).max(1));
         (w, self.next_seg_id)
     }
 }
@@ -955,8 +979,7 @@ mod tests {
         let s = settled.expect("big gap settles the previous window");
         assert_eq!(s.window_id, w1);
         assert_eq!(s.segments.len(), 1);
-        assert_ne!(w2, w1, "a fresh window opens");
-        assert!(w2 > w1, "window ids are monotonic");
+        assert_ne!(w2, w1, "a fresh window opens (random ids must differ)");
         assert_eq!(segs.len(), 1);
     }
 
