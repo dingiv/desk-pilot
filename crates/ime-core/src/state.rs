@@ -727,6 +727,17 @@ impl StateMachine {
             '\x08' => self.pinyin_backspace(env),
             '\n' | '\r' => self.pinyin_enter(),
             ' ' => self.pinyin_space(env),
+            // 链分隔符:`'` 是组合内结构字符(ti'an 的两条链),不是终结符。
+            // 追加进 buffer;预测层(拼音家族)按 `'` 切链组合。回格删 `'`
+            // 天然回到无链状态 —— 链结构纯由 buffer 内容决定,无隐藏状态。
+            '\'' => {
+                self.buffer.push('\'');
+                self.raw_buffer.push('\'');
+                self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
+                self.cursor = self.preedit.len();
+                self.candidates_fresh = false;
+                self.query_pinyin(env)
+            }
             c if c.is_ascii_alphabetic() => {
                 self.buffer.push(c.to_ascii_lowercase());
                 self.raw_buffer.push(c);
@@ -761,8 +772,11 @@ impl StateMachine {
         // Layer 3: if buffer has 2+ syllables, add first-syllable single-char
         // options for incremental composition (造词).
         // Interleave: a few top full comps, then single-char options.
+        // 链式输入(`ti'an`)不提供逐字选项 —— 部分提交按音节消耗 buffer,
+        // 会把 `'` 留在半截 buffer 里破坏链结构;链式候选只整体提交。
+        let chained = self.buffer.contains('\'');
         if let Some(first_syl) = env.first_syllable(&self.buffer) {
-            if first_syl.len() < self.buffer.len() {
+            if !chained && first_syl.len() < self.buffer.len() {
                 let max_full = 8usize.min(cands.len());
                 let max_chars = (CANDIDATE_SLOTS - max_full).min(8);
                 let char_cands: Vec<String> = env

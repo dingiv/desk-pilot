@@ -203,6 +203,100 @@ impl PinyinFamily {
         self.engine.dict().record_pick(pinyin, word);
     }
 
+    /// 链式组合预测:`ti'an` → [`ti`][`an`] 两条链,各链独立预测取 top-K,
+    /// beam 逐层组合(合成分 = 各链 raw_score 连乘,同深度组合间公平),
+    /// 组合文本命中大词典时抬到 `large_dict` 分 —— 成词组合("提案")排在
+    /// 凑字组合("提安")之前。链拼音无分隔查询 `exact`(key 形如 "tian"),
+    /// 其结果集天然包含所有按该切分组合的词条,`contains` 即成词检测,
+    /// TSV/FST 双后端通吃、零额外索引。
+    ///
+    /// 某条链无候选(非法音节 / 英文串)→ 整体无组合(返回空)—— 上层
+    /// 回退到常规候选路径,不会出现半截拼接。
+    fn predict_chained(&self, input: &str) -> Vec<ScoredCandidate> {
+        let chains: Vec<&str> = input.split('\'').filter(|s| !s.is_empty()).collect();
+        if chains.len() < 2 {
+            // 单链(`ti'`)或纯分隔(`''`,P2 空链语义)—— 未完成,等用户继续。
+            return Vec::new();
+        }
+
+        const K: usize = 8; // 每链参与组合的候选数
+        const BEAM: usize = 16; // 组合层保留宽度
+
+        let mut acc: Vec<(String, f64)> = vec![(String::new(), 1.0)];
+        for chain in &chains {
+            let mut top = self.predict(chain); // 链内不含 ' → 不会递归回这里
+            top.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap_or(std::cmp::Ordering::Equal));
+            // 同文本取高分(家族内多层可能重复出同一候选)。
+            let mut seen = std::collections::HashSet::new();
+            top.retain(|c| seen.insert(c.text.clone()));
+            top.truncate(K);
+            if top.is_empty() {
+                return Vec::new();
+            }
+            let mut next: Vec<(String, f64)> = Vec::with_capacity(acc.len() * top.len());
+            for (t, s) in &acc {
+                for c in &top {
+                    next.push((format!("{t}{}", c.text), s * c.raw_score));
+                }
+            }
+            next.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            next.truncate(BEAM);
+            acc = next;
+        }
+
+        // 成词抬分:链拼音无分隔(joined,key 形如 "tian")查询,结果集天然
+        // 覆盖所有按该切分组合的词条("提案"/"西安"在,"天"也在——它不是
+        // 组合文本,contains 不命中,零干扰)。FST 部署(rime-ice)装在
+        // lattice,带词频 → 按词频给分(freq_to_score);TSV 部署走
+        // large_dict.exact,无词频,抬到 large_dict 固定分。
+        let joined: String = chains.concat();
+        let lattice_guard = self.lattice.lock().unwrap();
+        let fst_words = lattice_guard.as_ref().map(|lat| lat.words_for(&joined));
+        let tsv_words = {
+            let mut v = None;
+            if fst_words.is_none() {
+                let w = self.large_dict.lock().unwrap().exact(&joined);
+                if !w.is_empty() {
+                    v = Some(w);
+                }
+            }
+            v
+        };
+
+        let mut seen = std::collections::HashSet::new();
+        acc.into_iter()
+            .filter(|(t, _)| !t.is_empty() && seen.insert(t.clone()))
+            .map(|(text, score)| {
+                let word_score = fst_words.as_ref().and_then(|ws| {
+                    ws.iter()
+                        .find(|(w, _)| *w == text)
+                        .and_then(|(_, freq)| {
+                            lattice_guard
+                                .as_ref()
+                                .map(|lat| lat.freq_to_score(&self.freq_scale, *freq))
+                        })
+                });
+                let dict_floor = tsv_words.as_ref().map(|ws| {
+                    if ws.iter().any(|w| *w == text) {
+                        self.weights.large_dict
+                    } else {
+                        0.0
+                    }
+                });
+                let raw = word_score
+                    .or(dict_floor)
+                    .map(|w| score.max(w))
+                    .unwrap_or(score);
+                ScoredCandidate {
+                    text,
+                    family: "pinyin",
+                    source: "chain",
+                    raw_score: raw.clamp(0.0, 1.0),
+                }
+            })
+            .collect()
+    }
+
     pub fn engine(&self) -> &inputx_pinyin::PinyinEngine {
         &self.engine
     }
@@ -448,6 +542,13 @@ impl CandidateFamily for PinyinFamily {
     fn predict(&self, input: &str) -> Vec<ScoredCandidate> {
         if input.is_empty() {
             return Vec::new();
+        }
+
+        // 链式输入(`ti'an`):`'` 切分的多条拼音链 —— 各链独立预测,候选层
+        // beam 组合,组合文本命中大词典时抬分(成词优先)。`'` 不是任何合法
+        // 音节的一部分,无 `'` 的常规输入零开销、行为不变。
+        if input.contains('\'') {
+            return self.predict_chained(input);
         }
 
         let dict = self.engine.dict();

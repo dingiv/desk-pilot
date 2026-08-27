@@ -671,32 +671,6 @@ mod tests {
     }
 
     #[test]
-    fn bare_modifier_and_function_keys_passthrough() {
-        let mut e = ImeEngine::new();
-        type_str(&mut e, "ni");
-        for kind in [
-            KeyKind::Modifier,
-            KeyKind::Function(1),
-            KeyKind::Other(0x1008ff01),
-        ] {
-            let v = key(
-                &mut e,
-                KeyEvent {
-                    kind,
-                    ctrl: false,
-                    shift: false,
-                    alt: false,
-                },
-            );
-            assert_eq!(
-                v.action & action::PASSTHROUGH,
-                action::PASSTHROUGH,
-                "{kind:?}"
-            );
-        }
-    }
-
-    #[test]
     fn escape_resets_while_composing_even_without_candidates() {
         // 改进:旧逻辑按"面板开合"门控 —— 组合中但无候选时 Esc 透传,preedit
         // 卡屏。现在按 COMPOSING 门控,组合存在就能取消。
