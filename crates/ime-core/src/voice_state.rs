@@ -18,6 +18,14 @@
 //! ## Thread safety
 //!
 //! 纯 `std::sync` —— `Mutex` + `AtomicBool`。不依赖 tokio runtime,任何线程可读可写。
+//!
+//! ## 优雅降级(batch 不可靠、流式可靠)
+//!
+//! 流式(本地)是**底线**:live 只由 `StreamFragment` 写入;段/窗口的 batch
+//! 文本在任何形式的缺席下(remote 端点掉线、识别失败、**迟到** —— remote
+//! batch ~3.5s 可晚于 merge_gap 触发的窗口关闭)都逐级回退流式拼接。校准
+//! (LLM)只增强 calc 预览与定稿,永不污染 live/plain。窗口关闭后 preview
+//! 保留为 closed snapshot,迟到事件**刷新**它而不是清掉。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -73,10 +81,17 @@ impl WindowState {
         out
     }
 
-    /// 基本预览(plain):窗口已关闭 → `BatchWindow`;未关闭 → 逐段拼接。
+    /// 基本预览(plain):`BatchWindow`(整窗权威 batch)> 逐段拼接(每段
+    /// `BatchSegment` > `StreamFragment`)。窗口未关闭恒为逐段拼接;关闭后
+    /// `BatchWindow` 缺席(batch 失败 / disabled / 单段复用段级 None,后端
+    /// 此时**不发事件**)也回退逐段拼接 —— 段级 batch/stream 文本仍在,不能
+    /// 让首选候选闪没。
     fn plain_preview(&self) -> String {
         if self.closed {
-            self.batch_window.clone().unwrap_or_default()
+            self.batch_window
+                .clone()
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| self.concat_segments())
         } else {
             self.concat_segments()
         }
@@ -106,13 +121,15 @@ struct Inner {
     live: String,
     /// 已定稿的句子,最新在前。`WindowCalibration` 时插入头部。
     finals: Vec<String>,
-    /// 当前活动窗口的组装预览(`plain` / `calc`)。`live_window` 被设置时刷新,
-    /// `live_window = None` 时清空。
+    /// 当前活动窗口的组装预览(`plain` / `calc`)。有活动窗口时刷新;窗口定稿
+    /// 后保留最后快照(closed snapshot),迟到事件对它**重算增强**,直到下一
+    /// 窗口首条流式替换。
     preview: Option<AsrPreview>,
     /// per-window 识别状态(`#asr/calc` 折叠源)。
     windows: HashMap<u64, WindowState>,
-    /// 当前正在识别中的窗口 id + 文本(用于 `set_preview` 数据源)。
-    live_window: Option<(u64, String)>,
+    /// 当前正在识别中的窗口 id(`StreamFragment` 维护,窗口定稿时清)。只做
+    /// refresh 的定位键 —— 文本在各自的 `WindowState` 里,不在此冗余。
+    current_window: Option<u64>,
 }
 
 /// Aura 连接状态(三态):正在连接 / 已连接 / 失败。
@@ -170,7 +187,7 @@ impl SharedVoiceState {
         g.live.clear();
         g.finals.clear();
         g.preview = None;
-        g.live_window = None;
+        g.current_window = None;
         g.windows.clear();
     }
 
@@ -182,7 +199,7 @@ impl SharedVoiceState {
         g.finals.clear();
         g.live.clear();
         g.preview = None;
-        g.live_window = None;
+        g.current_window = None;
         g.windows.clear();
         // history 是最旧 → 最新;逐个头插 → 最新落在 finals[0](与"最新在前"
         // 语义一致)。
@@ -267,7 +284,7 @@ impl SharedVoiceState {
                 ..
             } => {
                 g.live = text.clone();
-                g.live_window = Some((*window_id, text.clone()));
+                g.current_window = Some(*window_id);
                 let entry = g.windows.entry(*window_id).or_default();
                 if !entry.closed {
                     upsert_segment(&mut entry.segments, *segment_id, |s| {
@@ -297,8 +314,9 @@ impl SharedVoiceState {
                 window_id,
                 calibrated,
             } => {
-                g.live = calibrated.clone();
-                g.live_window = Some((*window_id, calibrated.clone()));
+                // 校准不写 `live` —— live 是流式底线(本地、可靠),迟到的校准
+                // 文本把 live 倒退回旧句会造成显示抖动。校准只进窗口状态,
+                // 供 calc 预览与窗口定稿存档。
                 let entry = g.windows.entry(*window_id).or_default();
                 entry.segment_calibration = Some(calibrated.clone());
                 Self::refresh_preview_locked(&mut g);
@@ -314,10 +332,10 @@ impl SharedVoiceState {
                     }
                 }
                 g.live.clear();
-                // 窗口已关闭。preview 仍保留,calc = 定稿(用户选 /calc 时看);
-                // plain = BatchWindow(若已到);live_window = None 防止下一次流式
-                // 进来又被这个 closed window 的预览覆盖。
-                g.live_window = None;
+                // 窗口已关闭。preview 仍保留(closed snapshot),calc = 定稿(用户
+                // 选 /calc 时看);plain = BatchWindow > 逐段拼接。current_window
+                // 清空 —— 下一条流式(下一窗口)到来时 preview 才切换目标。
+                g.current_window = None;
                 let entry = g.windows.entry(*window_id).or_default();
                 entry.closed = true;
                 entry.calibrated = Some(calibrated.clone());
@@ -335,19 +353,27 @@ impl SharedVoiceState {
         }
     }
 
-    /// 根据 `live_window` + 对应 `WindowState` 重新计算并写入 preview。
+    /// 根据 `current_window` + 对应 `WindowState` 重新计算并写入 preview。
+    ///
+    /// 无活动窗口(窗口定稿后、下一窗口首条流式前)时,按最近 preview 记录的
+    /// 窗口**重算增强**而非清空 —— remote batch(~3.5s)+ LLM 可晚于
+    /// merge_gap 触发的窗口关闭,迟到的 `BatchSegment` / `SegmentCalibration`
+    /// 仍会触发 refresh;清空会把首选候选(🎙 组装预览)闪没。清空只由
+    /// `reset` / `sync_history` / `clear_preview` 显式做。
     /// 调用者必须已持有 inner 锁。
     fn refresh_preview_locked(g: &mut Inner) {
-        let Some((window_id, _)) = g.live_window.as_ref() else {
-            g.preview = None;
+        let Some(&window_id) = g
+            .current_window
+            .as_ref()
+            .or_else(|| g.preview.as_ref().map(|p| &p.window_id))
+        else {
             return;
         };
-        let Some(win) = g.windows.get(window_id) else {
-            g.preview = None;
+        let Some(win) = g.windows.get(&window_id) else {
             return;
         };
         g.preview = Some(AsrPreview {
-            window_id: *window_id,
+            window_id,
             plain: win.plain_preview(),
             calc: win.calc_preview(),
         });
