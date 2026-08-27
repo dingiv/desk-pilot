@@ -3,6 +3,7 @@
 //! Zero OS dependencies — cross-compilable and fully unit-testable.
 
 pub mod asr_buffer;
+pub mod chain;
 pub mod dispatcher;
 pub mod engine;
 pub mod expander;

@@ -30,7 +30,9 @@
 //! the PhraseBook for future sessions.
 
 use crate::expander::Expander;
-use crate::family::magic::{MagicCommand, MagicMatch, MagicMember, Prediction};
+use crate::family::magic::{
+    ChainContext, MagicCommand, MagicMatch, MagicMember, Prediction,
+};
 use crate::matcher::Matcher;
 use crate::platform::{ImeView, CANDIDATE_SLOTS};
 use crate::PinyinEngine;
@@ -190,6 +192,21 @@ impl StateMachine {
     /// 每次字符变化后重查:精确匹配 → 命令预测;前缀 → 补全提示;未知 → raw。
     fn query_magic(&mut self, env: &dyn StepEnv) -> ImeView {
         let input = self.buffer.clone();
+
+        // ── 链式命令模式(X'#cmd):上游折叠求值 + 上下文传递 ──────────
+        if crate::chain::is_chain_command(&input) {
+            return self.query_chained_magic(&input, env);
+        }
+
+        // 链式上游回退:`#` 被删空后 buffer 只剩上游文本(含 `'`,非 `#`/`/`
+        // 开头)→ 回拼音组合继续编辑上游。
+        if input.contains('\'') && !input.starts_with('#') && !input.starts_with('/') {
+            self.state = ComposeState::Pinyin;
+            self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
+            self.cursor = self.preedit.len();
+            return self.query_pinyin(env);
+        }
+
         match env.magic().match_command(&input) {
             // TODO: 不用区分了, 魔法命令全都是 LIVE
             MagicMatch::Exact(cmd) => match cmd {
@@ -253,6 +270,232 @@ impl StateMachine {
             }
         }
         self.rebuild_magic_view()
+    }
+
+    /// 链式命令模式(`X'#cmd`):上游折叠求值 → 命令段匹配 → 按上下文声明
+    /// 分流(替换 / 拼接)。候选最终形态(`magic_predictions`)在此构造完成,
+    /// `select_magic` / `rebuild_magic_view` 无需感知链式。
+    ///
+    /// - 感知上下文的命令([`MagicMember::wants_context`] = Some):拿上游
+    ///   高亮首选([`ChainContext::First`]),预测**替换**候选列表;
+    /// - 不感知的命令:普通 `predict`,非交互预测与上游首选**拼接**;
+    ///   interactive 预测(命令会话内部导航)不参与拼接,原样显示;
+    /// - 命令段未完成(`#`、`#x` 前缀/未知):候选 = 上游预测(用户可提前
+    ///   选上游结果)或补全提示。
+    ///
+    /// MVP 注:上游取其候选 top1(命令模式下不导航上游;改上游请回格)。
+    /// 链式进入前的造词半成品(`committed_text`)不参与上游求值。
+    fn query_chained_magic(&mut self, input: &str, env: &dyn StepEnv) -> ImeView {
+        use crate::chain::{join_segments, split_segments, ChainSeg};
+
+        let segs = split_segments(input);
+        let Some((ChainSeg::Command(cmd), prefix)) = segs.split_last() else {
+            return self.rebuild_magic_view(); // 防御:is_chain_command 已保证
+        };
+        let (cmd, prefix) = (cmd.clone(), prefix.to_vec());
+        let upstream_buf = join_segments(&prefix);
+        let upstream_cands = self.eval_upstream(&upstream_buf, env);
+        let upstream_first = upstream_cands.first().cloned().unwrap_or_default();
+
+        match env.magic().match_command(&cmd) {
+            MagicMatch::Exact(MagicCommand::Live { token, name }) => {
+                self.ensure_command(name, Some(token), env);
+                let upstream = ChainContext::First(upstream_first.clone());
+                let wants = self
+                    .active_command
+                    .as_ref()
+                    .and_then(|m| m.wants_context());
+                let preds = match self.active_command.as_mut() {
+                    Some(member) => match wants {
+                        Some(_) => member.predict_with_context(self.ctx, &cmd, &upstream, env),
+                        None => member
+                            .predict(self.ctx, &cmd, env)
+                            .into_iter()
+                            .map(|p| {
+                                if p.interactive {
+                                    p
+                                } else {
+                                    p.chained_prefix(&upstream_first)
+                                }
+                            })
+                            .collect(),
+                    },
+                    None => Vec::new(),
+                };
+                self.magic_predictions = preds;
+                self.magic_hints.clear();
+                self.magic_selectable = cmd == format!("#{name}");
+            }
+            MagicMatch::Exact(MagicCommand::Static) => {
+                self.clear_active_command();
+                let trigger = Self::command_trigger(&cmd);
+                self.magic_predictions = env
+                    .magic()
+                    .static_prediction(&trigger)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| p.chained_prefix(&upstream_first))
+                    .collect();
+                self.magic_hints.clear();
+                self.magic_selectable = cmd == trigger;
+            }
+            // 片段命令(X'#/hello):片段展开 × 上游拼接(片段不感知上下文)。
+            MagicMatch::Snippet => {
+                self.ensure_command("", Some("__SNIPPET__"), env);
+                self.magic_predictions = self
+                    .active_command
+                    .as_mut()
+                    .map(|m| m.predict(self.ctx, &cmd, env))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| {
+                        if p.interactive {
+                            p
+                        } else {
+                            p.chained_prefix(&upstream_first)
+                        }
+                    })
+                    .collect();
+                self.magic_hints.clear();
+                self.magic_selectable = false;
+            }
+            MagicMatch::Args(MagicCommand::Live { token, name }) => {
+                self.ensure_command(name, Some(token), env);
+                // 参数输入态(#del/15):裸输入提交候选;提交时 force_fire 带
+                // 上游上下文强触发。
+                self.magic_predictions = vec![Prediction::submit(input.to_string())];
+                self.magic_hints.clear();
+                self.magic_selectable = false;
+            }
+            MagicMatch::Args(MagicCommand::Static) => {
+                self.clear_active_command();
+                self.magic_predictions.clear();
+                self.magic_hints.clear();
+                self.magic_selectable = false;
+            }
+            MagicMatch::Prefix(hints) => {
+                self.clear_active_command();
+                self.magic_predictions.clear();
+                self.magic_hints = hints;
+                self.magic_selectable = true;
+            }
+            MagicMatch::Unknown => {
+                // 命令段未知(# / #zzz):显示上游预测 —— 用户可选中上游结果
+                // 直接提交,或继续编辑命令段。
+                self.clear_active_command();
+                self.magic_predictions = upstream_cands
+                    .iter()
+                    .take(7)
+                    .map(|t| Prediction::commit(t.clone()))
+                    .collect();
+                self.magic_hints.clear();
+                self.magic_selectable = !self.magic_predictions.is_empty();
+            }
+        }
+        self.rebuild_magic_view()
+    }
+
+    /// 上游链折叠求值 → 候选文本列表(top8)。递归左折叠:前缀求值 →
+    /// `First` 上下文传给最后一段;文本段走统一打分(`'` 组合由拼音家族
+    /// 处理,即 P0),命令段临时 spawn 求值(级联中间命令不保异步会话 —
+    /// 会话态只有活动命令有)。
+    fn eval_upstream(&self, upstream: &str, env: &dyn StepEnv) -> Vec<String> {
+        use crate::chain::{join_segments, split_segments, ChainSeg};
+
+        if upstream.is_empty() {
+            return Vec::new();
+        }
+        let segs = split_segments(upstream);
+        let Some((last, prefix)) = segs.split_last() else {
+            return Vec::new();
+        };
+        let prefix_buf = join_segments(prefix);
+        let upstream_first = match last {
+            // 单段/中间链:上游首选来自前缀折叠。
+            ChainSeg::Command(_) if prefix_buf.is_empty() => String::new(),
+            ChainSeg::Command(_) => self
+                .eval_upstream(&prefix_buf, env)
+                .first()
+                .cloned()
+                .unwrap_or_default(),
+            ChainSeg::Text(_) => String::new(),
+        };
+        match last {
+            ChainSeg::Text(t) if t.is_empty() => Vec::new(),
+            ChainSeg::Text(t) => {
+                let ranked = env.scorer().rank_detailed(t, &self.context);
+                let texts: Vec<String> = ranked.into_iter().map(|c| c.text).take(8).collect();
+                if upstream_first.is_empty() {
+                    texts
+                } else {
+                    texts
+                        .into_iter()
+                        .map(|t| format!("{upstream_first}{t}"))
+                        .collect()
+                }
+            }
+            ChainSeg::Command(c) => {
+                let ctx = (!upstream_first.is_empty())
+                    .then(|| ChainContext::First(upstream_first.clone()));
+                self.eval_command(c, ctx.as_ref(), env)
+            }
+        }
+    }
+
+    /// 命令段求值(级联中间命令):临时 spawn + 上下文分流,产出候选文本
+    /// (interactive 项是命令会话导航,中间级联无意义,过滤)。
+    fn eval_command(
+        &self,
+        cmd: &str,
+        upstream: Option<&ChainContext>,
+        env: &dyn StepEnv,
+    ) -> Vec<String> {
+        match env.magic().match_command(cmd) {
+            MagicMatch::Exact(MagicCommand::Live { token, .. }) => {
+                let Some(mut m) = env.magic().spawn(token) else {
+                    return Vec::new();
+                };
+                let wants = m.wants_context();
+                let preds = match (upstream, wants) {
+                    (Some(u), Some(_)) => m.predict_with_context(self.ctx, cmd, u, env),
+                    (Some(u), None) => {
+                        let up = u.first_text().to_string();
+                        m.predict(self.ctx, cmd, env)
+                            .into_iter()
+                            .map(|p| {
+                                if p.interactive {
+                                    p
+                                } else {
+                                    p.chained_prefix(&up)
+                                }
+                            })
+                            .collect()
+                    }
+                    _ => m.predict(self.ctx, cmd, env),
+                };
+                preds
+                    .into_iter()
+                    .filter(|p| !p.interactive)
+                    .map(|p| p.commit_value().to_string())
+                    .take(8)
+                    .collect()
+            }
+            MagicMatch::Exact(MagicCommand::Static) => {
+                let trigger = Self::command_trigger(cmd);
+                env.magic()
+                    .static_prediction(&trigger)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| match upstream {
+                        Some(u) => p.chained_prefix(u.first_text()),
+                        None => p,
+                    })
+                    .map(|p| p.commit_value().to_string())
+                    .take(8)
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// 精确匹配时复用同名命令实例(保 req 异步态),否则新建。
@@ -364,12 +607,50 @@ impl StateMachine {
     /// `predict` —— 成员解析参数后决定动作(删除 / 提交 / 交互请求)。取首条
     /// 预测执行;无预测则提交原始缓冲。
     fn force_fire(&mut self, env: &dyn StepEnv) -> ImeView {
+        use crate::chain::{join_segments, split_segments, ChainSeg};
+
         let input = self.buffer.clone();
-        let preds = self
-            .active_command
-            .as_mut()
-            .map(|m| m.predict(self.ctx, &input, env))
-            .unwrap_or_default();
+
+        // 链式参数态(X'#del/15):命令段(含参数)提取,上游求值后带上下文
+        // 强触发;不感知的命令照旧拼接。
+        let preds = if crate::chain::is_chain_command(&input) {
+            let segs = split_segments(&input);
+            let (cmd, prefix) = match segs.split_last() {
+                Some((ChainSeg::Command(c), p)) => (c.clone(), p.to_vec()),
+                _ => (input.clone(), vec![]),
+            };
+            let upstream_first = self
+                .eval_upstream(&join_segments(&prefix), env)
+                .first()
+                .cloned()
+                .unwrap_or_default();
+            let upstream = ChainContext::First(upstream_first);
+            match self.active_command.as_mut() {
+                Some(m) => {
+                    if m.wants_context().is_some() {
+                        m.predict_with_context(self.ctx, &cmd, &upstream, env)
+                    } else {
+                        let up = upstream.first_text().to_string();
+                        m.predict(self.ctx, &cmd, env)
+                            .into_iter()
+                            .map(|p| {
+                                if p.interactive {
+                                    p
+                                } else {
+                                    p.chained_prefix(&up)
+                                }
+                            })
+                            .collect()
+                    }
+                }
+                None => Vec::new(),
+            }
+        } else {
+            self.active_command
+                .as_mut()
+                .map(|m| m.predict(self.ctx, &input, env))
+                .unwrap_or_default()
+        };
         if let Some(head) = preds.first().cloned() {
             if head.interactive {
                 // 交互(如 addon 请求中…):展示为候选,等待异步落地。
@@ -737,6 +1018,18 @@ impl StateMachine {
                 self.cursor = self.preedit.len();
                 self.candidates_fresh = false;
                 self.query_pinyin(env)
+            }
+            // 链式命令:`'#` 序列开启命令链(X'#translate)。`#` 不终结组合、
+            // 不提交 —— 上游链保留在 buffer 里,转入 Snippet 态做命令输入;
+            // 单独的 `#`(无 `'` 前导)维持旧的终结符行为(提交候选 + `#`)。
+            '#' if self.buffer.ends_with('\'') => {
+                self.buffer.push('#');
+                self.raw_buffer.push('#');
+                self.state = ComposeState::Snippet;
+                self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
+                self.cursor = self.preedit.len();
+                self.candidates_fresh = false;
+                self.query_magic(env)
             }
             c if c.is_ascii_alphabetic() => {
                 self.buffer.push(c.to_ascii_lowercase());

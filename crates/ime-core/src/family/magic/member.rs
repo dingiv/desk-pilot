@@ -148,9 +148,53 @@ impl Prediction {
         self.commit_text.as_deref().unwrap_or(&self.text)
     }
 
+    /// 链式拼接:不感知上下文的命令最终预测与上游首选拼接时,把 `prefix`
+    /// (上游文本)前缀到三文本(text / preedit / commit)。`commit_text` 为
+    /// `None` 时无需动 —— fallback 到已带前缀的 `text`。
+    pub fn chained_prefix(mut self, prefix: &str) -> Self {
+        if prefix.is_empty() {
+            return self;
+        }
+        self.text = format!("{prefix}{}", self.text);
+        if let Some(p) = &mut self.preedit {
+            *p = format!("{prefix}{p}");
+        }
+        if let Some(c) = &mut self.commit_text {
+            *c = format!("{prefix}{c}");
+        }
+        self
+    }
+
     /// preedit 预览文本(未单独指定时用展示文本)。
     pub fn preedit_value(&self) -> &str {
         self.preedit.as_deref().unwrap_or(&self.text)
+    }
+}
+
+// ── Chained prediction:上下文声明与传递 ─────────────────────────────────
+
+/// 链式预测中命令**感知上游**的粒度(成员声明,框架按声明传递)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextKind {
+    /// 上游链的高亮首选(`X'#t`)。
+    First,
+    // P2:Page(空链 `X''#t` → 上游整页候选)。
+}
+
+/// 传给感知上下文命令的上游求值结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainContext {
+    /// 上游链高亮首选的提交文本。
+    First(String),
+    // P2:Page(Vec<String>)。
+}
+
+impl ChainContext {
+    /// First 模式的上游文本(空上下文回退空串)。
+    pub fn first_text(&self) -> &str {
+        match self {
+            ChainContext::First(t) => t,
+        }
     }
 }
 
@@ -243,6 +287,28 @@ pub trait MagicMember: Send + Sync {
     /// (成员可发异步事件 + 订阅);`input` 是完整输入(如 `#asr?num=2`)。
     /// 返回空 = 无预测(只剩 rollback)。
     fn predict(&mut self, ctx: usize, input: &str, env: &dyn StepEnv) -> Vec<Prediction>;
+
+    /// 链式预测:声明本命令感知上游(`X'#cmd` 的 X 求值结果)。
+    /// `Some` → 框架把上游传给 [`predict_with_context`](MagicMember::predict_with_context),
+    /// 输出**替换**候选列表(如 `#translate`:预测 = 翻译结果);
+    /// `None`(默认)→ 不感知,框架用普通 `predict`,非交互预测与上游
+    /// **拼接**,interactive 预测(命令会话内部导航)不参与拼接。
+    fn wants_context(&self) -> Option<ContextKind> {
+        None
+    }
+
+    /// 带上游上下文的预测。默认实现忽略上下文(= 不感知);感知命令覆盖
+    /// 此方法消费 `upstream`(如翻译、拼接、大写变换)。
+    fn predict_with_context(
+        &mut self,
+        ctx: usize,
+        input: &str,
+        upstream: &ChainContext,
+        env: &dyn StepEnv,
+    ) -> Vec<Prediction> {
+        let _ = upstream;
+        self.predict(ctx, input, env)
+    }
 
     /// 用户选中了第 `index` 个**交互式**预测。成员更新内部状态后,调用方
     /// 重新查询 `predict` 替换选项(不上屏)。非交互预测不经过这里。

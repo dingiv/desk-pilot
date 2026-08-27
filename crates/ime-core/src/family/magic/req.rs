@@ -271,6 +271,9 @@ pub struct ReqMember {
     cur_path: Option<String>,
     /// 当前后缀(匹配路径之后的部分,path+query)。`None` = 尚未发过请求。
     arg: Option<String>,
+    /// 链式预测的上游文本(`X'#translate` 的 X 求值结果)。`$upstream`
+    /// 占位符的替换源;变化时结果失效重发。
+    upstream: Option<String>,
     /// Last `version` seen — `tick` compares to detect the worker landing.
     last_version: u64,
     async_state: Arc<ReqAsync>,
@@ -280,6 +283,29 @@ pub struct ReqMember {
 /// 常驻,泄漏量级为每条命令几个字符串,可接受)。
 fn leak(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
+}
+
+/// 极简 percent-encode(查询参数值):非保留字符原样,其余 `%XX`。
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// 后缀里 `$upstream` 占位符 → 上游文本(percent-encoded;无上游 → 空串)。
+fn substitute_upstream(s: &str, upstream: Option<&str>) -> String {
+    if !s.contains("$upstream") {
+        return s.to_string();
+    }
+    let up = urlencode(upstream.unwrap_or(""));
+    s.replace("$upstream", &up)
 }
 
 impl ReqMember {
@@ -294,6 +320,7 @@ impl ReqMember {
             specs: Vec::new(),
             cur_path: None,
             arg: None,
+            upstream: None,
             last_version: 0,
             async_state: Arc::new(ReqAsync::default()),
         }
@@ -319,6 +346,7 @@ impl ReqMember {
             specs,
             cur_path: None,
             arg: None,
+            upstream: None,
             last_version: 0,
             async_state: Arc::new(ReqAsync::default()),
         }
@@ -357,13 +385,47 @@ impl ReqMember {
             .base_url
             .clone()
             .unwrap_or_else(|| self.resources.req_base.lock().unwrap().clone());
-        let suffix = self.arg.as_deref().unwrap_or("");
+        // 用户未输后缀时,用配置模板的默认参数(如 `translate?text=$upstream`
+        // 的 text)构造 —— 上下文占位符($upstream)由此落地。
+        let suffix = match self.arg.as_deref() {
+            Some("") | None => self.default_suffix(),
+            Some(s) => s.to_string(),
+        };
+        let suffix = substitute_upstream(&suffix, self.upstream.as_deref());
         if self.prepend_cmd {
             let path = self.cur_path.as_deref().unwrap_or(self.name);
             format!("{base}/{path}{suffix}")
         } else {
             format!("{base}{suffix}")
         }
+    }
+
+    /// 当前匹配路径的模板默认后缀(`?key=default&…`);无模板参数则空串。
+    fn default_suffix(&self) -> String {
+        let Some(spec) = self
+            .specs
+            .iter()
+            .find(|s| Some(&s.path) == self.cur_path.as_ref())
+            .or(self.specs.first())
+        else {
+            return String::new();
+        };
+        if spec.params.is_empty() {
+            return String::new();
+        }
+        let q: Vec<String> = spec
+            .params
+            .iter()
+            .map(|p| {
+                let v = p
+                    .default
+                    .as_deref()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or("");
+                format!("{}={}", p.key, urlencode(v))
+            })
+            .collect();
+        format!("?{}", q.join("&"))
     }
 
     /// 预测:未发/请求中 → 交互占位;done → 服务器候选;fail → 不可提交错误。
@@ -410,6 +472,11 @@ impl ReqMember {
         });
         if let Some(p) = pick {
             obj["pick"] = serde_json::Value::String(p.to_string());
+        }
+        // 链式上游原文(POST body 双保险:URL 占位符之外,服务端也可从
+        // body 读,避免 URL 长度/转义问题)。
+        if let Some(u) = &self.upstream {
+            obj["upstream"] = serde_json::Value::String(u.clone());
         }
         obj.to_string()
     }
@@ -490,6 +557,7 @@ impl MagicMember for ReqMember {
             specs: self.specs.clone(),
             cur_path: None,
             arg: None,
+            upstream: None,
             last_version: 0,
             async_state: Arc::new(ReqAsync::default()),
         })
@@ -507,6 +575,35 @@ impl MagicMember for ReqMember {
         // 消费当前版本 —— tick 只对之后的异步落地触发重建。
         self.last_version = self.async_state.version.load(Ordering::Acquire);
         self.predictions()
+    }
+
+    /// 链式上下文声明:任一模板参数默认值含 `$upstream`(如
+    /// `translate?text=$upstream`)→ 感知上游(First)。声明即配置,无需代码。
+    fn wants_context(&self) -> Option<super::member::ContextKind> {
+        let wants = self.specs.iter().any(|s| {
+            s.params
+                .iter()
+                .any(|p| p.default.as_deref().is_some_and(|v| v.contains("$upstream")))
+        });
+        wants.then_some(super::member::ContextKind::First)
+    }
+
+    /// 带上游的预测:记录上游文本,上游变化时结果失效并强制重发(arg 未变
+    /// 也要重发 —— predict 的变化检测只看命令后缀)。
+    fn predict_with_context(
+        &mut self,
+        ctx: usize,
+        input: &str,
+        upstream: &super::member::ChainContext,
+        env: &dyn StepEnv,
+    ) -> Vec<Prediction> {
+        let up = upstream.first_text().to_string();
+        if self.upstream.as_deref() != Some(up.as_str()) {
+            self.upstream = Some(up);
+            self.invalidate_result();
+            self.arg = None; // 强制 predict 走"后缀变化"重发路径
+        }
+        self.predict(ctx, input, env)
     }
 
     fn pick(&mut self, _index: usize, text: &str, sm: &mut StateMachine, _env: &dyn StepEnv) {

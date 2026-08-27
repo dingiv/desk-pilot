@@ -22,7 +22,10 @@ use std::sync::{Arc, Mutex};
 
 pub use clip::{ClipMember, CLIP_HISTORY_CAP};
 pub use del::DelMember;
-pub use member::{preview_text, CommandArgs, MagicMember, Prediction, CANDIDATE_PREVIEW_MAX};
+pub use member::{
+    preview_text, ChainContext, CommandArgs, ContextKind, MagicMember, Prediction,
+    CANDIDATE_PREVIEW_MAX,
+};
 pub use req::{AddonCmdSpec, AddonConfig, ReqFetcher, DEFAULT_REQ_BASE};
 pub use snippet::SnippetMember;
 pub use voice::VoiceMember;
