@@ -13,6 +13,14 @@ magic:
   # req_base: http://127.0.0.1:14555/api   # #req backend base URL (CLI --req-base overrides)
 
   addons:
+    # 链式翻译示例(服务端起在 9788 即可用):mingtian...' #translate
+    # 把上游链首选(%E5%81%8F%E5%A5%BD urlencode 后)作为 text 参数发给服务,
+    # 服务返回的候选替换预测列表。$upstream 同时出现在 POST body 的 upstream 字段。
+    # - name: translate
+    #   url: http://127.0.0.1:9788
+    #   cmds:
+    #     - translate?text=$upstream
+
     - name: example_addon
       url: http://127.0.0.1:9788
       cmds:
