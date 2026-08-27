@@ -277,7 +277,8 @@ impl StateMachine {
     /// `select_magic` / `rebuild_magic_view` 无需感知链式。
     ///
     /// - 感知上下文的命令([`MagicMember::wants_context`] = Some):拿上游
-    ///   高亮首选([`ChainContext::First`]),预测**替换**候选列表;
+    ///   候选页(`first_text()` = 高亮首选;空链 `X''#t` 语义即整页),预测
+    ///   **替换**候选列表;
     /// - 不感知的命令:普通 `predict`,非交互预测与上游首选**拼接**;
     ///   interactive 预测(命令会话内部导航)不参与拼接,原样显示;
     /// - 命令段未完成(`#`、`#x` 前缀/未知):候选 = 上游预测(用户可提前
@@ -300,7 +301,11 @@ impl StateMachine {
         match env.magic().match_command(&cmd) {
             MagicMatch::Exact(MagicCommand::Live { token, name }) => {
                 self.ensure_command(name, Some(token), env);
-                let upstream = ChainContext::First(upstream_first.clone());
+                // 上下文与语法严格对应:普通链(X'#cmd)只传高亮首选;
+                // 空链(X''#cmd)传上游整页(#concat 类成员消费)。
+                let upstream = ChainContext {
+                    items: chain_context_items(&upstream_buf, &upstream_cands),
+                };
                 let wants = self
                     .active_command
                     .as_ref()
@@ -410,18 +415,23 @@ impl StateMachine {
             return Vec::new();
         };
         let prefix_buf = join_segments(prefix);
-        let upstream_first = match last {
-            // 单段/中间链:上游首选来自前缀折叠。
-            ChainSeg::Command(_) if prefix_buf.is_empty() => String::new(),
-            ChainSeg::Command(_) => self
-                .eval_upstream(&prefix_buf, env)
-                .first()
-                .cloned()
-                .unwrap_or_default(),
-            ChainSeg::Text(_) => String::new(),
+        // 命令段的上游 = 前缀折叠整页;文本段不需要上游对象(直接拼接)。
+        let upstream_page = match last {
+            ChainSeg::Command(_) if prefix_buf.is_empty() => Vec::new(),
+            ChainSeg::Command(_) => self.eval_upstream(&prefix_buf, env),
+            ChainSeg::Text(_) => Vec::new(),
         };
+        let upstream_first = upstream_page.first().cloned().unwrap_or_default();
         match last {
-            ChainSeg::Text(t) if t.is_empty() => Vec::new(),
+            // 尾空链(X''):透传前缀整页 —— 空链语义:下一命令的上下文
+            // 不是首选,是整页候选(X''#concat)。
+            ChainSeg::Text(t) if t.is_empty() => {
+                if prefix_buf.is_empty() {
+                    Vec::new()
+                } else {
+                    self.eval_upstream(&prefix_buf, env)
+                }
+            }
             ChainSeg::Text(t) => {
                 let ranked = env.scorer().rank_detailed(t, &self.context);
                 let texts: Vec<String> = ranked.into_iter().map(|c| c.text).take(8).collect();
@@ -435,8 +445,8 @@ impl StateMachine {
                 }
             }
             ChainSeg::Command(c) => {
-                let ctx = (!upstream_first.is_empty())
-                    .then(|| ChainContext::First(upstream_first.clone()));
+                let ctx = (!upstream_page.is_empty())
+                    .then(|| ChainContext { items: upstream_page.clone() });
                 self.eval_command(c, ctx.as_ref(), env)
             }
         }
@@ -619,12 +629,13 @@ impl StateMachine {
                 Some((ChainSeg::Command(c), p)) => (c.clone(), p.to_vec()),
                 _ => (input.clone(), vec![]),
             };
-            let upstream_first = self
-                .eval_upstream(&join_segments(&prefix), env)
-                .first()
-                .cloned()
-                .unwrap_or_default();
-            let upstream = ChainContext::First(upstream_first);
+            let upstream_buf = join_segments(&prefix);
+            let upstream = ChainContext {
+                items: chain_context_items(
+                    &upstream_buf,
+                    &self.eval_upstream(&upstream_buf, env),
+                ),
+            };
             match self.active_command.as_mut() {
                 Some(m) => {
                     if m.wants_context().is_some() {
@@ -1236,6 +1247,16 @@ impl StateMachine {
             None => format!("{prefix}{raw}{ch}"),
         };
         Self::commit_view(&text)
+    }
+}
+
+/// 链式上下文的裁剪:空链(`X''#cmd`,上游串以 `'` 结尾)→ 整页;普通链
+/// (`X'#cmd`)→ 仅高亮首选。与语法语义严格一致(#concat 单链只拼首选)。
+fn chain_context_items(upstream_buf: &str, cands: &[String]) -> Vec<String> {
+    if upstream_buf.ends_with('\'') {
+        cands.to_vec()
+    } else {
+        cands.first().cloned().into_iter().collect()
     }
 }
 

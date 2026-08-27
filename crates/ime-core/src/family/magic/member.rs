@@ -173,28 +173,26 @@ impl Prediction {
 
 // ── Chained prediction:上下文声明与传递 ─────────────────────────────────
 
-/// 链式预测中命令**感知上游**的粒度(成员声明,框架按声明传递)。
+/// 链式预测中命令**感知上游**的粒度(成员声明,文档性:框架统一传整页
+/// [`ChainContext::Page`],成员按声明取 first 或整页)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextKind {
-    /// 上游链的高亮首选(`X'#t`)。
+    /// 只用上游高亮首选(`X'#t`,如 `#translate`)。
     First,
-    // P2:Page(空链 `X''#t` → 上游整页候选)。
+    /// 用上游整页候选(空链 `X''#t`,如 `#concat`)。
+    Page,
 }
 
-/// 传给感知上下文命令的上游求值结果。
+/// 传给感知上下文命令的上游求值结果 —— 上游候选页(高亮首选在 `items[0]`)。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChainContext {
-    /// 上游链高亮首选的提交文本。
-    First(String),
-    // P2:Page(Vec<String>)。
+pub struct ChainContext {
+    pub items: Vec<String>,
 }
 
 impl ChainContext {
-    /// First 模式的上游文本(空上下文回退空串)。
+    /// 上游高亮首选的提交文本(空页回退空串)。
     pub fn first_text(&self) -> &str {
-        match self {
-            ChainContext::First(t) => t,
-        }
+        self.items.first().map(String::as_str).unwrap_or("")
     }
 }
 

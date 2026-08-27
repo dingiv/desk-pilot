@@ -55,6 +55,15 @@ fn main() {
         ImeView::str_field(&v.commit_text)
     );
 
+    // P2:空链整页上下文(shijian''#concat:整页候选拼接)
+    show(&mut e, "shijian''#concat");
+
+    // 对照:单链 First(shijian'#concat 只拼首选)
+    show(&mut e, "shijian'#concat");
+
+    // P2:#concat 无上游 → 用法提示(interactive,不上屏)
+    show(&mut e, "#concat");
+
     // 对照:单独 # 无 ' 前导 → 旧终结符行为
     type_str(&mut e, "nihao#date");
     let v = e.key(KeyEvent::space());

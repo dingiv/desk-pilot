@@ -11,6 +11,7 @@
 //! engine / FSM special-casing.
 
 mod clip;
+mod concat;
 mod del;
 mod member;
 mod req;
@@ -21,6 +22,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub use clip::{ClipMember, CLIP_HISTORY_CAP};
+pub use concat::ConcatMember;
 pub use del::DelMember;
 pub use member::{
     preview_text, ChainContext, CommandArgs, ContextKind, MagicMember, Prediction,
@@ -231,6 +233,7 @@ impl MagicFamily {
             Arc::new(DelMember::new(Arc::clone(&resources))),
             Arc::new(ReqMember::new_req(Arc::clone(&resources))),
             Arc::new(ClipMember::new(Arc::clone(&resources))),
+            Arc::new(ConcatMember::new()),
             // 片段命令:空名魔法命令(`#/hello?name=Mike`),经 `#` + `/` 路由。
             Arc::new(SnippetMember::new(Arc::clone(&resources))),
         ];
