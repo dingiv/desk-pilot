@@ -15,7 +15,7 @@ use super::MagicResources;
 use crate::state::{StateMachine, StepEnv};
 
 /// 固定删除长度选项。
-const FIXED_OPTIONS: &[u32] = &[10, 20, 30];
+const FIXED_OPTIONS: &[u32] = &[10, 20, 999];
 
 /// Live delete-text command (`#del`)。
 pub struct DelMember {
@@ -63,10 +63,10 @@ impl MagicMember for DelMember {
         let last_len = *self.resources.last_commit_len.lock().unwrap();
         let mut out = vec![];
         if last_len > 0 {
-            out.push(Prediction::delete(last_len, last_len.to_string()));
+            out.push(Prediction::delete(last_len, format!("<- {}", last_len)));
         }
         for n in FIXED_OPTIONS {
-            out.push(Prediction::delete(*n, n.to_string()));
+            out.push(Prediction::delete(*n, format!("<- {}", n)));
         }
         out
     }
