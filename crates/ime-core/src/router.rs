@@ -430,7 +430,14 @@ impl StateMachineTable {
             | KeyKind::Insert
             | KeyKind::Modifier
             | KeyKind::Function(_)
-            | KeyKind::Other(_) => StateMachine::passthrough_view(),
+            | KeyKind::Other(_) => {
+                if flags.contains(StateFlags::PANEL_OPEN) {
+                    sm.reset();
+                    handled_empty_view()
+                } else {
+                    StateMachine::passthrough_view()
+                }
+            },
 
             // 8. 可打印字符:交给组合状态机(idle 内部自分流:触发前缀进
             //    Snippet,小写进 Pinyin,其余返回透传视图)。
