@@ -76,8 +76,12 @@ impl FileLoader {
 
     fn resolve_ns(&self, ns: &str, rel: &str) -> Option<PathBuf> {
         let cfg = self.namespaces.get(ns)?;
-        let root = if is_dev() {
-            self.manifest_dir.join(&cfg.dev)
+        // dev 探测:编译期烙进的 manifest 目录下目标存在,或运行时带有
+        // CARGO_MANIFEST_DIR(cargo run)。直接执行二进制(无 env)时,
+        // 只要源码树还在(dev 机器)就走 dev 路径 —— 否则丢配置/词典。
+        let dev_root = self.manifest_dir.join(&cfg.dev);
+        let root = if is_dev() || dev_root.join(rel).exists() {
+            dev_root
         } else {
             expand_tilde(&cfg.prod)
         };
