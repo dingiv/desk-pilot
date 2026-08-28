@@ -197,7 +197,7 @@ async fn voice_server_main(
                         active_ctx = ctx as i64;
                         last_activity = tokio::time::Instant::now();
                         tracing::info!(ctx, is_new, connected, "voice Attach");
-                        if !connected {
+                        if !connected && !state.is_mock() {
                             // 断裂/未连 → 触发重连:一次性 health 探针种 is_connected
                             // (UI 显示"未连接"还是"语音识别中"),然后**总是**建流 ——
                             // 断连由流内部指数退避重试,连续失败超上限流结束(→ None →

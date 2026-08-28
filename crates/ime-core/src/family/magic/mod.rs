@@ -16,6 +16,7 @@ mod del;
 mod member;
 mod req;
 mod snippet;
+mod translate;
 mod voice;
 
 use std::collections::HashMap;
@@ -30,6 +31,7 @@ pub use member::{
 };
 pub use req::{AddonCmdSpec, AddonConfig, ReqFetcher, DEFAULT_REQ_BASE};
 pub use snippet::SnippetMember;
+pub use translate::TranslateMember;
 pub use voice::VoiceMember;
 
 use req::ReqMember;
@@ -234,6 +236,7 @@ impl MagicFamily {
             Arc::new(ReqMember::new_req(Arc::clone(&resources))),
             Arc::new(ClipMember::new(Arc::clone(&resources))),
             Arc::new(ConcatMember::new()),
+            Arc::new(TranslateMember::new()),
             // 片段命令:空名魔法命令(`#/hello?name=Mike`),经 `#` + `/` 路由。
             Arc::new(SnippetMember::new(Arc::clone(&resources))),
         ];

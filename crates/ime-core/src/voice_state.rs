@@ -149,6 +149,10 @@ pub struct SharedVoiceState {
     inner: Mutex<Inner>,
     /// Aura daemon 连通性三态(listener 的 health 探针 / SSE 流事件写入)。
     conn: AtomicU8,
+    /// Mock 模式(`--asr-text` 调试):冻结 conn / finals —— listener 不连接
+    /// aura、`set_conn` 不覆盖,seed 的数据稳定可见(与真实 listener 打架会让
+    /// mock 候选闪没/被 sync_history 换成真实历史)。
+    mock: AtomicU8,
 }
 
 impl SharedVoiceState {
@@ -156,12 +160,27 @@ impl SharedVoiceState {
         SharedVoiceState {
             inner: Mutex::new(Inner::default()),
             conn: AtomicU8::new(VoiceConn::Connecting as u8),
+            mock: AtomicU8::new(0),
         }
+    }
+
+    /// 进入/退出 mock 模式(`--asr-text`):true 时 `set_conn` 冻结、
+    /// voice listener 的 Attach 不发起真实连接。
+    pub fn set_mock(&self, on: bool) {
+        self.mock.store(on as u8, Ordering::Relaxed);
+    }
+
+    /// 是否处于 mock 模式。
+    pub fn is_mock(&self) -> bool {
+        self.mock.load(Ordering::Relaxed) != 0
     }
 
     // ── Connectivity(三态)──────────────────────────────────────────────
 
     pub fn set_conn(&self, c: VoiceConn) {
+        if self.is_mock() {
+            return; // mock:seed 的 Connected 不被探针/流回调覆盖
+        }
         self.conn.store(c as u8, Ordering::Relaxed);
     }
 

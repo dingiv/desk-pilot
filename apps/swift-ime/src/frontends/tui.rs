@@ -182,7 +182,9 @@ pub fn build_engine(cfg: &TuiConfig) -> (ImeEngine, Arc<ime_core::voice_state::S
 
     let voice_state = engine.voice_state();
     if let Some(ref text) = cfg.asr_text {
+        // mock:先种状态再冻结(listener 不连 aura、conn 不被覆盖),seed 稳定可见。
         voice_state.set_conn(ime_core::voice_state::VoiceConn::Connected);
+        voice_state.set_mock(true);
         voice_state.seed_final(text);
         crate::ime_log!("asr mock text: {text}");
     }
