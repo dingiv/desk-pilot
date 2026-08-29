@@ -207,7 +207,12 @@ impl StateMachine {
             return self.query_pinyin(env);
         }
 
-        match env.magic().match_command(&input) {
+        // 分隔符不参与命令匹配:`'` 是链结构字符(chain.rs),追加它不改变命令
+        // 语义 —— `#asr'` 的候选保持 `#asr` 的预测结果不变;用户继续输入
+        // (`#asr'#tr`)时由上面的 is_chain_command 分支接管。剥掉尾部全部 `'`
+        // (含 `#asr''` 空链准备态);命令文本/提交候选同样不含 `'`。
+        let match_input = input.trim_end_matches('\'').to_string();
+        match env.magic().match_command(&match_input) {
             // TODO: 不用区分了, 魔法命令全都是 LIVE
             MagicMatch::Exact(cmd) => match cmd {
                 MagicCommand::Live { token, name } => {
@@ -216,19 +221,19 @@ impl StateMachine {
                         .active_command
                         .as_mut()
                         // TODO: magic 命令调用点
-                        .map(|m| m.predict(self.ctx, &input, env))
+                        .map(|m| m.predict(self.ctx, &match_input, env))
                         .unwrap_or_default();
                     self.magic_hints.clear();
                     // 无参数时数字用于选中;有参数(拼 `?num=` 等)时数字是文本。
-                    self.magic_selectable = input == format!("#{name}");
+                    self.magic_selectable = match_input == format!("#{name}");
                 }
                 MagicCommand::Static => {
                     self.clear_active_command();
-                    let trigger = Self::command_trigger(&input);
+                    let trigger = Self::command_trigger(&match_input);
                     self.magic_predictions =
                         env.magic().static_prediction(&trigger).unwrap_or_default();
                     self.magic_hints.clear();
-                    self.magic_selectable = input == trigger;
+                    self.magic_selectable = match_input == trigger;
                 }
             },
             // 参数输入态(`#del/1`):不调 member.predict(不自动触发),展示裸输入
@@ -236,7 +241,7 @@ impl StateMachine {
             // (匹配逻辑只对 live 成员产生 Args,静态命令不会带参数。)
             MagicMatch::Args(MagicCommand::Live { token, name }) => {
                 self.ensure_command(name, Some(token), env);
-                self.magic_predictions = vec![Prediction::submit(input.clone())];
+                self.magic_predictions = vec![Prediction::submit(match_input.clone())];
                 self.magic_hints.clear();
                 self.magic_selectable = false;
             }
@@ -257,7 +262,7 @@ impl StateMachine {
                 self.magic_predictions = self
                     .active_command
                     .as_mut()
-                    .map(|m| m.predict(self.ctx, &input, env))
+                    .map(|m| m.predict(self.ctx, &match_input, env))
                     .unwrap_or_default();
                 self.magic_hints.clear();
                 self.magic_selectable = false; // 片段路径/查询里的数字是文本
