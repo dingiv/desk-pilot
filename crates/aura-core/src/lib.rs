@@ -100,6 +100,9 @@ pub struct VadWindow {
     /// the window-level batch pass and downstream archival. The AudioStore evicts the
     /// per-segment clips right after; this Arc is the only remaining copy.
     pub pcm: std::sync::Arc<Vec<i16>>,
+    /// batch 模型调用 wall-clock 毫秒数;单段窗口复用段级 batch 时为 0(不计时)。
+    /// 用于性能评估:跨 ASR 后端 / 跨音频长度 / GPU vs CPU 对比。
+    pub batch_asr_ms: u64,
 }
 
 impl VadWindow {

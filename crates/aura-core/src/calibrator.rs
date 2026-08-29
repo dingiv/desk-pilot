@@ -201,6 +201,7 @@ mod tests {
             streaming_text: "拼接".into(),
             batch_text: Some("窗口批式".into()),
             pcm: std::sync::Arc::new(Vec::new()),
+            batch_asr_ms: 0,
         }
     }
 

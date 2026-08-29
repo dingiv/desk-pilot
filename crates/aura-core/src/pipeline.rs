@@ -286,6 +286,8 @@ impl Pipeline {
                                     window_id = window.id,
                                     at_s = (window.start_s * 10.0).round() / 10.0,
                                     segs = window.segments.len(),
+                                    // batch 模型调用耗时;单段复用模式 = 0(不打点,见 asr_ms 段日志)。
+                                    asr_ms = window.batch_asr_ms,
                                     route_ms = route_ms.round() as u64,
                                     batch = %window.batch_text.clone().unwrap_or_default(),
                                     streaming = %window.streaming_text,
@@ -563,6 +565,7 @@ mod tests {
             streaming_text: "流式一流式二".into(),
             batch_text: Some("窗口批式".into()),
             pcm: std::sync::Arc::new(vec![0i16; 1600]),
+            batch_asr_ms: 0,
         };
         assert_eq!(s2.finalize_window(&win), "窗口批式", "window batch 优先");
     }

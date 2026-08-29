@@ -582,11 +582,16 @@ fn emit_window_edge(
     // PCM 与该段 PCM 完全相同,段级 batch 刚刚跑过同一音频,直接复用其结果(含 None:
     // 远程失败后立刻重试大概率仍失败,徒增 settle 延迟)。单段是常态(merge 仅发生在
     // <merge_gap 的停顿后),此优化省掉大多数窗口的一整次 batch 调用。
-    let batch_text = if settled.segments.len() == 1 {
+    let (batch_text, asr_ms) = if settled.segments.len() == 1 {
         debug!("单段窗口——复用段级 batch 结果,跳过整窗重跑");
-        settled.segments[0].batch_text.clone()
+        (settled.segments[0].batch_text.clone(), 0u64)
     } else {
-        batch_asr.recognize(&pcm, sr).ok().filter(|t| !t.trim().is_empty())
+        // `asr_ms` 计时:本 commit 简单写 0(性能埋点 v1);后续可在此位置包
+        // std::time::Instant::now() / elapsed() 替换为真实墙钟,值存到 VadWindow.batch_asr_ms
+        // 通过 window 日志输出。
+        let t0 = std::time::Instant::now();
+        let text = batch_asr.recognize(&pcm, sr).ok().filter(|t| !t.trim().is_empty());
+        (text, t0.elapsed().as_millis() as u64)
     };
     let streaming_text =
         settled.segments.iter().map(|s| s.streaming_text.as_str()).collect::<String>();
@@ -601,8 +606,8 @@ fn emit_window_edge(
             streaming_text,
             batch_text,
             pcm,
+            batch_asr_ms: asr_ms,
         },
-    }
     });
     // The window's Arc PCM is now the only remaining copy — release the per-segment clips.
     store.evict(&ids);
@@ -766,11 +771,15 @@ impl OnnxStage1Recognizer {
             _ => String::new(),
         };
         // One batch pass over the segment's PCM. Err (remote network) and empty text → None.
+        // `asr_ms` 计时 batch 模型调用时长(纯 wall-clock,从进 recognize 到响应落盘),
+        // 用于性能评估:对比不同 ASR 后端(sensevoice / qwen3-asr)/不同输入长度 / GPU vs CPU。
+        let asr_t0 = std::time::Instant::now();
         let batch_text = self
             .batch_asr
             .recognize(&seg_pcm, sr)
             .ok()
             .filter(|t| !t.trim().is_empty());
+        let asr_ms = asr_t0.elapsed().as_millis() as u64;
         // Neither pass produced text → noise segment: discard entirely.
         if streaming_text.trim().is_empty() && batch_text.is_none() {
             debug!("segment discarded — neither streaming nor batch produced text");
@@ -793,13 +802,14 @@ impl OnnxStage1Recognizer {
         if let Some(s) = settled {
             emit_window_edge(s, &self.audio_store, &*self.batch_asr, sr, on_event);
         }
-        // 段级日志(debug):窗口/段 id、时长、两路文本、会话喂帧数。
+        // 段级日志(debug):窗口/段 id、音频时长、batch 模型调用耗时、两路文本、会话喂帧数。
         if let Some(s) = segments.last() {
             debug!(
                 window = window_id,
                 segment = s.id,
                 dur_ms = ((s.end_s - s.start_s) * 1000.0).round() as u64,
                 fed,
+                asr_ms,
                 batch = s.batch_text.as_deref().unwrap_or("(none)"),
                 streaming = %s.streaming_text,
                 "段定稿(VadSegment)"
