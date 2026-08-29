@@ -50,7 +50,8 @@ models:
     gguf: "MODELS::qwen2.5-3b-instruct-q4_k_m.gguf"
     context_size: 4096
     threads: 8
-    gpu_layers: 0      # CPU = 0;有 GPU 设 ≥ 1
+    gpu_layers: 0      # CPU = 0;有 GPU 配 99 = 全部卸载(llama.cpp 自动按实际层数
+                       # clamp,无需知道确切层数;总层数见启动日志 n_layer 字段)
     batch_size: 512
     # extra_args: []  # 高级自定义(直接拼到 llama-server 命令行)
 

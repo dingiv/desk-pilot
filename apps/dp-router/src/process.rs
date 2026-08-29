@@ -8,9 +8,10 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{
     resolve_gguf_path, LocalModelConfig, LlamaServerConfig, ModelRuntimeStatus, ModelType,
@@ -99,10 +100,19 @@ impl LlamaProcess {
             "[dp-router] spawning llama-server: model={} port={} gguf={}",
             self.model_name, self.port, gguf.display()
         );
-        let child = cmd.spawn().with_context(|| {
+        let mut child = cmd.spawn().with_context(|| {
             format!("spawn llama-server failed (model={}, port={})", self.model_name, self.port)
         })?;
         let pid = child.id().unwrap_or(0);
+        // 接管子进程 stdout/stderr:逐行转投 tracing。一方面消除管道写满阻塞
+        // (Linux pipe 缓冲仅 64KB,llama-server 模型加载日志量轻易超过,不读会
+        // 死锁子进程);另一方面把 n_layer / mmproj / 错误等关键行带进统一日志。
+        if let Some(out) = child.stdout.take() {
+            pipe_to_tracing(out, self.model_name.clone(), self.port, self.config.gpu_layers);
+        }
+        if let Some(err) = child.stderr.take() {
+            pipe_to_tracing(err, self.model_name.clone(), self.port, self.config.gpu_layers);
+        }
         self.pid = Some(pid);
         self.child = Some(child);
         self.status = ModelRuntimeStatus::Starting;
@@ -189,6 +199,56 @@ impl LlamaProcess {
     }
 }
 
+/// 子进程 stdout/stderr 流 → tracing 逐行转发(每个 spawn 起两个 task,管道 EOF 即退出)。
+///
+/// 关键行提升(其余 debug,默认 RUST_LOG=info 不可见):
+///   - `n_layer = N`       → info(总层数;对照 gpu_layers 即知 GPU 卸载余量)
+///   - 含 `mmproj`          → info(多模态投影器加载结果;没加载成功 ASR 不可用)
+///   - 含 error / fail      → warn
+fn pipe_to_tracing(
+    stream: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    model: String,
+    port: u16,
+    gpu_layers: u32,
+) {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stream).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = line.trim_end();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(n) = parse_n_layer(line) {
+                let offload = if gpu_layers == 0 {
+                    "cpu".into()
+                } else if gpu_layers >= n {
+                    format!("all {n} layers on gpu")
+                } else {
+                    format!("{gpu_layers}/{n} layers on gpu")
+                };
+                info!(model = %model, port, n_layer = n, offload = %offload, "[llama-server] {line}");
+            } else if line.to_lowercase().contains("mmproj") {
+                info!(model = %model, port, "[llama-server] {line}");
+            } else {
+                let low = line.to_lowercase();
+                if low.contains("error") || low.contains("fail") {
+                    warn!(model = %model, port, "[llama-server] {line}");
+                } else {
+                    debug!(model = %model, port, "[llama-server] {line}");
+                }
+            }
+        }
+    });
+}
+
+/// 从 llama.cpp 日志行解析总层数 `n_layer = N`。
+/// `n_layer_kv_cache = 0` 这类(n_layer 后面不是紧跟 `=`)返回 None。
+fn parse_n_layer(line: &str) -> Option<u32> {
+    let idx = line.find("n_layer")?;
+    let rest = line[idx + "n_layer".len()..].trim_start().strip_prefix('=')?;
+    rest.trim().split_whitespace().next()?.parse().ok()
+}
+
 /// 端口分配器(线性扫描 `port_range`,已被占用的跳过 — `bind` 失败时回收)。
 pub struct PortAllocator {
     next: u16,
@@ -212,3 +272,21 @@ impl PortAllocator {
 
 /// 共享进程表:name → LlamaProcess 的 Arc<RwLock<...>>。
 pub type ProcessMap = Arc<RwLock<std::collections::HashMap<String, Arc<RwLock<LlamaProcess>>>>>;
+
+#[cfg(test)]
+mod tests {
+    use super::parse_n_layer;
+
+    #[test]
+    fn parse_n_layer_extracts_total() {
+        // llama.cpp 实际打印格式(llm_load_print_meta)
+        assert_eq!(parse_n_layer("llm_load_print_meta: n_layer = 36"), Some(36));
+        assert_eq!(parse_n_layer("llm_load_print_meta: n_layer = 28"), Some(28));
+        // 紧凑写法也容得下
+        assert_eq!(parse_n_layer("n_layer=12"), Some(12));
+        // 非总层数键 / 普通行 → None
+        assert_eq!(parse_n_layer("n_layer_kv_cache = 0"), None);
+        assert_eq!(parse_n_layer("n_gpu_layers = 99"), None);
+        assert_eq!(parse_n_layer("server is listening"), None);
+    }
+}
