@@ -105,6 +105,19 @@ impl AuraClient {
         Ok(v.get("connected").and_then(|x| x.as_bool()).unwrap_or(enabled))
     }
 
+    /// `POST /api/control/flush` — 主动归档:让 aura 立即关闭当前开放窗口并整窗
+    /// batch(IME 分字符 `'` = "我说完了"信号)。置位即返,不等识别结果 —— 结果
+    /// 走既有 SSE 数据面(/api/asr_stream)推送。
+    pub async fn flush_window(&self) -> Result<()> {
+        self.http
+            .post(format!("{}/api/control/flush", self.base))
+            .json(&serde_json::json!({}))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     /// `POST /api/correct {window_id, raw, corrected}` — record a user correction for a
     /// window (feeds Stage2).
     pub async fn correct(&self, window_id: u64, raw: &str, corrected: &str) -> Result<()> {

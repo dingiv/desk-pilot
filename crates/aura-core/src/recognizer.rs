@@ -27,7 +27,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::audio_store::{AudioStore, DEFAULT_CAP_SAMPLES};
 use crate::buffer::AudioRing;
@@ -108,6 +108,10 @@ pub struct Stage1Config {
     /// 运行信号(idle 深度睡眠):false → `run` 退出消费循环, 断开 scout; daemon 在下一个客户端
     /// 连接时置回 true 唤醒。与 `active`(scout 开关, 用户可单独控制) 独立。默认 true。
     pub running: Arc<AtomicBool>,
+    /// 主动归档信号(IME 侧"我说完了"—— 分字符键 `'` 触发):run 循环见 true 且存在可归档
+    /// 窗口 → 跳过 `merge_gap` 剩余等待,立即整窗 batch(`WindowEdge`)。消费中/说话中保持
+    /// 挂起(EOS 未到,立即切窗会截断);无窗口时消费掉(空按)。默认 false。
+    pub flush_window: Arc<AtomicBool>,
 }
 
 impl Stage1Config {
@@ -155,6 +159,7 @@ impl Stage1Config {
             batch_enabled: true,
             active: Arc::new(AtomicBool::new(true)),
             running: Arc::new(AtomicBool::new(true)),
+            flush_window: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -238,6 +243,8 @@ pub struct OnnxStage1Recognizer {
     active: Arc<AtomicBool>,
     /// idle 运行信号:false → run 退出循环(深度睡眠)。
     running: Arc<AtomicBool>,
+    /// 主动归档信号(`Stage1Config::flush_window`)—— run 循环消费,见下。
+    flush_window: Arc<AtomicBool>,
     /// The PCM store: segments' clips live here by id until their window settles.
     audio_store: Arc<AudioStore>,
 }
@@ -289,6 +296,7 @@ impl OnnxStage1Recognizer {
             merge_gap_s: cfg.merge_gap_s,
             active: cfg.active,
             running: cfg.running,
+            flush_window: cfg.flush_window,
             audio_store: Arc::new(AudioStore::new(DEFAULT_CAP_SAMPLES)),
             batch_asr,
         })
@@ -322,6 +330,7 @@ impl OnnxStage1Recognizer {
             merge_gap_s: cfg.merge_gap_s,
             active: cfg.active,
             running: cfg.running,
+            flush_window: cfg.flush_window,
             audio_store: Arc::new(AudioStore::new(DEFAULT_CAP_SAMPLES)),
             batch_asr,
         })
@@ -525,6 +534,24 @@ impl WindowTracker {
         } else {
             None
         }
+    }
+
+    /// 主动归档(用户侧"我说完了"信号):跳过 `merge_gap` 剩余等待,立即关闭开放窗口。
+    /// 语义与 [`Self::check_settle`] 的 suppress 条件一致 —— 有段进行中(`active`)或
+    /// 窗口为空时不动(调用方负责保持 flush 挂起重试);`speaking` 的墙钟抑制由调用方
+    /// 判断(它不在 tracker 状态里)。
+    fn force_settle(&mut self) -> Option<SettledSpans> {
+        let w = self.open.as_ref()?;
+        if w.active || w.segments.is_empty() {
+            return None;
+        }
+        self.take_open()
+    }
+
+    /// 是否有开放窗口(含进行中段)—— flush 挂起与否的判据:窗口在 → 保持挂起等 EOS;
+    /// 无窗口 → flush 落空,消费掉标记。
+    fn has_open_window(&self) -> bool {
+        self.open.is_some()
     }
 
     /// Seconds until [`Self::check_settle`] would close the open window (None = no pending
@@ -805,14 +832,14 @@ impl OnnxStage1Recognizer {
         // 段级日志(debug):窗口/段 id、音频时长、batch 模型调用耗时、两路文本、会话喂帧数。
         if let Some(s) = segments.last() {
             debug!(
-                window = window_id,
-                segment = s.id,
-                dur_ms = ((s.end_s - s.start_s) * 1000.0).round() as u64,
+                window_id = window_id,
+                segment_id = s.id,
+                time_ms = ((s.end_s - s.start_s) * 1000.0).round() as u64,
                 fed,
                 asr_ms,
                 batch = s.batch_text.as_deref().unwrap_or("(none)"),
                 streaming = %s.streaming_text,
-                "段定稿(VadSegment)"
+                "段定稿"
             );
         }
         // Final stream fragment: the segment's DEFINITIVE streaming text (live partials only
@@ -831,14 +858,20 @@ impl OnnxStage1Recognizer {
 }
 
 /// 下一次唤醒截止:最早的真实定时器,或 None(无定时 → 无限期挂起等音频)。
+/// `flush_pending`:主动归档挂起中 → 最长 50ms 后醒来重试(EOS 一到立即归档,
+/// 否则 condvar park 到 settle deadline 才醒,flush 延迟退化回 merge_gap)。
 fn next_wake_at(
     tracker: &WindowTracker,
     sess: &Option<ActiveSession>,
     ring_empty_since: Option<Instant>,
     now_s: f64,
     speaking: bool,
+    flush_pending: bool,
 ) -> Option<Duration> {
     let mut wake_at: Option<Duration> = None;
+    if flush_pending {
+        wake_at = Some(Duration::from_millis(50));
+    }
     if let Some(d) = tracker.settle_deadline(now_s, speaking) {
         let d = Duration::from_secs_f64(d.max(0.05));
         wake_at = Some(wake_at.map_or(d, |w| w.min(d)));
@@ -893,11 +926,31 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                 continue;
             }
 
-            // ② 时间驱动检查:窗口定稿 / 停滞看门狗 / 诊断
+            // ② 时间驱动检查:主动归档 / 窗口定稿 / 停滞看门狗 / 诊断
             let now_s = start.elapsed().as_secs_f64();
             // `speaking`(流式 partial 非空)抑制窗口按墙钟定稿——回溯式 VAD 的下一段 SOS
             // 尚未到达,若定稿会把下一段错划进新窗口。
             let speaking = sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
+            // 用户侧主动归档(IME 分字符 = "我说完了"):跳过 merge_gap 剩余等待立即整窗
+            // batch。说话中(EOS 未到)保持挂起下一 tick 重试 —— 立即切窗会截断尾音;
+            // 无窗口则消费掉标记(空按,不让陈旧 flush 影响之后的语音)。
+            if self.flush_window.load(Ordering::Acquire) {
+                if !speaking {
+                    match tracker.force_settle() {
+                        Some(settled) => {
+                            self.flush_window.store(false, Ordering::Release);
+                            info!(window_id = settled.window_id, segs = settled.segments.len(),
+                                "flush: 主动归档(跳过 merge_gap 等待)");
+                            emit_window_edge(settled, &self.audio_store, &*self.batch_asr, sr, on_event);
+                            sess = sasr.map(|asr| ActiveSession::new(asr.create_session())); // 窗口边界重置会话
+                        }
+                        None if !tracker.has_open_window() => {
+                            self.flush_window.store(false, Ordering::Release);
+                        }
+                        None => {} // 段进行中 → 挂起,等 EOS 后下一 tick 强制定稿
+                    }
+                }
+            }
             if let Some(settled) = tracker.check_settle(now_s, speaking) {
                 emit_window_edge(settled, &self.audio_store, &*self.batch_asr, sr, on_event);
                 sess = sasr.map(|asr| ActiveSession::new(asr.create_session())); // 窗口边界重置会话
@@ -916,7 +969,14 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
             }
 
             // ③ 取帧:ring 有帧直接取;空则 park 等音频/截止(断流>2s 且有 partial → 喂静音逼 EOS)
-            let wake_at = next_wake_at(&tracker, &sess, ring_empty_since, now_s, speaking);
+            let wake_at = next_wake_at(
+                &tracker,
+                &sess,
+                ring_empty_since,
+                now_s,
+                speaking,
+                self.flush_window.load(Ordering::Acquire),
+            );
             let frame = match self.drain_frame(&mut ring_empty_since, &sess, &mut last_silence_feed, wake_at) {
                 FrameResult::Frame(f) => f,
                 FrameResult::Parked => continue,
@@ -1012,6 +1072,39 @@ mod tests {
         let s = t.check_settle(3.0, false).expect("3.0 − 0.5 = 2.5 ≥ merge_gap → settle");
         assert_eq!(s.window_id, w1);
         assert!(t.check_settle(10.0, false).is_none(), "nothing open anymore");
+    }
+
+    #[test]
+    fn force_settle_skips_merge_gap_wait() {
+        // 主动归档:远未到 merge_gap 也能立即关窗(IME"我说完了"信号)。
+        let mut t = WindowTracker::new(2.5);
+        assert!(t.force_settle().is_none(), "无窗口 → None(调用方消费掉 flush 标记)");
+        assert!(!t.has_open_window());
+        let s1 = t.on_sos();
+        let (_, w1, _) = t.on_eos(seg(s1, 0.0, 0.5));
+        // 0.2s 后强制归档(gap 0.2 < merge_gap 2.5 —— 常规定稿还早)。
+        let s = t.force_settle().expect("有已定稿段 → 立即归档");
+        assert_eq!(s.window_id, w1);
+        assert_eq!(s.segments.len(), 1);
+        assert!(!t.has_open_window(), "窗已关");
+        assert!(t.check_settle(100.0, false).is_none(), "settle 路径不再重复触发");
+        // 归档后再次 force → 无窗口 → None。
+        assert!(t.force_settle().is_none());
+    }
+
+    #[test]
+    fn force_settle_holds_while_segment_active() {
+        // 段进行中(SOS 已见 EOS 未到)→ 不动,调用方保持 flush 挂起。
+        let mut t = WindowTracker::new(2.5);
+        let s1 = t.on_sos();
+        let (_, _, _) = t.on_eos(seg(s1, 0.0, 0.5));
+        let s2 = t.on_sos(); // 第二段开口
+        assert!(t.force_settle().is_none(), "active 段压制强制归档");
+        assert!(t.has_open_window(), "窗口仍在 → flush 保持挂起");
+        let (_, w, segs) = t.on_eos(seg(s2, 1.0, 1.5));
+        let s = t.force_settle().expect("EOS 落定后重试成功");
+        assert_eq!(s.window_id, w);
+        assert_eq!(segs.len(), 2);
     }
 
     #[test]

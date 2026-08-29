@@ -376,6 +376,8 @@ struct DaemonState {
     corrections: Arc<Mutex<Vec<(String, String)>>>,
     /// Scout-connection toggle (shared with the Stage1 recognizer's ingest + run loop).
     active: Arc<AtomicBool>,
+    /// 主动归档信号(IME 分字符)—— Stage1 消费循环消费;socket 端只置位。
+    flush_window: Arc<AtomicBool>,
     /// idle 深度睡眠信号: false → Stage1 退出 + 断开 scout; 恢复时置回 true。
     running: Arc<AtomicBool>,
     /// 当前是否处于 idle 深度睡眠。
@@ -509,6 +511,10 @@ fn main() -> Result<()> {
     let active = Arc::new(AtomicBool::new(true));
     // idle 深度睡眠信号: false → Stage1 消费循环退出 + 断开 scout; 恢复时置回 true。
     let running = Arc::new(AtomicBool::new(true));
+    // 主动归档信号(IME 分字符 `'` = "我说完了"):socket 置 true → Stage1 消费循环
+    // 跳过 merge_gap 剩余等待,立即整窗 batch。识别域动作,不 bump version ——
+    // 结果经数据面 /api/asr_stream 推送。
+    let flush_window = Arc::new(AtomicBool::new(false));
     // idle 恢复唤醒: daemon 在下一个客户端连接时置 running=true + notify pipeline 线程。
     let resume_cv: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
     let version = Arc::new(AtomicU64::new(0));
@@ -581,6 +587,7 @@ fn main() -> Result<()> {
         &spec,
         Arc::clone(&active),
         Arc::clone(&running),
+        Arc::clone(&flush_window),
         Arc::clone(&hotwords),
         Arc::clone(&corrections),
         Some(Arc::clone(&storage)), // WindowCalibration 时自动 record_final(archive+day log+ring)
@@ -637,6 +644,7 @@ fn main() -> Result<()> {
         corrections: Arc::clone(&corrections),
         active: Arc::clone(&active),
         running: Arc::clone(&running),
+        flush_window: Arc::clone(&flush_window),
         idle: Arc::new(AtomicBool::new(false)),
         subscribers: Arc::new(AtomicUsize::new(0)),
         resume_cv: Arc::clone(&resume_cv),
@@ -699,6 +707,9 @@ async fn serve_socket(state: DaemonState, bind_addr: String, port: u16, web_dist
         // ── actions (each mutates state → bumps version → next SSE tick pings) ──
         .route("/api/control/scout", post(control_scout))
         .route("/api/correct", post(correction_handler))
+        // 主动归档(IME 分字符 `'` = "我说完了"):识别域动作,不 bump version ——
+        // 归档产生的窗口事件走数据面 /api/asr_stream 推送。
+        .route("/api/control/flush", post(flush_handler))
         // ── binary / queries ──
         .route("/api/audio/{seq}", get(audio_handler))
         .route("/api/recordings", get(recordings_handler))
@@ -739,6 +750,14 @@ async fn control_scout(State(s): State<DaemonState>, body: Json<Value>) -> Json<
     s.active.store(next, Ordering::Relaxed);
     s.bump(); // connected changed → ping clients to re-fetch
     Json(json!({ "connected": next }))
+}
+
+/// `POST /api/control/flush` — 主动归档当前开放窗口(IME 分字符 `'` 触发)。
+/// 置位即返:Stage1 消费循环(≤50ms 唤醒)负责消费标记并立即整窗 batch。
+/// 说话中(EOS 未到)挂起重试;无窗口时标记被消费(空按)。
+async fn flush_handler(State(s): State<DaemonState>) -> Json<Value> {
+    s.flush_window.store(true, Ordering::Release);
+    Json(json!({ "flush": true }))
 }
 
 /// SSE subscription params: `?state_changed_frequency=<ms>` — the minimum interval between

@@ -58,6 +58,9 @@ pub enum VoiceCmd {
     /// `#asr` 会话退出(deactivate):清掉 ctx。懒惰的 server 也会在下次
     /// `try_refresh` 失败时自行放弃,Detach 只是让它放弃得更早。
     Detach { ctx: usize },
+    /// 主动归档(分字符键 `'` = "我说完了"):让 aura 立即关闭当前开放窗口并
+    /// 整窗 batch,跳过 merge_gap 剩余等待。未连接时 no-op。
+    FlushWindow,
 }
 
 /// 向 voice server 发命令的 typed sender(包装 io thread 的 `tx`)。
@@ -273,6 +276,23 @@ async fn voice_server_main(
                     Some(IoEvent::Voice(VoiceCmd::Detach { ctx })) => {
                         if active_ctx == ctx as i64 {
                             active_ctx = -1;
+                        }
+                    }
+                    Some(IoEvent::Voice(VoiceCmd::FlushWindow)) => {
+                        // 主动归档:仅在持有 aura 流时发(未连 = 没有进行中的语音,
+                        // no-op)。fire-and-forget —— 归档结果经 SSE 数据面回流。
+                        if connected && !state.is_mock() {
+                            last_activity = tokio::time::Instant::now();
+                            match AuraClient::new(&base) {
+                                Ok(client) => {
+                                    if let Err(e) = client.flush_window().await {
+                                        tracing::warn!(error = %e, "flush_window failed");
+                                    } else {
+                                        tracing::info!("flush_window → aura(主动归档)");
+                                    }
+                                }
+                                Err(e) => tracing::warn!(error = %e, "flush_window: client"),
+                            }
                         }
                     }
                     Some(IoEvent::Run { ctx, task }) => {

@@ -199,12 +199,13 @@ impl Pipeline {
         spec: &PipelineSpec,
         active: Arc<AtomicBool>,
         running: Arc<AtomicBool>,
+        flush_window: Arc<AtomicBool>,
         hotwords: Arc<Mutex<Vec<String>>>,
         corrections: Arc<Mutex<Vec<(String, String)>>>,
         storage: Option<Arc<Storage>>,
     ) -> Result<Self> {
         info!("loading Stage1 (ONNX) + Stage2 (Qwen calibrator) …");
-        let s1 = OnnxStage1Recognizer::new(stage1_config(spec, active, running)?)?;
+        let s1 = OnnxStage1Recognizer::new(stage1_config(spec, active, running, flush_window)?)?;
         let s2 = stage2_calibrator(spec, hotwords, corrections)?;
         Ok(Self { s1, s2, storage })
     }
@@ -388,6 +389,7 @@ fn stage1_config(
     spec: &PipelineSpec,
     active: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
+    flush_window: Arc<AtomicBool>,
 ) -> Result<Stage1Config> {
     // 自定义模型根目录:local 路径下 VAD/流式/批式全部改在其下解析。
     // (remote/disabled 批式时流式/VAD 仍走 MODELS 命名空间 —— model_dir 是 local 旋钮。)
@@ -398,6 +400,7 @@ fn stage1_config(
     let mut cfg = Stage1Config::with_models_dir(spec.scout_addr.clone(), model_dir);
     cfg.active = active;
     cfg.running = running;
+    cfg.flush_window = flush_window;
     // 客户端请求的 scout 推流 cadence(ms):None = scout 按自身 quantum 速率推。
     cfg.scout_chunk_ms = spec.scout_chunk_ms;
     // VAD / 分段(默认 = VadSpec::default,与 Stage1Config 内置默认一致)。
@@ -521,11 +524,11 @@ mod tests {
         assert!(cfg.batch_enabled, "remote batch stays on");
 
         // 本地只支持 sensevoice —— whisper / qwen3-asr 本地模型已删, 配置它们显式报错。
-        assert!(stage1_config(&spec(local("whisper")), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true))).is_err());
-        assert!(stage1_config(&spec(local("qwen3-asr")), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true))).is_err());
+        assert!(stage1_config(&spec(local("whisper")), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false))).is_err());
+        assert!(stage1_config(&spec(local("qwen3-asr")), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false))).is_err());
 
         // sensevoice → SenseVoice;provider/threads 落位。
-        let cfg = stage1_config(&spec(local("sensevoice")), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true))).unwrap();
+        let cfg = stage1_config(&spec(local("sensevoice")), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false))).unwrap();
         assert!(matches!(cfg.asr.backend, AsrBackend::SenseVoice { .. }));
         assert_eq!(cfg.asr.provider, "cpu");
         assert_eq!(cfg.asr.num_threads, 8);
@@ -575,7 +578,7 @@ mod tests {
         // x-asr → 指向 x-asr 模型目录;热词在引擎选择之后烘烤(整体替换不丢)。
         let mut s = spec(local("sensevoice"));
         s.stream.model = "x-asr".into();
-        let cfg = stage1_config(&s, Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true))).unwrap();
+        let cfg = stage1_config(&s, Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false))).unwrap();
         assert!(cfg.streaming.encoder.ends_with("x-asr/encoder-480ms.onnx"));
         assert!(cfg.streaming.bpe_vocab.ends_with("x-asr/bpe.vocab"));
         assert_eq!(
@@ -588,14 +591,14 @@ mod tests {
     #[test]
     fn stage1_config_disabled_batch_and_unknown_stream_rejected() {
         // disable → 纯流式:batch_enabled=false(不加载批式模型,DisabledAsr 顶位)。
-        let cfg = stage1_config(&spec(AsrSpec::Disabled), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true))).unwrap();
+        let cfg = stage1_config(&spec(AsrSpec::Disabled), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false))).unwrap();
         assert!(!cfg.batch_enabled);
         assert!(matches!(cfg.asr_kind, ProviderKind::Local { .. }), "不影响 streaming/VAD 的本地路径");
 
         // 未知流式引擎 → 显式报错(不静默回退默认)。
         let mut s = spec(local("sensevoice"));
         s.stream.model = "bogus".into();
-        assert!(stage1_config(&s, Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true))).is_err());
+        assert!(stage1_config(&s, Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false))).is_err());
     }
 
     #[test]
@@ -604,7 +607,7 @@ mod tests {
         s.vad.threshold = 0.6;
         s.vad.merge_gap = 2.5;
         let active = Arc::new(AtomicBool::new(false));
-        let cfg = stage1_config(&s, Arc::clone(&active), Arc::new(AtomicBool::new(true))).unwrap();
+        let cfg = stage1_config(&s, Arc::clone(&active), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false))).unwrap();
         assert!((cfg.vad.threshold - 0.6).abs() < 1e-6);
         assert_eq!(cfg.merge_gap_s, 2.5);
         assert_eq!(cfg.streaming.hotwords, vec!["Rust".to_string()], "seed baked into streaming");
@@ -618,7 +621,7 @@ mod tests {
         if let AsrSpec::Local { model_dir, .. } = &mut s.asr {
             *model_dir = Some("/custom/models".into());
         }
-        let cfg = stage1_config(&s, Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true))).unwrap();
+        let cfg = stage1_config(&s, Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false))).unwrap();
         assert!(cfg.vad.model.starts_with("/custom/models/silero-vad/"));
         assert!(matches!(&cfg.asr.backend, AsrBackend::SenseVoice { model, .. }
             if model.starts_with("/custom/models/sensevoice/")));
@@ -628,7 +631,7 @@ mod tests {
         if let AsrSpec::Local { model_dir, .. } = &mut s.asr {
             *model_dir = Some("/m".into());
         }
-        assert!(stage1_config(&s, Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true))).is_err());
+        assert!(stage1_config(&s, Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false))).is_err());
     }
 
     #[test]

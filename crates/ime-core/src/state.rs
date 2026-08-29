@@ -1007,7 +1007,14 @@ impl StateMachine {
             }
         }
 
-        // 其它字符:追加到缓冲,重查。
+        // 其它字符:追加到缓冲,重查。分字符键(`'`)附带"我说完了"信号 ——
+        // 语音会话进行中时让 aura 立即归档开放窗口(整窗 batch,跳过
+        // merge_gap 等待);无语音会话时 voice_cmd_tx 为 None,零开销跳过。
+        if ch == '\'' {
+            if let Some(tx) = env.voice_cmd_tx() {
+                tx.send(crate::io_thread::VoiceCmd::FlushWindow);
+            }
+        }
         self.buffer.push(ch);
         self.query_magic(env)
     }
@@ -1022,7 +1029,12 @@ impl StateMachine {
             // 链分隔符:`'` 是组合内结构字符(ti'an 的两条链),不是终结符。
             // 追加进 buffer;预测层(拼音家族)按 `'` 切链组合。回格删 `'`
             // 天然回到无链状态 —— 链结构纯由 buffer 内容决定,无隐藏状态。
+            // 附带"我说完了"信号:语音会话在听时让 aura 立即归档开放窗口
+            // (整窗 batch,跳过 merge_gap 等待);无语音会话 → tx 为 None,跳过。
             '\'' => {
+                if let Some(tx) = env.voice_cmd_tx() {
+                    tx.send(crate::io_thread::VoiceCmd::FlushWindow);
+                }
                 self.buffer.push('\'');
                 self.raw_buffer.push('\'');
                 self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
