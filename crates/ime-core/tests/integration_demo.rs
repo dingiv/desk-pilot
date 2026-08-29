@@ -10,7 +10,7 @@ fn commit(view: &ImeView) -> &str {
 }
 
 /// 起一个"健康"的 mock aura: `/health` 回 200,`/api/asr_stream` 回 200 并
-/// **保持连接**(不回 body),让 `subscribe_segments_owned` 的流活着、不触发
+/// **保持连接**(不回 body),让 `subscribe_events_owned` 的流活着、不触发
 /// voice server 的"断联即放弃"。测试结束后进程退出,线程随之丢弃。
 fn mock_aura() -> String {
     use std::io::{Read, Write};

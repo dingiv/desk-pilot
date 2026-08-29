@@ -32,44 +32,44 @@ pub use pipeline::{AsrSpec, LlmSpec, Pipeline, PipelineSpec, StreamSpec, TurnEve
 pub use prompt::PromptBuilder;
 pub use hub::{FinalTurn, Storage, TurnRecord};
 
-// ── Stage1 → Stage2 data contract · 边界范式（VadSegment / VadWindow）──────────────
+// ── Stage1 → Stage2 data contract · 边界范式（VadSentence / VadParagraph）──────────────
 // 设计: docs/aura/stages.md（2026-08-17 重构,替代旧的 Utterance/Stage1Action
 // "就地修改"契约;自 aura-asr 并入,2026-08-18）。两个时间参数切出两级实体:
-//   · VAD 间隔 (vad.min_silence)  → VadSegment  原子录音片段(段级流式会话 + 段级 batch)
-//   · merge 窗口 (vad.merge_gap)  → VadWindow   多段组合(定稿单位,拼接 PCM 重跑 batch)
+//   · VAD 间隔 (vad.min_silence)  → VadSentence  原子录音片段(句级流式会话 + 句级 batch)
+//   · merge 段落 (vad.merge_gap)  → VadParagraph   多句组合(定稿单位,拼接 PCM 重跑 batch)
 // PCM 由 [`audio_store::AudioStore`] 按 id 持有,实体只持 id——录音数据不随事件克隆。
-// 事件 append-only + 边界标记: Batch(每段)驱动 Stage2 联合整流当前窗口,WindowEdge
-// (窗口关闭)驱动定稿。batch 失败显式建模为 `Option`(远程网络可能出问题)。
+// 事件 append-only + 边界标记: Batch(每句)驱动 Stage2 联合整流当前段落,ParagraphEdge
+// (段落关闭)驱动定稿。batch 失败显式建模为 `Option`(远程网络可能出问题)。
 
 /// Audio clip id — assigned by [`audio_store::AudioStore`]. Entities hold ids, never PCM.
 pub type AudioId = u64;
-/// Segment id — monotonic within a pipeline run.
-pub type SegmentId = u64;
-/// Window id — monotonic within a run, assigned when the window OPENS (its first SOS), so
+/// Sentence id — monotonic within a pipeline run.
+pub type SentenceId = u64;
+/// Paragraph id — monotonic within a run, assigned when the paragraph OPENS (its first SOS), so
 /// live `StreamFragment` partials can carry the real id (no prospective guessing).
-pub type WindowId = u64;
+pub type ParagraphId = u64;
 
-/// One VAD-gap-delimited clip — the atomic Stage1 unit. A segment is complete the moment its
+/// One VAD-gap-delimited clip — the atomic Stage1 unit. A sentence is complete the moment its
 /// EOS fires: streaming session finalized, PCM inserted into the AudioStore, one batch pass
 /// packed in. `batch_text: None` is LEGAL — batch depends on the remote network and may fail;
-/// consumers fall back to `streaming_text` via [`VadSegment::best_text`].
+/// consumers fall back to `streaming_text` via [`VadSentence::best_text`].
 #[derive(Debug, Clone)]
-pub struct VadSegment {
-    pub id: SegmentId,
+pub struct VadSentence {
+    pub id: SentenceId,
     /// The clip's PCM, owned by the [`audio_store::AudioStore`] — never cloned into events.
     pub audio_id: AudioId,
     /// Wall-clock seconds since executor start (SOS).
     pub start_s: f64,
     /// Wall-clock seconds since executor start (EOS).
     pub end_s: f64,
-    /// Per-segment streaming ASR final (hotword-biased; the session spans exactly this segment).
+    /// Per-sentence streaming ASR final (hotword-biased; the session spans exactly this sentence).
     pub streaming_text: String,
-    /// Per-segment batch ASR result. `None` when the batch pass failed (network error) or
+    /// Per-sentence batch ASR result. `None` when the batch pass failed (network error) or
     /// returned empty text — HttpAsr's `Err` and OnnxAsr's empty string map to the same None.
     pub batch_text: Option<String>,
 }
 
-impl VadSegment {
+impl VadSentence {
     /// Best available text: `batch_text` when Some(non-empty), else `streaming_text`.
     pub fn best_text(&self) -> &str {
         self.batch_text
@@ -79,46 +79,46 @@ impl VadSegment {
     }
 }
 
-/// A merge-window composition of [`VadSegment`]s — the settle/final unit. Built when a big
-/// gap (≥ `merge_gap_s`) or the settle-timeout closes the window; carries a snapshot of its
-/// segments plus the window-level aggregation:
-/// - `streaming_text` = concat of the segments' streaming finals (zero cost, no re-run);
-/// - `batch_text` = ONE re-run of the batch model over the concatenated PCM (cross-segment
+/// A merge-paragraph composition of [`VadSentence`]s — the settle/final unit. Built when a big
+/// gap (≥ `merge_gap_s`) or the settle-timeout closes the paragraph; carries a snapshot of its
+/// sentences plus the paragraph-level aggregation:
+/// - `streaming_text` = concat of the sentences' streaming finals (zero cost, no re-run);
+/// - `batch_text` = ONE re-run of the batch model over the concatenated PCM (cross-sentence
 ///   context; the authoritative text Stage2 finalizes on). `None` on a failed re-run.
 #[derive(Debug, Clone)]
-pub struct VadWindow {
-    pub id: WindowId,
-    /// Settle-time snapshot (ids/timestamps/texts only — no PCM per segment).
-    pub segments: Vec<VadSegment>,
-    /// SOS of the FIRST segment.
+pub struct VadParagraph {
+    pub id: ParagraphId,
+    /// Settle-time snapshot (ids/timestamps/texts only — no PCM per sentence).
+    pub sentences: Vec<VadSentence>,
+    /// SOS of the FIRST sentence.
     pub start_s: f64,
-    /// EOS of the LAST segment.
+    /// EOS of the LAST sentence.
     pub end_s: f64,
     pub streaming_text: String,
     pub batch_text: Option<String>,
-    /// The whole window's concatenated PCM — assembled once at settle, shared (Arc) between
-    /// the window-level batch pass and downstream archival. The AudioStore evicts the
-    /// per-segment clips right after; this Arc is the only remaining copy.
+    /// The whole paragraph's concatenated PCM — assembled once at settle, shared (Arc) between
+    /// the paragraph-level batch pass and downstream archival. The AudioStore evicts the
+    /// per-sentence clips right after; this Arc is the only remaining copy.
     pub pcm: std::sync::Arc<Vec<i16>>,
-    /// batch 模型调用 wall-clock 毫秒数;单段窗口复用段级 batch 时为 0(不计时)。
+    /// batch 模型调用 wall-clock 毫秒数;单句段落复用句级 batch 时为 0(不计时)。
     /// 用于性能评估:跨 ASR 后端 / 跨音频长度 / GPU vs CPU 对比。
     pub batch_asr_ms: u64,
 }
 
-impl VadWindow {
-    /// The authoritative text Stage2 finalizes on: the window-level batch re-run when present,
-    /// else the concat of the segments' own best texts (per-segment batches may have succeeded
-    /// even when the window re-run failed).
+impl VadParagraph {
+    /// The authoritative text Stage2 finalizes on: the paragraph-level batch re-run when present,
+    /// else the concat of the sentences' own best texts (per-sentence batches may have succeeded
+    /// even when the paragraph re-run failed).
     pub fn best_text(&self) -> std::borrow::Cow<'_, str> {
         if let Some(t) = self.batch_text.as_deref().filter(|t| !t.trim().is_empty()) {
             return std::borrow::Cow::Borrowed(t);
         }
         std::borrow::Cow::Owned(
-            self.segments.iter().map(|s| s.best_text()).collect::<Vec<_>>().join(""),
+            self.sentences.iter().map(|s| s.best_text()).collect::<Vec<_>>().join(""),
         )
     }
 
-    /// Window duration in milliseconds (from the PCM the batch actually heard).
+    /// Paragraph duration in milliseconds (from the PCM the batch actually heard).
     pub fn duration_ms(&self) -> f32 {
         self.pcm.len() as f32 / 16_000.0 * 1000.0
     }
@@ -129,20 +129,20 @@ impl VadWindow {
 /// an earlier entity in place (the old paradigm's same-seq update is gone).
 #[derive(Debug, Clone)]
 pub enum Stage1Event {
-    /// Live streaming output for the CURRENT segment (per-segment session ⇒ the fragment
-    /// belongs to exactly one segment). Carries the real `window_id` (assigned at the
-    /// window's first SOS) + `segment_id`. Passes straight through to the UI — NOT a Stage2
+    /// Live streaming output for the CURRENT sentence (per-sentence session ⇒ the fragment
+    /// belongs to exactly one sentence). Carries the real `paragraph_id` (assigned at the
+    /// paragraph's first SOS) + `sentence_id`. Passes straight through to the UI — NOT a Stage2
     /// input (D2: no live-partial calibration). Emitted on every streaming decode change, plus
-    /// one FINAL fragment at EOS carrying the segment's definitive `streaming_text`.
-    StreamFragment { window_id: WindowId, segment_id: SegmentId, text: String, at_s: f64 },
-    /// A VAD gap closed a segment: its batch pass is packed in. `segments` is ALL segments
-    /// of the current window so far (Stage2 jointly calibrates them — the payload IS the
-    /// window, keeping Stage2 stateless). Provisional until the `WindowEdge`.
-    Batch { window_id: WindowId, segments: Vec<VadSegment> },
-    /// The merge window closed (big gap or settle-timeout): the window-level batch re-run is
+    /// one FINAL fragment at EOS carrying the sentence's definitive `streaming_text`.
+    StreamFragment { paragraph_id: ParagraphId, sentence_id: SentenceId, text: String, at_s: f64 },
+    /// A VAD gap closed a sentence: its batch pass is packed in. `sentences` is ALL sentences
+    /// of the current paragraph so far (Stage2 jointly calibrates them — the payload IS the
+    /// paragraph, keeping Stage2 stateless). Provisional until the `ParagraphEdge`.
+    Batch { paragraph_id: ParagraphId, sentences: Vec<VadSentence> },
+    /// The merge paragraph closed (big gap or settle-timeout): the paragraph-level batch re-run is
     /// done and packed. Authoritative — Stage2 finalizes on it; the AudioStore evicts the
-    /// segment clips right after this event.
-    WindowEdge { window: VadWindow },
+    /// sentence clips right after this event.
+    ParagraphEdge { paragraph: VadParagraph },
 }
 
 // ── ONNX 语音栈在 dp-models ────────────────────────────────────────────────────

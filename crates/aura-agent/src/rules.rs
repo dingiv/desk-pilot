@@ -1,6 +1,6 @@
 //! rules — the in-process **Stage3 rule trigger** (临时闭环演示;desktop-pet 秘书调度器
 //! 接管前的占位)。从 daemon main.rs 迁入(2026-08-18):Stage3 触发逻辑本就属 Stage3
-//! 能力层,daemon 只负责在 WindowCalibration 时调用它。
+//! 能力层,daemon 只负责在 ParagraphCalibration 时调用它。
 //!
 //! 策略:从整流后的文本提取大写拉丁专名候选,作为热词加入 store —— 把 Stage2 的纠偏
 //! 结果"锁进"后续轮次(在表术语解码更稳)。

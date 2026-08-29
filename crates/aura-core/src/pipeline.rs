@@ -6,22 +6,22 @@
 //! resolve() 产出），[`Pipeline::assemble`] 把它变成可运行的 Pipeline —— Stage1Config
 //! 逐字段落位 + ASR 后端选择 + Stage2 LLM 选择（local mistral.rs / remote HTTP）+ 模型
 //! 加载与预热。daemon 只负责 config 解析、socket 和 Stage3 触发；识别事件日志
-//! （流式/纠偏）与窗口归档（[`Storage::record_final`]）也在 run() 内部，不劳调用方。
+//! （流式/纠偏）与段落归档（[`Storage::record_final`]）也在 run() 内部，不劳调用方。
 //!
 //! Stage2 calibration runs on its own `aura-stage2` worker thread so the Stage1 consume loop
-//! never blocks on the LLM — streaming partials keep flowing while a window is being
-//! calibrated. A `StreamFragment` for segment N+1 can arrive BEFORE the `WindowCalibration`
-//! for window N.
+//! never blocks on the LLM — streaming partials keep flowing while a paragraph is being
+//! calibrated. A `StreamFragment` for sentence N+1 can arrive BEFORE the `ParagraphCalibration`
+//! for paragraph N.
 //!
 //! The worker drains the two Stage1 triggers off an mpsc channel (`StreamFragment` never
 //! crosses the channel — it passes straight through on the Stage1 thread): `Batch` →
-//! [`Stage2Calibrator::calibrate_window`] (joint calibration of the current window, result
-//! overwrites the window's stored calibration) → [`TurnEvent::SegmentCalibration`];
-//! `WindowEdge` → [`Stage2Calibrator::finalize_window`] (NO LLM — attach the stored
-//! calibration as the window's final field, move the left boundary) →
-//! [`TurnEvent::WindowCalibration`]. The worker also surfaces the two batch layers as
-//! [`TurnEvent::BatchSegment`] (the just-closed segment's batch) and [`TurnEvent::BatchWindow`]
-//! (the whole-window re-run).
+//! [`Stage2Calibrator::calibrate_paragraph`] (joint calibration of the current paragraph, result
+//! overwrites the paragraph's stored calibration) → [`TurnEvent::SentenceCalibration`];
+//! `ParagraphEdge` → [`Stage2Calibrator::finalize_paragraph`] (NO LLM — attach the stored
+//! calibration as the paragraph's final field, move the left boundary) →
+//! [`TurnEvent::ParagraphCalibration`]. The worker also surfaces the two batch layers as
+//! [`TurnEvent::BatchSentence`] (the just-closed sentence's batch) and [`TurnEvent::BatchParagraph`]
+//! (the whole-paragraph re-run).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -42,7 +42,7 @@ use dp_models::http::HttpLlm;
 // 具体值 —— 线协议/文件格式不进 core。VadSpec::default 与 Stage1Config::new 的内置
 // 默认一致(单测钉死,防两处漂移)。
 
-/// Fully-resolved pipeline 选型:音频源、种子热词、VAD/分段参数、流式 ASR、Stage1 batch
+/// Fully-resolved pipeline 选型:音频源、种子热词、VAD/分句参数、流式 ASR、Stage1 batch
 /// ASR、Stage2 LLM。[`Pipeline::assemble`] 的唯一输入(运行时共享句柄除外)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct PipelineSpec {
@@ -70,20 +70,20 @@ pub struct StreamSpec {
     pub model: String,
 }
 
-/// VAD/分段参数(具体值)。[`Default`] 与 [`Stage1Config::new`] 的内置默认逐字段一致。
+/// VAD/分句参数(具体值)。[`Default`] 与 [`Stage1Config::new`] 的内置默认逐字段一致。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VadSpec {
     /// Silero speech-probability threshold(0.5)。高=不敏感,低=易误触。
     pub threshold: f32,
-    /// 切段间隔秒(1.0)——短于此的停顿不切段。
+    /// 切句间隔秒(1.0)——短于此的停顿不切句。
     pub min_silence: f32,
-    /// 短于该时长的段被 Silero 丢弃(0.3)。
+    /// 短于该时长的句被 Silero 丢弃(0.3)。
     pub min_speech: f32,
     /// 超长强切兜底秒(28.0)。
     pub max_speech: f32,
-    /// ★merge 窗口间隔秒(5.0)——"什么算一句话"的上界;0 = 每段独立成窗。
+    /// ★merge 段落间隔秒(5.0)——"什么算一句话"的上界;0 = 每句独立成窗。
     pub merge_gap: f64,
-    /// 段边界扩展秒(0.3;0=off)——补 Silero 切掉的软起音/尾音。
+    /// 句边界扩展秒(0.3;0=off)——补 Silero 切掉的软起音/尾音。
     pub edge_margin: f32,
 }
 
@@ -119,7 +119,7 @@ pub enum AsrSpec {
     /// 要求 multipart form 里带 `model` 字段)。流式/VAD 仍走 MODELS 命名空间。
     Remote { endpoint: String, model: String },
     /// 批式整体禁用(纯流式模式):不加载批式模型,`batch_text` 恒 `None` —— 消费方
-    /// 按设计回退流式文本。省掉段级/窗口级 batch 调用(远程 ~3.5s/次)。
+    /// 按设计回退流式文本。省掉句级/段落级 batch 调用(远程 ~3.5s/次)。
     Disabled,
 }
 
@@ -155,31 +155,31 @@ impl LlmSpec {
     }
 }
 
-/// One turn surfaced to the caller. Data-plane event vocabulary (mirrors `AsrSegment`):
-/// [`StreamFragment`](TurnEvent::StreamFragment) + [`BatchSegment`](TurnEvent::BatchSegment) +
-/// [`BatchWindow`](TurnEvent::BatchWindow) from Stage1; [`SegmentCalibration`](TurnEvent::SegmentCalibration)
-/// + [`WindowCalibration`](TurnEvent::WindowCalibration) from Stage2.
+/// One turn surfaced to the caller. Data-plane event vocabulary (mirrors `AsrEvent`):
+/// [`StreamFragment`](TurnEvent::StreamFragment) + [`BatchSentence`](TurnEvent::BatchSentence) +
+/// [`BatchParagraph`](TurnEvent::BatchParagraph) from Stage1; [`SentenceCalibration`](TurnEvent::SentenceCalibration)
+/// + [`ParagraphCalibration`](TurnEvent::ParagraphCalibration) from Stage2.
 #[derive(Debug)]
 pub enum TurnEvent<'a> {
-    /// Live streaming output for the CURRENT segment (raw, uncalibrated). Straight from the
+    /// Live streaming output for the CURRENT sentence (raw, uncalibrated). Straight from the
     /// Stage1 thread — NOT a Stage2 input (D2: no live-partial calibration).
-    StreamFragment { window_id: u64, segment_id: u64, text: &'a str, at_s: f64 },
-    /// The just-closed segment's batch pass (per-segment batch, at EOS).
-    BatchSegment { window_id: u64, segment_id: u64, text: String },
-    /// The whole-window batch re-run (per WindowEdge) — authoritative raw_text.
-    BatchWindow { window_id: u64, text: String },
-    /// Stage2's provisional JOINT calibration of the current window (per Batch) — the
-    /// calibrated text so far, replacing the previous calibration of the same window.
-    SegmentCalibration { window_id: u64, calibrated: String, route_ms: f64 },
-    /// The settled window's final calibration (per WindowEdge) — the window's LAST joint
-    /// calibration attached as its field (no extra LLM run). Window-granularity final (D3).
-    WindowCalibration { window_id: u64, calibrated: String, route_ms: f64 },
+    StreamFragment { paragraph_id: u64, sentence_id: u64, text: &'a str, at_s: f64 },
+    /// The just-closed sentence's batch pass (per-sentence batch, at EOS).
+    BatchSentence { paragraph_id: u64, sentence_id: u64, text: String },
+    /// The whole-paragraph batch re-run (per ParagraphEdge) — authoritative raw_text.
+    BatchParagraph { paragraph_id: u64, text: String },
+    /// Stage2's provisional JOINT calibration of the current paragraph (per Batch) — the
+    /// calibrated text so far, replacing the previous calibration of the same paragraph.
+    SentenceCalibration { paragraph_id: u64, calibrated: String, route_ms: f64 },
+    /// The settled paragraph's final calibration (per ParagraphEdge) — the paragraph's LAST joint
+    /// calibration attached as its field (no extra LLM run). Paragraph-granularity final (D3).
+    ParagraphCalibration { paragraph_id: u64, calibrated: String, route_ms: f64 },
 }
 
 pub struct Pipeline {
     s1: OnnxStage1Recognizer,
     s2: Box<dyn Stage2Calibrator>,
-    /// Some → run() 在 WindowEdge 时自动 `record_final`(PCM→archive,三份文本→day log+ring)。
+    /// Some → run() 在 ParagraphEdge 时自动 `record_final`(PCM→archive,三份文本→day log+ring)。
     storage: Option<Arc<Storage>>,
 }
 
@@ -199,13 +199,13 @@ impl Pipeline {
         spec: &PipelineSpec,
         active: Arc<AtomicBool>,
         running: Arc<AtomicBool>,
-        flush_window: Arc<AtomicBool>,
+        flush_paragraph: Arc<AtomicBool>,
         hotwords: Arc<Mutex<Vec<String>>>,
         corrections: Arc<Mutex<Vec<(String, String)>>>,
         storage: Option<Arc<Storage>>,
     ) -> Result<Self> {
         info!("loading Stage1 (ONNX) + Stage2 (Qwen calibrator) …");
-        let s1 = OnnxStage1Recognizer::new(stage1_config(spec, active, running, flush_window)?)?;
+        let s1 = OnnxStage1Recognizer::new(stage1_config(spec, active, running, flush_paragraph)?)?;
         let s2 = stage2_calibrator(spec, hotwords, corrections)?;
         Ok(Self { s1, s2, storage })
     }
@@ -225,8 +225,8 @@ impl Pipeline {
         let on_turn = Arc::new(on_turn);
 
         // Stage2 worker on its own thread — drains the two Stage1 triggers off-channel.
-        // Events arrive in order on this single thread (Batch×N → WindowEdge), so Stage2's
-        // tiny window state (last calibration per window) can never desync.
+        // Events arrive in order on this single thread (Batch×N → ParagraphEdge), so Stage2's
+        // tiny paragraph state (last calibration per paragraph) can never desync.
         let (tx, rx) = mpsc::channel::<Stage1Event>();
         {
             let on_turn = Arc::clone(&on_turn);
@@ -236,81 +236,81 @@ impl Pipeline {
                 .spawn(move || {
                     for ev in rx {
                         match ev {
-                            Stage1Event::Batch { window_id, segments } => {
-                                // BatchSegment: the just-closed segment's batch text (per-segment
-                                // batch ran synchronously at EOS). `segments.last()` IS that
-                                // segment. Skipped when batch produced nothing (None).
-                                if let Some(seg) = segments.last() {
-                                    if let Some(text) = seg.batch_text.clone() {
-                                        on_turn(TurnEvent::BatchSegment {
-                                            window_id,
-                                            segment_id: seg.id,
+                            Stage1Event::Batch { paragraph_id, sentences } => {
+                                // BatchSentence: the just-closed sentence's batch text (per-sentence
+                                // batch ran synchronously at EOS). `sentences.last()` IS that
+                                // sentence. Skipped when batch produced nothing (None).
+                                if let Some(sentence) = sentences.last() {
+                                    if let Some(text) = sentence.batch_text.clone() {
+                                        on_turn(TurnEvent::BatchSentence {
+                                            paragraph_id,
+                                            sentence_id: sentence.id,
                                             text,
                                         });
                                     }
                                 }
                                 let t = Instant::now();
-                                let calibrated = s2.calibrate_window(window_id, &segments);
+                                let calibrated = s2.calibrate_paragraph(paragraph_id, &sentences);
                                 let route_ms = t.elapsed().as_secs_f64() * 1000.0;
-                                // 联合整流当前窗口(每 VAD gap 一次)——高频,debug。
+                                // 联合整流当前段落(每 VAD gap 一次)——高频,debug。
                                 info!(
-                                    window_id,
+                                    paragraph_id,
                                     route_ms = route_ms.round() as u64,
                                     calibrated = %calibrated,
-                                    "纠偏[segment]"
+                                    "纠偏[sentence]"
                                 );
-                                on_turn(TurnEvent::SegmentCalibration {
-                                    window_id,
+                                on_turn(TurnEvent::SentenceCalibration {
+                                    paragraph_id,
                                     calibrated,
                                     route_ms,
                                 });
                             }
-                            Stage1Event::WindowEdge { window } => {
-                                // BatchWindow: the whole-window batch re-run (authoritative
+                            Stage1Event::ParagraphEdge { paragraph } => {
+                                // BatchParagraph: the whole-paragraph batch re-run (authoritative
                                 // raw_text). Skipped when the re-run produced nothing (None —
-                                // single-segment windows reuse the segment's own None too).
-                                if let Some(text) = window.batch_text.clone() {
-                                    on_turn(TurnEvent::BatchWindow {
-                                        window_id: window.id,
+                                // single-sentence paragraphs reuse the sentence's own None too).
+                                if let Some(text) = paragraph.batch_text.clone() {
+                                    on_turn(TurnEvent::BatchParagraph {
+                                        paragraph_id: paragraph.id,
                                         text,
                                     });
                                 }
                                 let t = Instant::now();
-                                // 定稿不跑 LLM:取该窗口最后一次 Batch 联合整流的存档
-                                // (最后一个段到来时整流已完成),移动左边界。
-                                let calibrated = s2.finalize_window(&window);
+                                // 定稿不跑 LLM:取该段落最后一次 Batch 联合整流的存档
+                                // (最后一个句到来时整流已完成),移动左边界。
+                                let calibrated = s2.finalize_paragraph(&paragraph);
                                 let route_ms = t.elapsed().as_secs_f64() * 1000.0;
-                                // Log all three text layers — window-level batch (authoritative;
+                                // Log all three text layers — paragraph-level batch (authoritative;
                                 // empty = re-run failed), the streaming concat, and the Stage2
                                 // rewrite — so ASR-level loss is distinguishable from LLM rewriting.
                                 info!(
-                                    window_id = window.id,
-                                    at_s = (window.start_s * 10.0).round() / 10.0,
-                                    segs = window.segments.len(),
-                                    // batch 模型调用耗时;单段复用模式 = 0(不打点,见 asr_ms 段日志)。
-                                    asr_ms = window.batch_asr_ms,
+                                    paragraph_id = paragraph.id,
+                                    at_s = (paragraph.start_s * 10.0).round() / 10.0,
+                                    sentences = paragraph.sentences.len(),
+                                    // batch 模型调用耗时;单句复用模式 = 0(不打点,见 asr_ms 段日志)。
+                                    asr_ms = paragraph.batch_asr_ms,
                                     route_ms = route_ms.round() as u64,
-                                    batch = %window.batch_text.clone().unwrap_or_default(),
-                                    streaming = %window.streaming_text,
+                                    batch = %paragraph.batch_text.clone().unwrap_or_default(),
+                                    streaming = %paragraph.streaming_text,
                                     calibrated = %calibrated,
-                                    "纠偏[window]"
+                                    "纠偏[paragraph]"
                                 );
-                                // 归档:窗口 PCM → audio archive,三份文本 → day log + ring
+                                // 归档:段落 PCM → audio archive,三份文本 → day log + ring
                                 // (backs /api/audio + /api/recordings)。
                                 if let Some(storage) = &storage {
                                     storage.record_final(FinalTurn {
-                                        window_id: window.id,
-                                        at_s: window.start_s,
-                                        duration_ms: window.duration_ms(),
-                                        raw_text: window.batch_text.clone().unwrap_or_default(),
-                                        streaming_text: window.streaming_text.clone(),
+                                        paragraph_id: paragraph.id,
+                                        at_s: paragraph.start_s,
+                                        duration_ms: paragraph.duration_ms(),
+                                        raw_text: paragraph.batch_text.clone().unwrap_or_default(),
+                                        streaming_text: paragraph.streaming_text.clone(),
                                         calibrated: calibrated.clone(),
                                         route_ms,
-                                        pcm: (*window.pcm).clone(),
+                                        pcm: (*paragraph.pcm).clone(),
                                     });
                                 }
-                                on_turn(TurnEvent::WindowCalibration {
-                                    window_id: window.id,
+                                on_turn(TurnEvent::ParagraphCalibration {
+                                    paragraph_id: paragraph.id,
                                     calibrated,
                                     route_ms,
                                 });
@@ -332,23 +332,23 @@ impl Pipeline {
             let tx = tx.clone();
             let on_turn = Arc::clone(&on_turn);
             s1.run(&mut move |ev| match ev {
-            Stage1Event::StreamFragment { window_id, segment_id, text, at_s } => {
+            Stage1Event::StreamFragment { paragraph_id, sentence_id, text, at_s } => {
                 // 高频(说话中 ~0.5s/条)——debug;aura.yaml `log_level: debug` 打开。
                 debug!(
-                    window_id,
-                    segment_id,
+                    paragraph_id,
+                    sentence_id,
                     at_s = (at_s * 10.0).round() / 10.0,
                     text = %text,
                     "流式"
                 );
                 on_turn(TurnEvent::StreamFragment {
-                    window_id,
-                    segment_id,
+                    paragraph_id,
+                    sentence_id,
                     text: &text,
                     at_s,
                 });
             }
-            ev @ (Stage1Event::Batch { .. } | Stage1Event::WindowEdge { .. }) => {
+            ev @ (Stage1Event::Batch { .. } | Stage1Event::ParagraphEdge { .. }) => {
                 if tx.send(ev).is_err() {
                     tracing::error!("stage2 worker gone — dropping event");
                 }
@@ -389,7 +389,7 @@ fn stage1_config(
     spec: &PipelineSpec,
     active: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
-    flush_window: Arc<AtomicBool>,
+    flush_paragraph: Arc<AtomicBool>,
 ) -> Result<Stage1Config> {
     // 自定义模型根目录:local 路径下 VAD/流式/批式全部改在其下解析。
     // (remote/disabled 批式时流式/VAD 仍走 MODELS 命名空间 —— model_dir 是 local 旋钮。)
@@ -400,10 +400,10 @@ fn stage1_config(
     let mut cfg = Stage1Config::with_models_dir(spec.scout_addr.clone(), model_dir);
     cfg.active = active;
     cfg.running = running;
-    cfg.flush_window = flush_window;
+    cfg.flush_paragraph = flush_paragraph;
     // 客户端请求的 scout 推流 cadence(ms):None = scout 按自身 quantum 速率推。
     cfg.scout_chunk_ms = spec.scout_chunk_ms;
-    // VAD / 分段(默认 = VadSpec::default,与 Stage1Config 内置默认一致)。
+    // VAD / 分句(默认 = VadSpec::default,与 Stage1Config 内置默认一致)。
     let v = &spec.vad;
     cfg.vad.threshold = v.threshold;
     cfg.vad.min_silence_duration = v.min_silence;
@@ -416,7 +416,7 @@ fn stage1_config(
         min_silence_s = v.min_silence,
         merge_gap_s = v.merge_gap,
         edge_margin_s = ((v.edge_margin as f64) * 1000.0).round() / 1000.0, // f32 can't hold 0.3 — round in f64 for a clean display
-        "VAD: min_silence 切段 + merge_gap 合并碎片 + edge_margin 补边界 (解耦)"
+        "VAD: min_silence 切句 + merge_gap 合并碎片 + edge_margin 补边界 (解耦)"
     );
     // 流式引擎(恒本地):zipformer(默认) | x-asr。路径在 recognizer 侧解析,
     // 未知引擎在那里报错(不静默回退)。
@@ -483,7 +483,7 @@ fn stage2_calibrator(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{VadSegment, VadWindow};
+    use crate::{VadSentence, VadParagraph};
     use dp_models::onnx::AsrBackend;
     use dp_models::ProviderKind;
     use std::sync::atomic::Ordering;
@@ -536,13 +536,13 @@ mod tests {
 
     #[test]
     fn stage2_disabled_is_pass_through_without_any_llm() {
-        // llm.backend: disable → PassThrough:校准 = 原文拼接,定稿 = 窗口 best_text,
+        // llm.backend: disable → PassThrough:校准 = 原文拼接,定稿 = 段落 best_text,
         // 不加载任何模型(route_ms ≈ 0,calibrated 字段承载原文,下游形状不变)。
         let mut s = spec(local("sensevoice"));
         s.llm = LlmSpec::Disabled;
         let mut s2 = stage2_calibrator(&s, Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new()))).unwrap();
-        let segs = vec![
-            VadSegment {
+        let sentences = vec![
+            VadSentence {
                 id: 1,
                 audio_id: 1,
                 start_s: 0.0,
@@ -550,7 +550,7 @@ mod tests {
                 streaming_text: "流式一".into(),
                 batch_text: Some("批式一".into()),
             },
-            VadSegment {
+            VadSentence {
                 id: 2,
                 audio_id: 2,
                 start_s: 1.5,
@@ -559,18 +559,18 @@ mod tests {
                 batch_text: None, // batch 失败 → 回退 streaming
             },
         ];
-        assert_eq!(s2.calibrate_window(1, &segs), "批式一流式二");
-        let win = VadWindow {
+        assert_eq!(s2.calibrate_paragraph(1, &sentences), "批式一流式二");
+        let win = VadParagraph {
             id: 1,
-            segments: segs,
+            sentences: sentences,
             start_s: 0.0,
             end_s: 2.5,
             streaming_text: "流式一流式二".into(),
-            batch_text: Some("窗口批式".into()),
+            batch_text: Some("段落批式".into()),
             pcm: std::sync::Arc::new(vec![0i16; 1600]),
             batch_asr_ms: 0,
         };
-        assert_eq!(s2.finalize_window(&win), "窗口批式", "window batch 优先");
+        assert_eq!(s2.finalize_paragraph(&win), "段落批式", "paragraph batch 优先");
     }
 
     #[test]

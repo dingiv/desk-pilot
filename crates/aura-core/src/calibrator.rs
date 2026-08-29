@@ -1,12 +1,12 @@
-//! Stage2Calibrator — 联合整流 (joint calibration): turns a window's [`VadSegment`] texts into
+//! Stage2Calibrator — 联合整流 (joint calibration): turns a paragraph's [`VadSentence`] texts into
 //! polished text (加标点 / 修同音错字 / 英文规范 / 专有名词修正). Wraps an
 //! [`dp_models::LlmProvider`] (local mistral.rs or remote) + the LLM-layer hotword store
 //! (shared with Stage3) + the user-correction ring (shared with POST /api/correct).
 //!
-//! 窗口状态机 (2026-08-17 边界范式,规格修订):内部只维护**当前窗口的最后一次联合整流
-//! 结果**——每个 `Batch` 事件(每段一次)整体覆盖它;`WindowEdge` 到来时**不再调用 LLM**
-//! (最后一个段的 Batch 已把全窗口整流完),直接取存档作为该 VadWindow 的纠偏字段并
-//! 移动左边界(清空状态)。事件在单一 worker 线程上有序到达(Batch×N → WindowEdge),
+//! 段落状态机 (2026-08-17 边界范式,规格修订):内部只维护**当前段落的最后一次联合整流
+//! 结果**——每个 `Batch` 事件(每句一次)整体覆盖它;`ParagraphEdge` 到来时**不再调用 LLM**
+//! (最后一个句的 Batch 已把全段落整流完),直接取存档作为该 VadParagraph 的纠偏字段并
+//! 移动左边界(清空状态)。事件在单一 worker 线程上有序到达(Batch×N → ParagraphEdge),
 //! 状态不可能失步。The old ContextWindow (disabled — 3B 复读) is deleted: cross-sentence
 //! context enters through the joint input itself.
 
@@ -14,48 +14,48 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{VadSegment, VadWindow, WindowId};
+use crate::{VadSentence, VadParagraph, ParagraphId};
 
 use crate::prompt::PromptBuilder;
 
 /// Stage2's correction pass (纠偏/整流), driven by the two Stage1 events:
-/// - `Stage1Event::Batch` → [`calibrate_window`](Self::calibrate_window) — joint calibration
-///   of EVERY segment in the current window (multi-sentence); the result **overwrites** the
-///   window's stored calibration;
-/// - `Stage1Event::WindowEdge` → [`finalize_window`](Self::finalize_window) — move the left
-///   boundary. **No LLM call**: the last Batch already calibrated the whole window; the
-///   stored result simply becomes the VadWindow's calibrated field.
+/// - `Stage1Event::Batch` → [`calibrate_paragraph`](Self::calibrate_paragraph) — joint calibration
+///   of EVERY sentence in the current paragraph (multi-sentence); the result **overwrites** the
+///   paragraph's stored calibration;
+/// - `Stage1Event::ParagraphEdge` → [`finalize_paragraph`](Self::finalize_paragraph) — move the left
+///   boundary. **No LLM call**: the last Batch already calibrated the whole paragraph; the
+///   stored result simply becomes the VadParagraph's calibrated field.
 pub trait Stage2Calibrator: Send {
-    /// Joint calibration (per Batch). Input = ALL segments so far; overwrites the current
-    /// window's stored result.
-    fn calibrate_window(&mut self, window_id: WindowId, segments: &[VadSegment]) -> String;
-    /// Finalize (per WindowEdge): return the window's LAST joint calibration — no LLM run —
-    /// and clear the window state (left boundary moves). Falls back to the window's
+    /// Joint calibration (per Batch). Input = ALL sentences so far; overwrites the current
+    /// paragraph's stored result.
+    fn calibrate_paragraph(&mut self, paragraph_id: ParagraphId, sentences: &[VadSentence]) -> String;
+    /// Finalize (per ParagraphEdge): return the paragraph's LAST joint calibration — no LLM run —
+    /// and clear the paragraph state (left boundary moves). Falls back to the paragraph's
     /// best_text only in the impossible no-Batch case (defensive).
-    fn finalize_window(&mut self, window: &VadWindow) -> String;
+    fn finalize_paragraph(&mut self, paragraph: &VadParagraph) -> String;
 }
 
 /// Stage2 turned off (`llm.backend: disable`): calibration is the identity — no LLM is
-/// loaded, `calibrate_window` concatenates the segments' best texts, `finalize_window`
-/// returns the window's best text. The `calibrated` field downstream (wire, archival)
+/// loaded, `calibrate_paragraph` concatenates the sentences' best texts, `finalize_paragraph`
+/// returns the paragraph's best text. The `calibrated` field downstream (wire, archival)
 /// carries the raw best text unchanged, so consumers see the same shapes with zero LLM
 /// latency/cost. Useful for pure-ASR deployments and for A/B-ing Stage2's contribution.
 pub struct PassThroughCalibrator;
 
 impl Stage2Calibrator for PassThroughCalibrator {
-    fn calibrate_window(&mut self, _window_id: WindowId, segments: &[VadSegment]) -> String {
-        segments.iter().map(|s| s.best_text()).collect::<Vec<_>>().join("")
+    fn calibrate_paragraph(&mut self, _paragraph_id: ParagraphId, sentences: &[VadSentence]) -> String {
+        sentences.iter().map(|s| s.best_text()).collect::<Vec<_>>().join("")
     }
 
-    fn finalize_window(&mut self, window: &VadWindow) -> String {
-        window.best_text().into_owned()
+    fn finalize_paragraph(&mut self, paragraph: &VadParagraph) -> String {
+        paragraph.best_text().into_owned()
     }
 }
 
 /// Stage2 纠偏的输入源（配置 `llm.input`）——选择把哪些识别文本喂给 LLM。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum LlmInput {
-    /// 只用 batch 结果（`VadSegment::best_text()`：batch 优先，流式回退）。默认——batch 是权威。
+    /// 只用 batch 结果（`VadSentence::best_text()`：batch 优先，流式回退）。默认——batch 是权威。
     #[default]
     #[serde(rename = "batch")]
     Batch,
@@ -79,9 +79,9 @@ pub struct Stage2CalibratorImpl {
     corrections: Arc<Mutex<Vec<(String, String)>>>,
     /// 纠偏输入源（`llm.input`）。
     input: LlmInput,
-    /// 窗口状态机的全部状态:当前窗口 id + 其最后一次联合整流结果(每个 Batch 覆盖,
-    /// WindowEdge 消费并清空 = 移动左边界)。
-    current: Option<(WindowId, String)>,
+    /// 段落状态机的全部状态:当前段落 id + 其最后一次联合整流结果(每个 Batch 覆盖,
+    /// ParagraphEdge 消费并清空 = 移动左边界)。
+    current: Option<(ParagraphId, String)>,
 }
 
 impl Stage2CalibratorImpl {
@@ -99,20 +99,20 @@ impl Stage2CalibratorImpl {
 }
 
 impl Stage2Calibrator for Stage2CalibratorImpl {
-    fn calibrate_window(&mut self, window_id: WindowId, segments: &[VadSegment]) -> String {
+    fn calibrate_paragraph(&mut self, paragraph_id: ParagraphId, sentences: &[VadSentence]) -> String {
         let calibrated = match self.input {
             LlmInput::Batch => {
-                // One line per segment — the joint input IS the cross-sentence context.
-                let texts: Vec<&str> = segments.iter().map(|s| s.best_text()).collect();
+                // One line per sentence — the joint input IS the cross-sentence context.
+                let texts: Vec<&str> = sentences.iter().map(|s| s.best_text()).collect();
                 self.joint_calibrate(&texts, None)
             }
             LlmInput::Stream => {
-                let texts: Vec<&str> = segments.iter().map(|s| s.streaming_text.as_str()).collect();
+                let texts: Vec<&str> = sentences.iter().map(|s| s.streaming_text.as_str()).collect();
                 self.joint_calibrate(&texts, None)
             }
             LlmInput::Both => {
-                let texts: Vec<&str> = segments.iter().map(|s| s.best_text()).collect();
-                let streaming = segments
+                let texts: Vec<&str> = sentences.iter().map(|s| s.best_text()).collect();
+                let streaming = sentences
                     .iter()
                     .map(|s| s.streaming_text.as_str())
                     .collect::<Vec<_>>()
@@ -120,21 +120,21 @@ impl Stage2Calibrator for Stage2CalibratorImpl {
                 self.joint_calibrate(&texts, Some(&streaming))
             }
         };
-        // 识别一次之后,覆盖当前窗口的整流结果(WindowEdge 时它就是 VadWindow 的纠偏字段)。
-        self.current = Some((window_id, calibrated.clone()));
+        // 识别一次之后,覆盖当前段落的整流结果(ParagraphEdge 时它就是 VadParagraph 的纠偏字段)。
+        self.current = Some((paragraph_id, calibrated.clone()));
         calibrated
     }
 
-    fn finalize_window(&mut self, window: &VadWindow) -> String {
-        // 移动左边界:取走存档(不匹配/无存档 = 防御路径,理论不可达——窗口必有 Batch)。
+    fn finalize_paragraph(&mut self, paragraph: &VadParagraph) -> String {
+        // 移动左边界:取走存档(不匹配/无存档 = 防御路径,理论不可达——段落必有 Batch)。
         match self.current.take() {
-            Some((id, calibrated)) if id == window.id => calibrated,
+            Some((id, calibrated)) if id == paragraph.id => calibrated,
             _ => {
                 tracing::warn!(
-                    window = window.id,
-                    "WindowEdge 无匹配整流存档——回退窗口 best_text(理论不可达)"
+                    paragraph = paragraph.id,
+                    "ParagraphEdge 无匹配整流存档——回退段落 best_text(理论不可达)"
                 );
-                window.best_text().into_owned()
+                paragraph.best_text().into_owned()
             }
         }
     }
@@ -150,7 +150,7 @@ impl Stage2CalibratorImpl {
 
         let mut pb = PromptBuilder::new_multi(texts).hotwords(&hotwords);
         // Dual-transcript (llm.input: both): streaming head/tail is fuller — the instruction
-        // tells the LLM to补回 real words batch dropped at the segment head.
+        // tells the LLM to补回 real words batch dropped at the sentence head.
         if let Some(sref) = streaming_ref {
             pb = pb.streaming_ref(sref);
         }
@@ -169,10 +169,10 @@ impl Stage2CalibratorImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SegmentId;
+    use crate::SentenceId;
 
     /// Counting LLM stub — the shared handle lets the test READ the call count, proving
-    /// finalize_window makes NO LLM call.
+    /// finalize_paragraph makes NO LLM call.
     struct CountingLlm(Arc<Mutex<usize>>);
     impl dp_models::LlmProvider for CountingLlm {
         fn complete(&self, _system: &str, _user: &str) -> anyhow::Result<String> {
@@ -181,25 +181,25 @@ mod tests {
         }
     }
 
-    fn seg(id: SegmentId) -> VadSegment {
-        VadSegment {
+    fn sentence(id: SentenceId) -> VadSentence {
+        VadSentence {
             id,
             audio_id: id,
             start_s: 0.0,
             end_s: 0.1,
             streaming_text: format!("流式{id}"),
-            batch_text: Some(format!("段{id}")),
+            batch_text: Some(format!("句{id}")),
         }
     }
 
-    fn window(id: WindowId) -> VadWindow {
-        VadWindow {
+    fn paragraph(id: ParagraphId) -> VadParagraph {
+        VadParagraph {
             id,
-            segments: vec![seg(1), seg(2)],
+            sentences: vec![sentence(1), sentence(2)],
             start_s: 0.0,
             end_s: 1.0,
             streaming_text: "拼接".into(),
-            batch_text: Some("窗口批式".into()),
+            batch_text: Some("段落批式".into()),
             pcm: std::sync::Arc::new(Vec::new()),
             batch_asr_ms: 0,
         }
@@ -239,45 +239,45 @@ mod tests {
 
     #[test]
     fn llm_input_selects_source_text() {
-        let segs = vec![seg(1), seg(2)]; // batch "段1/段2", streaming "流式1/流式2"
+        let sentences = vec![sentence(1), sentence(2)]; // batch "句1/句2", streaming "流式1/流式2"
 
         // batch（默认）：只喂 batch 文本，无 streaming 信封。
         let (mut s, user) = s2_with_input(LlmInput::Batch);
-        s.calibrate_window(1, &segs);
+        s.calibrate_paragraph(1, &sentences);
         let u = user.lock().unwrap().clone().unwrap();
-        assert!(u.contains("段1") && u.contains("段2"), "batch 文本进 prompt: {u}");
+        assert!(u.contains("句1") && u.contains("句2"), "batch 文本进 prompt: {u}");
         assert!(!u.contains("流式1"), "batch 模式不喂流式");
         assert!(!u.contains("secondary_transcript"), "无双通道信封");
 
         // stream：只喂流式文本。
         let (mut s, user) = s2_with_input(LlmInput::Stream);
-        s.calibrate_window(1, &segs);
+        s.calibrate_paragraph(1, &sentences);
         let u = user.lock().unwrap().clone().unwrap();
         assert!(u.contains("流式1") && u.contains("流式2"), "流式文本进 prompt: {u}");
-        assert!(!u.contains("段1"), "stream 模式不喂 batch");
+        assert!(!u.contains("句1"), "stream 模式不喂 batch");
 
         // both：batch 进 primary_transcript + 流式进 secondary_transcript。
         let (mut s, user) = s2_with_input(LlmInput::Both);
-        s.calibrate_window(1, &segs);
+        s.calibrate_paragraph(1, &sentences);
         let u = user.lock().unwrap().clone().unwrap();
-        assert!(u.contains("段1") && u.contains("段2"), "both 模式 batch 进 primary_transcript");
+        assert!(u.contains("句1") && u.contains("句2"), "both 模式 batch 进 primary_transcript");
         assert!(u.contains("流式1") && u.contains("流式2"), "both 模式流式进 secondary_transcript");
         assert!(u.contains("secondary_transcript"), "双通道信封存在");
     }
 
     #[test]
-    fn window_state_machine_overwrites_and_finalizes_without_llm() {
+    fn paragraph_state_machine_overwrites_and_finalizes_without_llm() {
         let (mut s, calls) = s2();
-        // 两个 Batch(同窗口):每次联合整流跑一次 LLM,结果覆盖窗口存档。
-        assert_eq!(s.calibrate_window(7, &[seg(1)]), "整流OK");
+        // 两个 Batch(同段落):每次联合整流跑一次 LLM,结果覆盖段落存档。
+        assert_eq!(s.calibrate_paragraph(7, &[sentence(1)]), "整流OK");
         assert_eq!(*calls.lock().unwrap(), 1);
-        assert_eq!(s.calibrate_window(7, &[seg(1), seg(2)]), "整流OK");
+        assert_eq!(s.calibrate_paragraph(7, &[sentence(1), sentence(2)]), "整流OK");
         assert_eq!(*calls.lock().unwrap(), 2, "每个 Batch 一次 LLM");
-        // WindowEdge:不跑 LLM,直接返回存档(= 最后一次联合整流)。
-        assert_eq!(s.finalize_window(&window(7)), "整流OK", "final = 最后一次 Batch 的整流结果");
+        // ParagraphEdge:不跑 LLM,直接返回存档(= 最后一次联合整流)。
+        assert_eq!(s.finalize_paragraph(&paragraph(7)), "整流OK", "final = 最后一次 Batch 的整流结果");
         assert_eq!(*calls.lock().unwrap(), 2, "finalize 零 LLM 调用");
         // finalize 后状态清空(左边界已移):再 finalize 走防御回退 best_text,依然零 LLM。
-        assert_eq!(s.finalize_window(&window(9)), "窗口批式", "无存档回退窗口 best_text");
+        assert_eq!(s.finalize_paragraph(&paragraph(9)), "段落批式", "无存档回退段落 best_text");
         assert_eq!(*calls.lock().unwrap(), 2);
     }
 

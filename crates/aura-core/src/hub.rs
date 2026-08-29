@@ -21,24 +21,24 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-/// One finalized window's full Stage1+Stage2 result (what lands in the day log + `/results`).
+/// One finalized paragraph's full Stage1+Stage2 result (what lands in the day log + `/results`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnRecord {
-    /// The settled [`crate::VadWindow`]'s id (the archival unit is a WINDOW now).
-    pub window_id: u64,
+    /// The settled [`crate::VadParagraph`]'s id (the archival unit is a WINDOW now).
+    pub paragraph_id: u64,
     /// Wall-clock ms since unix epoch (absolute — day files must be self-contained).
     pub unix_ms: i64,
     /// Seconds since the pipeline started (matches the live log's `at_s`).
     pub at_s: f64,
     pub duration_ms: f32,
-    /// Window-level batch text (authoritative; the concat re-run).
+    /// Paragraph-level batch text (authoritative; the concat re-run).
     pub raw_text: String,
-    /// Concat of the segments' streaming finals (hotword-biased).
+    /// Concat of the sentences' streaming finals (hotword-biased).
     pub streaming_text: String,
     /// Stage2 calibrated text.
     pub calibrated: String,
     pub route_ms: f64,
-    /// The window's WAV path in the audio archive.
+    /// The paragraph's WAV path in the audio archive.
     pub wav: String,
 }
 
@@ -55,7 +55,7 @@ impl TurnLog {
         TurnLog { dir: dir.into(), retention_days: 7 }
     }
 
-    /// Set the retention window (days) — the daemon's config value, kept in
+    /// Set the retention paragraph (days) — the daemon's config value, kept in
     /// sync with the audio archive's.
     pub fn with_retention(mut self, days: u32) -> Self {
         if days > 0 {
@@ -81,7 +81,7 @@ impl TurnLog {
         writeln!(f, "{line}")
     }
 
-    /// Delete day files older than the retention window (ISO date names compare
+    /// Delete day files older than the retention paragraph (ISO date names compare
     /// lexicographically = chronologically).
     pub fn cleanup_expired(&self) -> usize {
         let cutoff = (Local::now() - chrono::Duration::days(self.retention_days as i64))
@@ -115,10 +115,10 @@ pub struct Storage {
     recent_cap: usize,
 }
 
-/// What `record_final` needs from a finalized window (everything but the wav path, which the
+/// What `record_final` needs from a finalized paragraph (everything but the wav path, which the
 /// audio archive assigns).
 pub struct FinalTurn {
-    pub window_id: u64,
+    pub paragraph_id: u64,
     pub at_s: f64,
     pub duration_ms: f32,
     pub raw_text: String,
@@ -130,7 +130,7 @@ pub struct FinalTurn {
 
 impl Storage {
     /// `audio`: the (already configured) audio archive. `turns_dir`: day-file
-    /// directory. `retention_days` is the shared retention window for both the
+    /// directory. `retention_days` is the shared retention paragraph for both the
     /// audio archive and the turn log.
     pub fn new(audio: Arc<AudioArchive>, turns_dir: impl Into<PathBuf>, retention_days: u32) -> Self {
         Storage {
@@ -142,7 +142,7 @@ impl Storage {
     }
 
     /// Startup wiring: rebuild the disk index (restart must not "lose" prior
-    /// recordings) and drop everything older than the retention window.
+    /// recordings) and drop everything older than the retention paragraph.
     /// Returns the number of day dirs/files removed.
     pub fn init(&self) -> usize {
         self.audio.scan_disk();
@@ -157,12 +157,12 @@ impl Storage {
         removed_audio + removed_turns
     }
 
-    /// Record one finalized window everywhere it belongs: PCM → audio archive,
+    /// Record one finalized paragraph everywhere it belongs: PCM → audio archive,
     /// transcript+calibration → day log + the recent ring. Returns the built record.
     pub fn record_final(&self, t: FinalTurn) -> TurnRecord {
-        let wav = self.audio.push(t.window_id, t.at_s, t.pcm);
+        let wav = self.audio.push(t.paragraph_id, t.at_s, t.pcm);
         let rec = TurnRecord {
-            window_id: t.window_id,
+            paragraph_id: t.paragraph_id,
             unix_ms: Local::now().timestamp_millis(),
             at_s: t.at_s,
             duration_ms: t.duration_ms,
@@ -174,7 +174,7 @@ impl Storage {
         };
         if let Err(e) = self.turns.append(&rec) {
             // Day-log failure must not break the live loop — the ring still serves /results.
-            warn!(error = %e, window_id = rec.window_id, "turn log append failed");
+            warn!(error = %e, paragraph_id = rec.paragraph_id, "turn log append failed");
         }
         let mut ring = self.recent.lock().unwrap();
         if ring.len() >= self.recent_cap {
@@ -215,16 +215,16 @@ mod tests {
         Storage::new(audio, root.join("turns"), 7)
     }
 
-    fn turn(window_id: u64) -> FinalTurn {
+    fn turn(paragraph_id: u64) -> FinalTurn {
         FinalTurn {
-            window_id,
-            at_s: window_id as f64,
+            paragraph_id,
+            at_s: paragraph_id as f64,
             duration_ms: 100.0,
-            raw_text: format!("原文{window_id}"),
-            streaming_text: format!("流式{window_id}"),
-            calibrated: format!("整流{window_id}"),
+            raw_text: format!("原文{paragraph_id}"),
+            streaming_text: format!("流式{paragraph_id}"),
+            calibrated: format!("整流{paragraph_id}"),
             route_ms: 42.0,
-            pcm: vec![window_id as i16; 1600],
+            pcm: vec![paragraph_id as i16; 1600],
         }
     }
 
@@ -241,7 +241,7 @@ mod tests {
         let log = std::fs::read_to_string(root.join("turns").join(format!("{day}.jsonl")))
             .expect("day log written");
         let parsed: TurnRecord = serde_json::from_str(log.lines().next().unwrap()).unwrap();
-        assert_eq!(parsed.window_id, 1);
+        assert_eq!(parsed.paragraph_id, 1);
         assert_eq!(parsed.calibrated, "整流1");
         assert_eq!(parsed.wav, rec.wav, "transcript links to the audio file");
         // 3) recent ring.
@@ -255,12 +255,12 @@ mod tests {
         let log = TurnLog::new(root.join("turns"));
         let mut rec = mk_rec(1);
         log.append_to_day("2026-07-17", &rec).unwrap();
-        rec.window_id = 2;
+        rec.paragraph_id = 2;
         log.append_to_day("2026-07-17", &rec).unwrap();
         let s = std::fs::read_to_string(root.join("turns/2026-07-17.jsonl")).unwrap();
         let seqs: Vec<u64> = s
             .lines()
-            .map(|l| serde_json::from_str::<TurnRecord>(l).unwrap().window_id)
+            .map(|l| serde_json::from_str::<TurnRecord>(l).unwrap().paragraph_id)
             .collect();
         assert_eq!(seqs, vec![1, 2]);
         // A different day → a different file (date-named rollover).
@@ -301,14 +301,14 @@ mod tests {
         for i in 1..=5 {
             s.record_final(turn(i));
         }
-        let ids: Vec<u64> = s.recent().iter().map(|r| r.window_id).collect();
+        let ids: Vec<u64> = s.recent().iter().map(|r| r.paragraph_id).collect();
         assert_eq!(ids, vec![3, 4, 5], "oldest evicted, newest last");
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    fn mk_rec(window_id: u64) -> TurnRecord {
+    fn mk_rec(paragraph_id: u64) -> TurnRecord {
         TurnRecord {
-            window_id,
+            paragraph_id,
             unix_ms: 0,
             at_s: 0.0,
             duration_ms: 0.0,

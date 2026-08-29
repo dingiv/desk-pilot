@@ -1,6 +1,6 @@
 //! vad — the OLD pure-logic VAD pieces (livekit-port era), kept for tests/examples and as a
 //! zero-dependency fallback: an energy VAD with hysteresis (ported from livekit-agents Silero
-//! params), a VAD-gated segmenter (the `StreamAdapter` pattern: accumulate frames between
+//! params), a VAD-gated sentence_splitter (the `StreamAdapter` pattern: accumulate frames between
 //! speech start/end, then batch-recognize), `SpeechEvent`, and the endpointing config.
 //! The PRODUCTION VAD is Silero via `dp_models::onnx` (feature `asr`, see `executor`).
 //!
@@ -133,7 +133,7 @@ impl EnergyVad {
     }
 }
 
-/// Placeholder until a real ASR is wired — returns empty text so the audio→VAD→segment→chunk
+/// Placeholder until a real ASR is wired — returns empty text so the audio→VAD→sentence→chunk
 /// plumbing is verifiable offline.
 pub struct StubAsr;
 impl Asr for StubAsr {
@@ -142,18 +142,18 @@ impl Asr for StubAsr {
     }
 }
 
-/// VAD-gated segmenter (livekit `StreamAdapterWrapper`): frames in → SpeechEvents out. On EndOfSpeech
+/// VAD-gated sentence_splitter (livekit `StreamAdapterWrapper`): frames in → SpeechEvents out. On EndOfSpeech
 /// it batch-recognizes the accumulated utterance and emits a Final event.
-pub struct VadSegmenter<A: Asr> {
+pub struct VadSentenceSplitter<A: Asr> {
     vad: EnergyVad,
     asr: A,
     sample_rate: u32,
 }
 
-impl<A: Asr> VadSegmenter<A> {
+impl<A: Asr> VadSentenceSplitter<A> {
     pub fn new(cfg: VadConfig, asr: A) -> Self {
         let sample_rate = cfg.sample_rate;
-        VadSegmenter { vad: EnergyVad::new(cfg), asr, sample_rate }
+        VadSentenceSplitter { vad: EnergyVad::new(cfg), asr, sample_rate }
     }
 
     pub fn push_frame(&mut self, frame: &[i16]) -> Vec<SpeechEvent> {
@@ -201,23 +201,23 @@ mod tests {
     }
 
     #[test]
-    fn segments_one_burst() {
+    fn sentences_one_burst() {
         let sr = 16000u32;
         let frame = (sr / 50) as usize; // 20ms = 320 samples
-        let mut seg = VadSegmenter::new(VadConfig::default(), StubAsr);
+        let mut sentence = VadSentenceSplitter::new(VadConfig::default(), StubAsr);
 
         let mut kinds: Vec<SpeechEventKind> = Vec::new();
         // 0.4s silence
         for _ in 0..20 {
-            for e in seg.push_frame(&silence(frame)) { kinds.push(e.kind); }
+            for e in sentence.push_frame(&silence(frame)) { kinds.push(e.kind); }
         }
         // 0.6s tone (30 frames, amp 6000 → RMS ~4200 >> threshold)
         for i in 0..30 {
-            for e in seg.push_frame(&tone(i, frame, sr, 6000.0)) { kinds.push(e.kind); }
+            for e in sentence.push_frame(&tone(i, frame, sr, 6000.0)) { kinds.push(e.kind); }
         }
         // 0.8s silence (40 frames > min_silence 550ms) → triggers EndOfSpeech → Final
         for _ in 0..40 {
-            for e in seg.push_frame(&silence(frame)) { kinds.push(e.kind); }
+            for e in sentence.push_frame(&silence(frame)) { kinds.push(e.kind); }
         }
 
         assert!(kinds.contains(&SpeechEventKind::StartOfSpeech), "expected StartOfSpeech, got {kinds:?}");
@@ -228,10 +228,10 @@ mod tests {
     fn pure_silence_no_events() {
         let sr = 16000u32;
         let frame = (sr / 50) as usize;
-        let mut seg = VadSegmenter::new(VadConfig::default(), StubAsr);
+        let mut sentence = VadSentenceSplitter::new(VadConfig::default(), StubAsr);
         let mut count = 0;
         for _ in 0..100 {
-            count += seg.push_frame(&silence(frame)).len();
+            count += sentence.push_frame(&silence(frame)).len();
         }
         assert_eq!(count, 0);
     }

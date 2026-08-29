@@ -8,7 +8,7 @@
 //! ## voice server(懒惰的)
 //!
 //! `#asr` 每次预测经 [`VoiceCmd::Attach`] 把 ctx 推给 voice server —— 它此刻才
-//! 一次性 `health()` 探针 + 建 SSE 连接;连接后每收到一个 `AsrSegment`,就"顺带"
+//! 一次性 `health()` 探针 + 建 SSE 连接;连接后每收到一个 `AsrEvent`,就"顺带"
 //! 检查 ctx 是否可用(`refresh_ui` 返回 bool),可用就顺带刷新 UI。失败一次即
 //! **放弃**:`active_ctx` 置 -1、丢 SSE 源、不再重连 —— 之后只继续等 `rx`。
 //! aura 断联由 `AuraClient` 内部重连兜底,我们不在乎。
@@ -19,7 +19,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use audio_aura_agent::client::AuraClient;
-use audio_aura_agent::view::AsrSegment;
+use audio_aura_agent::view::AsrEvent;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use tokio::select;
@@ -60,7 +60,7 @@ pub enum VoiceCmd {
     Detach { ctx: usize },
     /// 主动归档(分字符键 `'` = "我说完了"):让 aura 立即关闭当前开放窗口并
     /// 整窗 batch,跳过 merge_gap 剩余等待。未连接时 no-op。
-    FlushWindow,
+    FlushParagraph,
 }
 
 /// 向 voice server 发命令的 typed sender(包装 io thread 的 `tx`)。
@@ -90,8 +90,8 @@ pub struct IoThread {
     aux_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
-/// aura SSE 数据流(owned —— 由 `subscribe_segments_owned` 产生,可自由移动)。
-type Sse = Pin<Box<dyn futures::Stream<Item = AsrSegment>>>;
+/// aura SSE 数据流(owned —— 由 `subscribe_events_owned` 产生,可自由移动)。
+type Sse = Pin<Box<dyn futures::Stream<Item = AsrEvent>>>;
 
 /// 语音连接空闲超时默认值:退出 `#asr` 后,若长时间没有新的 ASR 使用(Attach),
 /// voice server 主动断开 aura,释放连接。可在 `swift-ime.yaml → voice.idle_time`
@@ -100,7 +100,7 @@ pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
 
 /// 对 SSE 流的一次 poll:拿到一个段,并**把流原样还回**,让循环决定续传还是放弃。
 /// 所有权进出,future 无借用,可放进 `FuturesUnordered`。
-async fn poll_seg(mut s: Sse) -> Option<(AsrSegment, Sse)> {
+async fn poll_event(mut s: Sse) -> Option<(AsrEvent, Sse)> {
     let seg = s.next().await?;
     Some((seg, s))
 }
@@ -176,7 +176,7 @@ async fn voice_server_main(
     state: Arc<SharedVoiceState>,
     idle_timeout_secs: u64,
 ) {
-    let mut sources: FuturesUnordered<Pin<Box<dyn Future<Output = Option<(AsrSegment, Sse)>>>>> =
+    let mut sources: FuturesUnordered<Pin<Box<dyn Future<Output = Option<(AsrEvent, Sse)>>>>> =
         FuturesUnordered::new();
     // 开关变量:当前有活 #asr 会话的 ctx;-1 = 无。
     let mut active_ctx: i64 = -1;
@@ -255,8 +255,8 @@ async fn voice_server_main(
                                         st.set_conn(v);
                                         notify_conn(&fe, -1); // 广播:有 #asr 的 ctx 刷新
                                     });
-                                    sources.push(Box::pin(poll_seg(Box::pin(
-                                        client.subscribe_segments_owned_with_conn(Some(on_conn)),
+                                    sources.push(Box::pin(poll_event(Box::pin(
+                                        client.subscribe_events_owned_with_conn(Some(on_conn)),
                                     ))));
                                     connected = true;
                                 }
@@ -278,20 +278,20 @@ async fn voice_server_main(
                             active_ctx = -1;
                         }
                     }
-                    Some(IoEvent::Voice(VoiceCmd::FlushWindow)) => {
+                    Some(IoEvent::Voice(VoiceCmd::FlushParagraph)) => {
                         // 主动归档:仅在持有 aura 流时发(未连 = 没有进行中的语音,
                         // no-op)。fire-and-forget —— 归档结果经 SSE 数据面回流。
                         if connected && !state.is_mock() {
                             last_activity = tokio::time::Instant::now();
                             match AuraClient::new(&base) {
                                 Ok(client) => {
-                                    if let Err(e) = client.flush_window().await {
-                                        tracing::warn!(error = %e, "flush_window failed");
+                                    if let Err(e) = client.flush_paragraph().await {
+                                        tracing::warn!(error = %e, "flush_paragraph failed");
                                     } else {
-                                        tracing::info!("flush_window → aura(主动归档)");
+                                        tracing::info!("flush_paragraph → aura(主动归档)");
                                     }
                                 }
-                                Err(e) => tracing::warn!(error = %e, "flush_window: client"),
+                                Err(e) => tracing::warn!(error = %e, "flush_paragraph: client"),
                             }
                         }
                     }
@@ -322,15 +322,15 @@ async fn voice_server_main(
                 }
             }
             // 臂 2:动态数据源 —— aura SSE 段。空源时禁用(零轮询)。
-            seg = sources.next(), if !sources.is_empty() => {
-                match seg {
-                    Some(Some((seg, s))) => {
-                        state.fold_segment(&seg);
-                        // 收到段 = 已连上(即使 Attach 时 health 误判为断,段也证活)。
+            ev = sources.next(), if !sources.is_empty() => {
+                match ev {
+                    Some(Some((ev, s))) => {
+                        state.fold_event(&ev);
+                        // 收到句事件 = 已连上(即使 Attach 时 health 误判为断,段也证活)。
                         state.set_conn(crate::voice_state::VoiceConn::Connected);
                         // 后台语音也算活动 —— 空闲超时只在"无 #asr 且无语音"时断开。
                         last_activity = tokio::time::Instant::now();
-                        tracing::info!(?seg, "voice segment folded");
+                        tracing::info!(?ev, "voice event folded");
                         // 有活跃 #asr 会话 → 顺带刷新 UI;无会话(后台监听)→
                         // 只折叠不刷新。
                         if active_ctx >= 0 {
@@ -338,7 +338,7 @@ async fn voice_server_main(
                         }
                         // **始终续传源**:后台监听也要保持连接、持续折叠数据 ——
                         // 不因"无会话/刷新失败"丢源(否则后台识别只收 1~3 字就断)。
-                        sources.push(Box::pin(poll_seg(s)));
+                        sources.push(Box::pin(poll_event(s)));
                     }
                     Some(None) => {
                         // SSE 流结束 → 丢源,不再 select。流断 = 语音服务暂不可用。

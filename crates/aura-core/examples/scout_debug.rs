@@ -1,9 +1,9 @@
 //! scout_debug — dedicated diagnostic for the omni-scout `/audio` connection.
 //!
-//! Connects to scout, streams windows, and reports:
-//!   - total windows received + bytes received
+//! Connects to scout, streams paragraphs, and reports:
+//!   - total paragraphs received + bytes received
 //!   - effective data rate (KB/s) vs expected (32 KB/s @ 16k mono s16le)
-//!   - window arrival cadence (windows/s vs expected ~31/s @ 512 samples)
+//!   - paragraph arrival cadence (paragraphs/s vs expected ~31/s @ 512 samples)
 //!   - ring fill ratio (if consuming)
 //!
 //! Run: cargo run -p audio-aura-core --example scout_debug -- 127.0.0.1:7879
@@ -19,17 +19,17 @@ fn main() {
         .nth(1)
         .or_else(|| std::env::var("SCOUT_ADDR").ok())
         .unwrap_or_else(|| "127.0.0.1:7878".to_string());
-    let window = 512usize;
+    let paragraph = 512usize;
 
-    println!("● scout_debug — connecting to {addr}/audio (window={window})");
-    println!("  expected rate: ~31 windows/s, ~32 KB/s (16k mono s16le)\n");
+    println!("● scout_debug — connecting to {addr}/audio (paragraph={paragraph})");
+    println!("  expected rate: ~31 paragraphs/s, ~32 KB/s (16k mono s16le)\n");
 
     let count = Arc::new(AtomicU64::new(0));
     let bytes = Arc::new(AtomicU64::new(0));
 
     let count_t = Arc::clone(&count);
     let bytes_t = Arc::clone(&bytes);
-    let src = ScoutAudioSource::new(addr.clone(), window);
+    let src = ScoutAudioSource::new(addr.clone(), paragraph);
     std::thread::spawn(move || {
         src.stream(
             move |win| {

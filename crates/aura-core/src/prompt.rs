@@ -44,7 +44,7 @@ const CONTEXT_INSTRUCTION: &str = "\
 如果提供了「最近对话」，其中每条是 (原文→校准) 对照，体现该用户 ASR 的常见错误模式（如同音字、\n\
 误读习惯）。据此纠当前句的同音字、理解意图。不要复读上文，每次只输出当前句的整理结果。";
 
-/// 双通道对照说明（仅当传了 streaming_ref 时拼接）—— 段头合并：批式(权威)偶发裁掉段头
+/// 双通道对照说明（仅当传了 streaming_ref 时拼接）—— 句头合并：批式(权威)偶发裁掉句头
 /// （VAD 起点回看余量不足），流式全程连续接收音频、头尾更全但同音字更多。
 const DUAL_TRANSCRIPT_INSTRUCTION: &str = r"
 # 双通道对照
@@ -76,7 +76,7 @@ pub struct PromptBuilder {
     raw_text: String,
     hotwords: Vec<String>,
     context: Option<String>,
-    /// 流式转写参照（可选）——用于补批式裁掉的段头/段尾，见 [`DUAL_TRANSCRIPT_INSTRUCTION`]。
+    /// 流式转写参照（可选）——用于补批式裁掉的句头/句尾，见 [`DUAL_TRANSCRIPT_INSTRUCTION`]。
     streaming_ref: Option<String>,
     /// `None` = 用 [`DEFAULT_FEW_SHOT`]；`Some(vec)` = 用给定示例（空 vec = 关闭 few-shot）。
     few_shot: Option<Vec<(String, String)>>,
@@ -89,9 +89,9 @@ pub struct PromptBuilder {
 }
 
 impl PromptBuilder {
-    /// 多段联合纠偏输入（边界范式）：一个窗口的多个 [`VadSegment`] 文本，每段一行
-    /// （行 = 段边界；多行让小模型知道这是同一人连续说的几段话，联合纠偏）。
-    /// 单段时等价于 [`PromptBuilder::new`]。空行被过滤。
+    /// 多句联合纠偏输入（边界范式）：一个段落的多个 [`VadSentence`] 文本，每句一行
+    /// （行 = 句边界；多行让小模型知道这是同一人连续说的几句话，联合纠偏）。
+    /// 单句时等价于 [`PromptBuilder::new`]。空行被过滤。
     pub fn new_multi(texts: &[&str]) -> Self {
         let joined = texts
             .iter()
@@ -259,14 +259,14 @@ mod tests {
     }
 
     #[test]
-    fn multi_segment_input_one_line_per_segment() {
-        // 边界范式: new_multi 每段一行,全部包进同一个 <primary_transcript> 信封。
-        let (sys, usr) = PromptBuilder::new_multi(&["第一段说 Rust", "", "第二段说 Bevy"]).build();
-        assert!(usr.contains("<primary_transcript>\n第一段说 Rust\n第二段说 Bevy\n</primary_transcript>"));
+    fn multi_sentence_input_one_line_per_sentence() {
+        // 边界范式: new_multi 每句一行,全部包进同一个 <primary_transcript> 信封。
+        let (sys, usr) = PromptBuilder::new_multi(&["第一句说 Rust", "", "第二段说 Bevy"]).build();
+        assert!(usr.contains("<primary_transcript>\n第一句说 Rust\n第二段说 Bevy\n</primary_transcript>"));
         assert!(sys.contains("多句联合"), "joint-calibration rule present");
-        // 单段时与 new 等价(无额外空行)。
-        let (_, single) = PromptBuilder::new_multi(&["只有一段"]).build();
-        assert!(single.contains("只有一段"));
+        // 单句时与 new 等价(无额外空行)。
+        let (_, single) = PromptBuilder::new_multi(&["只有一句"]).build();
+        assert!(single.contains("只有一句"));
     }
 
     #[test]

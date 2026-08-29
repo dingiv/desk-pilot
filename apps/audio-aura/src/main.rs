@@ -1,16 +1,16 @@
 //! aura-daemon — the audio-aura binary entry point: config 解析 + tracing + 客户端 socket。
-//! 流水线拼装(Stage1Config 组装/ASR·LLM 选型/模型加载/识别日志/窗口归档)全部在
+//! 流水线拼装(Stage1Config 组装/ASR·LLM 选型/模型加载/识别日志/段落归档)全部在
 //! aura-core 的 [`Pipeline::assemble`] —— 这里只产出 [`PipelineSpec`]、按下开关、搭服务。
 //! Socket 面:
 //! - `GET /api/state` — the complete [`AuraStateView`] snapshot (one source of truth).
 //! - `GET /api/stream?state_changed_frequency=<ms>` — SSE: `hello`, then `state_changed` pings
 //!   (throttled ≥250ms) whenever `version` advances. The client re-GETs /api/state on a ping.
-//! - `POST /api/control/scout` (toggle), `POST /api/correct` (user correction), `GET /api/audio/:window_id`.
+//! - `POST /api/control/scout` (toggle), `POST /api/correct` (user correction), `GET /api/audio/:paragraph_id`.
 //!
 //! Threading: the pipeline runs on a dedicated **std thread** ([`Pipeline::spawn`]) with Stage2
 //! on its own internal `aura-stage2` worker (so partials never freeze behind a 1-2s LLM route);
 //! the axum socket runs on a multi-thread tokio runtime on the main thread. The `on_turn`
-//! callback pushes recognition [`AsrSegment`]s onto a broadcast channel
+//! callback pushes recognition [`AsrEvent`]s onto a broadcast channel
 //! (the **data plane**, `/api/asr_stream`); settings changes (scout toggle / correction / Stage3
 //! hotword) bump a global `version: AtomicU64` (the **control plane** — `/api/stream` pings
 //! `state_changed`, clients re-GET `/api/state`). Recognition events do NOT bump `version`.
@@ -59,7 +59,7 @@ const SEED_HOTWORDS: &[&str] = &[
     "README", "贪吃蛇", "蛇身", "计分器",
 ];
 
-/// VAD / segmentation overrides from `aura.yaml`'s `asr.vad:` section (VAD 属 Stage1 语音
+/// VAD / sentence-segmentation overrides from `aura.yaml`'s `asr.vad:` section (VAD 属 Stage1 语音
 /// 前端,故挂 asr 下). All optional — an unset field falls back to the built-in default
 /// (= `VadSpec::default`,与 Stage1Config 内置默认一致,core 有防漂移单测).
 #[derive(Debug, Default, Deserialize, PartialEq)]
@@ -68,22 +68,22 @@ struct VadConf {
     /// Silero speech-probability threshold (default 0.5). Higher = less sensitive (fewer false
     /// triggers, may clip soft onsets); lower = more sensitive (may catch breath as speech).
     threshold: Option<f32>,
-    /// Seconds of trailing silence to end a segment / fire EOS (default 1.0). Pauses shorter
+    /// Seconds of trailing silence to end a sentence / fire EOS (default 1.0). Pauses shorter
     /// than this never split.
     min_silence: Option<f32>,
-    /// Segments shorter than this are discarded by Silero's state machine (default 0.3).
+    /// Sentences shorter than this are discarded by Silero's state machine (default 0.3).
     min_speech: Option<f32>,
     /// Force-split backstop for very long utterances, seconds (default 28.0).
     max_speech: Option<f32>,
-    /// ★Merge-window gap, seconds (default 5.0) — the UPPER bound of the medium-interval
-    /// window. Segments whose inter-speech silence < this join the SAME VadWindow (窗口级
-    /// batch 重跑,权威文本); ≥ this settles the window → WindowEdge 定稿. Lower bound is
-    /// implicit: `min_silence` is what splits segments in the first place, so the effective
-    /// window is (min_silence, merge_gap) ≈ 1–2.5s. "什么算一句话"的旋钮。0 = 每段独立成窗。
+    /// ★Merge-paragraph gap, seconds (default 5.0) — the UPPER bound of the medium-interval
+    /// paragraph. Sentences whose inter-speech silence < this join the SAME VadParagraph (段落级
+    /// batch 重跑,权威文本); ≥ this settles the paragraph → ParagraphEdge 定稿. Lower bound is
+    /// implicit: `min_silence` is what splits sentences in the first place, so the effective
+    /// paragraph is (min_silence, merge_gap) ≈ 1–2.5s. "什么算一句话"的旋钮。0 = 每句独立成段。
     merge_gap: Option<f64>,
-    /// ★Segment edge-extension, seconds (default 0.3; 0 = off). Silero cuts the soft onset
+    /// ★Sentence edge-extension, seconds (default 0.3; 0 = off). Silero cuts the soft onset
     /// (before its probability crosses `threshold`) and the fading coda (after it drops
-    /// below) from every segment — the extension re-pads both edges from the recall buffer,
+    /// below) from every sentence — the extension re-pads both edges from the recall buffer,
     /// so the batch ASR hears the real speech. Fixes "missing first/last character" on
     /// merged utterances.
     edge_margin: Option<f32>,
@@ -367,7 +367,7 @@ fn resolve(cli: Cli, conf: AuraConf) -> Settings {
 // UtteranceView) live in `audio_aura_agent::view` — the consumer-facing crate — shared with the
 // `audio_aura_agent::client` SDK so server and Rust clients can't drift. The daemon constructs
 // them; this module just imports.
-use audio_aura_agent::{AsrSegment, AuraStateView, ConfigView, CorrectionView, VadView};
+use audio_aura_agent::{AsrEvent, AuraStateView, ConfigView, CorrectionView, VadView};
 
 /// Shared daemon state surfaced over the socket.
 #[derive(Clone)]
@@ -377,7 +377,7 @@ struct DaemonState {
     /// Scout-connection toggle (shared with the Stage1 recognizer's ingest + run loop).
     active: Arc<AtomicBool>,
     /// 主动归档信号(IME 分字符)—— Stage1 消费循环消费;socket 端只置位。
-    flush_window: Arc<AtomicBool>,
+    flush_paragraph: Arc<AtomicBool>,
     /// idle 深度睡眠信号: false → Stage1 退出 + 断开 scout; 恢复时置回 true。
     running: Arc<AtomicBool>,
     /// 当前是否处于 idle 深度睡眠。
@@ -392,9 +392,9 @@ struct DaemonState {
     /// NOT bump — they're pushed via `asr_events` (the data plane). The SSE handler ticks at the
     /// client's rate and pings only when this advances.
     version: Arc<AtomicU64>,
-    /// Data-plane broadcast: recognition segments pushed directly to `GET /api/asr_stream`
+    /// Data-plane broadcast: recognition sentences pushed directly to `GET /api/asr_stream`
     /// subscribers (low-latency, every event — unlike the throttled control-plane ping).
-    asr_events: broadcast::Sender<AsrSegment>,
+    asr_events: broadcast::Sender<AsrEvent>,
     config: ConfigView,
     stage3_on: bool,
     /// The Storage supervisor: audio archive (hot replay + date-named WAV flush) +
@@ -512,14 +512,14 @@ fn main() -> Result<()> {
     // idle 深度睡眠信号: false → Stage1 消费循环退出 + 断开 scout; 恢复时置回 true。
     let running = Arc::new(AtomicBool::new(true));
     // 主动归档信号(IME 分字符 `'` = "我说完了"):socket 置 true → Stage1 消费循环
-    // 跳过 merge_gap 剩余等待,立即整窗 batch。识别域动作,不 bump version ——
+    // 跳过 merge_gap 剩余等待,立即整段 batch。识别域动作,不 bump version ——
     // 结果经数据面 /api/asr_stream 推送。
-    let flush_window = Arc::new(AtomicBool::new(false));
+    let flush_paragraph = Arc::new(AtomicBool::new(false));
     // idle 恢复唤醒: daemon 在下一个客户端连接时置 running=true + notify pipeline 线程。
     let resume_cv: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
     let version = Arc::new(AtomicU64::new(0));
-    // Data-plane channel: recognition segments pushed to /api/asr_stream subscribers.
-    let (asr_events, _) = broadcast::channel::<AsrSegment>(1024);
+    // Data-plane channel: recognition sentences pushed to /api/asr_stream subscribers.
+    let (asr_events, _) = broadcast::channel::<AsrEvent>(1024);
     let config = ConfigView {
         asr_backend: match &spec.asr {
             AsrSpec::Local { backend, .. } => backend.clone(),
@@ -581,58 +581,58 @@ fn main() -> Result<()> {
     }
     let _flusher = storage.audio.spawn_flusher();
 
-    // ── 全栈拼装在 core(Stage1Config 组装/ASR·LLM 选型/模型加载/预热/识别日志/窗口归档)──
+    // ── 全栈拼装在 core(Stage1Config 组装/ASR·LLM 选型/模型加载/预热/识别日志/段落归档)──
     // TODO: 这里是核心的模型推理触发点——assemble 加载模型,spawn 启动推理循环。
     let pipeline = Pipeline::assemble(
         &spec,
         Arc::clone(&active),
         Arc::clone(&running),
-        Arc::clone(&flush_window),
+        Arc::clone(&flush_paragraph),
         Arc::clone(&hotwords),
         Arc::clone(&corrections),
-        Some(Arc::clone(&storage)), // WindowCalibration 时自动 record_final(archive+day log+ring)
+        Some(Arc::clone(&storage)), // ParagraphCalibration 时自动 record_final(archive+day log+ring)
     )?;
 
-    // ── Pipeline on its core-owned thread ── recognition segments → DATA plane; Stage3 on
-    //    window finals. No event bus: the SSE handler pings off `version`.
+    // ── Pipeline on its core-owned thread ── recognition sentences → DATA plane; Stage3 on
+    //    paragraph finals. No event bus: the SSE handler pings off `version`.
     {
         let tool = tool.clone();
         let version = Arc::clone(&version);
         let asr_events = asr_events.clone();
         pipeline.spawn(Arc::clone(&running), Arc::clone(&resume_cv), move |ev| {
-            // Recognition events → DATA plane only (broadcast the segment). The control
+            // Recognition events → DATA plane only (broadcast the sentence). The control
             // plane (version/snapshot) is NOT bumped here — only settings changes bump it.
-            // (识别日志与窗口归档在 core 的 run() 内部——这里只做线协议映射。)
-            let segment = match ev {
-                TurnEvent::StreamFragment { window_id, segment_id, text, at_s } => {
-                    Some(AsrSegment::StreamFragment {
-                        window_id,
-                        segment_id,
+            // (识别日志与段落归档在 core 的 run() 内部——这里只做线协议映射。)
+            let sentence = match ev {
+                TurnEvent::StreamFragment { paragraph_id, sentence_id, text, at_s } => {
+                    Some(AsrEvent::StreamFragment {
+                        paragraph_id,
+                        sentence_id,
                         text: text.to_string(),
                         at_s,
                     })
                 }
-                TurnEvent::BatchSegment { window_id, segment_id, text } => {
-                    Some(AsrSegment::BatchSegment { window_id, segment_id, text })
+                TurnEvent::BatchSentence { paragraph_id, sentence_id, text } => {
+                    Some(AsrEvent::BatchSentence { paragraph_id, sentence_id, text })
                 }
-                TurnEvent::BatchWindow { window_id, text } => {
-                    Some(AsrSegment::BatchWindow { window_id, text })
+                TurnEvent::BatchParagraph { paragraph_id, text } => {
+                    Some(AsrEvent::BatchParagraph { paragraph_id, text })
                 }
-                TurnEvent::SegmentCalibration { window_id, calibrated, .. } => {
-                    Some(AsrSegment::SegmentCalibration { window_id, calibrated })
+                TurnEvent::SentenceCalibration { paragraph_id, calibrated, .. } => {
+                    Some(AsrEvent::SentenceCalibration { paragraph_id, calibrated })
                 }
-                TurnEvent::WindowCalibration { window_id, calibrated, route_ms } => {
+                TurnEvent::ParagraphCalibration { paragraph_id, calibrated, route_ms } => {
                     // Stage3 may add hotwords — that's a SETTINGS change → control plane.
                     if stage3_on && stage3_rule_trigger(&tool, &calibrated) {
                         version.fetch_add(1, Ordering::Release);
                     }
                     let _ = route_ms;
-                    Some(AsrSegment::WindowCalibration { window_id, calibrated })
+                    Some(AsrEvent::ParagraphCalibration { paragraph_id, calibrated })
                 }
             };
-            // Data plane: push the recognition segment directly to /api/asr_stream
+            // Data plane: push the recognition sentence directly to /api/asr_stream
             // subscribers (low-latency). Err only when there are no receivers (fine).
-            if let Some(seg) = segment {
+            if let Some(seg) = sentence {
                 let _ = asr_events.send(seg);
             }
         })?;
@@ -644,7 +644,7 @@ fn main() -> Result<()> {
         corrections: Arc::clone(&corrections),
         active: Arc::clone(&active),
         running: Arc::clone(&running),
-        flush_window: Arc::clone(&flush_window),
+        flush_paragraph: Arc::clone(&flush_paragraph),
         idle: Arc::new(AtomicBool::new(false)),
         subscribers: Arc::new(AtomicUsize::new(0)),
         resume_cv: Arc::clone(&resume_cv),
@@ -703,12 +703,12 @@ async fn serve_socket(state: DaemonState, bind_addr: String, port: u16, web_dist
         // ── the snapshot-sync contract ──
         .route("/api/state", get(state_handler))           // full AuraStateView snapshot
         .route("/api/stream", get(stream_asr))             // control plane: hello → state_changed* (throttled)
-        .route("/api/asr_stream", get(asr_stream))         // data plane: hello → recognition segments* (pushed)
+        .route("/api/asr_stream", get(asr_stream))         // data plane: hello → recognition sentences* (pushed)
         // ── actions (each mutates state → bumps version → next SSE tick pings) ──
         .route("/api/control/scout", post(control_scout))
         .route("/api/correct", post(correction_handler))
         // 主动归档(IME 分字符 `'` = "我说完了"):识别域动作,不 bump version ——
-        // 归档产生的窗口事件走数据面 /api/asr_stream 推送。
+        // 归档产生的段落事件走数据面 /api/asr_stream 推送。
         .route("/api/control/flush", post(flush_handler))
         // ── binary / queries ──
         .route("/api/audio/{seq}", get(audio_handler))
@@ -752,11 +752,11 @@ async fn control_scout(State(s): State<DaemonState>, body: Json<Value>) -> Json<
     Json(json!({ "connected": next }))
 }
 
-/// `POST /api/control/flush` — 主动归档当前开放窗口(IME 分字符 `'` 触发)。
-/// 置位即返:Stage1 消费循环(≤50ms 唤醒)负责消费标记并立即整窗 batch。
-/// 说话中(EOS 未到)挂起重试;无窗口时标记被消费(空按)。
+/// `POST /api/control/flush` — 主动归档当前开放段落(IME 分字符 `'` 触发)。
+/// 置位即返:Stage1 消费循环(≤50ms 唤醒)负责消费标记并立即整段 batch。
+/// 说话中(EOS 未到)挂起重试;无段落时标记被消费(空按)。
 async fn flush_handler(State(s): State<DaemonState>) -> Json<Value> {
-    s.flush_window.store(true, Ordering::Release);
+    s.flush_paragraph.store(true, Ordering::Release);
     Json(json!({ "flush": true }))
 }
 
@@ -804,9 +804,9 @@ async fn stream_asr(
     Sse::new(Guarded { inner: hello.chain(pings), _guard: guard }).keep_alive(KeepAlive::default())
 }
 
-/// `GET /api/asr_stream` — the DATA plane: pushes each recognition segment directly to the
+/// `GET /api/asr_stream` — the DATA plane: pushes each recognition sentence directly to the
 /// subscriber (low-latency, every event — not throttled, unlike the control-plane `/api/stream`).
-/// One `data: <AsrSegment json>\n\n` frame per recognition event (StreamFragment / BatchSegment
+/// One `data: <AsrEvent json>\n\n` frame per recognition event (StreamFragment / BatchSegment
 /// / BatchWindow / SegmentCalibration / WindowCalibration). Late/lagged subscribers get a
 /// `lagged` comment (broadcast backlog overflowed) and keep going.
 async fn asr_stream(State(s): State<DaemonState>) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
@@ -825,13 +825,13 @@ async fn asr_stream(State(s): State<DaemonState>) -> Sse<impl tokio_stream::Stre
     Sse::new(Guarded { inner: hello.chain(live), _guard: guard }).keep_alive(KeepAlive::default())
 }
 
-/// `GET /api/audio/:window_id` — serve the settled window's WAV for playback. The archive
+/// `GET /api/audio/:paragraph_id` — serve the settled paragraph's WAV for playback. The archive
 /// resolves transparently: hot tier first, then the flushed file on disk.
 async fn audio_handler(
     State(s): State<DaemonState>,
-    Path(window_id): Path<u64>,
+    Path(paragraph_id): Path<u64>,
 ) -> impl IntoResponse {
-    match s.storage.audio.wav(window_id) {
+    match s.storage.audio.wav(paragraph_id) {
         Some(wav) => {
             ([(axum::http::header::CONTENT_TYPE, "audio/wav")], wav).into_response()
         }
@@ -845,7 +845,7 @@ async fn recordings_handler(State(s): State<DaemonState>) -> Json<Value> {
 }
 
 /// `GET /api/results` — 最近定稿的识别文本(最旧 → 最新)。数据面(`/api/asr_stream`)
-/// 是 append-only broadcast,重连后的新订阅者**不会收到历史段**;本接口补足全量
+/// 是 append-only broadcast,重连后的新订阅者**不会收到历史句**;本接口补足全量
 /// 历史,供客户端重连后同步本地状态。
 async fn results_handler(State(s): State<DaemonState>) -> Json<Value> {
     let recs = s.storage.recent();
@@ -853,7 +853,7 @@ async fn results_handler(State(s): State<DaemonState>) -> Json<Value> {
         .iter()
         .map(|r| {
             json!({
-                "window_id": r.window_id,
+                "paragraph_id": r.paragraph_id,
                 "unix_ms": r.unix_ms,
                 "raw_text": r.raw_text,
                 "streaming_text": r.streaming_text,
@@ -864,13 +864,13 @@ async fn results_handler(State(s): State<DaemonState>) -> Json<Value> {
     Json(json!({ "results": texts }))
 }
 
-/// `POST /api/correct {window_id, raw, corrected}` — record a user correction for a settled
-/// window: push to the Stage2 correction store, flag the timeline entry `corrected_by_user`,
+/// `POST /api/correct {paragraph_id, raw, corrected}` — record a user correction for a settled
+/// paragraph: push to the Stage2 correction store, flag the timeline entry `corrected_by_user`,
 /// and bump `version` so clients re-fetch and see the badge.
 async fn correction_handler(State(s): State<DaemonState>, body: Json<Value>) -> Json<Value> {
     let raw = body.get("raw").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let corrected = body.get("corrected").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let window_id = body.get("window_id").and_then(|v| v.as_u64()).unwrap_or(0);
+    let paragraph_id = body.get("paragraph_id").and_then(|v| v.as_u64()).unwrap_or(0);
     if raw.is_empty() || corrected.is_empty() {
         return Json(json!({ "ok": false, "error": "raw and corrected required" }));
     }
@@ -882,8 +882,8 @@ async fn correction_handler(State(s): State<DaemonState>, body: Json<Value>) -> 
         } // evict oldest
         c.push((raw.clone(), corrected.clone()));
     }
-    // Data plane: tell subscribers to mark the window corrected (the live list is client-side).
-    let _ = s.asr_events.send(AsrSegment::Correction { window_id, raw, corrected });
+    // Data plane: tell subscribers to mark the paragraph corrected (the live list is client-side).
+    let _ = s.asr_events.send(AsrEvent::Correction { paragraph_id, raw, corrected });
     // Control plane: the corrections list changed → re-fetch snapshot.
     s.bump();
     info!("user correction added → Stage2");

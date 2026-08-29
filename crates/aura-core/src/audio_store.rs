@@ -1,11 +1,11 @@
 //! audio_store — the dedicated PCM data manager (R2 的"录音真实数据由专门 store 模块管理").
-//! Owns every clip by [`AudioId`]; pipeline entities ([`crate::VadSegment`]/[`crate::VadWindow`])
+//! Owns every clip by [`AudioId`]; pipeline entities ([`crate::VadSentence`]/[`crate::VadParagraph`])
 //! hold ids and never clone PCM around.
 //!
-//! Lifecycle: pre-settle hot store. The executor inserts each finalized segment's PCM at EOS;
-//! at window settle it `concat`s the window's clips (once — the resulting `Arc<Vec<i16>>` lives
-//! on the [`crate::VadWindow`]) and `evict`s the per-segment clips. Memory is bounded by
-//! `cap_samples` (oldest-first eviction), so a stuck window can never grow the process without
+//! Lifecycle: pre-settle hot store. The executor inserts each finalized sentence's PCM at EOS;
+//! at paragraph settle it `concat`s the paragraph's clips (once — the resulting `Arc<Vec<i16>>` lives
+//! on the [`crate::VadParagraph`]) and `evict`s the per-sentence clips. Memory is bounded by
+//! `cap_samples` (oldest-first eviction), so a stuck paragraph can never grow the process without
 //! limit. This is deliberately NOT the persistent archive (`aura_core::AudioArchive` handles
 //! post-settle WAV flush + retention) — nothing here ever touches disk.
 
@@ -39,7 +39,7 @@ impl AudioStore {
 
     /// Store a clip, return its id. Evicts oldest-first while over `cap_samples` — eviction
     /// targets the OLDEST id still held, which in the live pipeline is always a settled
-    /// window's leftover (normally already evicted explicitly), so this is a safety valve.
+    /// paragraph's leftover (normally already evicted explicitly), so this is a safety valve.
     pub fn insert(&self, pcm: Vec<i16>) -> AudioId {
         let mut g = self.inner.lock().unwrap();
         let id = g.next_id;
@@ -54,8 +54,8 @@ impl AudioStore {
         id
     }
 
-    /// Concatenate the clips for `ids` (window settle). Missing ids (already evicted)
-    /// contribute nothing — callers treat the result as the window PCM regardless.
+    /// Concatenate the clips for `ids` (paragraph settle). Missing ids (already evicted)
+    /// contribute nothing — callers treat the result as the paragraph PCM regardless.
     pub fn concat(&self, ids: &[AudioId]) -> Vec<i16> {
         let g = self.inner.lock().unwrap();
         let mut out = Vec::with_capacity(g.total.min(self.cap_samples));
@@ -67,7 +67,7 @@ impl AudioStore {
         out
     }
 
-    /// Drop the clips for `ids` (after settle — the window's `Arc<Vec<i16>>` is now the only
+    /// Drop the clips for `ids` (after settle — the paragraph's `Arc<Vec<i16>>` is now the only
     /// remaining copy). Unknown ids are ignored.
     pub fn evict(&self, ids: &[AudioId]) {
         let mut g = self.inner.lock().unwrap();

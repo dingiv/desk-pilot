@@ -1,6 +1,6 @@
 //! scout — omni-scout `/audio` client. Streams chunked 16 kHz mono S16LE PCM from a omni-scout
 //! daemon (real mic or `--mock-audio`), re-frames the variable-length chunks into fixed-size i16
-//! windows for downstream VAD, and auto-reconnects on drop.
+//! paragraphs for downstream VAD, and auto-reconnects on drop.
 //!
 //! Wire format (from omni-scout `server.rs`): `GET /audio` → `200 OK`,
 //! `Transfer-Encoding: chunked`, then `{hex-size}\r\n{pcm bytes}\r\n` chunks until `0\r\n\r\n`.
@@ -8,7 +8,7 @@
 //! Implementation: a single raw `read()` loop into an 8 KB buffer. Chunk boundaries are scanned
 //! manually (find `\r\n`, parse hex size, read that many bytes). No per-byte loops: PCM i16 pairs
 //! are batched via `chunks_exact`. This avoids BufReader/read_line overhead and the O(n) drain that
-//! starved the old implementation (only ~1 window/s instead of ~500/s).
+//! starved the old implementation (only ~1 paragraph/s instead of ~500/s).
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -19,11 +19,11 @@ use tracing::{info, warn};
 
 const READ_BUF: usize = 8 * 1024;
 
-/// A fixed-size i16 window pulled from omni-scout `/audio`. Pure sync IO in a dedicated thread —
+/// A fixed-size i16 paragraph pulled from omni-scout `/audio`. Pure sync IO in a dedicated thread —
 /// fine for a single audio stream; wrap in async later if multiple sources are needed.
 pub struct ScoutAudioSource {
     addr: String,
-    window: usize,
+    paragraph: usize,
     /// When false, the stream loop does NOT connect to scout (the existing connection, if any,
     /// ends naturally; no reconnect until set true again). This is the "toggle aura's OWN
     /// connection behavior" switch — it does NOT kill the scout process. Shared with the daemon's
@@ -32,19 +32,19 @@ pub struct ScoutAudioSource {
     /// Client-requested push cadence (ms): asks scout to aggregate source buffers into ~N-ms
     /// HTTP chunks (`/audio?chunk_ms=N`; scout clamps up to its capture quantum). `None` =
     /// one chunk per scout buffer. Fewer, larger network reads upstream — the consume loop
-    /// re-frames into 32ms windows regardless.
+    /// re-frames into 32ms paragraphs regardless.
     chunk_ms: Option<u64>,
 }
 
 impl ScoutAudioSource {
-    pub fn new(addr: impl Into<String>, window: usize) -> Self {
-        Self::with_active(addr, window, Arc::new(AtomicBool::new(true)))
+    pub fn new(addr: impl Into<String>, paragraph: usize) -> Self {
+        Self::with_active(addr, paragraph, Arc::new(AtomicBool::new(true)))
     }
 
     /// Like [`new`](Self::new) but with a shared `active` flag the caller can flip at runtime to
     /// pause/resume the scout connection (takes effect at the reconnect boundary).
-    pub fn with_active(addr: impl Into<String>, window: usize, active: Arc<AtomicBool>) -> Self {
-        ScoutAudioSource { addr: addr.into(), window, active, chunk_ms: None }
+    pub fn with_active(addr: impl Into<String>, paragraph: usize, active: Arc<AtomicBool>) -> Self {
+        ScoutAudioSource { addr: addr.into(), paragraph, active, chunk_ms: None }
     }
 
     /// Request a per-connection push cadence from scout (ms per HTTP chunk).
@@ -53,10 +53,10 @@ impl ScoutAudioSource {
         self
     }
 
-    /// Connect to `/audio` and call `on_window` for each fixed-size i16 window. Blocks the calling
+    /// Connect to `/audio` and call `on_paragraph` for each fixed-size i16 paragraph. Blocks the calling
     /// thread. Reconnects after `reconnect_delay` on any stream error. While `active == false`, it
     /// does NOT connect (and logs the pause/resume transitions).
-    pub fn stream<F: FnMut(&[i16])>(&self, mut on_window: F, reconnect_delay: Duration) -> ! {
+    pub fn stream<F: FnMut(&[i16])>(&self, mut on_paragraph: F, reconnect_delay: Duration) -> ! {
         info!(addr = %self.addr, "scout ingest started, connecting to /audio");
         let mut was_active = self.active.load(Ordering::Relaxed);
         loop {
@@ -73,14 +73,14 @@ impl ScoutAudioSource {
                 info!(addr = %self.addr, "scout ingest resumed — reconnecting");
                 was_active = true;
             }
-            if let Err(e) = self.stream_once(&mut on_window) {
+            if let Err(e) = self.stream_once(&mut on_paragraph) {
                 warn!(error = %e, retry_in = ?reconnect_delay, "scout stream ended; reconnecting");
             }
             std::thread::sleep(reconnect_delay);
         }
     }
 
-    fn stream_once<F: FnMut(&[i16])>(&self, on_window: &mut F) -> anyhow::Result<()> {
+    fn stream_once<F: FnMut(&[i16])>(&self, on_paragraph: &mut F) -> anyhow::Result<()> {
         let mut sock = TcpStream::connect(&self.addr)?;
         sock.set_nodelay(true)?; // minimise latency on small chunks
         // Optional client-requested push cadence: scout aggregates source buffers into ~N-ms
@@ -120,7 +120,7 @@ impl ScoutAudioSource {
         let mut state = State::SizeLine;
 
         // i16 reframe accumulator
-        let mut win: Vec<i16> = Vec::with_capacity(self.window);
+        let mut win: Vec<i16> = Vec::with_capacity(self.paragraph);
         let mut odd_byte: Option<u8> = None; // carry a lone byte across reads (odd PCM length)
 
         loop {
@@ -153,14 +153,14 @@ impl ScoutAudioSource {
                         body.extend_from_slice(&tmp[..n]);
                         continue;
                     }
-                    // We have the full payload: convert PCM bytes → i16 windows inline.
+                    // We have the full payload: convert PCM bytes → i16 paragraphs inline.
                     let payload = &body[..remaining];
                     let mut start = 0;
                     if let Some(b) = odd_byte.take() {
                         if !payload.is_empty() {
                             win.push(i16::from_le_bytes([b, payload[0]]));
-                            if win.len() == self.window {
-                                on_window(&win);
+                            if win.len() == self.paragraph {
+                                on_paragraph(&win);
                                 win.clear();
                             }
                             start = 1;
@@ -171,8 +171,8 @@ impl ScoutAudioSource {
                     let rest = &payload[start..];
                     for chunk in rest.chunks_exact(2) {
                         win.push(i16::from_le_bytes([chunk[0], chunk[1]]));
-                        if win.len() == self.window {
-                            on_window(&win);
+                        if win.len() == self.paragraph {
+                            on_paragraph(&win);
                             win.clear();
                         }
                     }
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn constructs() {
         let s = ScoutAudioSource::new("127.0.0.1:7878", 512);
-        assert_eq!(s.window, 512);
+        assert_eq!(s.paragraph, 512);
         assert_eq!(s.addr, "127.0.0.1:7878");
     }
 }

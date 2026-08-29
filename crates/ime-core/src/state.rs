@@ -1017,7 +1017,7 @@ impl StateMachine {
         // merge_gap 等待);无语音会话时 voice_cmd_tx 为 None,零开销跳过。
         if ch == '\'' {
             if let Some(tx) = env.voice_cmd_tx() {
-                tx.send(crate::io_thread::VoiceCmd::FlushWindow);
+                tx.send(crate::io_thread::VoiceCmd::FlushParagraph);
             }
         }
         self.buffer.push(ch);
@@ -1038,7 +1038,7 @@ impl StateMachine {
             // (整窗 batch,跳过 merge_gap 等待);无语音会话 → tx 为 None,跳过。
             '\'' => {
                 if let Some(tx) = env.voice_cmd_tx() {
-                    tx.send(crate::io_thread::VoiceCmd::FlushWindow);
+                    tx.send(crate::io_thread::VoiceCmd::FlushParagraph);
                 }
                 self.buffer.push('\'');
                 self.raw_buffer.push('\'');

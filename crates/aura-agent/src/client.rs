@@ -3,9 +3,9 @@
 //! - **Control plane** ([`subscribe`]): snapshot-sync. The daemon is the source of truth; this
 //!   fetches the full [`AuraStateView`] and re-fetches on each throttled `state_changed` ping.
 //!   Right for low-frequency state (connection, config, hotwords, corrections).
-//! - **Data plane** ([`subscribe_segments`]): live recognition segments pushed directly
-//!   (low-latency, every event). Each [`AsrSegment`] is one of the five recognition events
-//!   (StreamFragment / BatchSegment / BatchWindow / SegmentCalibration / WindowCalibration) —
+//! - **Data plane** ([`subscribe_events`]): live recognition segments pushed directly
+//!   (low-latency, every event). Each [`AsrEvent`] is one of the five recognition events
+//!   (StreamFragment / BatchSentence / BatchParagraph / SentenceCalibration / ParagraphCalibration) —
 //!   render the live text off this, without the ping→fetch round-trip.
 //!
 //! Both streams are resilient + infinite (they reconnect on drop). This crate is dependency-light
@@ -16,7 +16,7 @@
 //! use futures::StreamExt;
 //! # #[tokio::main] async fn main() -> anyhow::Result<()> {
 //! let client = AuraClient::new("http://127.0.0.1:9091")?;
-//! let segs = client.subscribe_segments();
+//! let segs = client.subscribe_events();
 //! tokio::pin!(segs);
 //! while let Some(seg) = segs.next().await {
 //!     println!("{seg:?}");
@@ -29,12 +29,12 @@ use std::time::Duration;
 use anyhow::Result;
 use futures::{Stream, StreamExt};
 
-use crate::view::{AsrSegment, AuraStateView};
+use crate::view::{AsrEvent, AuraStateView};
 
 /// SSE 重连的指数退避基准(1s → 2s → 4s → …,封顶 [`RECONNECT_MAX_DELAY`])。
 const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(1);
 /// 连续连接失败的上限:超过即**放弃**,流结束(返回 `None`)—— 上层(voice
-/// server)据此丢源、不再 select;下次 `#asr` 重新 `subscribe_segments_owned()`
+/// server)据此丢源、不再 select;下次 `#asr` 重新 `subscribe_events_owned()`
 /// 即"手动重连"(计数清零,重新走一遍退避)。
 const RECONNECT_MAX_ATTEMPTS: u32 = 10;
 /// 单次退避 sleep 的上限。
@@ -105,10 +105,10 @@ impl AuraClient {
         Ok(v.get("connected").and_then(|x| x.as_bool()).unwrap_or(enabled))
     }
 
-    /// `POST /api/control/flush` — 主动归档:让 aura 立即关闭当前开放窗口并整窗
+    /// `POST /api/control/flush` — 主动归档:让 aura 立即关闭当前开放段落并整段
     /// batch(IME 分字符 `'` = "我说完了"信号)。置位即返,不等识别结果 —— 结果
     /// 走既有 SSE 数据面(/api/asr_stream)推送。
-    pub async fn flush_window(&self) -> Result<()> {
+    pub async fn flush_paragraph(&self) -> Result<()> {
         self.http
             .post(format!("{}/api/control/flush", self.base))
             .json(&serde_json::json!({}))
@@ -119,22 +119,22 @@ impl AuraClient {
     }
 
     /// `POST /api/correct {window_id, raw, corrected}` — record a user correction for a
-    /// window (feeds Stage2).
-    pub async fn correct(&self, window_id: u64, raw: &str, corrected: &str) -> Result<()> {
+    /// paragraph (feeds Stage2; wire key `window_id` frozen).
+    pub async fn correct(&self, paragraph_id: u64, raw: &str, corrected: &str) -> Result<()> {
         self.http
             .post(format!("{}/api/correct", self.base))
-            .json(&serde_json::json!({ "window_id": window_id, "raw": raw, "corrected": corrected }))
+            .json(&serde_json::json!({ "window_id": paragraph_id, "raw": raw, "corrected": corrected }))
             .send()
             .await?
             .error_for_status()?;
         Ok(())
     }
 
-    /// `GET /api/audio/{window_id}` — the settled window's WAV bytes (for playback).
-    pub async fn audio(&self, window_id: u64) -> Result<Vec<u8>> {
+    /// `GET /api/audio/{window_id}` — the settled paragraph's WAV bytes (for playback).
+    pub async fn audio(&self, paragraph_id: u64) -> Result<Vec<u8>> {
         Ok(self
             .http
-            .get(format!("{}/api/audio/{}", self.base, window_id))
+            .get(format!("{}/api/audio/{}", self.base, paragraph_id))
             .send()
             .await?
             .error_for_status()?
@@ -143,7 +143,7 @@ impl AuraClient {
             .to_vec())
     }
 
-    /// `GET /api/recordings` — window ids of all known clips (hot + flushed), ascending.
+    /// `GET /api/recordings` — paragraph ids of all known clips (hot + flushed), ascending.
     pub async fn recordings(&self) -> Result<Vec<u64>> {
         let v: serde_json::Value = self
             .http
@@ -161,7 +161,7 @@ impl AuraClient {
 
     /// `GET /api/results` — 最近定稿的识别文本(最旧 → 最新),重连后全量同步用。
     /// 数据面 `/api/asr_stream` 是 append-only broadcast,新订阅者收不到历史段;
-    /// 此接口补足。返回 `(window_id, calibrated)` 对(可空校准文本)。
+    /// 此接口补足。返回 `(paragraph_id, calibrated)` 对(可空校准文本)。
     pub async fn results(&self) -> Result<Vec<(u64, String)>> {
         let v: serde_json::Value = self
             .http
@@ -190,7 +190,7 @@ impl AuraClient {
     }
 
     /// Raw `data:` payloads from an SSE endpoint, with reconnect. Shared by [`subscribe`] and
-    /// [`subscribe_segments`]. Yields one owned String per `data:` line (a frame may carry ≥1).
+    /// [`subscribe_events`]. Yields one owned String per `data:` line (a frame may carry ≥1).
     ///
     /// `on_conn`(可选):每次连接状态变化时调用(Connecting / Connected / Failed),
     /// 让上层**及时**感知"连不上"—— 即使流内部还在退避重试,UI 也该立刻切不可用。
@@ -277,43 +277,43 @@ impl AuraClient {
     }
 
     /// **Data plane** — live recognition segments pushed directly. Opens `GET /api/asr_stream` and
-    /// yields each [`AsrSegment`] (StreamFragment / BatchSegment / BatchWindow /
-    /// SegmentCalibration / WindowCalibration) as it happens — low-latency, every event, no
+    /// yields each [`AsrEvent`] (StreamFragment / BatchSentence / BatchParagraph /
+    /// SentenceCalibration / ParagraphCalibration) as it happens — low-latency, every event, no
     /// ping→fetch round-trip. Resilient + infinite (reconnects on drop). Render the live
     /// streaming text off this.
-    pub fn subscribe_segments(&self) -> impl Stream<Item = AsrSegment> + '_ {
+    pub fn subscribe_events(&self) -> impl Stream<Item = AsrEvent> + '_ {
         let url = format!("{}/api/asr_stream", self.base);
         async_stream::stream! {
             let data = self.sse_data(url, None);
             tokio::pin!(data);
             while let Some(payload) = data.next().await {
-                if let Ok(seg) = serde_json::from_str::<AsrSegment>(&payload) {
+                if let Ok(seg) = serde_json::from_str::<AsrEvent>(&payload) {
                     yield seg;
                 }
             }
         }
     }
 
-    /// Same as [`subscribe_segments`], but consumes `self` so the returned stream **owns** its
+    /// Same as [`subscribe_events`], but consumes `self` so the returned stream **owns** its
     /// client and is `'static` — usable across scopes, e.g. moved into a `FuturesUnordered` in
     /// the IoThread's voice server. Reconnect / resilient behavior is unchanged.
-    pub fn subscribe_segments_owned(self) -> impl Stream<Item = AsrSegment> + 'static {
-        self.subscribe_segments_owned_with_conn(None)
+    pub fn subscribe_events_owned(self) -> impl Stream<Item = AsrEvent> + 'static {
+        self.subscribe_events_owned_with_conn(None)
     }
 
     /// Owned data-plane stream + 连接状态回调(`on_conn` 每次 Connecting /
     /// Connected / Failed 时调用)—— voice server 用它把「连不上」及时汇报到
     /// UI,不必等退避重连到上限、流彻底结束。
-    pub fn subscribe_segments_owned_with_conn(
+    pub fn subscribe_events_owned_with_conn(
         self,
         on_conn: Option<Box<dyn Fn(SseConnState) + Send + Sync>>,
-    ) -> impl Stream<Item = AsrSegment> + 'static {
+    ) -> impl Stream<Item = AsrEvent> + 'static {
         let url = format!("{}/api/asr_stream", self.base);
         async_stream::stream! {
             let data = self.sse_data(url, on_conn);
             tokio::pin!(data);
             while let Some(payload) = data.next().await {
-                if let Ok(seg) = serde_json::from_str::<AsrSegment>(&payload) {
+                if let Ok(seg) = serde_json::from_str::<AsrEvent>(&payload) {
                     yield seg;
                 }
             }

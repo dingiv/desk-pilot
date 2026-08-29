@@ -1,6 +1,6 @@
 //! VoiceMember — `#asr`: voice prediction provider.
 //!
-//! 纯读路径:voice server 在引擎 I/O 线程上后台拉 SSE,折叠 AsrSegment 到
+//! 纯读路径:voice server 在引擎 I/O 线程上后台拉 SSE,折叠 AsrEvent 到
 //! [`SharedVoiceState`](crate::voice_state::SharedVoiceState)。本成员只读这个
 //! shared state 来产生候选 —— 不再有任何轮询 / 异步状态。
 //!

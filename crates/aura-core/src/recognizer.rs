@@ -1,22 +1,22 @@
 //! Stage1Recognizer — encapsulates the Stage1 "noodle": the audio ring + omni-scout ingest
-//! thread + Silero VAD + per-segment streaming sessions + per-segment batch passes + the
-//! window tracker. Owns ALL the loop state. It runs the consume loop internally and emits
+//! thread + Silero VAD + per-sentence streaming sessions + per-sentence batch passes + the
+//! paragraph tracker. Owns ALL the loop state. It runs the consume loop internally and emits
 //! [`Stage1Event`]s — it does NOT touch files or run Stage2 (that's `pipeline`'s job,
 //! `audio_aura_core::Pipeline`).
 //!
 //! Boundary paradigm (docs/aura/stages.md): the VAD gap (`min_silence`) closes a
-//! [`VadSegment`] (its own streaming session per D1 + one batch pass, packed as a `Batch`
-//! event); the merge window (`merge_gap`) closes a [`VadWindow`] (concatenated PCM re-run
-//! through the batch model, packed as a `WindowEdge` event). PCM lives in the
-//! [`AudioStore`] by id — events carry ids + texts only, plus the window's shared
+//! [`VadSentence`] (its own streaming session per D1 + one batch pass, packed as a `Batch`
+//! event); the merge paragraph (`merge_gap`) closes a [`VadParagraph`] (concatenated PCM re-run
+//! through the batch model, packed as a `ParagraphEdge` event). PCM lives in the
+//! [`AudioStore`] by id — events carry ids + texts only, plus the paragraph's shared
 //! `Arc<Vec<i16>>` assembled once at settle.
 //!
 //! ```ignore
 //! let exec = OnnxStage1Recognizer::new(Stage1Config::new(scout_addr))?;
 //! exec.run(&mut |ev| match ev {
-//!     Stage1Event::StreamFragment { window_id, segment_id, text, .. } => println!("…{text}"),
-//!     Stage1Event::Batch { window_id, segments } => stage2.calibrate_window(window_id, &segments),
-//!     Stage1Event::WindowEdge { window } => stage2.calibrate_final(&window),
+//!     Stage1Event::StreamFragment { paragraph_id, sentence_id, text, .. } => println!("…{text}"),
+//!     Stage1Event::Batch { paragraph_id, sentences } => stage2.calibrate_paragraph(paragraph_id, &sentences),
+//!     Stage1Event::ParagraphEdge { paragraph } => stage2.calibrate_final(&paragraph),
 //! });
 //! ```
 
@@ -32,7 +32,7 @@ use tracing::{debug, info, warn};
 use crate::audio_store::{AudioStore, DEFAULT_CAP_SAMPLES};
 use crate::buffer::AudioRing;
 use crate::scout::ScoutAudioSource;
-use crate::{AudioId, SegmentId, Stage1Event, VadEventKind, VadSegment, VadWindow, WindowId};
+use crate::{AudioId, SentenceId, Stage1Event, VadEventKind, VadSentence, VadParagraph, ParagraphId};
 // ONNX 语音栈在 dp-models(feature `speech`)——audio-aura 不再直接依赖 sherpa-onnx。
 use dp_models::onnx::{
     AsrBackend, AsrConfig, OnnxRuntimeManager, StreamingAsrConfig, StreamingSession, VadConfig,
@@ -42,13 +42,13 @@ use dp_models::{http::HttpAsr, AsrProvider, ProviderKind};
 
 /// Default ring capacity: 10 min @ 16 kHz mono (~19 MB).
 const DEFAULT_RING_CAP: usize = 16_000 * 600;
-/// Streaming-partial decode cadence: every N windows (~0.5s @ 32ms Silero windows).
+/// Streaming-partial decode cadence: every N paragraphs (~0.5s @ 32ms Silero paragraphs).
 const PARTIAL_EVERY_FRAMES: u32 = 15;
 /// Stale-session watchdog: reset the streaming session when its partial has been UNCHANGED
 /// this long AND no EOS came — that means VAD never latched (audio below `threshold` =
 /// discard-by-design), and its residue (hallucinated repetitions included) must NOT leak
-/// into whatever segment closes next (2026-08-17 实测:35s 悬置会话把上一段幻觉文本卷进
-/// 下一句). Real speech never trips this: a ≥min_silence pause closes the segment via EOS,
+/// into whatever sentence closes next (2026-08-17 实测:35s 悬置会话把上一句幻觉文本卷进
+/// 下一句). Real speech never trips this: a ≥min_silence pause closes the sentence via EOS,
 /// which resets the session long before the partial could go stale.
 const STALE_SESSION_RESET: Duration = Duration::from_secs(8);
 
@@ -89,13 +89,13 @@ pub struct Stage1Config {
     /// Batch ASR backend: `Local` (lib sherpa OnnxAsr) or `Remote` (HTTP, OpenAI-compatible).
     /// Streaming ASR + VAD stay local sherpa regardless (real-time partials need low latency).
     pub asr_kind: ProviderKind,
-    /// ★Merge-window gap (seconds) — the UPPER bound of the medium-interval window. VAD fires
-    /// EOS on every pause ≥ `min_silence` (kept low, ~1.0s, so each segment's batch pass kicks
-    /// in fast); a following segment joins the SAME window when the inter-speech silence <
-    /// this. Only a gap ≥ this (or no new speech for this long) closes the window →
-    /// `WindowEdge`. The lower bound is implicit: `min_silence` is what splits segments in the
-    /// first place, so the effective window is (min_silence, merge_gap) ≈ 1–2.5s. Decouples
-    /// "VAD sensitivity" from "what's one utterance". 0 → every segment is its own window.
+    /// ★Merge-paragraph gap (seconds) — the UPPER bound of the medium-interval paragraph. VAD fires
+    /// EOS on every pause ≥ `min_silence` (kept low, ~1.0s, so each sentence's batch pass kicks
+    /// in fast); a following sentence joins the SAME paragraph when the inter-speech silence <
+    /// this. Only a gap ≥ this (or no new speech for this long) closes the paragraph →
+    /// `ParagraphEdge`. The lower bound is implicit: `min_silence` is what splits sentences in the
+    /// first place, so the effective paragraph is (min_silence, merge_gap) ≈ 1–2.5s. Decouples
+    /// "VAD sensitivity" from "what's one utterance". 0 → every sentence is its own paragraph.
     pub merge_gap_s: f64,
     /// Batch-ASR switch (config `asr.backend: disable`): false → the batch model is NOT
     /// loaded and every batch pass returns empty (`batch_text` stays `None` — the legal
@@ -109,9 +109,9 @@ pub struct Stage1Config {
     /// 连接时置回 true 唤醒。与 `active`(scout 开关, 用户可单独控制) 独立。默认 true。
     pub running: Arc<AtomicBool>,
     /// 主动归档信号(IME 侧"我说完了"—— 分字符键 `'` 触发):run 循环见 true 且存在可归档
-    /// 窗口 → 跳过 `merge_gap` 剩余等待,立即整窗 batch(`WindowEdge`)。消费中/说话中保持
-    /// 挂起(EOS 未到,立即切窗会截断);无窗口时消费掉(空按)。默认 false。
-    pub flush_window: Arc<AtomicBool>,
+    /// 段落 → 跳过 `merge_gap` 剩余等待,立即整段 batch(`ParagraphEdge`)。消费中/说话中保持
+    /// 挂起(EOS 未到,立即切窗会截断);无段落时消费掉(空按)。默认 false。
+    pub flush_paragraph: Arc<AtomicBool>,
 }
 
 impl Stage1Config {
@@ -159,7 +159,7 @@ impl Stage1Config {
             batch_enabled: true,
             active: Arc::new(AtomicBool::new(true)),
             running: Arc::new(AtomicBool::new(true)),
-            flush_window: Arc::new(AtomicBool::new(false)),
+            flush_paragraph: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -209,8 +209,8 @@ impl Stage1Config {
 }
 
 /// A Stage1 recognizer: audio in → [`Stage1Event`]s out. `run` blocks forever (drives the
-/// ingest+consume loop) and invokes `on_event` for each interim partial / settled segment /
-/// closed window.
+/// ingest+consume loop) and invokes `on_event` for each interim partial / settled sentence /
+/// closed paragraph.
 pub trait Stage1Recognizer {
     /// 跑消费循环直到 `running` 被置 false(idle 深度睡眠)→ 返回。daemon 恢复时重新调用。
     fn run(&self, on_event: &mut dyn FnMut(Stage1Event)) -> ();
@@ -238,14 +238,14 @@ pub struct OnnxStage1Recognizer {
     ring: Arc<Mutex<AudioRing>>,
     /// Wakes the consume loop when the ingest thread pushes frames (no polling).
     ring_cv: Arc<Condvar>,
-    /// Merge-window gap (s) — see [`Stage1Config::merge_gap_s`].
+    /// Merge-paragraph gap (s) — see [`Stage1Config::merge_gap_s`].
     merge_gap_s: f64,
     active: Arc<AtomicBool>,
     /// idle 运行信号:false → run 退出循环(深度睡眠)。
     running: Arc<AtomicBool>,
-    /// 主动归档信号(`Stage1Config::flush_window`)—— run 循环消费,见下。
-    flush_window: Arc<AtomicBool>,
-    /// The PCM store: segments' clips live here by id until their window settles.
+    /// 主动归档信号(`Stage1Config::flush_paragraph`)—— run 循环消费,见下。
+    flush_paragraph: Arc<AtomicBool>,
+    /// The PCM store: sentences' clips live here by id until their paragraph settles.
     audio_store: Arc<AudioStore>,
 }
 
@@ -296,7 +296,7 @@ impl OnnxStage1Recognizer {
             merge_gap_s: cfg.merge_gap_s,
             active: cfg.active,
             running: cfg.running,
-            flush_window: cfg.flush_window,
+            flush_paragraph: cfg.flush_paragraph,
             audio_store: Arc::new(AudioStore::new(DEFAULT_CAP_SAMPLES)),
             batch_asr,
         })
@@ -330,7 +330,7 @@ impl OnnxStage1Recognizer {
             merge_gap_s: cfg.merge_gap_s,
             active: cfg.active,
             running: cfg.running,
-            flush_window: cfg.flush_window,
+            flush_paragraph: cfg.flush_paragraph,
             audio_store: Arc::new(AudioStore::new(DEFAULT_CAP_SAMPLES)),
             batch_asr,
         })
@@ -342,7 +342,7 @@ impl OnnxStage1Recognizer {
     }
 
     /// The PCM store this recognizer owns — clips are addressable by [`AudioId`] until their
-    /// window settles (then evicted; the window's `Arc<Vec<i16>>` is the surviving copy).
+    /// paragraph settles (then evicted; the paragraph's `Arc<Vec<i16>>` is the surviving copy).
     pub fn audio_store(&self) -> &Arc<AudioStore> {
         &self.audio_store
     }
@@ -378,7 +378,7 @@ fn spawn_ingest(
     Ok(())
 }
 
-/// Block until a full Silero window is available in the ring (wakes on the ingest thread's
+/// Block until a full Silero paragraph is available in the ring (wakes on the ingest thread's
 /// condvar notify). `timeout: Some` additionally caps the wait — `None` return means the
 /// deadline fired (the caller re-runs its time-based checks); `timeout: None` parks until
 /// audio arrives (no timer at all — nothing time-based is pending).
@@ -407,43 +407,43 @@ fn wait_frame(
     }
 }
 
-// ── Window tracker: pure windowing decisions over wall-clock SOS/EOS (unit-testable, no I/O) ──
+// ── Paragraph tracker: pure paragraphing decisions over wall-clock SOS/EOS (unit-testable, no I/O) ──
 // The recognizer owns the ASR side (sessions, batch passes, the AudioStore); this tracker owns
-// ONLY the boundary math — which segment belongs to which window, and when a window closes.
+// ONLY the boundary math — which sentence belongs to which paragraph, and when a paragraph closes.
 
-/// The open window: its settled segments + whether a segment is in progress (SOS seen,
-/// EOS pending). The in-progress segment's id/timing live recognizer-side ([`ActiveSession`]);
+/// The open paragraph: its settled sentences + whether a sentence is in progress (SOS seen,
+/// EOS pending). The in-progress sentence's id/timing live recognizer-side ([`ActiveSession`]);
 /// the tracker only needs "is one active" for settle suppression.
-struct OpenWindow {
-    window_id: WindowId,
-    segments: Vec<VadSegment>,
+struct OpenParagraph {
+    paragraph_id: ParagraphId,
+    sentences: Vec<VadSentence>,
     active: bool,
 }
 
-/// A window closed by a big gap or the settle-timeout — the recognizer turns this into a
-/// [`VadWindow`] (concat PCM + window-level batch re-run) and emits `WindowEdge`.
-struct SettledSpans {
-    window_id: WindowId,
-    segments: Vec<VadSegment>,
+/// A paragraph closed by a big gap or the settle-timeout — the recognizer turns this into a
+/// [`VadParagraph`] (concat PCM + paragraph-level batch re-run) and emits `ParagraphEdge`.
+struct SettledParagraph {
+    paragraph_id: ParagraphId,
+    sentences: Vec<VadSentence>,
 }
 
-struct WindowTracker {
+struct ParagraphTracker {
     merge_gap_s: f64,
-    next_seg_id: SegmentId,
-    /// 最近分配的 window id(供 `prospective` 给未开窗口预生成;下一个随机 id)。
-    last_win_id: WindowId,
-    open: Option<OpenWindow>,
+    next_sentence_id: SentenceId,
+    /// 最近分配的 paragraph id(供 `prospective` 给未开段落预生成;下一个随机 id)。
+    last_win_id: ParagraphId,
+    open: Option<OpenParagraph>,
 }
 
-impl WindowTracker {
+impl ParagraphTracker {
     fn new(merge_gap_s: f64) -> Self {
-        Self { merge_gap_s, next_seg_id: 1, last_win_id: 0, open: None }
+        Self { merge_gap_s, next_sentence_id: 1, last_win_id: 0, open: None }
     }
 
-    /// 生成一个**随机** window id(基于系统时间亚微秒纳秒,无依赖、不可预测,
+    /// 生成一个**随机** paragraph id(基于系统时间亚微秒纳秒,无依赖、不可预测,
     /// `u64` 足够宽不会快速碰撞)。用随机而非递增 —— 避免可预测性,也让重连后
-    /// 历史窗口 id 与新窗口不产生"连续/相邻"的假关联。
-    fn next_random_win_id(&mut self) -> WindowId {
+    /// 历史段落 id 与新段落不产生"连续/相邻"的假关联。
+    fn next_random_win_id(&mut self) -> ParagraphId {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos() as u64)
@@ -458,30 +458,30 @@ impl WindowTracker {
         id
     }
 
-    /// VAD StartOfSpeech. NOTE: the SOS is RETROACTIVE — it fires at the segment's EOS instant
+    /// VAD StartOfSpeech. NOTE: the SOS is RETROACTIVE — it fires at the sentence's EOS instant
     /// (its wall-clock IS the EOS time, NOT the speech onset), so the merge/split decision
     /// CANNOT happen here (using the EOS instant as the onset would inflate every gap by the
-    /// segment's own duration and settle on EVERY segment — the "window never has >1 segment"
-    /// bug). This only allocates the segment id + marks the window active; the settle decision
+    /// sentence's own duration and settle on EVERY sentence — the "paragraph never has >1 sentence"
+    /// bug). This only allocates the sentence id + marks the paragraph active; the settle decision
     /// moves to [`Self::on_eos`], which back-derives the true speech onset from the PCM.
-    fn on_sos(&mut self) -> SegmentId {
+    fn on_sos(&mut self) -> SentenceId {
         if self.open.is_none() {
             let id = self.next_random_win_id();
-            self.open = Some(OpenWindow { window_id: id, segments: Vec::new(), active: false });
+            self.open = Some(OpenParagraph { paragraph_id: id, sentences: Vec::new(), active: false });
         }
-        let segment_id = self.next_seg_id;
-        self.next_seg_id += 1;
-        self.open.as_mut().expect("window just ensured").active = true;
-        segment_id
+        let sentence_id = self.next_sentence_id;
+        self.next_sentence_id += 1;
+        self.open.as_mut().expect("paragraph just ensured").active = true;
+        sentence_id
     }
 
-    /// Settle the open window iff the gap from `onset` (the NEXT segment's true speech start)
-    /// back to its last segment ≥ merge_gap. `onset` must be the back-derived start, not the
+    /// Settle the open paragraph iff the gap from `onset` (the NEXT sentence's true speech start)
+    /// back to its last sentence ≥ merge_gap. `onset` must be the back-derived start, not the
     /// retroactive SOS instant.
-    fn settle_if_gap(&mut self, onset: f64) -> Option<SettledSpans> {
+    fn settle_if_gap(&mut self, onset: f64) -> Option<SettledParagraph> {
         let gap = {
             let w = self.open.as_ref()?;
-            let last = w.segments.last()?;
+            let last = w.sentences.last()?;
             onset - last.end_s
         };
         if gap >= self.merge_gap_s {
@@ -491,24 +491,24 @@ impl WindowTracker {
         }
     }
 
-    /// Record a completed segment. Settles the open window FIRST when the gap since its last
-    /// segment ≥ merge_gap (using `seg.start_s`, the BACK-DERIVED true onset), then pushes this
-    /// segment into the (possibly fresh) window. Returns (settled spans, window id, ALL segments
-    /// so far) — the payload IS the window, so Stage2 stays stateless.
-    fn on_eos(&mut self, seg: VadSegment) -> (Option<SettledSpans>, WindowId, Vec<VadSegment>) {
-        let settled = self.settle_if_gap(seg.start_s);
+    /// Record a completed sentence. Settles the open paragraph FIRST when the gap since its last
+    /// sentence ≥ merge_gap (using `sentence.start_s`, the BACK-DERIVED true onset), then pushes this
+    /// sentence into the (possibly fresh) paragraph. Returns (settled spans, paragraph id, ALL sentences
+    /// so far) — the payload IS the paragraph, so Stage2 stays stateless.
+    fn on_eos(&mut self, sentence: VadSentence) -> (Option<SettledParagraph>, ParagraphId, Vec<VadSentence>) {
+        let settled = self.settle_if_gap(sentence.start_s);
         if self.open.is_none() {
-            // First segment, or the previous window just settled.
+            // First sentence, or the previous paragraph just settled.
             let id = self.next_random_win_id();
-            self.open = Some(OpenWindow { window_id: id, segments: Vec::new(), active: false });
+            self.open = Some(OpenParagraph { paragraph_id: id, sentences: Vec::new(), active: false });
         }
-        let w = self.open.as_mut().expect("window just ensured");
+        let w = self.open.as_mut().expect("paragraph just ensured");
         w.active = false;
-        w.segments.push(seg);
-        (settled, w.window_id, w.segments.clone())
+        w.sentences.push(sentence);
+        (settled, w.paragraph_id, w.sentences.clone())
     }
 
-    /// Discard the in-progress segment (neither pass produced text — noise). Clears `active`
+    /// Discard the in-progress sentence (neither pass produced text — noise). Clears `active`
     /// without recording anything.
     fn drop_active(&mut self) {
         if let Some(w) = self.open.as_mut() {
@@ -517,18 +517,18 @@ impl WindowTracker {
     }
 
     /// Settle-timeout probe (call every loop tick with the current wall-clock). Closes the
-    /// window when it has been silent (no active speech) for ≥ `merge_gap_s` — this is how the
-    /// TRAILING window finalizes. Suppressed while a segment is in progress AND while `speaking`
+    /// paragraph when it has been silent (no active speech) for ≥ `merge_gap_s` — this is how the
+    /// TRAILING paragraph finalizes. Suppressed while a sentence is in progress AND while `speaking`
     /// is true — the streaming session still has a non-empty partial, i.e. someone is talking
     /// right now but this VAD's SOS for that speech hasn't arrived yet (it's RETROACTIVE, comes
     /// with EOS). Without this suppression the wall-clock timeout would fire mid-sentence and
-    /// split the next segment into a fresh window — the "window never has >1 segment" bug.
-    fn check_settle(&mut self, now: f64, speaking: bool) -> Option<SettledSpans> {
+    /// split the next sentence into a fresh paragraph — the "paragraph never has >1 sentence" bug.
+    fn check_settle(&mut self, now: f64, speaking: bool) -> Option<SettledParagraph> {
         let w = self.open.as_ref()?;
         if w.active || speaking {
             return None;
         }
-        let last = w.segments.last()?;
+        let last = w.sentences.last()?;
         if now - last.end_s >= self.merge_gap_s {
             self.take_open()
         } else {
@@ -536,98 +536,98 @@ impl WindowTracker {
         }
     }
 
-    /// 主动归档(用户侧"我说完了"信号):跳过 `merge_gap` 剩余等待,立即关闭开放窗口。
-    /// 语义与 [`Self::check_settle`] 的 suppress 条件一致 —— 有段进行中(`active`)或
-    /// 窗口为空时不动(调用方负责保持 flush 挂起重试);`speaking` 的墙钟抑制由调用方
+    /// 主动归档(用户侧"我说完了"信号):跳过 `merge_gap` 剩余等待,立即关闭开放段落。
+    /// 语义与 [`Self::check_settle`] 的 suppress 条件一致 —— 有句进行中(`active`)或
+    /// 段落为空时不动(调用方负责保持 flush 挂起重试);`speaking` 的墙钟抑制由调用方
     /// 判断(它不在 tracker 状态里)。
-    fn force_settle(&mut self) -> Option<SettledSpans> {
+    fn force_settle(&mut self) -> Option<SettledParagraph> {
         let w = self.open.as_ref()?;
-        if w.active || w.segments.is_empty() {
+        if w.active || w.sentences.is_empty() {
             return None;
         }
         self.take_open()
     }
 
-    /// 是否有开放窗口(含进行中段)—— flush 挂起与否的判据:窗口在 → 保持挂起等 EOS;
-    /// 无窗口 → flush 落空,消费掉标记。
-    fn has_open_window(&self) -> bool {
+    /// 是否有开放段落(含进行中段)—— flush 挂起与否的判据:段落在 → 保持挂起等 EOS;
+    /// 无段落 → flush 落空,消费掉标记。
+    fn has_open_paragraph(&self) -> bool {
         self.open.is_some()
     }
 
-    /// Seconds until [`Self::check_settle`] would close the open window (None = no pending
-    /// settle: nothing open, no segments yet, a segment in progress, or `speaking` — the next
-    /// segment's speech is ongoing but its SOS hasn't arrived yet). Drives the consume loop's
-    /// condvar deadline — wake exactly when the trailing window is due, not on a poll cadence.
+    /// Seconds until [`Self::check_settle`] would close the open paragraph (None = no pending
+    /// settle: nothing open, no sentences yet, a sentence in progress, or `speaking` — the next
+    /// sentence's speech is ongoing but its SOS hasn't arrived yet). Drives the consume loop's
+    /// condvar deadline — wake exactly when the trailing paragraph is due, not on a poll cadence.
     fn settle_deadline(&self, now: f64, speaking: bool) -> Option<f64> {
         let w = self.open.as_ref()?;
         if w.active || speaking {
             return None;
         }
-        let last = w.segments.last()?;
+        let last = w.sentences.last()?;
         Some((self.merge_gap_s - (now - last.end_s)).max(0.0))
     }
 
-    fn take_open(&mut self) -> Option<SettledSpans> {
-        self.open.take().map(|w| SettledSpans { window_id: w.window_id, segments: w.segments })
+    fn take_open(&mut self) -> Option<SettledParagraph> {
+        self.open.take().map(|w| SettledParagraph { paragraph_id: w.paragraph_id, sentences: w.sentences })
     }
 
-    /// The ids the segment currently being spoken WILL get: the open window's id (or the next
-    /// one when nothing is open) + the next segment id. Used to key live `StreamFragment`
+    /// The ids the sentence currently being spoken WILL get: the open paragraph's id (or the next
+    /// one when nothing is open) + the next sentence id. Used to key live `StreamFragment`
     /// partials —
     /// this VAD emits SOS RETROACTIVELY (with EOS), so the real assignment only exists at EOS.
-    /// Authoritative grouping arrives with the `Batch`/`WindowEdge` events.
+    /// Authoritative grouping arrives with the `Batch`/`ParagraphEdge` events.
     ///
-    /// window id 是随机的;未开窗时给一个"预测"随机值(仅用于给 partial 预分组,
+    /// paragraph id 是随机的;未开段落时给一个"预测"随机值(仅用于给 partial 预分组,
     /// 实际分配在 EOS 用 [`next_random_win_id`](Self::next_random_win_id))。
-    fn prospective(&self) -> (WindowId, SegmentId) {
+    fn prospective(&self) -> (ParagraphId, SentenceId) {
         let w = self
             .open
             .as_ref()
-            .map(|w| w.window_id)
+            .map(|w| w.paragraph_id)
             .unwrap_or_else(|| self.last_win_id.wrapping_add(1).max(1));
-        (w, self.next_seg_id)
+        (w, self.next_sentence_id)
     }
 }
 
-/// Turn settled spans into a [`VadWindow`] and emit `WindowEdge`: concat the clips from the
-/// store (once — the window keeps the `Arc`), re-run the batch model over the concatenated
-/// PCM (the authoritative window text), then evict the clips. An all-discarded window (no
-/// segments) emits nothing and just vanishes.
-fn emit_window_edge(
-    settled: SettledSpans,
+/// Turn settled spans into a [`VadParagraph`] and emit `ParagraphEdge`: concat the clips from the
+/// store (once — the paragraph keeps the `Arc`), re-run the batch model over the concatenated
+/// PCM (the authoritative paragraph text), then evict the clips. An all-discarded paragraph (no
+/// sentences) emits nothing and just vanishes.
+fn emit_paragraph_edge(
+    settled: SettledParagraph,
     store: &AudioStore,
     batch_asr: &dyn AsrProvider,
     sr: u32,
     on_event: &mut dyn FnMut(Stage1Event),
 ) {
-    if settled.segments.is_empty() {
+    if settled.sentences.is_empty() {
         return;
     }
-    let ids: Vec<AudioId> = settled.segments.iter().map(|s| s.audio_id).collect();
+    let ids: Vec<AudioId> = settled.sentences.iter().map(|s| s.audio_id).collect();
     let pcm = Arc::new(store.concat(&ids));
-    // ★单段窗口免重跑:窗口 batch 的意义是"跨段上下文重新整听"——只有一个段时拼接
-    // PCM 与该段 PCM 完全相同,段级 batch 刚刚跑过同一音频,直接复用其结果(含 None:
-    // 远程失败后立刻重试大概率仍失败,徒增 settle 延迟)。单段是常态(merge 仅发生在
-    // <merge_gap 的停顿后),此优化省掉大多数窗口的一整次 batch 调用。
-    let (batch_text, asr_ms) = if settled.segments.len() == 1 {
-        debug!("单段窗口——复用段级 batch 结果,跳过整窗重跑");
-        (settled.segments[0].batch_text.clone(), 0u64)
+    // ★单句段落免重跑:段落 batch 的意义是"跨段上下文重新整听"——只有一个段时拼接
+    // PCM 与该句 PCM 完全相同,句级 batch 刚刚跑过同一音频,直接复用其结果(含 None:
+    // 远程失败后立刻重试大概率仍失败,徒增 settle 延迟)。单句是常态(merge 仅发生在
+    // <merge_gap 的停顿后),此优化省掉大多数段落的一整次 batch 调用。
+    let (batch_text, asr_ms) = if settled.sentences.len() == 1 {
+        debug!("单句段落——复用句级 batch 结果,跳过整段重跑");
+        (settled.sentences[0].batch_text.clone(), 0u64)
     } else {
         // `asr_ms` 计时:本 commit 简单写 0(性能埋点 v1);后续可在此位置包
-        // std::time::Instant::now() / elapsed() 替换为真实墙钟,值存到 VadWindow.batch_asr_ms
-        // 通过 window 日志输出。
+        // std::time::Instant::now() / elapsed() 替换为真实墙钟,值存到 VadParagraph.batch_asr_ms
+        // 通过 paragraph 日志输出。
         let t0 = std::time::Instant::now();
         let text = batch_asr.recognize(&pcm, sr).ok().filter(|t| !t.trim().is_empty());
         (text, t0.elapsed().as_millis() as u64)
     };
     let streaming_text =
-        settled.segments.iter().map(|s| s.streaming_text.as_str()).collect::<String>();
-    let start_s = settled.segments.first().map(|s| s.start_s).unwrap_or(0.0);
-    let end_s = settled.segments.last().map(|s| s.end_s).unwrap_or(0.0);
-    on_event(Stage1Event::WindowEdge {
-        window: VadWindow {
-            id: settled.window_id,
-            segments: settled.segments,
+        settled.sentences.iter().map(|s| s.streaming_text.as_str()).collect::<String>();
+    let start_s = settled.sentences.first().map(|s| s.start_s).unwrap_or(0.0);
+    let end_s = settled.sentences.last().map(|s| s.end_s).unwrap_or(0.0);
+    on_event(Stage1Event::ParagraphEdge {
+        paragraph: VadParagraph {
+            id: settled.paragraph_id,
+            sentences: settled.sentences,
             start_s,
             end_s,
             streaming_text,
@@ -636,16 +636,16 @@ fn emit_window_edge(
             batch_asr_ms: asr_ms,
         },
     });
-    // The window's Arc PCM is now the only remaining copy — release the per-segment clips.
+    // The paragraph's Arc PCM is now the only remaining copy — release the per-sentence clips.
     store.evict(&ids);
 }
 
 /// The live streaming session + its partial-throttle state. D1 adaptation: sherpa's VAD
-/// emits SOS RETROACTIVELY (together with EOS — the segment only pops complete), so the
+/// emits SOS RETROACTIVELY (together with EOS — the sentence only pops complete), so the
 /// session CANNOT be created at speech onset. Instead it is fed CONTINUOUSLY and RESET at
-/// every segment boundary (EOS) and window settle — each session therefore covers exactly
-/// [previous boundary, this EOS] ≈ this one segment (+ surrounding silence, which decodes
-/// to nothing). Per-segment attribution is preserved; live partials keep flowing.
+/// every sentence boundary (EOS) and paragraph settle — each session therefore covers exactly
+/// [previous boundary, this EOS] ≈ this one sentence (+ surrounding silence, which decodes
+/// to nothing). Per-sentence attribution is preserved; live partials keep flowing.
 struct ActiveSession {
     stream: StreamingSession,
     frames_since_partial: u32,
@@ -655,10 +655,10 @@ struct ActiveSession {
     /// Diagnostic: frames fed since the last reset.
     fed: u32,
     /// Every fed frame, accumulated — the EXACT audio this streaming session heard. At EOS this
-    /// becomes the segment's PCM (shared with the batch ASR), so streaming and batch see the
+    /// becomes the sentence's PCM (shared with the batch ASR), so streaming and batch see the
     /// same audio — including the soft onset BEFORE VAD's threshold crossing, which the VAD's
-    /// own segment cuts off (the "batch drops the first 2-3 chars" bug). Bounded by the segment
-    /// length (+ boundary silence), reset at every EOS / window settle.
+    /// own sentence cuts off (the "batch drops the first 2-3 chars" bug). Bounded by the sentence
+    /// length (+ boundary silence), reset at every EOS / paragraph settle.
     pcm: Vec<i16>,
 }
 
@@ -723,11 +723,11 @@ impl OnnxStage1Recognizer {
 
     /// 喂流式会话(VAD 门控):`detected()` 为 true 时 accept+解码,起音翻转(false→true)补喂
     /// 最近 ~0.5s 的 lead-in(soft onset 进会话)。空闲 park,只累积有界 lead-in。
-    /// `accept_waveform` 与 `pcm` 喂**完全相同**的帧 → 流式与 batch 共享同一段音频。
+    /// `accept_waveform` 与 `pcm` 喂**完全相同**的帧 → 流式与 batch 共享同一句音频。
     fn feed_streaming(
         &self,
         sess: &mut Option<ActiveSession>,
-        tracker: &mut WindowTracker,
+        tracker: &mut ParagraphTracker,
         lead_in: &mut VecDeque<Vec<i16>>,
         speech_active: &mut bool,
         frame: &[i16],
@@ -748,16 +748,16 @@ impl OnnxStage1Recognizer {
                 a.frames_since_partial = 0; // 补喂后重新起解码节拍
             }
             a.stream.accept_waveform(sr as i32, frame);
-            a.pcm.extend_from_slice(frame); // 流式与 batch 共用同一段音频
+            a.pcm.extend_from_slice(frame); // 流式与 batch 共用同一句音频
             a.fed += 1;
             a.frames_since_partial += 1;
             if a.frames_since_partial >= PARTIAL_EVERY_FRAMES {
                 let partial = asr.decode_and_result(&a.stream);
                 if !partial.is_empty() && partial != a.last_partial {
-                    let (window_id, segment_id) = tracker.prospective();
+                    let (paragraph_id, sentence_id) = tracker.prospective();
                     on_event(Stage1Event::StreamFragment {
-                        window_id,
-                        segment_id,
+                        paragraph_id,
+                        sentence_id,
                         text: partial.clone(),
                         at_s,
                     });
@@ -776,83 +776,83 @@ impl OnnxStage1Recognizer {
         *speech_active = v_detected;
     }
 
-    /// 定稿一个 VAD 段(EOS 臂):finalize 流式会话 → streaming_text,段 PCM 跑 batch,
-    /// emit `Batch`(及可能的 `WindowEdge`)。`fallback_pcm` = 流式未配置时的 VAD
-    /// edge-extended 段。返回 true = 段被丢弃(双路文本都空,噪声段)。
-    fn finalize_segment(
+    /// 定稿一个 VAD 句(EOS 臂):finalize 流式会话 → streaming_text,句 PCM 跑 batch,
+    /// emit `Batch`(及可能的 `ParagraphEdge`)。`fallback_pcm` = 流式未配置时的 VAD
+    /// edge-extended 句。返回 true = 句被丢弃(双路文本都空,噪声句)。
+    fn finalize_sentence(
         &self,
         sess: Option<ActiveSession>,
-        tracker: &mut WindowTracker,
-        cur_seg: &mut SegmentId,
+        tracker: &mut ParagraphTracker,
+        cur_sentence: &mut SentenceId,
         sr: u32,
         end_s: f64,
         fallback_pcm: Vec<i16>,
         fed: u32,
         on_event: &mut dyn FnMut(Stage1Event),
     ) -> bool {
-        // 段 PCM = 流式 session 累积的完整音频(含段首 soft onset)——与流式听到的完全一致,
-        // 区别只在 batch 一次整段听(大块)vs 流式逐帧听(小块)。流式未配置时 fallback VAD 段。
-        let seg_pcm = sess.as_ref().map(|a| a.pcm.clone()).unwrap_or(fallback_pcm);
+        // 句 PCM = 流式 session 累积的完整音频(含句首 soft onset)——与流式听到的完全一致,
+        // 区别只在 batch 一次整句听(大块)vs 流式逐帧听(小块)。流式未配置时 fallback VAD 句。
+        let sentence_pcm = sess.as_ref().map(|a| a.pcm.clone()).unwrap_or(fallback_pcm);
         let streaming_text = match (self.mgr.streaming_asr(), sess.as_ref()) {
             (Some(asr), Some(a)) => asr.finalize_and_result(&a.stream),
             _ => String::new(),
         };
-        // One batch pass over the segment's PCM. Err (remote network) and empty text → None.
+        // One batch pass over the sentence's PCM. Err (remote network) and empty text → None.
         // `asr_ms` 计时 batch 模型调用时长(纯 wall-clock,从进 recognize 到响应落盘),
         // 用于性能评估:对比不同 ASR 后端(sensevoice / qwen3-asr)/不同输入长度 / GPU vs CPU。
         let asr_t0 = std::time::Instant::now();
         let batch_text = self
             .batch_asr
-            .recognize(&seg_pcm, sr)
+            .recognize(&sentence_pcm, sr)
             .ok()
             .filter(|t| !t.trim().is_empty());
         let asr_ms = asr_t0.elapsed().as_millis() as u64;
-        // Neither pass produced text → noise segment: discard entirely.
+        // Neither pass produced text → noise sentence: discard entirely.
         if streaming_text.trim().is_empty() && batch_text.is_none() {
-            debug!("segment discarded — neither streaming nor batch produced text");
+            debug!("sentence discarded — neither streaming nor batch produced text");
             tracker.drop_active();
             return true;
         }
         // Speech onset back-derived from the PCM duration (SOS was retroactive, so its
         // wall-clock IS the EOS instant).
-        let start_s = (end_s - seg_pcm.len() as f64 / sr as f64).max(0.0);
-        let seg = VadSegment {
-            id: *cur_seg,
-            audio_id: self.audio_store.insert(seg_pcm),
+        let start_s = (end_s - sentence_pcm.len() as f64 / sr as f64).max(0.0);
+        let sentence = VadSentence {
+            id: *cur_sentence,
+            audio_id: self.audio_store.insert(sentence_pcm),
             start_s,
             end_s,
             streaming_text,
             batch_text,
         };
-        let (settled, window_id, segments) = tracker.on_eos(seg);
-        // A big gap settled the previous window FIRST — emit it before this segment's Batch.
+        let (settled, paragraph_id, sentences) = tracker.on_eos(sentence);
+        // A big gap settled the previous paragraph FIRST — emit it before this sentence's Batch.
         if let Some(s) = settled {
-            emit_window_edge(s, &self.audio_store, &*self.batch_asr, sr, on_event);
+            emit_paragraph_edge(s, &self.audio_store, &*self.batch_asr, sr, on_event);
         }
-        // 段级日志(debug):窗口/段 id、音频时长、batch 模型调用耗时、两路文本、会话喂帧数。
-        if let Some(s) = segments.last() {
+        // 句级日志(debug):段落/段 id、音频时长、batch 模型调用耗时、两路文本、会话喂帧数。
+        if let Some(s) = sentences.last() {
             debug!(
-                window_id = window_id,
-                segment_id = s.id,
+                paragraph_id = paragraph_id,
+                sentence_id = s.id,
                 time_ms = ((s.end_s - s.start_s) * 1000.0).round() as u64,
                 fed,
                 asr_ms,
                 batch = s.batch_text.as_deref().unwrap_or("(none)"),
                 streaming = %s.streaming_text,
-                "段定稿"
+                "句定稿"
             );
         }
-        // Final stream fragment: the segment's DEFINITIVE streaming text (live partials only
+        // Final stream fragment: the sentence's DEFINITIVE streaming text (live partials only
         // decode up to the last throttle frame; finalize is authoritative).
-        if let Some(s) = segments.last().filter(|s| !s.streaming_text.is_empty()) {
+        if let Some(s) = sentences.last().filter(|s| !s.streaming_text.is_empty()) {
             on_event(Stage1Event::StreamFragment {
-                window_id,
-                segment_id: s.id,
+                paragraph_id,
+                sentence_id: s.id,
                 text: s.streaming_text.clone(),
                 at_s: end_s,
             });
         }
-        on_event(Stage1Event::Batch { window_id, segments });
+        on_event(Stage1Event::Batch { paragraph_id, sentences });
         false
     }
 }
@@ -861,7 +861,7 @@ impl OnnxStage1Recognizer {
 /// `flush_pending`:主动归档挂起中 → 最长 50ms 后醒来重试(EOS 一到立即归档,
 /// 否则 condvar park 到 settle deadline 才醒,flush 延迟退化回 merge_gap)。
 fn next_wake_at(
-    tracker: &WindowTracker,
+    tracker: &ParagraphTracker,
     sess: &Option<ActiveSession>,
     ring_empty_since: Option<Instant>,
     now_s: f64,
@@ -904,12 +904,12 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
         let mut frames_in = 0u64;
 
         let sasr = self.mgr.streaming_asr();
-        // 流式会话:段/窗口边界重置,由 VAD detected() 门控喂帧。`cur_seg` 由回溯式 SOS 分配
-        // (与 EOS 同批到达),EOS 臂用它建段。
+        // 流式会话:段/段落边界重置,由 VAD detected() 门控喂帧。`cur_sentence` 由回溯式 SOS 分配
+        // (与 EOS 同批到达),EOS 臂用它建句。
         let mut sess: Option<ActiveSession> = sasr.map(|asr| ActiveSession::new(asr.create_session()));
         let mut ring_empty_since: Option<Instant> = None;
-        let mut tracker = WindowTracker::new(self.merge_gap_s);
-        let mut cur_seg: SegmentId = 0;
+        let mut tracker = ParagraphTracker::new(self.merge_gap_s);
+        let mut cur_sentence: SentenceId = 0;
         let mut last_silence_feed = Instant::now(); // 断流喂静音的节流(100ms)
         let mut lead_in: VecDeque<Vec<i16>> = VecDeque::new(); // 起音补喂缓冲(~0.5s)
         let mut speech_active = false; // 上一帧 detected()——翻转时补喂 lead_in
@@ -926,39 +926,39 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                 continue;
             }
 
-            // ② 时间驱动检查:主动归档 / 窗口定稿 / 停滞看门狗 / 诊断
+            // ② 时间驱动检查:主动归档 / 段落定稿 / 停滞看门狗 / 诊断
             let now_s = start.elapsed().as_secs_f64();
-            // `speaking`(流式 partial 非空)抑制窗口按墙钟定稿——回溯式 VAD 的下一段 SOS
-            // 尚未到达,若定稿会把下一段错划进新窗口。
+            // `speaking`(流式 partial 非空)抑制段落按墙钟定稿——回溯式 VAD 的下一句 SOS
+            // 尚未到达,若定稿会把下一句错划进新段落。
             let speaking = sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
-            // 用户侧主动归档(IME 分字符 = "我说完了"):跳过 merge_gap 剩余等待立即整窗
-            // batch。说话中(EOS 未到)保持挂起下一 tick 重试 —— 立即切窗会截断尾音;
-            // 无窗口则消费掉标记(空按,不让陈旧 flush 影响之后的语音)。
-            if self.flush_window.load(Ordering::Acquire) {
+            // 用户侧主动归档(IME 分字符 = "我说完了"):跳过 merge_gap 剩余等待立即整段
+            // batch。说话中(EOS 未到)保持挂起下一 tick 重试 —— 立即切段会截断尾音;
+            // 无段落则消费掉标记(空按,不让陈旧 flush 影响之后的语音)。
+            if self.flush_paragraph.load(Ordering::Acquire) {
                 if !speaking {
                     match tracker.force_settle() {
                         Some(settled) => {
-                            self.flush_window.store(false, Ordering::Release);
-                            info!(window_id = settled.window_id, segs = settled.segments.len(),
+                            self.flush_paragraph.store(false, Ordering::Release);
+                            info!(paragraph_id = settled.paragraph_id, sentences = settled.sentences.len(),
                                 "flush: 主动归档(跳过 merge_gap 等待)");
-                            emit_window_edge(settled, &self.audio_store, &*self.batch_asr, sr, on_event);
-                            sess = sasr.map(|asr| ActiveSession::new(asr.create_session())); // 窗口边界重置会话
+                            emit_paragraph_edge(settled, &self.audio_store, &*self.batch_asr, sr, on_event);
+                            sess = sasr.map(|asr| ActiveSession::new(asr.create_session())); // 段落边界重置会话
                         }
-                        None if !tracker.has_open_window() => {
-                            self.flush_window.store(false, Ordering::Release);
+                        None if !tracker.has_open_paragraph() => {
+                            self.flush_paragraph.store(false, Ordering::Release);
                         }
-                        None => {} // 段进行中 → 挂起,等 EOS 后下一 tick 强制定稿
+                        None => {} // 句进行中 → 挂起,等 EOS 后下一 tick 强制定稿
                     }
                 }
             }
             if let Some(settled) = tracker.check_settle(now_s, speaking) {
-                emit_window_edge(settled, &self.audio_store, &*self.batch_asr, sr, on_event);
-                sess = sasr.map(|asr| ActiveSession::new(asr.create_session())); // 窗口边界重置会话
+                emit_paragraph_edge(settled, &self.audio_store, &*self.batch_asr, sr, on_event);
+                sess = sasr.map(|asr| ActiveSession::new(asr.create_session())); // 段落边界重置会话
             }
             if let Some(a) = sess.as_ref() {
                 if !a.last_partial.is_empty() && a.last_change.elapsed() >= STALE_SESSION_RESET {
                     warn!(stale_s = a.last_change.elapsed().as_secs(), partial = %a.last_partial,
-                        "流式会话停滞重置——VAD 未定段的微弱音频不残留到下一句");
+                        "流式会话停滞重置——VAD 未定句的微弱音频不残留到下一句");
                     sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
                 }
             }
@@ -975,7 +975,7 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                 ring_empty_since,
                 now_s,
                 speaking,
-                self.flush_window.load(Ordering::Acquire),
+                self.flush_paragraph.load(Ordering::Acquire),
             );
             let frame = match self.drain_frame(&mut ring_empty_since, &sess, &mut last_silence_feed, wake_at) {
                 FrameResult::Frame(f) => f,
@@ -983,7 +983,7 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
             };
             frames_in += 1;
 
-            // ④ VAD:每帧跑(便宜),得到 detected()(实时语音信号,门控流式) + 分段事件
+            // ④ VAD:每帧跑(便宜),得到 detected()(实时语音信号,门控流式) + 分句事件
             let vad = self.mgr.vad().unwrap();
             let events = vad.push_frame(&frame);
             let v_detected = vad.detected();
@@ -995,19 +995,19 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                 &frame, sr, start.elapsed().as_secs_f64(), v_detected, on_event,
             );
 
-            // ⑥ 分段:SOS 分配段号;EOS 定稿成段(batch + WindowEdge)
+            // ⑥ 分句:SOS 分配段号;EOS 定稿成段(batch + ParagraphEdge)
             for ev in events {
                 match ev.kind {
-                    VadEventKind::StartOfSpeech => cur_seg = tracker.on_sos(),
+                    VadEventKind::StartOfSpeech => cur_sentence = tracker.on_sos(),
                     VadEventKind::EndOfSpeech => {
                         let end_s = start.elapsed().as_secs_f64();
                         let a = sess.take();
                         let fed = a.as_ref().map(|a| a.fed).unwrap_or(0);
                         sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
-                        if self.finalize_segment(
-                            a, &mut tracker, &mut cur_seg, sr, end_s, ev.pcm.clone(), fed, on_event,
+                        if self.finalize_sentence(
+                            a, &mut tracker, &mut cur_sentence, sr, end_s, ev.pcm.clone(), fed, on_event,
                         ) {
-                            continue; // 噪声段(双路文本都空)——丢弃
+                            continue; // 噪声句(双路文本都空)——丢弃
                         }
                     }
                 }
@@ -1020,8 +1020,8 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
 mod tests {
     use super::*;
 
-    fn seg(id: SegmentId, start_s: f64, end_s: f64) -> VadSegment {
-        VadSegment {
+    fn sentence(id: SentenceId, start_s: f64, end_s: f64) -> VadSentence {
+        VadSentence {
             id,
             audio_id: id,
             start_s,
@@ -1032,116 +1032,116 @@ mod tests {
     }
 
     #[test]
-    fn short_gap_absorbs_into_same_window() {
-        let mut t = WindowTracker::new(2.5);
+    fn short_gap_absorbs_into_same_paragraph() {
+        let mut t = ParagraphTracker::new(2.5);
         let s1 = t.on_sos();
-        let (settled, w1, segs) = t.on_eos(seg(s1, 0.0, 0.5));
+        let (settled, w1, sentences) = t.on_eos(sentence(s1, 0.0, 0.5));
         assert!(settled.is_none());
-        assert_eq!(segs.len(), 1);
+        assert_eq!(sentences.len(), 1);
 
-        // gap 1.0−0.5 = 0.5 < 2.5 → same window, second segment (merge happens at EOS,
+        // gap 1.0−0.5 = 0.5 < 2.5 → same paragraph, second sentence (merge happens at EOS,
         // where the true onset is back-derived).
         let s2 = t.on_sos();
-        let (settled, w, segs) = t.on_eos(seg(s2, 1.0, 1.5));
+        let (settled, w, sentences) = t.on_eos(sentence(s2, 1.0, 1.5));
         assert!(settled.is_none(), "short gap must NOT settle");
-        assert_eq!(w, w1, "same window continues");
-        assert_eq!(segs.len(), 2, "both segments in one window");
+        assert_eq!(w, w1, "same paragraph continues");
+        assert_eq!(sentences.len(), 2, "both sentences in one paragraph");
     }
 
     #[test]
-    fn big_gap_settles_previous_window_and_opens_new_one() {
-        let mut t = WindowTracker::new(2.5);
+    fn big_gap_settles_previous_paragraph_and_opens_new_one() {
+        let mut t = ParagraphTracker::new(2.5);
         let s1 = t.on_sos();
-        let (_, w1, _) = t.on_eos(seg(s1, 0.0, 0.5));
-        // gap 5.0−0.5 = 4.5 ≥ 2.5 → settle w1 at the next segment's EOS, open w2.
+        let (_, w1, _) = t.on_eos(sentence(s1, 0.0, 0.5));
+        // gap 5.0−0.5 = 4.5 ≥ 2.5 → settle w1 at the next sentence's EOS, open w2.
         let s2 = t.on_sos();
-        let (settled, w2, segs) = t.on_eos(seg(s2, 5.0, 5.5));
-        let s = settled.expect("big gap settles the previous window");
-        assert_eq!(s.window_id, w1);
-        assert_eq!(s.segments.len(), 1);
-        assert_ne!(w2, w1, "a fresh window opens (random ids must differ)");
-        assert_eq!(segs.len(), 1);
+        let (settled, w2, sentences) = t.on_eos(sentence(s2, 5.0, 5.5));
+        let s = settled.expect("big gap settles the previous paragraph");
+        assert_eq!(s.paragraph_id, w1);
+        assert_eq!(s.sentences.len(), 1);
+        assert_ne!(w2, w1, "a fresh paragraph opens (random ids must differ)");
+        assert_eq!(sentences.len(), 1);
     }
 
     #[test]
-    fn settle_timeout_closes_trailing_window() {
-        let mut t = WindowTracker::new(2.5);
+    fn settle_timeout_closes_trailing_paragraph() {
+        let mut t = ParagraphTracker::new(2.5);
         let s1 = t.on_sos();
-        let (_, w1, _) = t.on_eos(seg(s1, 0.0, 0.5));
+        let (_, w1, _) = t.on_eos(sentence(s1, 0.0, 0.5));
         assert!(t.check_settle(2.0, false).is_none(), "2.0 − 0.5 = 1.5 < 2.5, not yet");
         let s = t.check_settle(3.0, false).expect("3.0 − 0.5 = 2.5 ≥ merge_gap → settle");
-        assert_eq!(s.window_id, w1);
+        assert_eq!(s.paragraph_id, w1);
         assert!(t.check_settle(10.0, false).is_none(), "nothing open anymore");
     }
 
     #[test]
     fn force_settle_skips_merge_gap_wait() {
-        // 主动归档:远未到 merge_gap 也能立即关窗(IME"我说完了"信号)。
-        let mut t = WindowTracker::new(2.5);
-        assert!(t.force_settle().is_none(), "无窗口 → None(调用方消费掉 flush 标记)");
-        assert!(!t.has_open_window());
+        // 主动归档:远未到 merge_gap 也能立即关段(IME"我说完了"信号)。
+        let mut t = ParagraphTracker::new(2.5);
+        assert!(t.force_settle().is_none(), "无段落 → None(调用方消费掉 flush 标记)");
+        assert!(!t.has_open_paragraph());
         let s1 = t.on_sos();
-        let (_, w1, _) = t.on_eos(seg(s1, 0.0, 0.5));
+        let (_, w1, _) = t.on_eos(sentence(s1, 0.0, 0.5));
         // 0.2s 后强制归档(gap 0.2 < merge_gap 2.5 —— 常规定稿还早)。
-        let s = t.force_settle().expect("有已定稿段 → 立即归档");
-        assert_eq!(s.window_id, w1);
-        assert_eq!(s.segments.len(), 1);
-        assert!(!t.has_open_window(), "窗已关");
+        let s = t.force_settle().expect("有已定稿句 → 立即归档");
+        assert_eq!(s.paragraph_id, w1);
+        assert_eq!(s.sentences.len(), 1);
+        assert!(!t.has_open_paragraph(), "段已关");
         assert!(t.check_settle(100.0, false).is_none(), "settle 路径不再重复触发");
-        // 归档后再次 force → 无窗口 → None。
+        // 归档后再次 force → 无段落 → None。
         assert!(t.force_settle().is_none());
     }
 
     #[test]
-    fn force_settle_holds_while_segment_active() {
-        // 段进行中(SOS 已见 EOS 未到)→ 不动,调用方保持 flush 挂起。
-        let mut t = WindowTracker::new(2.5);
+    fn force_settle_holds_while_sentence_active() {
+        // 句进行中(SOS 已见 EOS 未到)→ 不动,调用方保持 flush 挂起。
+        let mut t = ParagraphTracker::new(2.5);
         let s1 = t.on_sos();
-        let (_, _, _) = t.on_eos(seg(s1, 0.0, 0.5));
-        let s2 = t.on_sos(); // 第二段开口
-        assert!(t.force_settle().is_none(), "active 段压制强制归档");
-        assert!(t.has_open_window(), "窗口仍在 → flush 保持挂起");
-        let (_, w, segs) = t.on_eos(seg(s2, 1.0, 1.5));
+        let (_, _, _) = t.on_eos(sentence(s1, 0.0, 0.5));
+        let s2 = t.on_sos(); // 第二句开口
+        assert!(t.force_settle().is_none(), "active 句压制强制归档");
+        assert!(t.has_open_paragraph(), "段落仍在 → flush 保持挂起");
+        let (_, w, sentences) = t.on_eos(sentence(s2, 1.0, 1.5));
         let s = t.force_settle().expect("EOS 落定后重试成功");
-        assert_eq!(s.window_id, w);
-        assert_eq!(segs.len(), 2);
+        assert_eq!(s.paragraph_id, w);
+        assert_eq!(sentences.len(), 2);
     }
 
     #[test]
     fn settle_deadline_counts_down_to_merge_gap() {
         // The condvar wake deadline: exactly when check_settle would fire (consumes loop
         // parks on the ring condvar instead of polling — this is its only wake source for
-        // the trailing window).
-        let mut t = WindowTracker::new(2.5);
+        // the trailing paragraph).
+        let mut t = ParagraphTracker::new(2.5);
         assert!(t.settle_deadline(0.0, false).is_none(), "nothing open yet");
         let s1 = t.on_sos();
-        t.on_eos(seg(s1, 0.0, 0.5));
+        t.on_eos(sentence(s1, 0.0, 0.5));
         assert!((t.settle_deadline(1.0, false).unwrap() - 2.0).abs() < 1e-9, "2.5 − (1.0 − 0.5)");
         assert!((t.settle_deadline(3.0, false).unwrap() - 0.0).abs() < 1e-9, "due now, clamped at 0");
-        let _s2 = t.on_sos(); // segment in progress (active=true)
-        assert!(t.settle_deadline(1.2, false).is_none(), "active segment ⇒ suppressed, no deadline");
+        let _s2 = t.on_sos(); // sentence in progress (active=true)
+        assert!(t.settle_deadline(1.2, false).is_none(), "active sentence ⇒ suppressed, no deadline");
     }
 
     #[test]
-    fn active_segment_suppresses_settle_timeout() {
-        // Regression guard: a long following segment must not be mistaken for "no
-        // continuation" and force-split the window mid-speech.
-        let mut t = WindowTracker::new(2.5);
+    fn active_sentence_suppresses_settle_timeout() {
+        // Regression guard: a long following sentence must not be mistaken for "no
+        // continuation" and force-split the paragraph mid-speech.
+        let mut t = ParagraphTracker::new(2.5);
         let s1 = t.on_sos();
-        t.on_eos(seg(s1, 0.0, 0.5));
-        let _s2 = t.on_sos(); // segment in progress (active=true)
-        assert!(t.check_settle(100.0, false).is_none(), "active segment ⇒ settle suppressed");
+        t.on_eos(sentence(s1, 0.0, 0.5));
+        let _s2 = t.on_sos(); // sentence in progress (active=true)
+        assert!(t.check_settle(100.0, false).is_none(), "active sentence ⇒ settle suppressed");
     }
 
     #[test]
     fn speaking_suppresses_settle_waiting_for_retroactive_sos() {
-        // 回溯式 VAD 的回归防护:下一段的 SOS 要等它的 EOS 才到——在它到达前,流式
+        // 回溯式 VAD 的回归防护:下一句的 SOS 要等它的 EOS 才到——在它到达前,流式
         // session 的 partial 非空(=speaking=true)必须抑制 settle 超时。否则墙钟超时
-        // 会在下一段说话时定稿,把它错划进新窗口(症状:窗口永远只有 1 个 segment)。
-        let mut t = WindowTracker::new(2.5);
+        // 会在下一句说话时定稿,把它错划进新段落(症状:段落永远只有 1 个 sentence)。
+        let mut t = ParagraphTracker::new(2.5);
         let s1 = t.on_sos();
-        t.on_eos(seg(s1, 0.0, 0.5));
-        // 下一段正在说话(SOS 尚未到),墙钟已远超 merge_gap —— speaking=true 抑制。
+        t.on_eos(sentence(s1, 0.0, 0.5));
+        // 下一句正在说话(SOS 尚未到),墙钟已远超 merge_gap —— speaking=true 抑制。
         assert!(t.check_settle(100.0, true).is_none(), "speaking ⇒ settle suppressed");
         assert!(t.settle_deadline(100.0, true).is_none(), "speaking ⇒ no settle deadline");
         // 说话停止(speaking=false)后,同一时刻立刻能定稿。
@@ -1149,32 +1149,32 @@ mod tests {
     }
 
     #[test]
-    fn merge_gap_zero_makes_every_segment_its_own_window() {
-        let mut t = WindowTracker::new(0.0);
+    fn merge_gap_zero_makes_every_sentence_its_own_paragraph() {
+        let mut t = ParagraphTracker::new(0.0);
         let s1 = t.on_sos();
-        let (_, w1, _) = t.on_eos(seg(s1, 0.0, 0.5));
-        // Any gap ≥ 0 settles at the next segment's EOS (gap 0.6 − 0.5 = 0.1 ≥ 0).
+        let (_, w1, _) = t.on_eos(sentence(s1, 0.0, 0.5));
+        // Any gap ≥ 0 settles at the next sentence's EOS (gap 0.6 − 0.5 = 0.1 ≥ 0).
         let s2 = t.on_sos();
-        let (settled, w2, _) = t.on_eos(seg(s2, 0.6, 0.7));
-        assert_eq!(settled.expect("gap 0.1 ≥ 0 settles").window_id, w1);
+        let (settled, w2, _) = t.on_eos(sentence(s2, 0.6, 0.7));
+        assert_eq!(settled.expect("gap 0.1 ≥ 0 settles").paragraph_id, w1);
         assert_ne!(w2, w1);
         // …and the settle timeout fires immediately after an EOS too.
         let s3 = t.on_sos();
-        t.on_eos(seg(s3, 10.0, 10.5));
+        t.on_eos(sentence(s3, 10.0, 10.5));
         assert!(t.check_settle(10.5, false).is_some(), "now − end = 0 ≥ 0 → settle");
     }
 
-    /// Counting batch-ASR stub — proves the single-segment window skips the re-run.
+    /// Counting batch-ASR stub — proves the single-sentence paragraph skips the re-run.
     struct CountingAsr(std::sync::Mutex<usize>);
     impl AsrProvider for CountingAsr {
         fn recognize(&self, _pcm: &[i16], _sr: u32) -> anyhow::Result<String> {
             *self.0.lock().unwrap() += 1;
-            Ok("窗口重跑".into())
+            Ok("段落重跑".into())
         }
     }
 
-    fn seg_into(store: &AudioStore, id: SegmentId, batch: Option<&str>) -> VadSegment {
-        VadSegment {
+    fn sentence_into(store: &AudioStore, id: SentenceId, batch: Option<&str>) -> VadSentence {
+        VadSentence {
             id,
             audio_id: store.insert(vec![1i16; 1600]),
             start_s: id as f64,
@@ -1185,59 +1185,59 @@ mod tests {
     }
 
     #[test]
-    fn single_segment_window_reuses_segment_batch_no_rerun() {
+    fn single_sentence_paragraph_reuses_sentence_batch_no_rerun() {
         let store = AudioStore::new(1_000_000);
         let asr = CountingAsr(std::sync::Mutex::new(0));
         let mut events = Vec::new();
         // batch Some → propagated verbatim; None → propagates as None (no retry either).
-        for batch in [Some("段级结果"), None] {
+        for batch in [Some("句级结果"), None] {
             events.clear();
-            let settled = SettledSpans {
-                window_id: 1,
-                segments: vec![seg_into(&store, 1, batch)],
+            let settled = SettledParagraph {
+                paragraph_id: 1,
+                sentences: vec![sentence_into(&store, 1, batch)],
             };
-            emit_window_edge(settled, &store, &asr, 16000, &mut |ev| events.push(ev));
-            assert_eq!(*asr.0.lock().unwrap(), 0, "单段窗口绝不重跑 batch");
+            emit_paragraph_edge(settled, &store, &asr, 16000, &mut |ev| events.push(ev));
+            assert_eq!(*asr.0.lock().unwrap(), 0, "单句段落绝不重跑 batch");
             match &events[0] {
-                Stage1Event::WindowEdge { window } => assert_eq!(
-                    window.batch_text.as_deref(),
+                Stage1Event::ParagraphEdge { paragraph } => assert_eq!(
+                    paragraph.batch_text.as_deref(),
                     batch,
-                    "窗口 batch_text = 段级结果原样复用(含 None)"
+                    "段落 batch_text = 句级结果原样复用(含 None)"
                 ),
-                other => panic!("expected WindowEdge, got {other:?}"),
+                other => panic!("expected ParagraphEdge, got {other:?}"),
             }
         }
     }
 
     #[test]
-    fn multi_segment_window_reruns_batch_once() {
+    fn multi_sentence_paragraph_reruns_batch_once() {
         let store = AudioStore::new(1_000_000);
         let asr = CountingAsr(std::sync::Mutex::new(0));
-        let settled = SettledSpans {
-            window_id: 1,
-            segments: vec![seg_into(&store, 1, Some("段1")), seg_into(&store, 2, Some("段2"))],
+        let settled = SettledParagraph {
+            paragraph_id: 1,
+            sentences: vec![sentence_into(&store, 1, Some("句1")), sentence_into(&store, 2, Some("句2"))],
         };
         let mut events = Vec::new();
-        emit_window_edge(settled, &store, &asr, 16000, &mut |ev| events.push(ev));
-        assert_eq!(*asr.0.lock().unwrap(), 1, "多段窗口恰好重跑一次");
+        emit_paragraph_edge(settled, &store, &asr, 16000, &mut |ev| events.push(ev));
+        assert_eq!(*asr.0.lock().unwrap(), 1, "多句段落恰好重跑一次");
         match &events[0] {
-            Stage1Event::WindowEdge { window } => {
-                assert_eq!(window.batch_text.as_deref(), Some("窗口重跑"));
+            Stage1Event::ParagraphEdge { paragraph } => {
+                assert_eq!(paragraph.batch_text.as_deref(), Some("段落重跑"));
             }
-            other => panic!("expected WindowEdge, got {other:?}"),
+            other => panic!("expected ParagraphEdge, got {other:?}"),
         }
     }
 
     #[test]
     fn drop_active_discards_without_recording() {
-        let mut t = WindowTracker::new(2.5);
-        let _ = t.on_sos(); // opens empty window 0, allocates seg 0, active=true
-        t.drop_active(); // noise → active=false, window 0 stays open but empty
-        // Empty window → settle timeout has nothing to close.
-        assert!(t.check_settle(100.0, false).is_none(), "no segments → nothing to settle");
-        // The next segment reuses the still-open window.
+        let mut t = ParagraphTracker::new(2.5);
+        let _ = t.on_sos(); // opens empty paragraph 0, allocates sentence 0, active=true
+        t.drop_active(); // noise → active=false, paragraph 0 stays open but empty
+        // Empty paragraph → settle timeout has nothing to close.
+        assert!(t.check_settle(100.0, false).is_none(), "no sentences → nothing to settle");
+        // The next sentence reuses the still-open paragraph.
         let s2 = t.on_sos();
-        let (_, w, _) = t.on_eos(seg(s2, 1.0, 1.1));
-        assert_eq!(w, 1, "window reused (not re-opened) after drop_active");
+        let (_, w, _) = t.on_eos(sentence(s2, 1.0, 1.1));
+        assert_eq!(w, 1, "paragraph reused (not re-opened) after drop_active");
     }
 }
