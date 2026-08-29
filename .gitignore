@@ -57,4 +57,3 @@ __pycache__
 /assets
 native/target/
 native/*.node
-apps/dp-models/dp-models

@@ -74,6 +74,23 @@ impl FileLoader {
         self.candidates(path_or_ns).into_iter().find(|p| p.exists())
     }
 
+    /// 返回命名空间根目录(dev 优先,prod fallback)。用于把整个目录
+    /// 交给调用方自行遍历(如 dp-router 的 `POST /admin/models/load`
+    /// 按名在 `MODELS::` 根下搜索 GGUF)。
+    pub fn ns_root(&self, name: &str) -> Option<PathBuf> {
+        let cfg = self.namespaces.get(name)?;
+        let dev_root = self.manifest_dir.join(&cfg.dev);
+        let root = if is_dev() || dev_root.exists() {
+            dev_root
+        } else {
+            expand_tilde(&cfg.prod)
+        };
+        if let Some(parent) = root.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        Some(root)
+    }
+
     fn resolve_ns(&self, ns: &str, rel: &str) -> Option<PathBuf> {
         let cfg = self.namespaces.get(ns)?;
         // dev 探测:编译期烙进的 manifest 目录下目标存在,或运行时带有

@@ -11,6 +11,7 @@
 | **visual-rover**（视觉漫游者） | `docs/design.md` `docs/decisions.md` | 视觉 GUI agent（SoM 标记 → LLM → 操作） | 设计阶段，部分落地 |
 | **geek-familiar**（使魔引擎） | `docs/familiar/` | 桌面精灵悬浮窗：皮肤渲染 + 秘书 UI + agent 调度 | 渲染层验证通过；M1 接入 daemon 待做 |
 | **ime**（输入法） | `docs/ime/` | 输入法增强引擎：snippets 展开 + 语音缓冲插入 + 动作触发；跨平台 ibus/TSF/IMK/TextExpander | 设计完成，待 Phase 1 `ime-core` |
+| **dp-router**（本地 LLM 路由） | `docs/dp-router.md` `docs/dp-router-migration.md` | 本地 GGUF 模型进程管理 + OpenAI 兼容 HTTP 暴露 + 远程上游 fallback | v1 可用，aura Stage2 已切到 remote |
 
 ## 阅读路径
 

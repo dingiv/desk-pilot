@@ -33,6 +33,9 @@ members = [
 
     # desk-pilot-manager (GUI desktop manager)
     "apps/dp-box",
+
+    # dp-router (local LLM router, OpenAI-compatible)
+    "apps/dp-router",
 ]
 
 [workspace.package]

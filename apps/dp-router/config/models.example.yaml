@@ -1,0 +1,72 @@
+# dp-router 配置示例 — 拷贝为 `dp-router.yaml` 并按需修改。
+#
+# dev: 放在 `apps/dp-router/dp-router.yaml`
+# prod: 放在 `~/.desk-pilot/dp-router.yaml`(由 `shared::loader!()` 解析)
+
+server:
+  # dp-router 对外监听地址(OpenAI 兼容端点)。
+  addr: "127.0.0.1:8080"
+
+llama_server:
+  # `llama-server` 二进制绝对路径。dev 一般指向 thirdparty/llama.cpp/build/bin/llama-server,
+  # prod 可指向系统安装的(apt / brew / release tarball)。
+  path: "/workspaces/gui_agent/desk-pilot/thirdparty/llama.cpp/build/bin/llama-server"
+
+  # 子进程端口分配区间(避开常见应用)。
+  port_range: [18001, 18099]
+
+  # 子进程 /health 探活间隔(秒)。
+  health_check_interval_s: 5
+
+  # 单模型最大重启次数,超过则标记 offline 不再尝试。
+  restart_max_retries: 3
+
+  # 重启退避基数(秒),实际等待 = base * 2^attempt。
+  restart_backoff_base_s: 1
+
+# 默认模型搜索根目录。POST /admin/models/load 不带 gguf 字段时,服务端
+# 在此目录下按 name 寻找匹配 GGUF(规则:`${root}/${name}.gguf` →
+# `${root}/${name}/*.gguf` → 大小写不敏感前缀匹配,首个命中即返)。
+# 支持 MODELS:: 命名空间(dev: MODELS:: = assets/models/;
+# prod: 默认 ~/.desk-pilot/models/)或绝对路径。
+# 留空 = 不支持动态加载,只能从下方 `models:` 预加载列表启。
+models_root: "MODELS::"
+
+models:
+  # 启动时预加载的本地模型列表。每个 spawn 一个 llama-server 子进程,独占一个端口。
+  # name 是 OpenAI 兼容请求里 `model` 字段的匹配键(必须唯一)。
+  # 可以为空 — 所有模型通过 POST /admin/models/load 动态拉起。
+  #
+  # type: llm(默认)| asr
+  #   llm — 文本生成,路由 /v1/chat/completions
+  #   asr — 语音转写,路由 /v1/audio/transcriptions;额外需要 mmproj 多模态投影器
+  #         (llama.cpp 原生支持 OpenAI 兼容 /v1/audio/transcriptions — 直接透传 multipart 即可)
+
+  # 示例 1:LLM(文本生成)
+  - name: "qwen2.5-3b-instruct-q4_k_m"
+    type: llm
+    # GGUF 文件路径。支持 `MODELS::xxx.gguf` 命名空间(dev: assets/models/xxx.gguf;
+    # prod: ~/.desk-pilot/models/xxx.gguf)或绝对路径。
+    gguf: "MODELS::qwen2.5-3b-instruct-q4_k_m.gguf"
+    context_size: 4096
+    threads: 8
+    gpu_layers: 0      # CPU = 0;有 GPU 设 ≥ 1
+    batch_size: 512
+    # extra_args: []  # 高级自定义(直接拼到 llama-server 命令行)
+
+  # 示例 2:ASR(语音转写) — 需 mmproj 多模态投影器(llama.cpp server 加载后自动启用 audio 端点)
+  - name: "qwen3-asr"
+    type: asr
+    gguf: "MODELS::Qwen3-ASR-1.7B-Q4_K_M-GGUF/Qwen3-ASR-1.7B-Q4_K_M.gguf"
+    mmproj: "MODELS::Qwen3-ASR-1.7B-Q4_K_M-GGUF/mmproj-Qwen3-ASR-1.7B-Q4_K_M.gguf"
+    context_size: 4096
+    threads: 8
+    gpu_layers: 0
+    batch_size: 512
+
+# 远程 OpenAI 兼容上游(可选)。未命中本地模型时 fallback。
+# base_url 留空 → 关闭上游,未命中直接 404。
+remote_upstream:
+  base_url: ""        # e.g. "http://192.168.1.6:8080/v1"
+  api_key: ""         # bearer token,原样透传
+  default_model: ""   # 请求缺 model 时兜底

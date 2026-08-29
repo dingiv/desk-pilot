@@ -1,0 +1,46 @@
+[package]
+name = "dp-router"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+description = "desk-pilot 本地 LLM 路由服务:sspawn llama-server 子进程管理本地 GGUF 模型,对外提供 OpenAI 兼容 HTTP 接口(默认 :8080),按 model 名字段路由本地/远程上游。"
+
+[[bin]]
+name = "dp-router"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["multipart"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+anyhow = "1"
+thiserror = "2"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+shared = { path = "../../crates/shared", features = ["log"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+uuid = { version = "1", features = ["v4"] }
+
+[build-dependencies]
+shared = { path = "../../crates/shared" }
+
+# FileLoader namespaces (consumed by build.rs → shared::loader!()).
+# CONF: runtime config — dev reads this crate's dir (apps/dp-router/dp-router.yaml),
+# prod reads the unified config folder ~/.desk-pilot/dp-router.yaml.
+# MODELS: GGUF 模型默认目录 — dev 指向 <workspace>/assets/models,
+#         prod 指向 ~/.desk-pilot/models。
+# (Don't write the bracketed section name in comments — the loader's naive
+# scanner matches the first occurrence anywhere in the file.)
+[package.metadata.shared]
+CONF = { dev = ".", prod = "~/.desk-pilot" }
+MODELS = { dev = "../../assets/models", prod = "~/.desk-pilot/models" }

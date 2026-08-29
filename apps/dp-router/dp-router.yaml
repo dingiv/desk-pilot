@@ -1,0 +1,48 @@
+# dp-router 本地开发配置(dev: 由 shared::loader!() 解析 apps/dp-router/dp-router.yaml)。
+
+server:
+  addr: "127.0.0.1:8080"
+
+llama_server:
+  path: "/workspaces/gui_agent/desk-pilot/thirdparty/llama.cpp/build/bin/llama-server"
+  port_range: [18001, 18099]
+  health_check_interval_s: 5
+  restart_max_retries: 3
+  restart_backoff_base_s: 1
+
+# 默认模型搜索根目录。POST /admin/models/load 不带 gguf 字段时,服务端
+# 在此目录下按 name 寻找匹配 GGUF(规则:`${root}/${name}.gguf` →
+# `${root}/${name}/*.gguf` → 大小写不敏感前缀匹配)。
+# 支持 MODELS:: 命名空间与绝对路径。dev 默认指向仓库 assets/models/。
+models_root: "MODELS::"
+
+# 启动时预加载的本地模型列表(每个 spawn 一个 llama-server 子进程)。
+# 可以为空 — 所有模型通过 POST /admin/models/load 动态拉起。
+#
+# type 字段(llm | asr,默认 llm):
+#   llm — 文本生成,路由 /v1/chat/completions
+#   asr — 语音转写,路由 /v1/audio/transcriptions,需额外配 mmproj 多模态投影器
+#         (llama.cpp 原生支持 OpenAI /v1/audio/transcriptions,见
+#          thirdparty/llama.cpp/tools/server/server-context.cpp:4982)
+models:
+  - name: "qwen2.5-3b-instruct-q4_k_m"
+    type: llm
+    gguf: "/workspaces/gui_agent/desk-pilot/assets/models/qwen2.5-3b-instruct-q4_k_m.gguf"
+    context_size: 2048
+    threads: 8
+    gpu_layers: 0
+    batch_size: 512
+
+  - name: "qwen3-asr"
+    type: asr
+    gguf: "/workspaces/gui_agent/desk-pilot/assets/models/Qwen3-ASR-1.7B-Q4_K_M-GGUF/Qwen3-ASR-1.7B-Q4_K_M.gguf"
+    mmproj: "/workspaces/gui_agent/desk-pilot/assets/models/Qwen3-ASR-1.7B-Q4_K_M-GGUF/mmproj-Qwen3-ASR-1.7B-Q4_K_M.gguf"
+    context_size: 4096
+    threads: 8
+    gpu_layers: 0
+    batch_size: 512
+
+remote_upstream:
+  base_url: ""
+  api_key: ""
+  default_model: ""
