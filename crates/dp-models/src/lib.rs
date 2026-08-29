@@ -1,11 +1,11 @@
-//! dp-models — desk-pilot 的本地模型 Provider 抽象层。
+//! dp-models — desk-pilot 的本地模型 Provider 抽象层 + 内部 SDK。
 //!
 //! 定义统一的 task trait (`AsrProvider`/`LlmProvider`/`VlmProvider`)，下游 (aura / visual-rover)
-//! 通过 trait 对象调用，不关心推理是 **local** (lib 嵌入: sherpa/mistral.rs/candle) 还是
-//! **remote** (OpenAI 兼容 HTTP: vLLM/SGLang/qwen3-asr-rs server/云端)。
+//! 通过 trait 对象调用，不关心推理是 **local** (lib 嵌入: sherpa-onnx 语音栈) 还是
+//! **remote** (OpenAI 兼容 HTTP: dp-router / vLLM / 任意 OpenAI 兼容服务)。
 //!
-//! 本 crate 只做抽象 + remote 实现；local 实现留在各专业 crate (OnnxAsr / Calibrator / 未来
-//! candle VLM)，它们 `impl dp_models::XxxProvider`。工厂 (选 local/remote) 在各 app
+//! 本 crate 只做抽象 + remote 实现；local 实现留在各专业 crate (OnnxAsr)，它们
+//! `impl dp_models::XxxProvider`。工厂 (选 local/remote) 在各 app
 //! (aura-daemon / visual-rover-app)。
 //!
 //! 所有 trait **同步** (匹配 Stage1 的同步线程模型；remote 实现用 `reqwest::blocking`)。
@@ -19,14 +19,7 @@ pub mod http;
 #[cfg(feature = "speech")]
 pub mod onnx;
 
-/// 本地 LLM (mistral.rs Qwen GGUF, feature `mistral`)。从 aura-core 迁入——
-/// 把 mistralrs 重依赖隔离到 dp-models。dp-models 是通用模型提供库, 本地 LLM 是其中一种实现。
-#[cfg(feature = "mistral")]
-pub mod mistral;
-
 pub use config::ProviderKind;
-#[cfg(feature = "mistral")]
-pub use mistral::MistralLlm;
 
 // ── VAD 数据契约(纯数据,不依赖 sherpa;由 onnx 模块与 aura-asr 的 EnergyVad 共用)──
 
@@ -78,7 +71,7 @@ mod tests {
     /// 伞形 marker 的契约: 每个实现类标识自己的 kind, 上层按 kind/能力取用。
     #[test]
     fn providers_identify_their_kind() {
-        assert_eq!(HttpAsr::new("http://x").kind(), "remote-http");
+        assert_eq!(HttpAsr::new("http://x", "m").kind(), "remote-http");
         assert_eq!(HttpLlm::new("http://x", "m").kind(), "remote-http");
         assert_eq!(HttpVlm::new("http://x", "m").kind(), "remote-http");
     }

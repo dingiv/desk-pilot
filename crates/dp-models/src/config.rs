@@ -4,16 +4,17 @@ use serde::{Deserialize, Serialize};
 
 /// 一个 task 的后端选择: local (lib 嵌入) 或 remote (HTTP 服务)。
 ///
-/// 序列化为 internally-tagged: `{"kind":"local"}` 或 `{"kind":"remote","endpoint":"..."}`，
-/// 方便和 task-specific 字段 (backend/provider/threads/model) 在下游配置里平铺。
+/// 序列化为 internally-tagged: `{"kind":"local"}` 或 `{"kind":"remote","endpoint":"...","model":"..."}`，
+/// 方便和 task-specific 字段 (backend/provider/threads) 在下游配置里平铺。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum ProviderKind {
-    /// 本地 lib 嵌入 (sherpa / mistral.rs / candle)，进程内推理。
+    /// 本地 lib 嵌入 (sherpa-onnx 语音栈)，进程内推理。
     #[default]
     Local,
     /// 远程 HTTP 服务 (vLLM / SGLang / qwen3-asr-rs server / 云端)，OpenAI 兼容协议。
-    Remote { endpoint: String },
+    /// `model` = 服务端模型名(必传;OpenAI 规范要求 multipart form / chat completion body 都带 `model`)。
+    Remote { endpoint: String, model: String },
 }
 
 impl ProviderKind {
@@ -23,7 +24,7 @@ impl ProviderKind {
 
     pub fn endpoint(&self) -> Option<&str> {
         match self {
-            Self::Remote { endpoint } => Some(endpoint),
+            Self::Remote { endpoint, .. } => Some(endpoint),
             _ => None,
         }
     }

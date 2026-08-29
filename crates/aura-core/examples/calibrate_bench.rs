@@ -1,8 +1,12 @@
-//! calibrate_bench — 测试 Stage2 纠偏模型 (Qwen3-1.7B) 对各种 ASR 错误文本的整流能力。
-//! 每个用例模拟真实的 ASR 输出（同音错字、无标点、英文混入等），看 Stage2 能否纠正。
+//! calibrate_bench — 测试 Stage2 纠偏模型对各种 ASR 错误文本的整流能力(走 dp-router)。
+//! 每个用例模拟真实的 ASR 输出(同音错字、无标点、英文混入等)，看 Stage2 能否纠正。
 //!
 //! Run:
-//!   cargo run -p audio-aura-core --example calibrate_bench --features asr,cuda [model_file.gguf]
+//!   cargo run -p audio-aura-core --example calibrate_bench --features asr
+//!
+//! 通过环境变量覆盖默认 endpoint / model:
+//!   DP_ROUTER_ENDPOINT (默认 http://127.0.0.1:8080)
+//!   DP_ROUTER_MODEL    (默认 qwen2.5-3b-instruct-q4_k_m)
 //!
 //! 可选 RUST_LOG=stage2::prompt=debug 看每轮完整提示词。
 
@@ -14,13 +18,13 @@ use audio_aura_core::{Calibrator, PromptBuilder};
 fn main() -> anyhow::Result<()> {
     shared::init_tracing();
 
-    // ── 加载模型 ──
-    // 模型文件名可通过命令行参数指定, 默认 Qwen2.5-3B
-    let model_file = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "qwen2.5-3b-instruct-q4_k_m.gguf".to_string());
-    eprintln!("[load] {model_file} …");
-    let calibrator = Calibrator::load_default(&model_file)?;
+    // ── 连 dp-router ──
+    let endpoint = std::env::var("DP_ROUTER_ENDPOINT")
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+    let model = std::env::var("DP_ROUTER_MODEL")
+        .unwrap_or_else(|_| "qwen2.5-3b-instruct-q4_k_m".to_string());
+    eprintln!("[load] {model} via {endpoint} …");
+    let calibrator = Calibrator::load(&endpoint, &model)?;
     let _ = calibrator.infer("system", "hi"); // warmup
     eprintln!("[load] ready\n");
 

@@ -7,12 +7,11 @@ description = "audio-aura daemon binary — config parsing (CLI/yaml → Pipelin
 [[bin]]
 name = "aura-daemon"
 path = "src/main.rs"
-required-features = ["asr", "cuda"]
+required-features = ["asr"]
 
 [features]
 default = []
 asr = ["audio-aura-core/asr"]
-cuda = ["audio-aura-core/cuda"]
 
 [dependencies]
 audio-aura-core = { path = "../../crates/aura-core" }

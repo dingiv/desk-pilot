@@ -35,10 +35,6 @@ use crate::calibrator::{LlmInput, PassThroughCalibrator, Stage2Calibrator, Stage
 use crate::hub::{FinalTurn, Storage};
 use crate::recognizer::{OnnxStage1Recognizer, Stage1Config, Stage1Recognizer};
 use crate::Stage1Event;
-// 本地 LLM (aura 封装层 Calibrator, 持有 dp_models::MistralLlm), 仅 mistral feature 下存在。
-#[cfg(feature = "mistral")]
-use crate::Calibrator;
-
 use dp_models::http::HttpLlm;
 
 // ── PipelineSpec — 选型描述（daemon resolve() 产出，assemble() 消费）────────────────
@@ -118,8 +114,10 @@ pub enum AsrSpec {
         threads: i32,
         model_dir: Option<String>,
     },
-    /// 远程 HTTP(OpenAI 兼容 `/v1/audio/transcriptions`)。流式/VAD 仍走 MODELS 命名空间。
-    Remote { endpoint: String },
+    /// 远程 HTTP(OpenAI 兼容 `/v1/audio/transcriptions`)。`endpoint` = base URL,
+    /// `model` = 服务端模型名(必须与 dp-router.yaml `models[].name` 对齐;OpenAI 规范
+    /// 要求 multipart form 里带 `model` 字段)。流式/VAD 仍走 MODELS 命名空间。
+    Remote { endpoint: String, model: String },
     /// 批式整体禁用(纯流式模式):不加载批式模型,`batch_text` 恒 `None` —— 消费方
     /// 按设计回退流式文本。省掉段级/窗口级 batch 调用(远程 ~3.5s/次)。
     Disabled,
@@ -139,10 +137,8 @@ impl AsrSpec {
 /// Stage2 LLM 选型。
 #[derive(Debug, Clone, PartialEq)]
 pub enum LlmSpec {
-    /// 本地 mistral.rs(Candle GGUF)。`model` = GGUF 文件名;`model_dir` = 根目录覆盖
-    /// (None → MODELS 命名空间)。
-    Local { model: String, model_dir: Option<String> },
-    /// 远程 HTTP(OpenAI 兼容 `/v1/chat/completions`,vLLM/SGLang)。`model` = 服务端模型名。
+    /// 远程 HTTP(OpenAI 兼容 `/v1/chat/completions`,目标为 dp-router 或 vLLM / SGLang / 任意
+    /// OpenAI 兼容服务)。`model` = 服务端模型名;`endpoint` = base URL(不带 `/v1`)。
     Remote { endpoint: String, model: String },
     /// Stage2 整体禁用:不加载任何 LLM,校准 = 恒等(`calibrated` 直接承载原文)。
     /// 纯 ASR 部署 / 对照 Stage2 贡献用。
@@ -150,10 +146,9 @@ pub enum LlmSpec {
 }
 
 impl LlmSpec {
-    /// "local" | "remote" | "disabled" — 配置快照(ConfigView)的显示标签。
+    /// "remote" | "disabled" — 配置快照(ConfigView)的显示标签。
     pub fn kind(&self) -> &'static str {
         match self {
-            LlmSpec::Local { .. } => "local",
             LlmSpec::Remote { .. } => "remote",
             LlmSpec::Disabled => "disabled",
         }
@@ -428,9 +423,9 @@ fn stage1_config(
     //   "whisper"   → large-v3-turbo
     //   "qwen3-asr" → Qwen3-Audio ASR 1.7B int8 (high accuracy, slow on CPU)
     Ok(match &spec.asr {
-        AsrSpec::Remote { endpoint } => {
-            info!("ASR: remote HTTP {endpoint}");
-            cfg.with_remote_asr(endpoint.clone())
+        AsrSpec::Remote { endpoint, model } => {
+            info!("ASR: remote HTTP {endpoint} (model {model})");
+            cfg.with_remote_asr(endpoint.clone(), model.clone())
         }
         AsrSpec::Disabled => {
             info!("ASR batch: disabled — streaming-only (batch_text 恒 None,回退流式文本)");
@@ -460,7 +455,7 @@ fn stage1_config(
     })
 }
 
-/// Stage2 组装:local mistral.rs Calibrator(加载 + "你好"预热)或 remote HttpLlm,
+/// Stage2 组装:remote HttpLlm(指向 dp-router 或任意 OpenAI 兼容上游);
 /// 包成 Stage2CalibratorImpl 并接共享热词/纠偏 store。
 fn stage2_calibrator(
     spec: &PipelineSpec,
@@ -475,26 +470,6 @@ fn stage2_calibrator(
         LlmSpec::Remote { endpoint, model } => {
             info!("Stage2 LLM: remote HTTP {endpoint} (model {model})");
             Arc::new(HttpLlm::new(endpoint.clone(), model.clone()))
-        }
-        LlmSpec::Local { model, model_dir } => {
-            #[cfg(feature = "mistral")]
-            {
-                let calibrator = match model_dir {
-                    Some(dir) => Calibrator::load(dir, model)?,
-                    None => Calibrator::load_default(model)?,
-                };
-                let _ = calibrator.calibrate_blocking("你好", None, &[]); // HF warmup
-                info!("Stage2 LLM: local mistral.rs ({model})");
-                Arc::new(calibrator)
-            }
-            #[cfg(not(feature = "mistral"))]
-            {
-                let _ = (model, model_dir);
-                anyhow::bail!(
-                    "llm.backend: local 需要 audio-aura-core 的 mistral/cuda feature \
-                     (daemon 用 `--features asr,cuda` 构建), 或改用 llm.backend: remote"
-                );
-            }
         }
     };
     Ok(Box::new(Stage2CalibratorImpl::new(llm, hotwords, corrections, spec.llm_input)))
@@ -516,7 +491,7 @@ mod tests {
             vad: VadSpec::default(),
             stream: StreamSpec { model: "zipformer".into() },
             asr,
-            llm: LlmSpec::Local { model: "m.gguf".into(), model_dir: None },
+            llm: LlmSpec::Remote { endpoint: "http://127.0.0.1:8080".into(), model: "test-model".into() },
             llm_input: LlmInput::Batch,
         }
     }
@@ -535,7 +510,7 @@ mod tests {
     fn stage1_config_selects_backend_per_spec() {
         // remote → batch ASR 走 HTTP(流式/VAD 仍本地)。
         let cfg = stage1_config(
-            &spec(AsrSpec::Remote { endpoint: "http://127.0.0.1:8000".into() }),
+            &spec(AsrSpec::Remote { endpoint: "http://127.0.0.1:8000".into(), model: "x".into() }),
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(true)),
         )

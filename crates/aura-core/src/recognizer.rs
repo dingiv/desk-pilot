@@ -191,9 +191,14 @@ impl Stage1Config {
     }
 
     /// Use a remote HTTP ASR (OpenAI-compatible `/v1/audio/transcriptions`) instead of local
-    /// sherpa. Streaming ASR + VAD stay local sherpa (real-time partials need low latency).
-    pub fn with_remote_asr(mut self, endpoint: impl Into<String>) -> Self {
-        self.asr_kind = ProviderKind::Remote { endpoint: endpoint.into() };
+    /// sherpa. `model` = 服务端模型名(必传;OpenAI 规范要求 multipart 带 `model` 字段,
+    /// 与目标服务如 dp-router.yaml `models[].name` 对齐)。
+    /// 流式 ASR + VAD 仍本地 sherpa(实时 partial 需要低延迟)。
+    pub fn with_remote_asr(mut self, endpoint: impl Into<String>, model: impl Into<String>) -> Self {
+        self.asr_kind = ProviderKind::Remote {
+            endpoint: endpoint.into(),
+            model: model.into(),
+        };
         self
     }
 }
@@ -263,7 +268,9 @@ impl OnnxStage1Recognizer {
             (ProviderKind::Local, _) => {
                 Arc::clone(mgr.asr().expect("local asr just loaded")) as Arc<dyn AsrProvider>
             }
-            (ProviderKind::Remote { endpoint }, _) => Arc::new(HttpAsr::new(endpoint.clone())),
+            (ProviderKind::Remote { endpoint, model }, _) => {
+                Arc::new(HttpAsr::new(endpoint.clone(), model.clone()))
+            }
         };
         mgr.warm();
         let ring = Arc::new(Mutex::new(AudioRing::new(cfg.ring_cap_samples)));
@@ -295,7 +302,9 @@ impl OnnxStage1Recognizer {
             (ProviderKind::Local, _) => {
                 Arc::clone(mgr.asr().expect("local mgr must carry the batch ASR")) as Arc<dyn AsrProvider>
             }
-            (ProviderKind::Remote { endpoint }, _) => Arc::new(HttpAsr::new(endpoint.clone())),
+            (ProviderKind::Remote { endpoint, model }, _) => {
+                Arc::new(HttpAsr::new(endpoint.clone(), model.clone()))
+            }
         };
         let ring = Arc::new(Mutex::new(AudioRing::new(cfg.ring_cap_samples)));
         let ring_cv = Arc::new(Condvar::new());
@@ -593,6 +602,7 @@ fn emit_window_edge(
             batch_text,
             pcm,
         },
+    }
     });
     // The window's Arc PCM is now the only remaining copy — release the per-segment clips.
     store.evict(&ids);

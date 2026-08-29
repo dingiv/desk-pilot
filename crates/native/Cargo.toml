@@ -9,7 +9,6 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-cuda = ["audio-aura-core/cuda"]
 
 [dependencies]
 audio-aura-core = { path = "../aura-core" }

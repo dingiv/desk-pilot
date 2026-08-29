@@ -1,11 +1,15 @@
 //! stage12_live — thin Stage1→Stage2 bench built on `audio_aura_core::Pipeline`. (Moved here from
 //! aura-asr: the old "noodle" loop now lives inside `OnnxStage1Recognizer` + `Pipeline`.) Streams
-//! omni-scout `/audio`, runs two-pass Stage1 + Qwen calibration, and writes bench/live-*.md.
+//! omni-scout `/audio`, runs two-pass Stage1 + Stage2 calibration (over dp-router), and writes
+//! bench/live-*.md.
 //!
 //! Stage3 is NOT exercised here (this is the S1→S2 behavior benchmark). The Stage3 feedback loop
 //! lives in the `daemon` crate.
 //!
-//! Run: cargo run -p audio-aura-core --example stage12_live --features asr,cuda -- 127.0.0.1:7879
+//! Run: cargo run -p audio-aura-core --example stage12_live --features asr -- 127.0.0.1:7879
+//!
+//! dp-router endpoint / model 可由 DP_ROUTER_ENDPOINT / DP_ROUTER_MODEL 覆盖(默认
+//! http://127.0.0.1:8080 / qwen2.5-3b-instruct-q4_k_m)。
 
 use std::fs;
 use std::io::Write;
@@ -29,6 +33,11 @@ fn main() -> anyhow::Result<()> {
         .or_else(|| std::env::var("SCOUT_ADDR").ok())
         .unwrap_or_else(|| "127.0.0.1:7878".to_string());
 
+    let router_endpoint = std::env::var("DP_ROUTER_ENDPOINT")
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+    let router_model = std::env::var("DP_ROUTER_MODEL")
+        .unwrap_or_else(|_| "qwen2.5-3b-instruct-q4_k_m".to_string());
+
     // Shared hotword store (the Stage3→Stage2 feedback channel; Stage3 is off in this bench, but
     // the store is the same shape the daemon uses).
     let hotwords: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![
@@ -40,10 +49,12 @@ fn main() -> anyhow::Result<()> {
         "README".into(),
     ]));
 
-    eprintln!("[load] Stage1 (Silero VAD + 流式 Zipformer + SenseVoice) + Stage2 (Qwen3-1.7B) …");
+    eprintln!(
+        "[load] Stage1 (Silero VAD + 流式 Zipformer + SenseVoice) + Stage2 ({router_model} via {router_endpoint}) …"
+    );
     let s1 = OnnxStage1Recognizer::new(Stage1Config::new(scout_addr.clone()))?;
-    let calibrator = Calibrator::load_default("Qwen3-1.7B-Q8_0.gguf")?;
-    let _ = calibrator.calibrate_blocking("你好", None, &[]); // HF warmup
+    let calibrator = Calibrator::load(&router_endpoint, &router_model)?;
+    let _ = calibrator.calibrate_blocking("你好", None, &[]); // HTTP warmup (避免首轮冷启动)
     let corrections = Arc::new(Mutex::new(Vec::new()));
     let s2 = Stage2CalibratorImpl::new(Arc::new(calibrator), Arc::clone(&hotwords), corrections, LlmInput::Batch);
 

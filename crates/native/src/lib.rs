@@ -11,7 +11,8 @@ use napi::{Env, Task};
 use napi_derive::napi;
 use audio_aura_core::Calibrator as Inner;
 
-/// Resident router engine exposed to Node. Model loaded once in `load`, kept warm.
+/// Resident router engine exposed to Node. Talks to dp-router over HTTP (kept warm as long as
+/// the connection is alive); no model weights in this process.
 #[napi]
 pub struct RouterEngine {
     inner: Arc<Inner>,
@@ -19,9 +20,11 @@ pub struct RouterEngine {
 
 #[napi]
 impl RouterEngine {
+    /// `endpoint` is the dp-router base URL (e.g. `http://127.0.0.1:8080`); `model` is the
+    /// server-side model name registered with dp-router (e.g. `qwen2.5-3b-instruct-q4_k_m`).
     #[napi(factory)]
-    pub fn load(model_dir: String, model_file: String) -> Result<RouterEngine> {
-        let inner = Inner::load(&model_dir, &model_file).map_err(err)?;
+    pub fn load(endpoint: String, model: String) -> Result<RouterEngine> {
+        let inner = Inner::load(&endpoint, &model).map_err(err)?;
         Ok(RouterEngine {
             inner: Arc::new(inner),
         })
@@ -49,8 +52,8 @@ impl Task for RouteTask {
     type JsValue = String;
 
     fn compute(&mut self) -> Result<String> {
-        // aura 的 Calibrator 封装层持有 dp_models::MistralLlm, 并保留 calibrate_blocking
-        // (PromptBuilder 组装 + infer) 作为 Stage2 便捷入口。
+        // aura 的 Calibrator 封装层持有 dp_models::http::HttpLlm(连 dp-router),
+        // 并保留 calibrate_blocking (PromptBuilder 组装 + infer) 作为 Stage2 便捷入口。
         self.inner
             .calibrate_blocking(&self.raw_text, self.context.as_deref(), &[])
             .map_err(err)

@@ -133,22 +133,23 @@ struct LocalAsrConf {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RemoteAsrConf {
-    /// 服务地址 (e.g. http://127.0.0.1:8000)。
+    /// 服务地址 (e.g. http://127.0.0.1:8080 — dp-router,统一 LLM + ASR)。
     endpoint: Option<String>,
+    /// 服务端模型名(必填;OpenAI `/v1/audio/transcriptions` multipart form 必带 `model`)。
+    /// 需与 dp-router.yaml `models[].name` 对齐(如 "qwen3-asr")。
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// `llm:` — Stage2 LLM。
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct LlmConf {
-    /// Deployment: "local" (默认, in-process mistral.rs) | "remote" (HTTP)。
+    /// Deployment: "remote" (默认,连 dp-router) | "disable" (Stage2 关闭)。
     backend: Option<String>,
-    /// local: GGUF 文件名(在 `model_dir` 或 MODELS 命名空间内);
-    /// remote: 服务端模型名(传给 /v1/chat/completions)。
+    /// remote: 服务端模型名(传给 /v1/chat/completions)。默认 qwen2.5-3b-instruct-q4_k_m。
     model: Option<String>,
-    /// local-only:模型根目录覆盖(默认 MODELS 命名空间)。
-    model_dir: Option<String>,
-    /// remote-only:服务地址。
+    /// remote: 服务地址(默认 http://127.0.0.1:8080,指向 dp-router)。
     endpoint: Option<String>,
     /// Stage2 纠偏输入源: "batch" (默认) | "stream" | "both"。
     input: Option<LlmInput>,
@@ -315,7 +316,10 @@ fn resolve(cli: Cli, conf: AuraConf) -> Settings {
         model: asr.stream.model.clone().unwrap_or_else(|| "zipformer".to_string()),
     };
     let asr_spec = match asr.backend.as_deref() {
-        Some("remote") => AsrSpec::Remote { endpoint: asr.remote.endpoint.clone().unwrap_or_default() },
+        Some("remote") => AsrSpec::Remote {
+                endpoint: asr.remote.endpoint.clone().unwrap_or_default(),
+                model: asr.remote.model.clone().unwrap_or_else(|| "qwen3-asr".to_string()),
+            },
         Some("disable") => AsrSpec::Disabled,
         _ => AsrSpec::Local {
             backend: asr.local.model.clone().unwrap_or_else(|| "sensevoice".to_string()),
@@ -325,12 +329,13 @@ fn resolve(cli: Cli, conf: AuraConf) -> Settings {
             model_dir: asr.local.model_dir.clone(),
         },
     };
-    // Stage2 LLM: local mistral.rs GGUF (可选 model_dir), remote OpenAI-compatible, 或禁用。
-    let model = llm.model.clone().unwrap_or_else(|| "Qwen3-1.7B-Q8_0.gguf".to_string());
+    // Stage2 LLM: remote OpenAI-compatible (默认连 dp-router :8080) 或 disable。
+    let model = llm.model.clone().unwrap_or_else(|| "qwen2.5-3b-instruct-q4_k_m".to_string());
+    let endpoint = llm.endpoint.clone().unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
     let llm_spec = match llm.backend.as_deref() {
-        Some("remote") => LlmSpec::Remote { endpoint: llm.endpoint.clone().unwrap_or_default(), model },
         Some("disable") => LlmSpec::Disabled,
-        _ => LlmSpec::Local { model, model_dir: llm.model_dir.clone() },
+        // 缺省 / 显式 remote → Remote(包含 "remote" 外的任何 backend 字符串:宽容兼旧配置)。
+        _ => LlmSpec::Remote { endpoint, model },
     };
     Settings {
         bind_addr: bind_addr.unwrap_or_else(|| "127.0.0.1".to_string()),
@@ -522,7 +527,7 @@ fn main() -> Result<()> {
         },
         llm_kind: spec.llm.kind().to_string(),
         model: match &spec.llm {
-            LlmSpec::Local { model, .. } | LlmSpec::Remote { model, .. } => model.clone(),
+            LlmSpec::Remote { model, .. } => model.clone(),
             LlmSpec::Disabled => String::new(),
         },
         vad: VadView {
@@ -903,7 +908,8 @@ mod tests {
         assert_eq!(s.port, 1234);
         assert_eq!(s.bind_addr, "127.0.0.1", "bind addr default");
         assert!(!s.stage3_on, "--no-stage3 beats the config file");
-        assert!(matches!(&s.spec.llm, LlmSpec::Local { model, .. } if model == "Qwen3-1.7B-Q8_0.gguf"));
+        assert!(matches!(&s.spec.llm, LlmSpec::Remote { model, endpoint }
+            if model == "qwen2.5-3b-instruct-q4_k_m" && endpoint == "http://127.0.0.1:8080"));
         assert_eq!(s.spec.hotwords.len(), super::SEED_HOTWORDS.len(), "seed fallback");
         assert_eq!(s.web_dist.as_deref(), Some("/tmp/dist"));
         assert_eq!(s.log_level, "debug", "log_level from the config file");
@@ -927,7 +933,7 @@ mod tests {
         let conf = AuraConf {
             asr: AsrConf {
                 backend: Some("remote".into()),
-                remote: RemoteAsrConf { endpoint: Some("http://127.0.0.1:8000".into()) },
+                remote: RemoteAsrConf { endpoint: Some("http://127.0.0.1:8080".into()), model: None },
                 ..Default::default()
             },
             llm: LlmConf {
@@ -939,7 +945,7 @@ mod tests {
             ..Default::default()
         };
         let s = resolve(Cli::default(), conf);
-        assert!(matches!(&s.spec.asr, AsrSpec::Remote { endpoint } if endpoint == "http://127.0.0.1:8000"));
+        assert!(matches!(&s.spec.asr, AsrSpec::Remote { endpoint, model } if endpoint == "http://127.0.0.1:8000"));
         assert!(matches!(&s.spec.llm, LlmSpec::Remote { endpoint, model }
             if endpoint == "http://127.0.0.1:3000" && model == "m.gguf"));
     }

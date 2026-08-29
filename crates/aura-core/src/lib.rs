@@ -149,28 +149,23 @@ pub enum Stage1Event {
 pub use dp_models::{VadEvent, VadEventKind};
 /// The ASR provider abstraction (local OnnxAsr / remote HttpAsr both impl it).
 pub use dp_models::AsrProvider as Asr;
+// Stage2 LLM 走 dp-router(OpenAI 兼容)。Calibrator 持 HttpLlm, 需要 trait 在 scope。
+use dp_models::LlmProvider;
 
-// ── Calibrator (aura 的 Stage2 本地 LLM 封装层) ─────────────────────────────
-// 模型本体 (mistralrs GGUF 加载) 在 `dp_models::mistral::MistralLlm` —— dp-models 是通用
-// 模型提供库, 命名面向通用能力 (local-mistral provider)。`Calibrator` 是 aura 自己的
-// 封装层: 持有 MistralLlm, 附加 Stage2 的 prompt 组装 (calibrate_blocking), 保持
-// `audio_aura_core::Calibrator` 的 API 不变 (native/examples 直接用)。
-#[cfg(feature = "mistral")]
+// ── Calibrator (aura 的 Stage2 LLM 封装层) ─────────────────────────────
+// Stage2 走 dp-router(OpenAI 兼容 HTTP, 见 apps/dp-router)。`Calibrator` 是 aura 自己的
+// 封装层: 持有 `dp_models::http::HttpLlm`(连到 dp-router), 附加 Stage2 的 prompt 组装
+// (`calibrate_blocking`), 保持 `audio_aura_core::Calibrator` 的 API 稳定
+// (native crate / examples 直接用)。
 pub struct Calibrator {
-    inner: dp_models::MistralLlm,
+    inner: dp_models::http::HttpLlm,
 }
 
-#[cfg(feature = "mistral")]
 impl Calibrator {
-    pub fn load(model_dir: &str, model_file: &str) -> anyhow::Result<Self> {
-        Ok(Self { inner: dp_models::MistralLlm::load(model_dir, model_file)? })
-    }
-
-    /// Load by model file name only — the model **directory** is resolved via the shared
-    /// `MODELS` namespace (declared in dp-models' `Cargo.toml`; dev = workspace
-    /// `assets/models`, prod = `~/.desk-pilot/models`).
-    pub fn load_default(model_file: &str) -> anyhow::Result<Self> {
-        Ok(Self { inner: dp_models::MistralLlm::load_default(model_file)? })
+    /// 连接到 dp-router(或任意 OpenAI 兼容上游)。`endpoint` 是 base URL(不带 /v1);
+    /// `model` 是服务端模型名。
+    pub fn load(endpoint: &str, model: &str) -> anyhow::Result<Self> {
+        Ok(Self { inner: dp_models::http::HttpLlm::new(endpoint, model) })
     }
 
     /// Run the merged 整流+路由 on one utterance; returns the model's raw JSON text.
@@ -190,11 +185,10 @@ impl Calibrator {
 
     /// Raw one-shot chat: send a (system, user) pair.
     pub fn infer(&self, system: &str, user: &str) -> anyhow::Result<String> {
-        self.inner.infer(system, user)
+        self.inner.complete(system, user)
     }
 }
 
-#[cfg(feature = "mistral")]
 impl dp_models::LlmProvider for Calibrator {
     fn complete(&self, system: &str, user: &str) -> anyhow::Result<String> {
         self.inner.complete(system, user)

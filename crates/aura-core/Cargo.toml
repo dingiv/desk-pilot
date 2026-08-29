@@ -31,22 +31,21 @@ name = "streaming_asr_hot"
 required-features = ["asr"]
 
 # Thin Stage1→Stage2 bench built on the Pipeline composer.
+# Stage2 LLM 走 dp-router(OpenAI 兼容 `/v1/chat/completions`);examples 默认指向
+# http://127.0.0.1:8080,可通过 DP_ROUTER_ENDPOINT / DP_ROUTER_MODEL 环境变量覆盖。
 [[example]]
 name = "stage12_live"
-required-features = ["asr", "cuda"]
+required-features = ["asr"]
 
 [[example]]
 name = "calibrate_bench"
-required-features = ["asr", "cuda"]
+required-features = ["asr"]
 
 [features]
 default = []
-# 本地 Stage2 LLM (mistral.rs)—— 依赖已迁至 dp-models, 这里转发。默认关闭(轻)。
-mistral = ["dp-models/mistral"]
-# 本地 LLM 走 CUDA(mistralrs/cuda; 隐式开启 mistral)。daemon `--features asr,cuda`。
-cuda = ["mistral", "dp-models/cuda"]
 # Stage1 local ASR (Silero VAD + streaming/batch via dp-models' sherpa-onnx wrapper) + the
 # executor/composer modules. Default build stays light (contract + storage).
+# Stage2 LLM 走 dp-router(http),不再需要 cuda / mistral 重依赖。
 asr = ["dp-models/speech"]
 
 [dependencies]
