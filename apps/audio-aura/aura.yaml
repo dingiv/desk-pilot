@@ -36,7 +36,8 @@ asr:
     threads: 8                  # 批式 intra-op 线程 (8 核甜点)
     # model_dir: "/path/to/models"  # 模型根目录覆盖 (默认 MODELS 命名空间; VAD/流式/批式全走它)
   remote:                       # backend=remote 时生效
-    endpoint: "http://127.0.0.1:8000"  # OpenAI 兼容服务地址 (qwen-asr-serve 等)
+    endpoint: "http://127.0.0.1:8080"  # OpenAI 兼容服务地址 (dp-router,本机)
+    model: "qwen3-asr"          # dp-router 端注册的 ASR 模型名 (与 dp-router.yaml models[].name 对齐)
     # api_key: ...              # 未来: HttpAsr 尚未支持鉴权, 落键无行为故先不开
   # backend=disable: 纯流式模式 —— 不加载批式模型, batch_text 恒 None (回退流式文本),
   # 省掉段级/窗口级 batch 调用 (远程 ~3.5s/次)。
