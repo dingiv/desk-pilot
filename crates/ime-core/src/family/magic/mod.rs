@@ -250,6 +250,13 @@ impl MagicFamily {
     /// (expansion == trigger) and resolves the static FRESH from the registry.
     /// A user snippet shadowing the same trigger has expansion ≠ trigger, so
     /// the override is untouched.
+    /// idle 键是否触发器引导符(命令 `#` / 片段 `/`)—— 状态机据此决定
+    /// 是否进入 snippet 态。原 matcher trie 的等价简化:所有触发器必然
+    /// 以这两个引导符之一开头(成员注册表见 matcher_entries)。
+    pub fn is_trigger_start(&self, ch: char) -> bool {
+        ch == '#' || ch == '/'
+    }
+
     pub fn matcher_entries(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for s in &self.statics {

@@ -8,7 +8,7 @@ pub mod family;
 pub mod fsm;
 pub mod frontend;
 pub mod io_thread;
-pub mod matcher;
+
 pub mod scoring;
 pub mod store;
 pub mod voice_state;
@@ -22,6 +22,6 @@ pub use fsm::state;
 
 
 pub use expander::Expander;
-pub use matcher::Matcher;
+
 pub use frontend::{CandidateSlot, ImeView, CANDIDATE_SLOTS};
 pub use router::{KeyEvent, KeyKind, StateFlags, StateMachineTable};

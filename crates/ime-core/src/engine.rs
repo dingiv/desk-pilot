@@ -67,9 +67,7 @@ pub const DEFAULT_VOICE_AURA_BASE: &str = "http://127.0.0.1:9091";
 /// Self-contained IME engine. Manages the dispatcher, per-context state
 /// machines, input context, and async waits.
 pub struct ImeEngine {
-    /// 组合表(snippet/命令触发器 trie)+ 变量展开器(原 Dispatcher 字段,
-    /// 转发层裁撤后引擎直持)。
-    matcher: crate::Matcher,
+    /// 变量展开器(引擎直持,原 Dispatcher 字段)。
     expander: crate::Expander,
     /// 统一打分器(家族容器 + 合成;合成段 S6 归 stage3 后处理)。
     scorer: crate::family::UnifiedScorer,
@@ -170,7 +168,6 @@ impl ImeEngine {
         if let Some(m) = Arc::get_mut(&mut magic) {
             m.register_addons(&addons);
         }
-        let matcher = crate::Matcher::new(magic.matcher_entries());
         // 片段注册表:内置 + 外部注入(SNIP md / 配置);名字为片段名(如 `sig`,
         // 调用 `#/sig`)。
         let mut snippets: Vec<SnippetEntry> = vec![
@@ -228,7 +225,6 @@ impl ImeEngine {
             scoring.priorities,
         );
         let engine = ImeEngine {
-            matcher,
             expander,
             scorer,
             pinyin_family,
@@ -846,9 +842,6 @@ impl Default for ImeEngine {
 // ── StepEnv:状态机访问家族能力的接面(原 Dispatcher 职责,转发层裁撤)──
 
 impl crate::fsm::state::StepEnv for ImeEngine {
-    fn matcher(&self) -> &crate::Matcher {
-        &self.matcher
-    }
     fn expander(&self) -> &crate::Expander {
         &self.expander
     }

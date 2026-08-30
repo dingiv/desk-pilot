@@ -33,7 +33,7 @@ use crate::expander::Expander;
 use crate::family::magic::{
     ChainContext, MagicCommand, MagicMatch, MagicMember, Prediction,
 };
-use crate::matcher::Matcher;
+
 use crate::frontend::{ImeView, CANDIDATE_SLOTS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -997,7 +997,7 @@ impl StateMachine {
     // ── Idle ───────────────────────────────────────────────────────────
 
     fn handle_idle(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
-        if env.matcher().is_trigger_prefix(ch) {
+        if env.magic().is_trigger_start(ch) {
             self.state = ComposeState::Snippet;
             self.comp.buffer.push(ch);
             self.comp.preedit = self.comp.buffer.clone();
@@ -1387,7 +1387,6 @@ pub(crate) fn apply_input_casing(word: &str, raw_input: &str) -> String {
 /// Borrowed engine components needed by the FSM to evaluate transitions.
 pub trait StepEnv {
     //(InputContext 经全路径引用;trait 方法签名保持与家族 API 一致)
-    fn matcher(&self) -> &Matcher;
     fn expander(&self) -> &Expander;
 
     /// Unified candidate scorer — combines all families.
@@ -1514,13 +1513,11 @@ mod step_env_tests {
     use crate::family::pinyin::PinyinFamily;
     use crate::family::english::EnglishFamily;
     use crate::family::UnifiedScorer;
-    use crate::Matcher;
     use crate::Expander;
     use std::sync::Arc;
 
     /// 轻量测试桩:内嵌组件的 StepEnv(原 new_for_test Dispatcher 的替身)。
     struct TestEnv {
-        matcher: Matcher,
         expander: Expander,
         scorer: UnifiedScorer,
         magic: MagicFamily,
@@ -1528,7 +1525,6 @@ mod step_env_tests {
 
     impl TestEnv {
         fn new() -> Self {
-            let entries = vec![("#date".into(), "2026-07-23".into())];
             let magic = MagicFamily::new();
             magic.set_snippets(vec![crate::store::snippet_md::SnippetEntry {
                 name: "greet".into(),
@@ -1542,7 +1538,6 @@ mod step_env_tests {
                 crate::scoring::FamilyPriorities::default(),
             );
             TestEnv {
-                matcher: Matcher::new(entries),
                 expander: Expander::new(Arc::new(StaticProvider {
                     date: "2026-07-23".into(),
                     clipboard: String::new(),
@@ -1566,9 +1561,6 @@ mod step_env_tests {
     }
 
     impl StepEnv for TestEnv {
-        fn matcher(&self) -> &Matcher {
-            &self.matcher
-        }
         fn expander(&self) -> &Expander {
             &self.expander
         }
@@ -1715,7 +1707,6 @@ mod step_env_tests {
             date: Mutex::new("2026-08-05".into()),
         });
         let mut d = TestEnv::new();
-        d.matcher = Matcher::new(Vec::new());
         d.expander = Expander::new(provider);
         d.magic()
             .set_snippets(vec![crate::store::snippet_md::SnippetEntry {
