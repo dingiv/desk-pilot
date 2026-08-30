@@ -169,3 +169,18 @@ state.rs 内部自访问。过渡策略:聚合体暴露与旧字段同形的访�
     `recency_persistence_across_sessions` 集成测试红,找回完整函数体后转绿
     (测试护航价值实证)
   - 测试:ime-core 160+21+2、swift-ime 7+12+15 全绿
+- **S2 ✅** 后处理抽取 + meta 同序修复:
+  - query_pinyin 拆两段:Stage 2(scorer 单点)→ Stage 3 `postprocess()`
+    (promote_single_letter → PanelItem 化 → Layer 3 造词重排)
+  - 新增 `PanelItem { text, meta, partial }`:candidates/last_meta/
+    partial_commit_indices 三列表由它单点派生 —— **同源同序**,消除
+    重排后的对齐假设(last_meta 错位 bug 从结构上修复)
+  - 单字区 meta 自源(source="single",家族内 raw 分,weight-scoring
+    登记注记);tail 不再静默丢词头窗口里的链(旧 skip(max_full) 缺陷)
+  - 链式豁免(chained buffer 不出逐字选项)保留 —— chained prediction
+    护航点
+  - 断言 meta_aligns_with_candidates_after_compose_rerank(meta[i].text
+    == candidates[i] 全序;单字区 meta.source == "single")
+  - last_commit_family:降级为"注释澄清"(select 后 reset 的一次性
+    通信,信息源 = panel.meta.find(text));S4 下沉时再议归属
+  - 测试:ime-core 161+21+2、swift-ime 7+12+15 全绿

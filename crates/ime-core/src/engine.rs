@@ -501,6 +501,17 @@ impl ImeEngine {
             .unwrap_or_default()
     }
 
+    /// 候选元数据(与 [`candidates`](Self::candidates) 同序)—— 测试断言
+    /// meta 对齐用;调试视图经 view.candidates[].meta 走 fill_view。
+    pub(crate) fn last_meta(&self) -> Vec<crate::fsm::state::CandMeta> {
+        self.contexts
+            .lock()
+            .unwrap()
+            .get(&DEFAULT_CTX)
+            .map(|pc| pc.sm.last_meta().to_vec())
+            .unwrap_or_default()
+    }
+
     /// Current candidates with full detail (source, score) for debugging.
     /// When the state machine is in Snippet state with fresh candidates, those
     /// are returned directly (they were produced by the Matcher→Expander path,
@@ -779,6 +790,27 @@ mod tests {
 
     fn eng() -> ImeEngine {
         ImeEngine::new()
+    }
+
+    #[test]
+    fn meta_aligns_with_candidates_after_compose_rerank() {
+        // S2:Layer 3 造词重排后,last_meta 与 candidates 必须同序同源 ——
+        // 曾在重排前采样,单字区的 meta 错位显示别人的来源。
+        use crate::fsm::router::{KeyKind, KeyEvent};
+        let mut e = ImeEngine::new();
+        for c in "nihao".chars() {
+            e.predict(KeyEvent { kind: KeyKind::Char(c), ctrl: false, shift: false, alt: false });
+        }
+        let cands = e.candidates();
+        let meta = e.last_meta();
+        assert_eq!(cands.len(), meta.len(), "meta/candidates 同长");
+        for (i, m) in meta.iter().enumerate() {
+            assert_eq!(m.text, cands[i], "同序: meta[{}] == candidates[{}]", i, i);
+        }
+        // 单字区(partial)的 meta 是自己的来源(single),不再是别人的。
+        if let Some(pos) = cands.iter().position(|c| c == "你") {
+            assert_eq!(meta[pos].source, "single", "单字区 meta 自源: {}", meta[pos].source);
+        }
     }
 
     #[test]

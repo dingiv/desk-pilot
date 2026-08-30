@@ -83,6 +83,8 @@ pub struct StateMachine {
     /// How many of the first candidates are full-word compositions
     /// (for backward compat and UI display offset).
     pub full_comp_count: usize,
+    /// postprocess → query_pinyin 的带出槽(stage3 内部中间值,非持久状态)。
+    pending_full_comp_count: usize,
     /// Indices in `candidates` that are single-char partial-commit options.
     partial_commit_indices: Vec<bool>,
     /// Short-term input context — accumulates recently committed text.
@@ -118,6 +120,16 @@ pub(crate) struct CandMeta {
     pub score: f64,
     pub family: &'static str,
     pub source: &'static str,
+}
+
+/// Stage 3 后处理的产出项:候选文本 + 元数据 + 部分提交标记,三者同源。
+/// candidates / last_meta / partial_commit_indices 三个列表由此单点派生
+/// (S2 规范化:消除重排后独立数组间的对齐假设)。
+#[derive(Debug, Clone)]
+pub(crate) struct PanelItem {
+    pub text: String,
+    pub meta: CandMeta,
+    pub partial: bool,
 }
 
 impl StateMachine {
@@ -1079,132 +1091,21 @@ impl StateMachine {
     }
 
     fn query_pinyin(&mut self, env: &dyn StepEnv) -> ImeView {
-        // Unified scorer: collects candidates from all enabled families,
-        // ranks them by weighted score, returns deduplicated text list.
+        // ── Stage 2:家族预测(scorer 单点调用;合成段 S6 归 stage3)──
         let ranked = env.scorer().rank_detailed(&self.buffer, &self.context);
-        let ranked = promote_single_letter(&self.buffer, ranked);
-        // 候选词自带元数据(来源家族/成员 + 权重)—— 调试 meta 与提交来源判断共用。
-        self.last_meta = ranked
-            .iter()
-            .map(|c| CandMeta {
-                text: c.text.clone(),
-                score: c.score,
-                family: c.family,
-                source: c.source,
-            })
-            .collect();
-        let cands: Vec<String> = ranked.into_iter().map(|c| c.text).collect();
+        // ── Stage 3:后处理统一管线 ──
+        let items = self.postprocess(ranked, env);
 
-        let mut merged = Vec::new();
-        self.partial_commit_indices.clear();
+        // 三列表同源同序落位 —— fill_view 的窗口偏移 / select 的家族判定 /
+        // ">" 部分提交标记全从同一 PanelItem 序列出发,不再有独立数组间的
+        // 对齐假设(修复:meta 采样曾在重排前,last_meta 与 candidates 错位)。
+        self.full_comp_count = self.pending_full_comp_count;
+        self.candidates = items.iter().map(|i| i.text.clone()).collect();
+        self.partial_commit_indices = items.iter().map(|i| i.partial).collect();
+        self.last_meta = items.iter().map(|i| i.meta.clone()).collect();
 
-        // Layer 3: if buffer has 2+ syllables, add first-syllable single-char
-        // options for incremental composition (造词).
-        // Interleave: a few top full comps, then single-char options.
-        // 链式输入(`ti'an`)不提供逐字选项 —— 部分提交按音节消耗 buffer,
-        // 会把 `'` 留在半截 buffer 里破坏链结构;链式候选只整体提交。
-        let chained = self.buffer.contains('\'');
-        if let Some(first_syl) = env.first_syllable(&self.buffer) {
-            if !chained && first_syl.len() < self.buffer.len() {
-                // 槽位分配(总 16,view.candidates 定长):造词场景的多字链头
-                // 大多是 decomp 垃圾链(如 jianshipin → 监视频/检视频/健食品),
-                // 对逐字造词无价值 —— 词头只收**真词**(非 decomp 来源),
-                // 剩余槽位全给单字。曾用 8+8 定额:jianshipin 造"剪视频"时,
-                // 剪在 jian 单字表第 9,刚好被截,逐字造词无法起步。
-                let real_words: Vec<usize> = cands
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| {
-                        self.last_meta
-                            .get(*i)
-                            .map(|m| m.source != "decomp")
-                            .unwrap_or(true)
-                    })
-                    .map(|(i, _)| i)
-                    .take(4)
-                    .collect();
-                // 嵌入词典场景(无 FST 大词典):候选全是 decomp 链,"你好"
-                // 也是链 —— 过滤后 head 为空会让单字区顶到槽 1,space 提交
-                // 变成单字部分提交。保底收首候选(rank 分序的第一名)。
-                let real_words = if real_words.is_empty() {
-                    vec![0]
-                } else {
-                    real_words
-                };
-                let max_full = real_words.len();
-                // 单字区全量放出(不再截 12):merged 可超 16 槽,
-                // fill_view 按页切窗后翻页全部可达。
-                let max_chars = 32usize;
-                // 造词单字候选:直接走 pinyin 家族的 predict(单音节输入 =
-                // single 路径,dict.lookup + 衰减排序)。修复 B2 双实例脑裂:
-                // 曾用独立的 InputxPinyin 实例(学习路径全在 family),其
-                // L0 永远为空,用户的选择历史从不影响造词候选排序。
-                let char_cands: Vec<String> = env
-                    .scorer()
-                    .family("pinyin")
-                    .map(|f| f.predict(&first_syl, &self.context))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|c| c.text)
-                    .filter(|c| c.chars().count() == 1 && !merged.contains(c))
-                    .take(max_chars)
-                    .collect();
-
-                if !char_cands.is_empty() {
-                    // Top full comps(真词)。
-                    let full_head = real_words
-                        .iter()
-                        .filter_map(|&i| cands.get(i).cloned())
-                        .collect::<Vec<_>>();
-                    self.full_comp_count = full_head.len();
-                    for _ in 0..full_head.len() {
-                        self.partial_commit_indices.push(false);
-                    }
-                    merged.extend(full_head);
-
-                    // Single-char options (labeled ">").
-                    for _ in 0..char_cands.len() {
-                        self.partial_commit_indices.push(true);
-                    }
-                    merged.extend(char_cands);
-
-                    // Remaining full comps.
-                    let full_tail: Vec<String> = cands
-                        .iter()
-                        .skip(max_full)
-                        .filter(|&c| !merged.contains(c))
-                        .cloned()
-                        .collect();
-                    for _ in 0..full_tail.len() {
-                        self.partial_commit_indices.push(false);
-                    }
-                    merged.extend(full_tail);
-                } else {
-                    self.full_comp_count = cands.len();
-                    for _ in 0..cands.len() {
-                        self.partial_commit_indices.push(false);
-                    }
-                    merged = cands;
-                }
-            } else {
-                self.full_comp_count = cands.len();
-                for _ in 0..cands.len() {
-                    self.partial_commit_indices.push(false);
-                }
-                merged = cands;
-            }
-        } else {
-            self.full_comp_count = cands.len();
-            for _ in 0..cands.len() {
-                self.partial_commit_indices.push(false);
-            }
-            merged = cands;
-        }
-
-        let cands = merged;
-
+        let cands = self.candidates.clone();
         if !cands.is_empty() {
-            self.candidates.clone_from(&cands);
             self.candidate_highlight = 0;
             self.candidate_page = 0;
             self.candidates_fresh = true;
@@ -1213,6 +1114,101 @@ impl StateMachine {
             self.candidates_fresh = false;
         }
         self.make_view()
+    }
+
+    /// Stage 3 后处理:全局调整(promote_single_letter)→ 造词单字区重排
+    /// → 产出与 candidates 同序的 PanelItem 序列(meta/partial 同源)。
+    /// full_comp_count 经 `pending_full_comp_count` 带出(postprocess 需
+    /// &mut self 读 buffer/查询家族,而 query_pinyin 的落位段统一写)。
+    fn postprocess(&mut self, ranked: Vec<crate::family::RankedCandidate>, env: &dyn StepEnv) -> Vec<PanelItem> {
+        // 1. 全局调整:单字母输入的 self/case 置顶(与 candidates_detailed
+        //    镜像同规则,见 engine.rs 同名调用)。
+        let ranked = promote_single_letter(&self.buffer, ranked);
+        // 2. PanelItem 化:meta 与文本同源。
+        let mut items: Vec<PanelItem> = ranked
+            .into_iter()
+            .map(|c| PanelItem {
+                meta: CandMeta {
+                    text: c.text.clone(),
+                    score: c.score,
+                    family: c.family,
+                    source: c.source,
+                },
+                text: c.text,
+                partial: false,
+            })
+            .collect();
+
+        // 3. Layer 3 造词单字区:buffer ≥2 音节时追加首音节单字(逐字造词)。
+        //    链式输入(`ti'an`)豁免 —— 部分提交按音节消耗 buffer,会把
+        //    `'` 留在半截 buffer 里破坏链结构;链式候选只整体提交。
+        let chained = self.buffer.contains('\'');
+        if let Some(first_syl) = env.first_syllable(&self.buffer) {
+            if !chained && first_syl.len() < self.buffer.len() {
+                // 词头只收**真词**(非 decomp 链:X食品 类拼接对逐字造词
+                // 无价值);嵌入词典场景全 decomp 时保底收首候选(nihao 的
+                // "你好"也是链,head 空会让单字区顶到槽 1,space 变部分提交)。
+                let real_words: Vec<usize> = items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, it)| it.meta.source != "decomp")
+                    .map(|(i, _)| i)
+                    .take(4)
+                    .collect();
+                let real_words = if real_words.is_empty() { vec![0] } else { real_words };
+                // 单字区全量放出:merged 可超 16 槽,fill_view 按页切窗后
+                // 翻页全部可达。
+                let max_chars = 32usize;
+                // 造词单字候选:直接走 pinyin 家族的 predict(单音节输入 =
+                // single 路径)。修复 B2 双实例脑裂:曾用独立 InputxPinyin
+                // 实例,L0 永远为空,选择历史从不影响造词候选排序。
+                let char_items: Vec<PanelItem> = env
+                    .scorer()
+                    .family("pinyin")
+                    .map(|f| f.predict(&first_syl, &self.context))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|c| {
+                        c.text.chars().count() == 1
+                            && !items.iter().any(|it| it.text == c.text)
+                    })
+                    .take(max_chars)
+                    .map(|c| PanelItem {
+                        meta: CandMeta {
+                            text: c.text.clone(),
+                            // 家族内 raw 分(meta 显示语义与合成分类别不同,
+                            // 单字区未过 ×priority —— 翻译标注见 weight-scoring.md)
+                            score: c.raw_score,
+                            family: c.family,
+                            source: c.source,
+                        },
+                        text: c.text,
+                        partial: true,
+                    })
+                    .collect();
+
+                if !char_items.is_empty() {
+                    let head: Vec<PanelItem> = real_words
+                        .iter()
+                        .filter_map(|&i| items.get(i).cloned())
+                        .collect();
+                    let head_len = head.len();
+                    // tail:其余全部(head 之外的真词与链都保留 —— 旧实现
+                    // skip(max_full) 会静默丢掉词头窗口里的链)。
+                    let tail: Vec<PanelItem> = items
+                        .into_iter()
+                        .filter(|it| !head.iter().any(|h| h.text == it.text))
+                        .collect();
+                    let mut out = head;
+                    out.extend(char_items);
+                    out.extend(tail);
+                    self.pending_full_comp_count = head_len;
+                    return out;
+                }
+            }
+        }
+        self.pending_full_comp_count = items.len();
+        items
     }
 
     fn pinyin_backspace(&mut self, env: &dyn StepEnv) -> ImeView {
