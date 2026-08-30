@@ -29,11 +29,11 @@ use std::sync::{Arc, Mutex};
 use crate::dispatcher::Dispatcher;
 use crate::family::magic::{MagicFamily, ReqFetcher};
 use crate::family::InputContext;
-use crate::router::{StateFlags, StateMachineTable};
+use crate::fsm::router::{StateFlags, StateMachineTable};
 // 统一键事件由输入路由层定义(旧名 InputEvent;构造器同名,测试平移)。
 use crate::platform::ImeView;
-pub use crate::router::KeyEvent;
-use crate::state::{StateMachine, StepEnv};
+pub use crate::fsm::router::KeyEvent;
+use crate::fsm::state::{StateMachine, StepEnv};
 use crate::store::PersistenceManager;
 use crate::store::snippet_md::*;
 
@@ -80,7 +80,7 @@ pub struct ImeEngine {
     magic: Arc<MagicFamily>,
     /// The snippet-variable provider — same `Arc` the dispatcher's expander holds.
     /// `set_variable` writes through it so `$CLIPBOARD`-style templates resolve fresh.
-    provider: Arc<dyn crate::expander::VariableProvider>,
+    provider: Arc<dyn crate::family::magic::expander::VariableProvider>,
     /// 候选每页条数(swift-ime.yaml → input.page_size;默认 7)。传给每个新建的
     /// StateMachine —— 之前写死在 `StateMachine::new` 里(FIXME)。
     page_size: u32,
@@ -108,7 +108,7 @@ impl ImeEngine {
         Self::with_config(
             weights,
             crate::family::english::EnglishWeights::default(),
-            Box::new(crate::expander::DefaultProvider),
+            Box::new(crate::family::magic::expander::DefaultProvider),
             Vec::new(),
             crate::scoring::ScoringConfig::default(),
             Arc::new(crate::frontend::NoopFrontend::default()),
@@ -143,7 +143,7 @@ impl ImeEngine {
     pub fn with_config(
         pinyin_weights: crate::family::pinyin::PinyinWeights,
         english_weights: crate::family::english::EnglishWeights,
-        provider: Box<dyn crate::expander::VariableProvider>,
+        provider: Box<dyn crate::family::magic::expander::VariableProvider>,
         extra_snippets: Vec<crate::store::snippet_md::SnippetEntry>,
         scoring: crate::scoring::ScoringConfig,
         frontend: Arc<dyn crate::frontend::FrontEndHandle>,
@@ -180,7 +180,7 @@ impl ImeEngine {
         snippets.extend(extra_snippets);
         magic.set_snippets(snippets);
         // Shared with the dispatcher's expander — `set_variable` writes through the same Arc.
-        let provider: Arc<dyn crate::expander::VariableProvider> = Arc::from(provider);
+        let provider: Arc<dyn crate::family::magic::expander::VariableProvider> = Arc::from(provider);
         let expander = crate::Expander::new(Arc::clone(&provider));
         // 共享 voice state(voice server 折叠写入、#asr 成员同步读)。
         let voice_state = Arc::new(crate::voice_state::SharedVoiceState::new());
@@ -408,7 +408,7 @@ impl ImeEngine {
             .sm
             .candidates
             .first()
-            .map(|c| crate::state::apply_input_casing(c, &pc.sm.raw_buffer))
+            .map(|c| crate::fsm::state::apply_input_casing(c, &pc.sm.raw_buffer))
             .unwrap_or_else(|| pc.sm.raw_buffer.clone());
         let mut v = ImeView::empty();
         if !text.is_empty() {
@@ -503,7 +503,7 @@ impl ImeEngine {
         };
         // Snippet state (命令组合):candidates 来自命令预测 / 补全,不是 scorer。
         // 直接返回,让 #asr 语音 / #date 日期 / 补全提示正确显示。
-        if pc.sm.state == crate::state::ComposeState::Snippet && pc.sm.candidates_fresh {
+        if pc.sm.state == crate::fsm::state::ComposeState::Snippet && pc.sm.candidates_fresh {
             let family: &'static str = pc
                 .sm
                 .active_command
@@ -531,10 +531,10 @@ impl ImeEngine {
         let ctx = pc.text_context.clone();
         let buffer = pc.sm.buffer.clone();
         drop(map);
-        use crate::state::StepEnv;
+        use crate::fsm::state::StepEnv;
         // 与状态机同序:单字母置顶规则(promote_single_letter)在这里同样
         // 生效 —— 否则 detailed 镜像与机器候选列表顺序分叉。
-        crate::state::promote_single_letter(
+        crate::fsm::state::promote_single_letter(
             &buffer,
             self.dispatcher.scorer().rank_detailed(&buffer, &ctx),
         )
@@ -641,7 +641,7 @@ impl ImeEngine {
 
     pub fn magic_tick_ctx(&self, ctx: usize) -> Option<ImeView> {
         self.with_ctx(ctx, |disp, pc| {
-            use crate::state::ComposeState;
+            use crate::fsm::state::ComposeState;
             // 排查流式不刷新:每个 drain 是否到这里、state/has_member 是否正常。
             tracing::info!(
                 ctx,
@@ -684,7 +684,7 @@ impl ImeEngine {
     ///
     /// 线程安全:`contexts` 由 `Mutex` 保护,主线程写、I/O 线程读,无竞争。
     pub fn is_voice_ctx_alive(&self, ctx: usize) -> bool {
-        use crate::state::ComposeState;
+        use crate::fsm::state::ComposeState;
         let map = self.contexts.lock().unwrap();
         let alive = map.get(&ctx).is_some_and(|pc| {
             pc.sm.state == ComposeState::Snippet
@@ -1001,7 +1001,7 @@ mod tests {
     #[test]
     fn snippet_query_params_inject_template_variables() {
         // #/hello?name=Mike → 查询参数注入模板变量 $name。
-        use crate::expander::VariableProvider;
+        use crate::family::magic::expander::VariableProvider;
         #[derive(Clone)]
         struct NoVars;
         impl VariableProvider for NoVars {

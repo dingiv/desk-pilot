@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use super::member::{CommandArgs, MagicMember, Prediction};
 use super::MagicResources;
-use crate::state::StepEnv;
+use crate::fsm::state::StepEnv;
 
 /// 剪贴板历史容量。
 pub const CLIP_HISTORY_CAP: usize = 20;

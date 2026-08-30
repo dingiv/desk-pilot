@@ -139,7 +139,7 @@ pub fn build_engine(cfg: &TuiConfig) -> (ImeEngine, Arc<ime_core::voice_state::S
     let mut engine = ImeEngine::with_config(
         weights,
         eng_weights,
-        Box::new(ime_core::expander::DefaultProvider),
+        Box::new(ime_core::family::magic::expander::DefaultProvider),
         snippets,
         sw_cfg.weights.to_scoring(),
         cfg.frontend.clone().unwrap_or_else(|| Arc::new(ime_core::frontend::NoopFrontend::default())),
@@ -398,7 +398,7 @@ use std::sync::Mutex;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::ExecutableCommand;
-use ime_core::router::KeyKind;
+use ime_core::fsm::router::KeyKind;
 use ime_core::voice_state::SharedVoiceState;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -465,7 +465,7 @@ impl SharedIme {
     }
 
     /// 渲染用元数据(候选来源/分数 + 状态标志),与引擎短暂互斥。
-    fn render_meta(&self) -> (Vec<ime_core::family::RankedCandidate>, ime_core::router::StateFlags) {
+    fn render_meta(&self) -> (Vec<ime_core::family::RankedCandidate>, ime_core::fsm::router::StateFlags) {
         let e = self.engine.lock().unwrap();
         (e.candidates_detailed(), e.state_flags())
     }
@@ -726,7 +726,7 @@ fn render(
     history: &[String],
     voice_state: &SharedVoiceState,
     detailed: &[ime_core::family::RankedCandidate],
-    flags: ime_core::router::StateFlags,
+    flags: ime_core::fsm::router::StateFlags,
 ) {
     let area = f.area();
     let rows = Layout::vertical([
@@ -825,7 +825,7 @@ fn render_status(
     f: &mut Frame,
     area: Rect,
     voice_state: &SharedVoiceState,
-    flags: ime_core::router::StateFlags,
+    flags: ime_core::fsm::router::StateFlags,
 ) {
     let voice = voice_state.snapshot();
     let vs = if voice.is_empty() {

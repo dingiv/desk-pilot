@@ -14,7 +14,7 @@
 //! entries, prediction hints and activation dispatch are all generated from the
 //! registry. No engine / FSM special-casing needed.
 
-use crate::state::{StateMachine, StepEnv};
+use crate::fsm::state::{StateMachine, StepEnv};
 
 /// 命令的一条预测选项。
 ///
@@ -118,7 +118,7 @@ impl Prediction {
     }
 
     /// 参数输入态候选:展示文本 = 完整输入(`#del/15`);选中后框架不提交文本,
-    /// 而是用完整输入调用成员 `predict` 强制触发(见 [`select_magic`](crate::state::StateMachine::select_magic))。
+    /// 而是用完整输入调用成员 `predict` 强制触发(见 [`select_magic`](crate::fsm::state::StateMachine::select_magic))。
     pub fn submit(text: impl Into<String>) -> Self {
         Prediction {
             text: text.into(),

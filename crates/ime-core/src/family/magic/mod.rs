@@ -14,6 +14,7 @@ mod clip;
 mod concat;
 mod del;
 mod member;
+pub mod expander;
 mod req;
 mod snippet;
 mod translate;
@@ -36,7 +37,7 @@ pub use voice::VoiceMember;
 
 use req::ReqMember;
 
-use crate::expander::today_str;
+use crate::family::magic::expander::today_str;
 use crate::store::snippet_md::SnippetEntry;
 
 /// SharedVoiceState 槽 —— voice listener task 在 IoThread 上折叠 SSE 段写入,

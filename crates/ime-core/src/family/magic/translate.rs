@@ -9,7 +9,7 @@
 //! 语音高亮传给翻译)的联调桩。接入真实翻译模型时只改 [`translate`]。
 
 use super::member::{ChainContext, CommandArgs, ContextKind, MagicMember, Prediction};
-use crate::state::{StateMachine, StepEnv};
+use crate::fsm::state::{StateMachine, StepEnv};
 
 pub struct TranslateMember;
 

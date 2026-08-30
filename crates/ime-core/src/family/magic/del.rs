@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use super::member::{CommandArgs, MagicMember, Prediction};
 use super::MagicResources;
-use crate::state::{StateMachine, StepEnv};
+use crate::fsm::state::{StateMachine, StepEnv};
 
 /// 固定删除长度选项。
 const FIXED_OPTIONS: &[u32] = &[10, 20, 999];

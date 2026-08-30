@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use super::member::{CommandArgs, MagicMember, Prediction};
 use super::MagicResources;
-use crate::state::StepEnv;
+use crate::fsm::state::StepEnv;
 
 /// 空名片段命令(`#/hello?name=Mike`)。
 pub struct SnippetMember {

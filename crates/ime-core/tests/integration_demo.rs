@@ -49,7 +49,7 @@ fn eng_with_aura(base: &str) -> ImeEngine {
     ImeEngine::with_config(
         ime_core::family::pinyin::PinyinWeights::default(),
         ime_core::family::english::EnglishWeights::default(),
-        Box::new(ime_core::expander::DefaultProvider),
+        Box::new(ime_core::family::magic::expander::DefaultProvider),
         Vec::new(),
         ime_core::scoring::ScoringConfig::default(),
         std::sync::Arc::new(ime_core::frontend::NoopFrontend::default()),

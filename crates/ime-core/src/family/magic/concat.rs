@@ -8,7 +8,7 @@
 //! 单独使用(`#concat` 无上游)给出提示(空链语法是它存在的意义)。
 
 use super::member::{ChainContext, ContextKind, MagicMember, Prediction};
-use crate::state::{StateMachine, StepEnv};
+use crate::fsm::state::{StateMachine, StepEnv};
 
 pub struct ConcatMember;
 

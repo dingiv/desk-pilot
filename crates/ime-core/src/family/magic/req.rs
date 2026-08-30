@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use super::member::{MagicMember, Prediction};
 use super::MagicResources;
-use crate::state::{StateMachine, StepEnv};
+use crate::fsm::state::{StateMachine, StepEnv};
 
 /// Default local magic backend — override via [`MagicFamily::set_req_base`] (or the
 /// frontend's config: `magic.req_base`).

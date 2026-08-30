@@ -4,7 +4,7 @@
 //! Candidate generation is delegated to the [`UnifiedScorer`], which collects
 //! and ranks candidates from all enabled prediction families.
 
-use crate::expander::Expander;
+use crate::family::magic::expander::Expander;
 use crate::family::english::EnglishFamily;
 use crate::family::magic::MagicFamily;
 use crate::family::pinyin::PinyinFamily;
@@ -12,7 +12,7 @@ use crate::family::CandidateFamily;
 use crate::family::UnifiedScorer;
 use crate::matcher::Matcher;
 use crate::platform::ImeView;
-use crate::state::{StateMachine, StepEnv};
+use crate::fsm::state::{StateMachine, StepEnv};
 use std::sync::Arc;
 
 pub struct Dispatcher {
@@ -212,7 +212,7 @@ impl StepEnv for Dispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expander::StaticProvider;
+    use crate::family::magic::expander::StaticProvider;
 
     fn d() -> Dispatcher {
         let entries = vec![("#date".into(), "2026-07-23".into())];
@@ -245,7 +245,7 @@ mod tests {
         let _v = d.process_key('n', &mut s);
         assert_eq!(
             s.state,
-            crate::state::ComposeState::Pinyin,
+            crate::fsm::state::ComposeState::Pinyin,
             "single letter should enter pinyin state"
         );
         // 'n' alone is not a complete syllable; candidates depend on FST/decomp.
@@ -313,7 +313,7 @@ mod tests {
         d.process_key('e', &mut s);
         assert_eq!(
             ImeView::str_field(&d.process_key(' ', &mut s).commit_text),
-            crate::expander::today_str(),
+            crate::family::magic::expander::today_str(),
             "#date commits today"
         );
         // After magic, typing letters enters pinyin.
@@ -342,7 +342,7 @@ mod tests {
         // Template with a mid-text $CURSOR marker: committing places the caret
         // at the marker's offset in the EXPANDED text (variables before it are
         // variable-length, so the offset is computed after expansion).
-        use crate::expander::{Expander, VariableProvider};
+        use crate::family::magic::expander::{Expander, VariableProvider};
         use std::sync::Mutex;
 
         #[derive(Default)]
@@ -393,6 +393,6 @@ mod tests {
         d.process_key('n', &mut s);
         d.reset(&mut s);
         assert!(s.buffer.is_empty());
-        assert_eq!(s.state, crate::state::ComposeState::Idle);
+        assert_eq!(s.state, crate::fsm::state::ComposeState::Idle);
     }
 }

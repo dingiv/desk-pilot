@@ -25,7 +25,7 @@ use std::sync::Arc;
 use super::member::{CommandArgs, MagicMember, Prediction};
 use super::MagicResources;
 use crate::io_thread::{VoiceCmd, VoiceCmdSender};
-use crate::state::{StateMachine, StepEnv};
+use crate::fsm::state::{StateMachine, StepEnv};
 use crate::voice_state::SharedVoiceState;
 
 const MAX_SUBMIT: usize = 4;
