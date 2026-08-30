@@ -622,7 +622,7 @@ impl MagicMember for ReqMember {
             return None; // no request finished since the last rebuild
         }
         self.last_version = cur;
-        let input = sm.buffer.clone();
+        let input = sm.comp.buffer.clone();
         Some(self.predict(sm.ctx, &input, env))
     }
 }

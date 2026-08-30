@@ -50,32 +50,15 @@ pub struct StateMachine {
     /// 把异步工作事件发到正确的 ctx 并 refresh 对应上下文。
     pub ctx: usize,
     pub state: ComposeState,
-    /// 键入的原始文本(保留大小写)。预测用 [`buffer`](小写);展示与提交
-    /// 用这里。英文候选提交时按它回填大小写(English 而非 english)。
-    /// 不变式:`buffer` 是 `raw_buffer` 的 ASCII 小写,二者等长。
-    pub raw_buffer: String,
-    /// Raw pinyin buffer — remaining uncommitted pinyin syllables.
-    pub buffer: String,
-
-    /// Visual preedit: committed hanzi + remaining pinyin.
-    pub preedit: String,
+    /// 组合会话(S4 下沉):原始键入/预测串/预编辑/光标/造词半成品。
+    pub comp: Composition,
 
     /// 调试模式:候选词显示提供者与权重(`[score family/source]`)。
     pub candidate_meta_enabled: bool,
 
-    /// Cursor 管理
-    /// Cursor byte offset within preedit.
-    pub cursor: usize,
-
     /// 候选面板(S4 下沉):items/meta/partial 同源同序 + 高亮/分页。
     pub panel: CandidatePanel,
 
-    /// **pinyin 家族**
-    /// 自生词系统
-    /// Hanzi already committed during incremental composition (e.g. "李正").
-    pub committed_text: String,
-    /// Pinyin corresponding to the committed hanzi (e.g. "lizheng").
-    committed_pinyin_buf: String,
     /// postprocess → query_pinyin 的带出槽(stage3 内部中间值,非持久状态)。
     pending_full_comp_count: usize,
     /// Short-term input context — accumulates recently committed text.
@@ -109,6 +92,26 @@ pub(crate) struct CandMeta {
     pub score: f64,
     pub family: &'static str,
     pub source: &'static str,
+}
+
+/// 组合会话(S4 状态下沉):一次输入组合的文本状态 —— 原始键入、预测串、
+/// 预编辑展示、光标、造词半成品。生命周期:idle 起步,提交/重置终。
+/// 不变式:`buffer` 是 `raw_buffer` 的 ASCII 小写,二者等长。
+#[derive(Debug, Default)]
+pub(crate) struct Composition {
+    /// 键入的原始文本(保留大小写)。英文候选提交时按它回填大小写
+    /// (English 而非 english)。
+    pub raw_buffer: String,
+    /// 剩余未提交的拼音/字母串(小写;预测输入)。
+    pub buffer: String,
+    /// 展示预编辑:committed 汉字 + 剩余拼音。
+    pub preedit: String,
+    /// preedit 内的光标字节偏移。
+    pub cursor: usize,
+    /// 造词半成品:逐字选择期间已提交的汉字(如 "李正")。
+    pub committed_text: String,
+    /// 已提交部分对应的拼音(如 "lizheng")。
+    pub committed_pinyin: String,
 }
 
 /// 候选面板(S4 状态下沉):items/meta/partial 三列表同源同序
@@ -176,9 +179,9 @@ impl std::fmt::Debug for StateMachine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StateMachine")
             .field("state", &self.state)
-            .field("buffer", &self.buffer)
-            .field("preedit", &self.preedit)
-            .field("cursor", &self.cursor)
+            .field("buffer", &self.comp.buffer)
+            .field("preedit", &self.comp.preedit)
+            .field("cursor", &self.comp.cursor)
             .field("panel.items", &self.panel.items)
             .field("panel.highlight", &self.panel.highlight)
             .field("panel.page", &self.panel.page)
@@ -233,7 +236,7 @@ impl StateMachine {
 
     /// 每次字符变化后重查:精确匹配 → 命令预测;前缀 → 补全提示;未知 → raw。
     fn query_magic(&mut self, env: &dyn StepEnv) -> ImeView {
-        let input = self.buffer.clone();
+        let input = self.comp.buffer.clone();
 
         // ── 链式命令模式(X'#cmd):上游折叠求值 + 上下文传递 ──────────
         if crate::fsm::chain::is_chain_command(&input) {
@@ -244,8 +247,8 @@ impl StateMachine {
         // 开头)→ 回拼音组合继续编辑上游。
         if input.contains('\'') && !input.starts_with('#') && !input.starts_with('/') {
             self.state = ComposeState::Pinyin;
-            self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
-            self.cursor = self.preedit.len();
+            self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
+            self.comp.cursor = self.comp.preedit.len();
             return self.query_pinyin(env);
         }
 
@@ -595,7 +598,7 @@ impl StateMachine {
         // 参数输入态的裸提交候选文本 == 缓冲,不重复追加 rollback。
         let is_submit = self.magic_predictions.first().map(|p| p.submit).unwrap_or(false);
         if !is_submit {
-            cands.push(self.buffer.clone()); // rollback — 最后一项
+            cands.push(self.comp.buffer.clone()); // rollback — 最后一项
         }
         self.panel.items = cands;
         self.panel.fresh = true;
@@ -606,11 +609,11 @@ impl StateMachine {
         if let Some(head) = self.magic_predictions.first() {
             // preedit 用选项独立的预览文本(默认=展示文本)—— 允许候选行展示
             // 精简结果、文本框给完整预览。
-            self.preedit = head.preedit_value().to_string();
+            self.comp.preedit = head.preedit_value().to_string();
         } else {
-            self.preedit = self.buffer.clone();
+            self.comp.preedit = self.comp.buffer.clone();
         }
-        self.cursor = self.preedit.len();
+        self.comp.cursor = self.comp.preedit.len();
         self.make_view()
     }
 
@@ -650,12 +653,12 @@ impl StateMachine {
         // 2. 补全提示:改写输入(不提交)。
         if index < n_preds + n_hints {
             let hint = self.magic_hints[index - n_preds].clone();
-            self.buffer = hint;
+            self.comp.buffer = hint;
             self.magic_hints.clear();
             return self.query_magic(env);
         }
         // 3. rollback:提交原始缓冲。
-        let raw = std::mem::take(&mut self.buffer);
+        let raw = std::mem::take(&mut self.comp.buffer);
         self.reset();
         Self::commit_view(&raw)
     }
@@ -666,7 +669,7 @@ impl StateMachine {
     fn force_fire(&mut self, env: &dyn StepEnv) -> ImeView {
         use crate::fsm::chain::{join_segments, split_segments, ChainSeg};
 
-        let input = self.buffer.clone();
+        let input = self.comp.buffer.clone();
 
         // 链式参数态(X'#del/15):命令段(含参数)提取,上游求值后带上下文
         // 强触发;不感知的命令照旧拼接。
@@ -729,7 +732,7 @@ impl StateMachine {
             };
         }
         // 无预测 → 提交原始输入。
-        let raw = std::mem::take(&mut self.buffer);
+        let raw = std::mem::take(&mut self.comp.buffer);
         self.reset();
         Self::commit_view(&raw)
     }
@@ -753,16 +756,16 @@ impl StateMachine {
         if !is_partial {
             // Full commit: combine committed_text + selected text. 英文候选按
             // 键入的原始大小写回填(raw_buffer),汉字候选天然 no-op。
-            let picked_cased = apply_input_casing(&picked, &self.raw_buffer);
-            let final_text = if self.committed_text.is_empty() {
+            let picked_cased = apply_input_casing(&picked, &self.comp.raw_buffer);
+            let final_text = if self.comp.committed_text.is_empty() {
                 picked_cased.clone()
             } else {
-                format!("{}{}", self.committed_text, picked_cased)
+                format!("{}{}", self.comp.committed_text, picked_cased)
             };
-            let full_pinyin = if self.committed_text.is_empty() {
-                self.buffer.clone()
+            let full_pinyin = if self.comp.committed_text.is_empty() {
+                self.comp.buffer.clone()
             } else {
-                format!("{}{}", self.committed_pinyin(), self.buffer)
+                format!("{}{}", self.committed_pinyin(), self.comp.buffer)
             };
             // 提交候选的来源家族 —— 两个家族的单词本各自闭环:
             // 拼音提交 → 拼音 L0/单词本;英文提交 → 英文家族(且词典词不学)。
@@ -780,7 +783,7 @@ impl StateMachine {
             // (committed_text 非空)后提交,整体无条件加入单词本。
             // 直接提交(空格选 top,未逐字选择)**不学** —— decomp 选项
             // 下次输入时 Viterbi 会重新组合出同样的候选,无需入本。
-            if !self.committed_text.is_empty() {
+            if !self.comp.committed_text.is_empty() {
                 env.learn_composed_phrase(&full_pinyin, &final_text);
             }
             self.context.update(&final_text);
@@ -790,20 +793,20 @@ impl StateMachine {
             Self::commit_view(&final_text)
         } else {
             // Partial commit: append this single character, shrink buffer.
-            self.committed_text.push_str(&picked);
-            let first_syl = env.first_syllable(&self.buffer).unwrap_or_default();
+            self.comp.committed_text.push_str(&picked);
+            let first_syl = env.first_syllable(&self.comp.buffer).unwrap_or_default();
             let first_len = first_syl.len();
-            if first_len > 0 && first_len <= self.buffer.len() {
+            if first_len > 0 && first_len <= self.comp.buffer.len() {
                 // Record this single-char pick in L0.
-                let consumed = self.buffer[..first_len].to_string();
+                let consumed = self.comp.buffer[..first_len].to_string();
                 env.record_pick(&consumed, &picked);
-                self.committed_pinyin_buf.push_str(&consumed);
-                self.buffer = self.buffer[first_len..].to_string();
+                self.comp.committed_pinyin.push_str(&consumed);
+                self.comp.buffer = self.comp.buffer[first_len..].to_string();
                 // 同步收缩 raw_buffer(consumed 是小写音节,等字节长)。
-                self.raw_buffer = self.raw_buffer[first_len..].to_string();
+                self.comp.raw_buffer = self.comp.raw_buffer[first_len..].to_string();
             }
-            self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
-            self.cursor = self.preedit.len();
+            self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
+            self.comp.cursor = self.comp.preedit.len();
             self.panel.fresh = false;
             self.panel.highlight = 0;
             self.query_pinyin(env)
@@ -813,16 +816,16 @@ impl StateMachine {
     pub fn reset(&mut self) {
         self.clear_active_command();
         self.state = ComposeState::Idle;
-        self.buffer.clear();
-        self.raw_buffer.clear();
-        self.preedit.clear();
-        self.cursor = 0;
+        self.comp.buffer.clear();
+        self.comp.raw_buffer.clear();
+        self.comp.preedit.clear();
+        self.comp.cursor = 0;
         self.panel.items.clear();
         self.panel.highlight = 0;
         self.panel.page = 0;
         self.panel.fresh = false;
-        self.committed_text.clear();
-        self.committed_pinyin_buf.clear();
+        self.comp.committed_text.clear();
+        self.comp.committed_pinyin.clear();
         self.panel.full_comp_count = 0;
         self.panel.partial.clear();
         self.magic_hints.clear();
@@ -864,16 +867,16 @@ impl StateMachine {
         }
         let hl = self.panel.highlight;
         if let Some(p) = self.magic_predictions.get(hl) {
-            self.preedit = p.text.clone();
+            self.comp.preedit = p.text.clone();
         } else {
-            self.preedit = self.buffer.clone();
+            self.comp.preedit = self.comp.buffer.clone();
         }
-        self.cursor = self.preedit.len();
+        self.comp.cursor = self.comp.preedit.len();
     }
 
     /// Full pinyin for the committed portion.
     fn committed_pinyin(&self) -> String {
-        self.committed_pinyin_buf.clone()
+        self.comp.committed_pinyin.clone()
     }
 
     /// 把 preedit 里的字面换行转义成 `\n` 文本(展示用),并同步调整光标字节偏移:
@@ -904,7 +907,7 @@ impl StateMachine {
         // preedit 是应用文本框里显示的内容;多行片段(如 #/angle 三角形)含
         // 字面 `\n`,直接显示会破坏应用排版 → 转义成 `\n` 文本。光标字节偏移
         // 同步调整(每个光标前的 `\n` 多占 1 字节)。
-        let (escaped, display_cursor) = Self::escape_preedit(&self.preedit, self.cursor);
+        let (escaped, display_cursor) = Self::escape_preedit(&self.comp.preedit, self.comp.cursor);
         ImeView::set_str(&mut view.preedit_text, &escaped);
         view.preedit_cursor = display_cursor as u32;
         // ── 翻页窗口:16 槽 = 从当前页首起的滑动窗口 ──
@@ -938,8 +941,8 @@ impl StateMachine {
         // 高亮,将提交的合成结果)严格区分。命令态显示 `#asr`,拼音态显示
         // 正在打的拼音(raw_buffer,保留大小写)。
         let raw = match self.state {
-            ComposeState::Snippet => self.buffer.clone(),
-            ComposeState::Pinyin => self.raw_buffer.clone(),
+            ComposeState::Snippet => self.comp.buffer.clone(),
+            ComposeState::Pinyin => self.comp.raw_buffer.clone(),
             ComposeState::Idle => String::new(),
         };
         ImeView::set_str(&mut view.aux_up, &raw);
@@ -996,19 +999,19 @@ impl StateMachine {
     fn handle_idle(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
         if env.matcher().is_trigger_prefix(ch) {
             self.state = ComposeState::Snippet;
-            self.buffer.push(ch);
-            self.preedit = self.buffer.clone();
-            self.cursor = 1;
+            self.comp.buffer.push(ch);
+            self.comp.preedit = self.comp.buffer.clone();
+            self.comp.cursor = 1;
             return self.make_view();
         }
         if ch.is_ascii_alphabetic() {
             // 大写字母视作小写进行预测(English → english),展示与提交
             // 保留原始大小写(raw_buffer)。
             self.state = ComposeState::Pinyin;
-            self.buffer.push(ch.to_ascii_lowercase());
-            self.raw_buffer.push(ch);
-            self.preedit = self.raw_buffer.clone();
-            self.cursor = self.preedit.len();
+            self.comp.buffer.push(ch.to_ascii_lowercase());
+            self.comp.raw_buffer.push(ch);
+            self.comp.preedit = self.comp.raw_buffer.clone();
+            self.comp.cursor = self.comp.preedit.len();
             self.panel.fresh = false;
             return self.query_pinyin(env);
         }
@@ -1026,8 +1029,8 @@ impl StateMachine {
     fn handle_snippet(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
         // Backspace: pop last char, re-query. Empty → reset.
         if ch == '\x08' {
-            self.buffer.pop();
-            if self.buffer.is_empty() {
+            self.comp.buffer.pop();
+            if self.comp.buffer.is_empty() {
                 self.reset();
                 return ImeView::empty();
             }
@@ -1036,7 +1039,7 @@ impl StateMachine {
 
         // Enter: force raw text.
         if ch == '\n' || ch == '\r' {
-            let raw = std::mem::take(&mut self.buffer);
+            let raw = std::mem::take(&mut self.comp.buffer);
             self.reset();
             return Self::commit_view(&raw);
         }
@@ -1067,7 +1070,7 @@ impl StateMachine {
                 tx.send(crate::io_thread::VoiceCmd::FlushParagraph);
             }
         }
-        self.buffer.push(ch);
+        self.comp.buffer.push(ch);
         self.query_magic(env)
     }
 
@@ -1087,30 +1090,30 @@ impl StateMachine {
                 if let Some(tx) = env.voice_cmd_tx() {
                     tx.send(crate::io_thread::VoiceCmd::FlushParagraph);
                 }
-                self.buffer.push('\'');
-                self.raw_buffer.push('\'');
-                self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
-                self.cursor = self.preedit.len();
+                self.comp.buffer.push('\'');
+                self.comp.raw_buffer.push('\'');
+                self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
+                self.comp.cursor = self.comp.preedit.len();
                 self.panel.fresh = false;
                 self.query_pinyin(env)
             }
             // 链式命令:`'#` 序列开启命令链(X'#translate)。`#` 不终结组合、
             // 不提交 —— 上游链保留在 buffer 里,转入 Snippet 态做命令输入;
             // 单独的 `#`(无 `'` 前导)维持旧的终结符行为(提交候选 + `#`)。
-            '#' if self.buffer.ends_with('\'') => {
-                self.buffer.push('#');
-                self.raw_buffer.push('#');
+            '#' if self.comp.buffer.ends_with('\'') => {
+                self.comp.buffer.push('#');
+                self.comp.raw_buffer.push('#');
                 self.state = ComposeState::Snippet;
-                self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
-                self.cursor = self.preedit.len();
+                self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
+                self.comp.cursor = self.comp.preedit.len();
                 self.panel.fresh = false;
                 self.query_magic(env)
             }
             c if c.is_ascii_alphabetic() => {
-                self.buffer.push(c.to_ascii_lowercase());
-                self.raw_buffer.push(c);
-                self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
-                self.cursor = self.preedit.len();
+                self.comp.buffer.push(c.to_ascii_lowercase());
+                self.comp.raw_buffer.push(c);
+                self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
+                self.comp.cursor = self.comp.preedit.len();
                 self.panel.fresh = false;
                 self.query_pinyin(env)
             }
@@ -1120,7 +1123,7 @@ impl StateMachine {
 
     fn query_pinyin(&mut self, env: &dyn StepEnv) -> ImeView {
         // ── Stage 2:家族预测(scorer 单点调用;合成段 S6 归 stage3)──
-        let ranked = env.scorer().rank_detailed(&self.buffer, &self.context);
+        let ranked = env.scorer().rank_detailed(&self.comp.buffer, &self.context);
         // ── Stage 3:后处理统一管线 ──
         let items = self.postprocess(ranked, env);
 
@@ -1151,7 +1154,7 @@ impl StateMachine {
     fn postprocess(&mut self, ranked: Vec<crate::family::RankedCandidate>, env: &dyn StepEnv) -> Vec<PanelItem> {
         // 1. 全局调整:单字母输入的 self/case 置顶(与 candidates_detailed
         //    镜像同规则,见 engine.rs 同名调用)。
-        let ranked = promote_single_letter(&self.buffer, ranked);
+        let ranked = promote_single_letter(&self.comp.buffer, ranked);
         // 2. PanelItem 化:meta 与文本同源。
         let mut items: Vec<PanelItem> = ranked
             .into_iter()
@@ -1187,7 +1190,7 @@ impl StateMachine {
                 // 单字区全量放出:merged 可超 16 槽,fill_view 按页切窗后
                 // 翻页全部可达。
                 let char_items: Vec<PanelItem> = env
-                    .compose_single_chars(&self.buffer, &self.context, &texts, 32)
+                    .compose_single_chars(&self.comp.buffer, &self.context, &texts, 32)
                     .into_iter()
                     .map(|c| PanelItem {
                         meta: CandMeta {
@@ -1229,29 +1232,29 @@ impl StateMachine {
 
     fn pinyin_backspace(&mut self, env: &dyn StepEnv) -> ImeView {
         // If we have committed text, backspace undoes the last committed char.
-        if !self.committed_text.is_empty() {
-            self.committed_text.pop();
+        if !self.comp.committed_text.is_empty() {
+            self.comp.committed_text.pop();
             // Undo the last consumed syllable from committed_pinyin_buf.
-            let last_syl = env.first_syllable(&self.committed_pinyin_buf);
+            let last_syl = env.first_syllable(&self.comp.committed_pinyin);
             if let Some(syl) = last_syl {
-                let trim = self.committed_pinyin_buf.len().saturating_sub(syl.len());
-                self.committed_pinyin_buf.truncate(trim);
+                let trim = self.comp.committed_pinyin.len().saturating_sub(syl.len());
+                self.comp.committed_pinyin.truncate(trim);
                 // Prepend the syllable back to buffer.
-                self.buffer = format!("{syl}{}", self.buffer);
-                self.raw_buffer = format!("{syl}{}", self.raw_buffer);
+                self.comp.buffer = format!("{syl}{}", self.comp.buffer);
+                self.comp.raw_buffer = format!("{syl}{}", self.comp.raw_buffer);
             }
-            self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
-            self.cursor = self.preedit.len();
+            self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
+            self.comp.cursor = self.comp.preedit.len();
             self.panel.fresh = false;
             return self.query_pinyin(env);
         }
 
-        self.buffer.pop();
-        self.raw_buffer.pop();
-        self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
-        self.cursor = self.preedit.len();
+        self.comp.buffer.pop();
+        self.comp.raw_buffer.pop();
+        self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
+        self.comp.cursor = self.comp.preedit.len();
         self.panel.fresh = false;
-        if self.buffer.is_empty() {
+        if self.comp.buffer.is_empty() {
             self.reset();
             ImeView::empty()
         } else {
@@ -1261,8 +1264,8 @@ impl StateMachine {
 
     fn pinyin_enter(&mut self) -> ImeView {
         // Enter 强选 raw 文本:提交原始大小写(raw_buffer),非小写 buffer。
-        let raw = std::mem::take(&mut self.raw_buffer);
-        let committed = std::mem::take(&mut self.committed_text);
+        let raw = std::mem::take(&mut self.comp.raw_buffer);
+        let committed = std::mem::take(&mut self.comp.committed_text);
         let text = if committed.is_empty() {
             raw
         } else {
@@ -1275,9 +1278,9 @@ impl StateMachine {
     fn pinyin_space(&mut self, env: &dyn StepEnv) -> ImeView {
         if !self.panel.fresh {
             // No candidates — commit raw (committed_text + raw_buffer)。
-            let committed = std::mem::take(&mut self.committed_text);
-            let raw = std::mem::take(&mut self.raw_buffer);
-            let _ = std::mem::take(&mut self.buffer);
+            let committed = std::mem::take(&mut self.comp.committed_text);
+            let raw = std::mem::take(&mut self.comp.raw_buffer);
+            let _ = std::mem::take(&mut self.comp.buffer);
             self.panel.items.clear();
             self.state = ComposeState::Idle;
             let text = if committed.is_empty() {
@@ -1301,9 +1304,9 @@ impl StateMachine {
     fn pinyin_terminator(&mut self, ch: char) -> ImeView {
         let fresh = self.panel.fresh;
         let top = self.panel.items.first().cloned();
-        let committed = std::mem::take(&mut self.committed_text);
-        let raw = std::mem::take(&mut self.raw_buffer);
-        let _ = std::mem::take(&mut self.buffer);
+        let committed = std::mem::take(&mut self.comp.committed_text);
+        let raw = std::mem::take(&mut self.comp.raw_buffer);
+        let _ = std::mem::take(&mut self.comp.buffer);
         self.panel.fresh = false;
         self.state = ComposeState::Idle;
         self.panel.items.clear();

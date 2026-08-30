@@ -403,8 +403,8 @@ impl StateMachineTable {
                 }
             }
             KeyKind::BracketLeft => {
-                if flags.contains(StateFlags::PANEL_OPEN) && sm.cursor > 0 {
-                    sm.cursor = sm.cursor.saturating_sub(1);
+                if flags.contains(StateFlags::PANEL_OPEN) && sm.comp.cursor > 0 {
+                    sm.comp.cursor = sm.comp.cursor.saturating_sub(1);
                     sm.make_view()
                 } else {
                     StateMachine::passthrough_view()
@@ -412,9 +412,9 @@ impl StateMachineTable {
             }
             KeyKind::BracketRight => {
                 if flags.contains(StateFlags::PANEL_OPEN) {
-                    let max = sm.preedit.chars().count();
-                    if sm.cursor < max {
-                        sm.cursor += 1;
+                    let max = sm.comp.preedit.chars().count();
+                    if sm.comp.cursor < max {
+                        sm.comp.cursor += 1;
                     }
                     sm.make_view()
                 } else {
@@ -472,7 +472,7 @@ impl StateMachine {
     /// 从组合状态机提取状态标志位(路由前查表、路由后同步都用这里)。
     pub fn state_flags(&self) -> StateFlags {
         let mut f = StateFlags::empty();
-        if self.state != ComposeState::Idle || !self.buffer.is_empty() {
+        if self.state != ComposeState::Idle || !self.comp.buffer.is_empty() {
             f |= StateFlags::COMPOSING;
         }
         if !self.panel.items.is_empty() {
@@ -483,7 +483,7 @@ impl StateMachine {
             ComposeState::Pinyin => f |= StateFlags::PINYIN,
             ComposeState::Snippet => f |= StateFlags::SNIPPET,
         }
-        if !self.committed_text.is_empty() {
+        if !self.comp.committed_text.is_empty() {
             f |= StateFlags::WORD_BUILDING;
         }
         if self.has_pending_choices() {

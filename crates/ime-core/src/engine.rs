@@ -418,8 +418,8 @@ impl ImeEngine {
             .panel
             .items
             .first()
-            .map(|c| crate::fsm::state::apply_input_casing(c, &pc.sm.raw_buffer))
-            .unwrap_or_else(|| pc.sm.raw_buffer.clone());
+            .map(|c| crate::fsm::state::apply_input_casing(c, &pc.sm.comp.raw_buffer))
+            .unwrap_or_else(|| pc.sm.comp.raw_buffer.clone());
         let mut v = ImeView::empty();
         if !text.is_empty() {
             ImeView::set_str(&mut v.commit_text, &text);
@@ -475,8 +475,8 @@ impl ImeEngine {
                         }
                     }
                 }
-                ImeView::set_str(&mut v.preedit_text, &pc.sm.preedit);
-                v.preedit_cursor = pc.sm.cursor as u32;
+                ImeView::set_str(&mut v.preedit_text, &pc.sm.comp.preedit);
+                v.preedit_cursor = pc.sm.comp.cursor as u32;
                 v
             })
             .unwrap_or_else(ImeView::empty)
@@ -488,7 +488,7 @@ impl ImeEngine {
             .lock()
             .unwrap()
             .get(&DEFAULT_CTX)
-            .map(|pc| pc.sm.buffer.clone())
+            .map(|pc| pc.sm.comp.buffer.clone())
             .unwrap_or_default()
     }
 
@@ -677,7 +677,7 @@ impl ImeEngine {
             // Live 成员的 tick 当前返回 None(由 listener 主动 refresh_ui 触发);
             // 但 frontend 拉 magic_tick 时仍要拿到最新候选 —— 重新调 predict 一次。
             let preds = new_preds.unwrap_or_else(|| {
-                let input = pc.sm.buffer.clone();
+                let input = pc.sm.comp.buffer.clone();
                 member.predict(ctx, &input, disp)
             });
             pc.sm.active_command = Some(member);

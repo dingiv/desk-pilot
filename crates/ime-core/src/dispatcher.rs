@@ -412,7 +412,7 @@ mod tests {
         let mut s = sm();
         d.process_key('n', &mut s);
         d.reset(&mut s);
-        assert!(s.buffer.is_empty());
+        assert!(s.comp.buffer.is_empty());
         assert_eq!(s.state, crate::fsm::state::ComposeState::Idle);
     }
 }
