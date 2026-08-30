@@ -132,76 +132,32 @@ impl Default for MagicResources {
     }
 }
 
-/// 精确匹配到的命令(供状态机 spawn / 展开)。
+/// 魔法命令解析结果的数据对:activation token(spawn 实例用)+ 命令名。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MagicCommand {
-    /// 静态命令(无实例,直接展开)。
-    Static,
-    /// live 命令:token 用于 spawn 实例。
-    Live {
-        token: &'static str,
-        name: &'static str,
-    },
+pub struct LiveCommand {
+    pub token: &'static str,
+    pub name: &'static str,
 }
 
 /// 输入匹配结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MagicMatch {
     /// 精确匹配某命令(完整路径,可带查询参数,如 `#asr?num=2`、`#eg/name?nick=5`)。
-    Exact(MagicCommand),
+    Exact(LiveCommand),
     /// 输入是某注册完整路径的严格前缀 → 补全提示(选中改写输入)。
     Prefix(Vec<String>),
     /// **参数输入态**:输入是某注册命令路径 + `/` 或 `?` 参数(如 `#del/15`)。
     /// 框架展示裸输入提交候选,不自动触发;提交时解析前缀并强制触发。
-    Args(MagicCommand),
+    Args(LiveCommand),
     /// 片段命令(`#/…`)精确匹配。
     Snippet,
     /// 无匹配。
     Unknown,
 }
 
-/// A static command: fixed expansion text, no interactive session. The expansion
-/// is computed on demand (matcher entries freeze it at engine build; prediction
-/// hints resolve it fresh).
-pub struct StaticCmd {
-    pub trigger: &'static str,
-    pub description: &'static str,
-    expansion: Arc<dyn Fn() -> String + Send + Sync>,
-}
-
-impl StaticCmd {
-    pub fn new(
-        trigger: &'static str,
-        description: &'static str,
-        expansion: impl Fn() -> String + Send + Sync + 'static,
-    ) -> Self {
-        StaticCmd {
-            trigger,
-            description,
-            expansion: Arc::new(expansion),
-        }
-    }
-
-    pub fn expansion(&self) -> String {
-        (self.expansion)()
-    }
-}
-
-impl Clone for StaticCmd {
-    fn clone(&self) -> Self {
-        StaticCmd {
-            trigger: self.trigger,
-            description: self.description,
-            expansion: Arc::clone(&self.expansion),
-        }
-    }
-}
-
 // `today_str` lives in the expander (shared by `$DATE` variables + `#date`).
 
 pub struct MagicFamily {
-    /// Static commands (inline expansion).
-    statics: Vec<StaticCmd>,
     /// Live commands, each with an activation token.
     members: Vec<Arc<dyn MagicMember>>,
     token_map: HashMap<&'static str, usize>,
@@ -229,12 +185,6 @@ impl MagicFamily {
             }
         }
         MagicFamily {
-            statics: vec![
-                StaticCmd::new("#date", "insert today's date", today_str),
-                StaticCmd::new("#password", "password manager", || {
-                    "[password manager — not yet implemented]".into()
-                }),
-            ],
             members,
             token_map,
             resources,
@@ -259,9 +209,6 @@ impl MagicFamily {
 
     pub fn matcher_entries(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        for s in &self.statics {
-            out.push((s.trigger.to_string(), s.trigger.to_string()));
-        }
         for m in &self.members {
             // 空名成员(片段命令)不进 matcher trie —— 它经 `#` + `/` 特判路由。
             if m.name().is_empty() {
@@ -278,7 +225,7 @@ impl MagicFamily {
     }
 
     /// Spawn a fresh member instance for an activation token (matcher `Complete`).
-    /// `None` if the token isn't a live command (static expansion path handles it).
+    /// `None` if the token isn't a live command.
     pub fn spawn(&self, token: &str) -> Option<Box<dyn MagicMember>> {
         let idx = *self.token_map.get(token)?;
         Some(self.members[idx].spawn())
@@ -292,11 +239,6 @@ impl MagicFamily {
             return Vec::new();
         }
         let mut out = Vec::new();
-        for s in &self.statics {
-            if s.trigger.starts_with(prefix) && s.trigger != prefix {
-                out.push(s.trigger.to_string());
-            }
-        }
         for m in &self.members {
             if m.name().is_empty() {
                 continue;
@@ -344,11 +286,6 @@ impl MagicFamily {
 
         // 2. 前缀匹配:rest 是某注册完整路径的严格前缀 → 补全提示。
         let mut hints = Vec::new();
-        for s in &self.statics {
-            if s.trigger.starts_with(path) && s.trigger != path {
-                hints.push(s.trigger.to_string());
-            }
-        }
         for m in &self.members {
             if m.name().is_empty() {
                 continue;
@@ -371,17 +308,12 @@ impl MagicFamily {
         MagicMatch::Unknown
     }
 
-    /// 完整路径 → 命令:静态触发串 or live 成员的已注册路径。
-    fn command_for_path(&self, path: &str) -> Option<MagicCommand> {
-        for s in &self.statics {
-            if s.trigger == format!("#{path}") {
-                return Some(MagicCommand::Static);
-            }
-        }
+    /// 完整路径 → live 命令。
+    fn command_for_path(&self, path: &str) -> Option<LiveCommand> {
         for m in &self.members {
             if m.registered_paths().iter().any(|rp| rp == path) {
                 if let Some(token) = m.activation_token() {
-                    return Some(MagicCommand::Live {
+                    return Some(LiveCommand {
                         token,
                         name: m.name(),
                     });
@@ -393,8 +325,8 @@ impl MagicFamily {
 
     /// 参数输入态:找**最长**注册完整路径 `P` 使 `path` 以 `P + "/"` 开头
     /// (即 `path` 是某命令的路径参数扩展,如 `del/1` → `del`)。静态命令无参数。
-    fn command_for_arg_prefix(&self, path: &str) -> Option<MagicCommand> {
-        let mut best: Option<(usize, MagicCommand)> = None;
+    fn command_for_arg_prefix(&self, path: &str) -> Option<LiveCommand> {
+        let mut best: Option<(usize, LiveCommand)> = None;
         for m in &self.members {
             let Some(token) = m.activation_token() else {
                 continue;
@@ -405,31 +337,18 @@ impl MagicFamily {
                     && path.as_bytes()[rp.len()] == b'/'
                 {
                     if best.as_ref().map_or(true, |(bl, _)| rp.len() > *bl) {
-                        best = Some((rp.len(), MagicCommand::Live {
-                            token,
-                            name: m.name(),
-                        }));
+                        best = Some((
+                            rp.len(),
+                            LiveCommand {
+                                token,
+                                name: m.name(),
+                            },
+                        ));
                     }
                 }
             }
         }
         best.map(|(_, cmd)| cmd)
-    }
-
-    /// Static expansion text for a full trigger (e.g. `#date` → today's date).
-    pub fn static_expansion(&self, trigger: &str) -> Option<String> {
-        self.statics
-            .iter()
-            .find(|s| s.trigger == trigger)
-            .map(|s| s.expansion())
-    }
-
-    /// 静态命令的预测:展开值作为一条提交预测。
-    pub fn static_prediction(&self, trigger: &str) -> Option<Vec<Prediction>> {
-        self.statics
-            .iter()
-            .find(|s| s.trigger == trigger)
-            .map(|s| vec![Prediction::commit(s.expansion())])
     }
 
     /// Attach the shared voice state — voice listener task 与魔法成员都通过它
@@ -559,7 +478,6 @@ impl MagicFamily {
 impl Clone for MagicFamily {
     fn clone(&self) -> Self {
         MagicFamily {
-            statics: self.statics.clone(),
             members: self.members.clone(),
             token_map: self.token_map.clone(),
             resources: Arc::clone(&self.resources),
@@ -581,15 +499,10 @@ mod tests {
     fn matcher_entries_cover_all_commands() {
         let fam = MagicFamily::new();
         let entries: Vec<(String, String)> = fam.matcher_entries();
-        // Statics carry a sentinel (trigger == expansion) — resolved FRESH at
-        // completion so a long-running engine doesn't commit the startup date.
+        // 静态命令已整体移除(原 #date/#password sentinel 不复存在)。
         assert!(
-            entries.contains(&("#date".into(), "#date".into())),
-            "{entries:?}"
-        );
-        assert!(
-            entries.contains(&("#password".into(), "#password".into())),
-            "{entries:?}"
+            !entries.iter().any(|(t, _)| t == "#date" || t == "#password"),
+            "static commands removed: {entries:?}"
         );
         assert!(entries.contains(&("#asr".into(), "__ASR_BUFFER__".into())));
         assert!(

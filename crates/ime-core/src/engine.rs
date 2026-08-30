@@ -160,7 +160,7 @@ impl ImeEngine {
         page_size: u32,
     ) -> Self {
         // Magic command entries are generated from the member registry (#asr, #flush,
-        // #submit, #req, #date, #password …) — adding a command = one member, nothing
+        // #submit, #req …) — adding a command = one member, nothing
         // here. `/`-snippets are now the empty-name snippet magic command (`#/sig`).
         let mut magic = Arc::new(MagicFamily::new());
         // 注册配置化 addon 插件命令 —— 必须在 matcher 构建前(magic 此刻
@@ -578,7 +578,7 @@ impl ImeEngine {
             return Vec::new();
         };
         // Snippet state (命令组合):candidates 来自命令预测 / 补全,不是 scorer。
-        // 直接返回,让 #asr 语音 / #date 日期 / 补全提示正确显示。
+        // 直接返回,让 #asr 语音 / 命令补全提示正确显示。
         if pc.sm.state == crate::fsm::state::ComposeState::Snippet && pc.sm.panel.fresh {
             let family: &'static str = pc
                 .sm.magic.active

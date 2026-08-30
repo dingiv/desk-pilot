@@ -31,7 +31,7 @@
 
 use crate::expander::Expander;
 use crate::family::magic::{
-    ChainContext, MagicCommand, MagicMatch, MagicMember, Prediction,
+    ChainContext, LiveCommand, MagicMatch, MagicMember, Prediction,
 };
 
 use crate::frontend::{ImeView, CANDIDATE_SLOTS};
@@ -226,18 +226,6 @@ impl StateMachine {
 
     // ── Magic command prediction (Snippet state) ────────────────────────
 
-    /// `#asr?num=2` → `#asr`(名字段,用于静态命令展开 / 无参判定)。
-    fn command_trigger(input: &str) -> String {
-        if input.len() < 2 {
-            return input.to_string();
-        }
-        let rest = &input[1..];
-        let name_len = rest
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric())
-            .count();
-        format!("#{}", &rest[..name_len])
-    }
 
     /// 每次字符变化后重查:精确匹配 → 命令预测;前缀 → 补全提示;未知 → raw。
     fn query_magic(&mut self, env: &dyn StepEnv) -> ImeView {
@@ -263,40 +251,21 @@ impl StateMachine {
         // (含 `#asr''` 空链准备态);命令文本/提交候选同样不含 `'`。
         let match_input = input.trim_end_matches('\'').to_string();
         match env.magic().match_command(&match_input) {
-            // TODO: 不用区分了, 魔法命令全都是 LIVE
-            MagicMatch::Exact(cmd) => match cmd {
-                MagicCommand::Live { token, name } => {
-                    self.ensure_command(name, Some(token), env);
-                    self.magic.predictions = self.magic.active
-                        .as_mut()
-                        // TODO: magic 命令调用点
-                        .map(|m| m.predict(self.ctx, &match_input, env))
-                        .unwrap_or_default();
-                    self.magic.hints.clear();
-                    // 无参数时数字用于选中;有参数(拼 `?num=` 等)时数字是文本。
-                    self.magic.selectable = match_input == format!("#{name}");
-                }
-                MagicCommand::Static => {
-                    self.clear_active_command();
-                    let trigger = Self::command_trigger(&match_input);
-                    self.magic.predictions =
-                        env.magic().static_prediction(&trigger).unwrap_or_default();
-                    self.magic.hints.clear();
-                    self.magic.selectable = match_input == trigger;
-                }
-            },
+            MagicMatch::Exact(LiveCommand { token, name }) => {
+                self.ensure_command(name, Some(token), env);
+                self.magic.predictions = self.magic.active
+                    .as_mut()
+                    .map(|m| m.predict(self.ctx, &match_input, env))
+                    .unwrap_or_default();
+                self.magic.hints.clear();
+                // 无参数时数字用于选中;有参数(拼 `?num=` 等)时数字是文本。
+                self.magic.selectable = match_input == format!("#{name}");
+            }
             // 参数输入态(`#del/1`):不调 member.predict(不自动触发),展示裸输入
             // 提交候选;数字是参数文本。提交时 force-fire 解析前缀再触发。
-            // (匹配逻辑只对 live 成员产生 Args,静态命令不会带参数。)
-            MagicMatch::Args(MagicCommand::Live { token, name }) => {
+            MagicMatch::Args(LiveCommand { token, name }) => {
                 self.ensure_command(name, Some(token), env);
                 self.magic.predictions = vec![Prediction::submit(match_input.clone())];
-                self.magic.hints.clear();
-                self.magic.selectable = false;
-            }
-            MagicMatch::Args(MagicCommand::Static) => {
-                self.clear_active_command();
-                self.magic.predictions.clear();
                 self.magic.hints.clear();
                 self.magic.selectable = false;
             }
@@ -352,7 +321,7 @@ impl StateMachine {
         let upstream_first = upstream_cands.first().cloned().unwrap_or_default();
 
         match env.magic().match_command(&cmd) {
-            MagicMatch::Exact(MagicCommand::Live { token, name }) => {
+            MagicMatch::Exact(LiveCommand { token, name }) => {
                 self.ensure_command(name, Some(token), env);
                 // 上下文与语法严格对应:普通链(X'#cmd)只传高亮首选;
                 // 空链(X''#cmd)传上游整页(#concat 类成员消费)。
@@ -383,19 +352,6 @@ impl StateMachine {
                 self.magic.hints.clear();
                 self.magic.selectable = cmd == format!("#{name}");
             }
-            MagicMatch::Exact(MagicCommand::Static) => {
-                self.clear_active_command();
-                let trigger = Self::command_trigger(&cmd);
-                self.magic.predictions = env
-                    .magic()
-                    .static_prediction(&trigger)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|p| p.chained_prefix(&upstream_first))
-                    .collect();
-                self.magic.hints.clear();
-                self.magic.selectable = cmd == trigger;
-            }
             // 片段命令(X'#/hello):片段展开 × 上游拼接(片段不感知上下文)。
             MagicMatch::Snippet => {
                 self.ensure_command("", Some("__SNIPPET__"), env);
@@ -415,17 +371,11 @@ impl StateMachine {
                 self.magic.hints.clear();
                 self.magic.selectable = false;
             }
-            MagicMatch::Args(MagicCommand::Live { token, name }) => {
+            MagicMatch::Args(LiveCommand { token, name }) => {
                 self.ensure_command(name, Some(token), env);
                 // 参数输入态(#del/15):裸输入提交候选;提交时 force_fire 带
                 // 上游上下文强触发。
                 self.magic.predictions = vec![Prediction::submit(input.to_string())];
-                self.magic.hints.clear();
-                self.magic.selectable = false;
-            }
-            MagicMatch::Args(MagicCommand::Static) => {
-                self.clear_active_command();
-                self.magic.predictions.clear();
                 self.magic.hints.clear();
                 self.magic.selectable = false;
             }
@@ -512,7 +462,7 @@ impl StateMachine {
         env: &dyn StepEnv,
     ) -> Vec<String> {
         match env.magic().match_command(cmd) {
-            MagicMatch::Exact(MagicCommand::Live { token, .. }) => {
+            MagicMatch::Exact(LiveCommand { token, .. }) => {
                 let Some(mut m) = env.magic().spawn(token) else {
                     return Vec::new();
                 };
@@ -537,20 +487,6 @@ impl StateMachine {
                 preds
                     .into_iter()
                     .filter(|p| !p.interactive)
-                    .map(|p| p.commit_value().to_string())
-                    .take(8)
-                    .collect()
-            }
-            MagicMatch::Exact(MagicCommand::Static) => {
-                let trigger = Self::command_trigger(cmd);
-                env.magic()
-                    .static_prediction(&trigger)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|p| match upstream {
-                        Some(u) => p.chained_prefix(u.first_text()),
-                        None => p,
-                    })
                     .map(|p| p.commit_value().to_string())
                     .take(8)
                     .collect()
@@ -1650,16 +1586,14 @@ mod step_env_tests {
     fn pinyin_and_snippet_coexist() {
         let d = d();
         let mut s = sm();
-        // Type #date — 静态命令预测为今天日期,space commits。
-        d.process_key('#', &mut s);
-        d.process_key('d', &mut s);
-        d.process_key('a', &mut s);
-        d.process_key('t', &mut s);
-        d.process_key('e', &mut s);
+        // Type #/greet — 片段命令预测为模板展开,space commits。
+        for c in "#/greet".chars() {
+            d.process_key(c, &mut s);
+        }
         assert_eq!(
             ImeView::str_field(&d.process_key(' ', &mut s).commit_text),
-            crate::family::magic::expander::today_str(),
-            "#date commits today"
+            "你好,我是 AI 秘书",
+            "snippet commits expansion"
         );
         // After magic, typing letters enters pinyin.
         d.process_key('n', &mut s);

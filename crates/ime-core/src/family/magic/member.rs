@@ -1,6 +1,6 @@
 //! MagicMember — one magic command (a Member of the Magic family).
 //!
-//! `#asr`, `#req`, `#date`, `#/hello` … are all members of [`MagicFamily`]. In the
+//! `#asr`, `#req`, `#/hello` … are all members of [`MagicFamily`]. In the
 //! **prediction model**, a member is a prediction provider: when the user input
 //! exactly matches a command (with optional args), the FSM asks it for prediction
 //! options via [`MagicMember::predict`]; the options appear in the candidate list
