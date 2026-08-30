@@ -867,23 +867,31 @@ impl StateMachine {
         let (escaped, display_cursor) = Self::escape_preedit(&self.preedit, self.cursor);
         ImeView::set_str(&mut view.preedit_text, &escaped);
         view.preedit_cursor = display_cursor as u32;
-        let n = self.candidates.len().min(CANDIDATE_SLOTS);
+        // ── 翻页窗口:16 槽 = 从当前页首起的滑动窗口 ──
+        // view.candidates 定长(协议),但内容跟随 candidate_page 滑动 ——
+        // merged 全量候选(如造词单字区 15+ 个、全量链)翻页全部可达。
+        // view.candidate_highlight 同步换算成窗口内序(addon 直接用作列表
+        // 光标);candidate_page 仍是页号(addon 据此算选词的全局序)。
+        let page_size = self.candidate_page_size.max(1);
+        let start = (self.candidate_page * page_size).min(self.candidates.len());
+        let window = &self.candidates[start.min(self.candidates.len())..];
+        let n = window.len().min(CANDIDATE_SLOTS);
         for i in 0..n {
-            ImeView::set_str(&mut view.candidates[i].text, &self.candidates[i]);
+            ImeView::set_str(&mut view.candidates[i].text, &window[i]);
             // Mark single-char partial-commit candidates with ">" label.
-            if self.partial_commit_indices.get(i).copied().unwrap_or(false) {
+            if self.partial_commit_indices.get(start + i).copied().unwrap_or(false) {
                 ImeView::set_str(&mut view.candidates[i].label, ">");
             }
             // 调试模式:候选词后附提供者与权重。
             if self.candidate_meta_enabled {
-                if let Some(m) = self.last_meta.get(i) {
+                if let Some(m) = self.last_meta.get(start + i) {
                     let meta = format!("[{:.3} {}/{}]", m.score, m.family, m.source);
                     ImeView::set_str(&mut view.candidates[i].meta, &meta);
                 }
             }
         }
         view.candidate_count = n as u32;
-        view.candidate_highlight = self.candidate_highlight as u32;
+        view.candidate_highlight = self.candidate_highlight.saturating_sub(start) as u32;
         view.candidate_page = self.candidate_page as u32;
         view.candidate_page_size = self.candidate_page_size as u32;
         // aux_up(候选框顶部)= **原始输入**(你打了什么),与 preedit_text(应用
@@ -1124,7 +1132,9 @@ impl StateMachine {
                     real_words
                 };
                 let max_full = real_words.len();
-                let max_chars = (CANDIDATE_SLOTS - max_full).min(16);
+                // 单字区全量放出(不再截 12):merged 可超 16 槽,
+                // fill_view 按页切窗后翻页全部可达。
+                let max_chars = 32usize;
                 // 造词单字候选:直接走 pinyin 家族的 predict(单音节输入 =
                 // single 路径,dict.lookup + 衰减排序)。修复 B2 双实例脑裂:
                 // 曾用独立的 InputxPinyin 实例(学习路径全在 family),其

@@ -181,3 +181,14 @@ exact 固定 0.88 不看词频:the/and 与低频词同权(同输入只有一个 
   - 断言:ime-core compose_head_falls_back_when_no_real_words +
     golden compose_single_char_options_reach_jian_tail(剪 ≤ 槽 10)
   - 测试:ime-core 158+21+2、swift-ime 7+12+15 全绿
+- **🟡 真翻页 ✅**(用户纠正"翻页是引擎自己定的,为什么改不了"——正确):
+  - 查证:fcitx5 addon 源码在仓库内(release/fcitx/swift-ime.cpp,445 行),
+    CANDIDATE_SLOTS=16 是手工镜像,非外部协议 —— "改不了"论断撤回
+  - change_page/router 的翻页状态机本就完整(PageUp/Down/±/=,highlight
+    跟随页首),缺的只是 fill_view 不切窗(永远 merged[0..16])
+  - 修复:fill_view 装载"从当前页首起的 16 条"滑动窗口;highlight 换算
+    窗口内序;C++ 侧同步 —— 去掉 next() 旧页推进循环(窗口已对齐当前页),
+    选词回传全局序(winStart + i)
+  - Layer 3 单字区全量放出(merged 不再截 12),翻页全部可达
+  - 断言 candidate_view_pages_slide_over_merged(页 3 窗口首 == merged[21])
+  - 测试:ime-core 159+21+2、swift-ime 7+12+15 全绿

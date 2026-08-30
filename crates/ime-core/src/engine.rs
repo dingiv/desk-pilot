@@ -778,6 +778,34 @@ mod tests {
     }
 
     #[test]
+    fn candidate_view_pages_slide_over_merged() {
+        // 翻页窗口:fill_view 装载"从当前页首起的 16 条"而非固定前 16 ——
+        // 造词单字区全量放出后,merged 超过 16 的候选翻页可达。
+        // nihao(嵌入词典):merged = [你好] + 单字区 + 链尾,页大小 7。
+        use crate::fsm::router::{KeyKind, KeyEvent};
+        let mut e = ImeEngine::new();
+        for c in "nihao".chars() {
+            e.predict(KeyEvent { kind: KeyKind::Char(c), ctrl: false, shift: false, alt: false });
+        }
+        let all = e.candidates();
+        assert!(all.len() > 16, "merged 超过 16 槽: {}", all.len());
+        // 第 3 页(page 2)首条 = merged[14]。
+        for _ in 0..2 {
+            e.predict(KeyEvent { kind: KeyKind::PageDown, ctrl: false, shift: false, alt: false });
+        }
+        let v = e.predict(KeyEvent { kind: KeyKind::PageDown, ctrl: false, shift: false, alt: false });
+        assert_eq!(v.candidate_page, 3);
+        let page3_head = ImeView::str_field(&v.candidates[0].text);
+        assert_eq!(
+            Some(page3_head),
+            all.get(3 * 7).map(String::as_str),
+            "窗口滑动到页 3: view[0] == merged[21]"
+        );
+        // 选词全局序:页内第一个候选的提交 = merged[21](partial 单字 →
+        // 部分提交;这里只验证窗口内容对齐,不触发提交)。
+    }
+
+    #[test]
     fn compose_head_falls_back_when_no_real_words() {
         // 嵌入词典(无 FST)下 nihao 候选全是 decomp 链 —— 造词 head 的
         // 真词过滤必须保底收首候选,否则单字区顶到槽 1,space 变成单字

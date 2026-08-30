@@ -151,17 +151,20 @@ void SwiftImeEngine::apply_view(fcitx::InputContext *ic, const ImeView &v) {
                                   : 7);
             list->setCursorPositionAfterPaging(
                 fcitx::CursorPositionAfterPaging::ResetToFirst);
+            // 引擎的 view.candidates 是"从当前页首起的滑动窗口"(16 槽),
+            // 窗口起点 = candidate_page * page_size —— 列表从窗口头显示
+            // (即当前页),无需再用 next() 推进旧页。选词回传全局序:
+            // start + i,引擎 sm.select(全局) 直接命中 merged。
+            const unsigned int winStart =
+                v.candidate_page * (v.candidate_page_size > 0
+                                        ? v.candidate_page_size
+                                        : 7);
             for (unsigned int i = 0;
                  i < v.candidate_count && i < CANDIDATE_SLOTS; i++) {
                 list->append<SwiftCandidateWord>(
                     std::string(v.candidates[i].text),
-                    std::string(v.candidates[i].meta), (int)i, this);
-            }
-            if (list->toPageable()) {
-                auto *p = list->toPageable();
-                for (unsigned int pg = 0;
-                     pg < v.candidate_page && p->hasNext(); pg++)
-                    p->next();
+                    std::string(v.candidates[i].meta),
+                    (int)(winStart + i), this);
             }
             // 高亮:直接用全局光标 API,与引擎内部的 candidate_highlight
             // 精确同步。旧的 nextCandidate 循环从初始 -1 光标起跳,首次调用
