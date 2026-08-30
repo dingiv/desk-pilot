@@ -193,7 +193,7 @@ impl StateMachine {
         let input = self.buffer.clone();
 
         // ── 链式命令模式(X'#cmd):上游折叠求值 + 上下文传递 ──────────
-        if crate::chain::is_chain_command(&input) {
+        if crate::fsm::chain::is_chain_command(&input) {
             return self.query_chained_magic(&input, env);
         }
 
@@ -291,7 +291,7 @@ impl StateMachine {
     /// MVP 注:上游取其候选 top1(命令模式下不导航上游;改上游请回格)。
     /// 链式进入前的造词半成品(`committed_text`)不参与上游求值。
     fn query_chained_magic(&mut self, input: &str, env: &dyn StepEnv) -> ImeView {
-        use crate::chain::{join_segments, split_segments, ChainSeg};
+        use crate::fsm::chain::{join_segments, split_segments, ChainSeg};
 
         let segs = split_segments(input);
         let Some((ChainSeg::Command(cmd), prefix)) = segs.split_last() else {
@@ -409,7 +409,7 @@ impl StateMachine {
     /// 处理,即 P0),命令段临时 spawn 求值(级联中间命令不保异步会话 —
     /// 会话态只有活动命令有)。
     fn eval_upstream(&self, upstream: &str, env: &dyn StepEnv) -> Vec<String> {
-        use crate::chain::{join_segments, split_segments, ChainSeg};
+        use crate::fsm::chain::{join_segments, split_segments, ChainSeg};
 
         if upstream.is_empty() {
             return Vec::new();
@@ -621,13 +621,13 @@ impl StateMachine {
     /// `predict` —— 成员解析参数后决定动作(删除 / 提交 / 交互请求)。取首条
     /// 预测执行;无预测则提交原始缓冲。
     fn force_fire(&mut self, env: &dyn StepEnv) -> ImeView {
-        use crate::chain::{join_segments, split_segments, ChainSeg};
+        use crate::fsm::chain::{join_segments, split_segments, ChainSeg};
 
         let input = self.buffer.clone();
 
         // 链式参数态(X'#del/15):命令段(含参数)提取,上游求值后带上下文
         // 强触发;不感知的命令照旧拼接。
-        let preds = if crate::chain::is_chain_command(&input) {
+        let preds = if crate::fsm::chain::is_chain_command(&input) {
             let segs = split_segments(&input);
             let (cmd, prefix) = match segs.split_last() {
                 Some((ChainSeg::Command(c), p)) => (c.clone(), p.to_vec()),

@@ -3,11 +3,12 @@
 
 use self::phrase::PhraseBook;
 use super::{CandidateFamily, InputContext, ScoredCandidate};
-use crate::recency::RecentStore;
-
 pub mod dict;
 pub mod lattice;
 pub mod phrase;
+mod recency;
+
+use recency::RecentStore;
 
 use dict::LargeDict;
 use std::sync::{Arc, Mutex};
