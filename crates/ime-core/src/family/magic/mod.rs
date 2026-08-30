@@ -37,8 +37,8 @@ pub use voice::VoiceMember;
 
 use req::ReqMember;
 
-use crate::family::magic::expander::today_str;
 use crate::store::snippet_md::SnippetEntry;
+use crate::fsm::state::StepEnv;
 
 /// SharedVoiceState 槽 —— voice listener task 在 IoThread 上折叠 SSE 段写入,
 /// 魔法成员 (`#asr` / `#submit`) 同步读。引擎构造时一次性注入。
@@ -130,6 +130,17 @@ impl Default for MagicResources {
             scout_inject_url: Mutex::new("http://127.0.0.1:7878".to_string()),
         }
     }
+}
+
+/// Stage2 查询答案(S5):壳直接落位 MagicSession 的三个字段。
+#[derive(Debug, Default)]
+pub struct MagicAnswer {
+    /// 预测选项(不含 rollback;rebuild_magic_view 附加)。
+    pub predictions: Vec<Prediction>,
+    /// 补全提示(Prefix 态;选中改写输入)。
+    pub hints: Vec<String>,
+    /// 数字键是否用于选中候选(false = 数字是命令/参数文本)。
+    pub selectable: bool,
 }
 
 /// 魔法命令解析结果的数据对:activation token(spawn 实例用)+ 命令名。
@@ -255,6 +266,81 @@ impl MagicFamily {
 
     /// **魔法家族匹配核心逻辑**
     ///
+    /// Stage2 统一查询(S5 家族化):非链式 snippet 态的命令预测。
+    /// ensure(spawn / 同名保活 / deactivate)与成员 predict 全部内聚;
+    /// `active` 是壳持有的 live 实例缓存(保 req 异步态等跨键状态),
+    /// 壳只负责把 [`MagicAnswer`] 落位候选面板。`input` 传原始 buffer
+    /// (尾部 `'` 链结构字符在此剥除,不参与命令匹配)。
+    pub fn query(
+        &self,
+        active: &mut Option<Box<dyn MagicMember>>,
+        ctx: usize,
+        input: &str,
+        env: &dyn StepEnv,
+    ) -> MagicAnswer {
+        let match_input = input.trim_end_matches('\'').to_string();
+        let mut ans = MagicAnswer::default();
+        match self.match_command(&match_input) {
+            MagicMatch::Exact(LiveCommand { token, name }) => {
+                self.ensure_active(active, ctx, name, Some(token));
+                ans.predictions = active
+                    .as_mut()
+                    .map(|m| m.predict(ctx, &match_input, env))
+                    .unwrap_or_default();
+                // 无参数时数字用于选中;有参数(拼 `?num=` 等)时数字是文本。
+                ans.selectable = match_input == format!("#{name}");
+            }
+            // 参数输入态(`#del/1`):不调 member.predict(不自动触发),展示
+            // 裸输入提交候选;提交时 force-fire 解析前缀再触发。
+            MagicMatch::Args(LiveCommand { token, name }) => {
+                self.ensure_active(active, ctx, name, Some(token));
+                ans.predictions = vec![Prediction::submit(match_input)];
+            }
+            MagicMatch::Prefix(hints) => {
+                Self::clear_active(active, ctx);
+                ans.hints = hints;
+                ans.selectable = true; // 前缀 → 数字选中补全
+            }
+            MagicMatch::Snippet => {
+                self.ensure_active(active, ctx, "", Some("__SNIPPET__"));
+                ans.predictions = active
+                    .as_mut()
+                    .map(|m| m.predict(ctx, &match_input, env))
+                    .unwrap_or_default();
+                // 片段路径/查询里的数字是文本
+            }
+            MagicMatch::Unknown => {
+                Self::clear_active(active, ctx);
+            }
+        }
+        ans
+    }
+
+    /// ensure:同名保活(保 req 异步态),否则 deactivate 旧实例并 spawn 新的。
+    fn ensure_active(
+        &self,
+        active: &mut Option<Box<dyn MagicMember>>,
+        ctx: usize,
+        name: &'static str,
+        token: Option<&'static str>,
+    ) {
+        let keep = active.as_ref().map(|m| m.name() == name).unwrap_or(false);
+        if keep {
+            return;
+        }
+        Self::clear_active(active, ctx);
+        if let Some(tok) = token {
+            *active = self.spawn(tok);
+        }
+    }
+
+    /// deactivate 并清空 live 实例。
+    fn clear_active(active: &mut Option<Box<dyn MagicMember>>, ctx: usize) {
+        if let Some(mut m) = active.take() {
+            m.deactivate(ctx);
+        }
+    }
+
     /// 按**注册的完整命令路径**(`eg`、`eg/name`、`eg1`…)做匹配:
     /// - **完整路径精确匹配** → `Exact`,立即执行(带 `?` 查询参数也算精确,查询
     ///   不参与匹配/预测);

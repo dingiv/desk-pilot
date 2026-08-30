@@ -240,54 +240,17 @@ impl StateMachine {
             return self.query_pinyin(env);
         }
 
-        // 分隔符不参与命令匹配:`'` 是链结构字符(chain.rs),追加它不改变命令
-        // 语义 —— `#asr'` 的候选保持 `#asr` 的预测结果不变;用户继续输入
-        // (`#asr'#tr`)时由上面的 is_chain_command 分支接管。剥掉尾部全部 `'`
-        // (含 `#asr''` 空链准备态);命令文本/提交候选同样不含 `'`。
-        let match_input = input.trim_end_matches('\'').to_string();
-        match env.magic().match_command(&match_input) {
-            MagicMatch::Exact(LiveCommand { token, name }) => {
-                self.ensure_command(name, Some(token), env);
-                self.magic.predictions = self.magic.active
-                    .as_mut()
-                    .map(|m| m.predict(self.ctx, &match_input, env))
-                    .unwrap_or_default();
-                self.magic.hints.clear();
-                // 无参数时数字用于选中;有参数(拼 `?num=` 等)时数字是文本。
-                self.magic.selectable = match_input == format!("#{name}");
-            }
-            // 参数输入态(`#del/1`):不调 member.predict(不自动触发),展示裸输入
-            // 提交候选;数字是参数文本。提交时 force-fire 解析前缀再触发。
-            MagicMatch::Args(LiveCommand { token, name }) => {
-                self.ensure_command(name, Some(token), env);
-                self.magic.predictions = vec![Prediction::submit(match_input.clone())];
-                self.magic.hints.clear();
-                self.magic.selectable = false;
-            }
-            MagicMatch::Prefix(hints) => {
-                self.clear_active_command();
-                self.magic.predictions.clear();
-                self.magic.hints = hints;
-                self.magic.selectable = true; // 前缀 → 数字选中补全
-            }
-            MagicMatch::Snippet => {
-                self.ensure_command("", Some("__SNIPPET__"), env);
-                self.magic.predictions = self.magic.active
-                    .as_mut()
-                    .map(|m| m.predict(self.ctx, &match_input, env))
-                    .unwrap_or_default();
-                self.magic.hints.clear();
-                self.magic.selectable = false; // 片段路径/查询里的数字是文本
-            }
-            MagicMatch::Unknown => {
-                self.clear_active_command();
-                self.magic.predictions.clear();
-                self.magic.hints.clear();
-                self.magic.selectable = false;
-            }
-        }
+        // ── Stage 2:家族统一查询(ensure/predict 内聚 MagicFamily,S5)──
+        let answer = env
+            .magic()
+            .query(&mut self.magic.active, self.ctx, &input, env);
+        // ── Stage 3:答案落位面板 ──
+        self.magic.predictions = answer.predictions;
+        self.magic.hints = answer.hints;
+        self.magic.selectable = answer.selectable;
         self.rebuild_magic_view()
     }
+
 
     /// 链式命令模式(`X'#cmd`):上游折叠求值 → 命令段匹配 → 按上下文声明
     /// 分流(替换 / 拼接)。候选最终形态(`magic_predictions`)在此构造完成,
