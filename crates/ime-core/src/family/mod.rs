@@ -398,8 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_family_skipped() {
-        struct DisabledFamily;
+    fn disabled_family_skipped() {        struct DisabledFamily;
         impl CandidateFamily for DisabledFamily {
             fn name(&self) -> &'static str {
                 "disabled"

@@ -25,6 +25,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{CandidateFamily, ScoredCandidate};
@@ -62,6 +63,10 @@ enum DictType {
     Grade,
     Frequency,
     User,
+    /// 缓存文件专用:行内分数已是归一化终值,**原样通过**、不再映射。
+    /// (修复 B1:曾误用 Grade 当 passthrough,`grade_to_score` 把归一化
+    /// 分数塌缩到 2000/5500/8000/9500 四档,重启后前缀排序退化。)
+    Passthrough,
 }
 
 /// Detect dict type from header lines (first 3 lines).
@@ -160,7 +165,8 @@ fn sort_case_insensitive(words: &mut [(String, u32)]) {
 // ── EnglishFamily ───────────────────────────────────────────────────────
 
 pub struct EnglishFamily {
-    enabled: bool,
+    /// 运行时开关(AtomicBool:trait `set_family_enabled` 经 `&self` 写入)。
+    enabled: AtomicBool,
     base_words: Vec<(String, u32)>,
     user_words: Mutex<Vec<(String, u32)>>,
     priority: u32,
@@ -172,7 +178,7 @@ pub struct EnglishFamily {
 impl EnglishFamily {
     pub fn new() -> Self {
         EnglishFamily {
-            enabled: true,
+            enabled: AtomicBool::new(true),
             base_words: Vec::new(),
             user_words: Mutex::new(Vec::new()),
             priority: 70,
@@ -225,7 +231,7 @@ impl EnglishFamily {
                 .unwrap_or(100);
             let score = match dict_type {
                 DictType::Grade => grade_to_score(raw),
-                DictType::Frequency | DictType::User => raw,
+                DictType::Frequency | DictType::User | DictType::Passthrough => raw,
             };
             match map.get_mut(&key) {
                 Some((_, sc)) if score > *sc => *sc = score,
@@ -243,7 +249,7 @@ impl EnglishFamily {
         let entries: Vec<(String, u32)> = map.into_values().collect();
 
         match dict_type {
-            DictType::Grade => {
+            DictType::Grade | DictType::Passthrough => {
                 let mut w = entries;
                 sort_case_insensitive(&mut w);
                 w
@@ -261,10 +267,6 @@ impl EnglishFamily {
         self.priority = priority;
         self.weights = weights;
         self
-    }
-
-    pub fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
     }
 
     // ── Dictionary loading ─────────────────────────────────────────────
@@ -350,8 +352,9 @@ impl EnglishFamily {
         h.finish()
     }
 
-    /// Cache format:
-    ///   # @cache: <source_path> <hash>
+    /// Cache format (v2 — v1 曾把缓存内容错走 grade_to_score 重映射,B1 修复时
+    /// 升版:旧头校验必然失败 → 缓存自动重建,存量污染自愈):
+    ///   # @cache: v2 <source_path> <hash>
     ///   word\tfreq
     ///   ...
     fn write_cache(
@@ -361,7 +364,7 @@ impl EnglishFamily {
         words: &[(String, u32)],
     ) -> std::io::Result<()> {
         let mut f = std::fs::File::create(cache_path)?;
-        writeln!(f, "# @cache: {source_path} {hash}")?;
+        writeln!(f, "# @cache: v2 {source_path} {hash}")?;
         for (w, s) in words {
             writeln!(f, "{w}\t{s}")?;
         }
@@ -376,15 +379,15 @@ impl EnglishFamily {
         let data = std::fs::read(cache_path).map_err(|_| ())?;
         let s = std::str::from_utf8(&data).map_err(|_| ())?;
 
-        // Validate header: must match source path and hash.
+        // Validate header: must match version, source path and hash.
         let first_line = s.lines().next().ok_or(())?;
-        let expected = format!("# @cache: {source_path} {expected_hash}");
+        let expected = format!("# @cache: v2 {source_path} {expected_hash}");
         if first_line.trim() != expected {
             return Err(());
         }
 
-        // Parse word list from cache.
-        let words = Self::parse_and_normalize(&data, DictType::Grade); // Grade = Passthrough (scores already normalized)
+        // Parse word list from cache — 分数已是归一化终值,Passthrough 原样通过。
+        let words = Self::parse_and_normalize(&data, DictType::Passthrough);
         if words.is_empty() {
             return Err(());
         }
@@ -509,7 +512,11 @@ impl CandidateFamily for EnglishFamily {
         self.priority
     }
     fn enabled(&self) -> bool {
-        self.enabled
+        self.enabled.load(Ordering::Relaxed)
+    }
+    /// 运行时开关(修复 B3:此前默认 no-op,禁用静默无效)。
+    fn set_family_enabled(&self, on: bool) {
+        self.enabled.store(on, Ordering::Release);
     }
     fn top_n(&self) -> usize {
         8
@@ -674,6 +681,49 @@ mod tests {
         // zzz should also be loaded but with low decile score.
         let z = fam.predict("zzz");
         assert!(!z.is_empty());
+    }
+
+    #[test]
+    fn cache_reload_preserves_scores() {
+        // B1 回归:缓存重载必须与首次加载分数完全一致。曾用 Grade 重Parse
+        // 缓存,decile 归一化分数(任意 1~10000)被 grade_to_score 塌缩到
+        // 2000/5500/8000/9500 四档 —— 重启后前缀排序退化。
+        let fam = EnglishFamily::with_default_dict();
+        // 12 个词、频率拉开差距 → decile 归一化后分数落在多个档位。
+        let content: String = (0..12)
+            .map(|i| format!("w{i:02}\t{}\n", 100_000u32 >> i))
+            .collect();
+        let d = temp_dict("cache-b1", &format!("# @type: frequency\n{content}"));
+
+        fam.load_dict_file(&d).unwrap(); // 首次:parse + 写缓存
+        let first: Vec<(String, u32)> = fam.user_words.lock().unwrap().clone();
+
+        fam.load_dict_file(&d).unwrap(); // 二次:命中缓存
+        let second: Vec<(String, u32)> = fam.user_words.lock().unwrap().clone();
+
+        assert_eq!(first, second, "缓存重载后分数必须与首次加载一致");
+        // 钉死档位多样性:若修复回退(分数塌缩),中间档会被抹平。
+        let distinct: std::collections::HashSet<u32> = first.iter().map(|(_, s)| *s).collect();
+        assert!(
+            distinct.len() >= 4,
+            "decile 归一化应产生多档分数, got {distinct:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_cache_header_invalidates() {
+        // v1 缓存(无版本号)必须被视为无效 → 触发重建,存量污染自愈。
+        let fam = EnglishFamily::with_default_dict();
+        let d = temp_dict("legacy", "# @type: frequency\nhello\t100000\n");
+        let cache_path = format!("{d}.en_cache");
+        std::fs::write(&cache_path, "# @cache: /stale/path 12345\nhello\t2000\n").unwrap();
+
+        fam.load_dict_file(&d).unwrap(); // v1 头校验失败 → 重 parse + 重写缓存
+        let first = std::fs::read_to_string(&cache_path).unwrap();
+        assert!(
+            first.starts_with("# @cache: v2 "),
+            "缓存应被重建为 v2 头, got: {first:?}"
+        );
     }
 
     #[test]

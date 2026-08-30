@@ -6,12 +6,12 @@ use super::{CandidateFamily, InputContext, ScoredCandidate};
 use crate::recency::RecentStore;
 
 pub mod dict;
-pub mod engine;
 pub mod lattice;
 pub mod phrase;
 
 use dict::LargeDict;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::store::WeightStore;
 
@@ -30,7 +30,8 @@ pub struct PinyinFamily {
     large_dict: Mutex<LargeDict>,
     lattice: Mutex<Option<lattice::LatticeDecoder>>,
     recency: Mutex<RecentStore>,
-    enabled: bool,
+    /// 运行时开关(AtomicBool:trait `set_family_enabled` 经 `&self` 写入)。
+    enabled: AtomicBool,
     weights: PinyinWeights,
     store: Mutex<Option<Arc<WeightStore>>>,
     /// freq→score 映射参数(swift-ime.yaml → weights.freq_scale)。
@@ -113,7 +114,7 @@ impl PinyinFamily {
             large_dict: Mutex::new(LargeDict::new()),
             lattice: Mutex::new(None),
             recency: Mutex::new(RecentStore::new()),
-            enabled: true,
+            enabled: AtomicBool::new(true),
             weights,
             store: Mutex::new(None),
             freq_scale: scoring.freq_scale,
@@ -147,7 +148,7 @@ impl PinyinFamily {
             large_dict: Mutex::new(LargeDict::new()),
             lattice: Mutex::new(None),
             recency: Mutex::new(RecentStore::new()),
-            enabled: true,
+            enabled: AtomicBool::new(true),
             weights,
             store: Mutex::new(None),
             freq_scale: scoring.freq_scale,
@@ -182,10 +183,6 @@ impl PinyinFamily {
                 );
             }
         }
-    }
-
-    pub fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
     }
 
     /// Record a committed word for the recent member: stamps the current
@@ -366,6 +363,20 @@ pub fn initials_from_pinyin(raw: &str) -> String {
         .unwrap_or_default()
 }
 
+/// 最长合法音节前缀("lizhengming" → "li","kuifa" → "kui")。
+/// 纯函数(无实例状态)—— StepEnv::first_syllable 的实现基础。
+/// (输入需为 ASCII 小写拼音;与原 InputxPinyin::first_syllable 同语义。)
+pub fn first_syllable_of(pinyin: &str) -> Option<String> {
+    let max = pinyin.len().min(6);
+    for len in (1..=max).rev() {
+        let candidate = &pinyin[..len];
+        if inputx_pinyin::is_valid_syllable(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
 impl Default for PinyinFamily {
     fn default() -> Self {
         Self::new()
@@ -401,7 +412,11 @@ impl CandidateFamily for PinyinFamily {
         100
     }
     fn enabled(&self) -> bool {
-        self.enabled
+        self.enabled.load(Ordering::Relaxed)
+    }
+    /// 运行时开关(修复 B3:此前默认 no-op,禁用静默无效)。
+    fn set_family_enabled(&self, on: bool) {
+        self.enabled.store(on, Ordering::Release);
     }
     fn top_n(&self) -> usize {
         128
@@ -787,6 +802,71 @@ impl CandidateFamily for PinyinFamily {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn l0_picks_reorder_single_syllable_candidates() {
+        // B2 回归:造词单字候选 = family.predict(首音节),与学习路径同引擎
+        // —— record_pick 的 L0 状态必须影响候选顺序。此前双实例脑裂,造词
+        // 候选走的独立实例从不接收 pick,用户的选择历史永远不生效。
+        let fam = PinyinFamily::new();
+        fam.record_pick("ni", "腻");
+        fam.record_pick("ni", "腻");
+        fam.record_pick("ni", "腻"); // 3-pick 自动钉选
+        let cands = fam.predict("ni");
+        assert_eq!(
+            cands.first().map(|c| c.text.as_str()),
+            Some("腻"),
+            "3-pick 钉选后应排首位, got: {:?}",
+            cands.iter().take(5).map(|c| &c.text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn first_syllable_of_splits_longest_prefix() {
+        assert_eq!(first_syllable_of("lizhengming"), Some("li".into()));
+        assert_eq!(first_syllable_of("kuifa"), Some("kui".into()));
+        assert_eq!(first_syllable_of("nihao"), Some("ni".into()));
+        assert_eq!(first_syllable_of("zzz"), None, "无合法音节前缀 → None");
+    }
+
+    #[test]
+    fn set_family_enabled_toggles() {        // B3 回归:运行时开关必须真实生效(此前 trait 默认 no-op,禁用静默无效)。
+        let fam = PinyinFamily::new();
+        assert!(fam.enabled(), "默认启用");
+        fam.set_family_enabled(false);
+        assert!(!fam.enabled(), "禁用后 enabled() = false");
+        fam.set_family_enabled(true);
+        assert!(fam.enabled());
+    }
+
+    #[test]
+    fn scorer_skips_disabled_pinyin_family() {
+        // B3 端到端:scorer 经 trait set_family_enabled 禁用 pinyin →
+        // 统一排序不再出汉字候选;恢复后回来。
+        use crate::family::english::EnglishFamily;
+        let scorer = crate::family::UnifiedScorer::new(
+            vec![
+                Box::new(PinyinFamily::new()),
+                Box::new(EnglishFamily::with_default_dict()),
+            ],
+            crate::scoring::FamilyPriorities::default(),
+        );
+        let name = "nihao";
+        assert!(
+            scorer.rank(name).iter().any(|c| c.contains('你')),
+            "启用时应有汉字候选"
+        );
+        scorer
+            .family("pinyin")
+            .unwrap()
+            .set_family_enabled(false);
+        assert!(
+            !scorer.rank(name).iter().any(|c| c.contains('你')),
+            "禁用 pinyin 后不再出汉字候选"
+        );
+        scorer.family("pinyin").unwrap().set_family_enabled(true);
+        assert!(scorer.rank(name).iter().any(|c| c.contains('你')));
+    }
 
     #[test]
     fn pinyin_family_nihao() {

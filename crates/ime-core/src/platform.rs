@@ -2,23 +2,6 @@
 //! returned by the engine after every key event. Platform frontends diff it
 //! against the previous frame and apply only the changes.
 
-/// Pinyin-to-hanzi engine. Community crate `inputx-pinyin` fills this.
-pub trait PinyinEngine: Send + Sync {
-    /// Given a pinyin string, return candidate hanzi strings (empty if no match).
-    fn candidates(&self, pinyin: &str) -> Vec<String>;
-
-    /// Extract the first valid pinyin syllable from the input.
-    /// E.g., "lizhengming" → Some("li"), "kuifa" → Some("kui").
-    fn first_syllable(&self, pinyin: &str) -> Option<String>;
-
-    /// Record a user pick in inputx-pinyin's L0 layer for frequency boosting.
-    /// After 3 picks the word auto-pins to the top.
-    fn record_pick(&self, pinyin: &str, word: &str);
-
-    /// Learn a new phrase — save it for future sessions (PhraseBook).
-    fn learn_phrase(&self, pinyin: &str, hanzi: &str);
-}
-
 // ── Action: 一次输入处理后引擎对调用者的指令 ────────────────────────────
 
 /// `ImeView::action` 的位标志(bitflags)。外界调用者(前端)**不再自行拦截

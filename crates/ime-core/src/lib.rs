@@ -23,6 +23,6 @@ pub mod voice_state;
 pub use dispatcher::Dispatcher;
 pub use expander::Expander;
 pub use matcher::Matcher;
-pub use platform::{CandidateSlot, ImeView, PinyinEngine, CANDIDATE_SLOTS};
+pub use platform::{CandidateSlot, ImeView, CANDIDATE_SLOTS};
 pub use router::{KeyEvent, KeyKind, StateFlags, StateMachineTable};
 pub use snippet_store::SnippetStore;

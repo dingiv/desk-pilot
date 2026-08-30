@@ -7,19 +7,16 @@
 use crate::expander::Expander;
 use crate::family::english::EnglishFamily;
 use crate::family::magic::MagicFamily;
-use crate::family::pinyin::engine::InputxPinyin;
 use crate::family::pinyin::PinyinFamily;
 use crate::family::UnifiedScorer;
 use crate::matcher::Matcher;
 use crate::platform::ImeView;
 use crate::state::{StateMachine, StepEnv};
-use crate::PinyinEngine;
 use std::sync::Arc;
 
 pub struct Dispatcher {
     matcher: Matcher,
     expander: Expander,
-    pinyin: Box<dyn PinyinEngine>,
     scorer: UnifiedScorer,
     /// The magic command registry — same `Arc` the engine holds, so late resource
     /// attachment (voice buffer, req base) is visible to the FSM and the members.
@@ -60,18 +57,13 @@ impl Dispatcher {
         Dispatcher {
             matcher,
             expander,
-            pinyin: Box::new(InputxPinyin::new()),
             scorer,
             magic,
         }
     }
 
     #[cfg(test)]
-    pub fn new_for_test(
-        matcher: Matcher,
-        expander: Expander,
-        pinyin: Box<dyn PinyinEngine>,
-    ) -> Self {
+    pub fn new_for_test(matcher: Matcher, expander: Expander) -> Self {
         // Minimal scorer for tests — just the pinyin family.
         let pinyin_only = PinyinFamily::new();
         let scorer = UnifiedScorer::new(
@@ -82,7 +74,6 @@ impl Dispatcher {
         Dispatcher {
             matcher,
             expander,
-            pinyin,
             scorer,
             magic: Arc::new(MagicFamily::new()),
         }
@@ -213,14 +204,8 @@ impl StepEnv for Dispatcher {
     fn expander(&self) -> &Expander {
         &self.expander
     }
-    fn pinyin(&self) -> &dyn PinyinEngine {
-        &*self.pinyin
-    }
     fn scorer(&self) -> &UnifiedScorer {
         &self.scorer
-    }
-    fn first_syllable(&self, pinyin: &str) -> Option<String> {
-        self.pinyin.first_syllable(pinyin)
     }
     fn record_pick(&self, pinyin: &str, word: &str) {
         // Route through PinyinFamily (via scorer) for per-family auto-learning.
@@ -248,27 +233,6 @@ mod tests {
     use super::*;
     use crate::expander::StaticProvider;
 
-    struct StubPinyin;
-    impl PinyinEngine for StubPinyin {
-        fn first_syllable(&self, pinyin: &str) -> Option<String> {
-            let cand = &pinyin[..pinyin.len().min(2)];
-            if cand.chars().all(|c| c.is_ascii_lowercase()) {
-                Some(cand.to_string())
-            } else {
-                None
-            }
-        }
-        fn record_pick(&self, _pinyin: &str, _word: &str) {}
-        fn learn_phrase(&self, _pinyin: &str, _hanzi: &str) {}
-        fn candidates(&self, pinyin: &str) -> Vec<String> {
-            match pinyin {
-                "n" => vec!["嗯".into()],
-                "ni" => vec!["你".into(), "呢".into()],
-                _ => Vec::new(),
-            }
-        }
-    }
-
     fn d() -> Dispatcher {
         let entries = vec![("#date".into(), "2026-07-23".into())];
         let d = Dispatcher::new_for_test(
@@ -277,7 +241,6 @@ mod tests {
                 date: "2026-07-23".into(),
                 clipboard: String::new(),
             })),
-            Box::new(StubPinyin),
         );
         // 片段经 magic 注册表(`#/greet`),而非 matcher trie。
         d.magic()
@@ -420,7 +383,6 @@ mod tests {
         let d = Dispatcher::new_for_test(
             Matcher::new(Vec::new()),
             Expander::new(provider),
-            Box::new(StubPinyin),
         );
         d.magic()
             .set_snippets(vec![crate::store::snippet_md::SnippetEntry {

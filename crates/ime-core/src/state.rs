@@ -35,7 +35,6 @@ use crate::family::magic::{
 };
 use crate::matcher::Matcher;
 use crate::platform::{ImeView, CANDIDATE_SLOTS};
-use crate::PinyinEngine;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ComposeState {
@@ -1100,10 +1099,17 @@ impl StateMachine {
             if !chained && first_syl.len() < self.buffer.len() {
                 let max_full = 8usize.min(cands.len());
                 let max_chars = (CANDIDATE_SLOTS - max_full).min(8);
+                // 造词单字候选:直接走 pinyin 家族的 predict(单音节输入 =
+                // single 路径,dict.lookup + 衰减排序)。修复 B2 双实例脑裂:
+                // 曾用独立的 InputxPinyin 实例(学习路径全在 family),其
+                // L0 永远为空,用户的选择历史从不影响造词候选排序。
                 let char_cands: Vec<String> = env
-                    .pinyin()
-                    .candidates(&first_syl)
+                    .scorer()
+                    .family("pinyin")
+                    .map(|f| f.predict(&first_syl))
+                    .unwrap_or_default()
                     .into_iter()
+                    .map(|c| c.text)
                     .filter(|c| c.chars().count() == 1 && !merged.contains(c))
                     .take(max_chars)
                     .collect();
@@ -1328,13 +1334,15 @@ pub(crate) fn apply_input_casing(word: &str, raw_input: &str) -> String {
 pub trait StepEnv {
     fn matcher(&self) -> &Matcher;
     fn expander(&self) -> &Expander;
-    fn pinyin(&self) -> &dyn PinyinEngine;
 
     /// Unified candidate scorer — combines all families.
     fn scorer(&self) -> &crate::family::UnifiedScorer;
 
     /// Extract the first valid pinyin syllable from the input.
-    fn first_syllable(&self, pinyin: &str) -> Option<String>;
+    /// (纯函数:最长合法音节前缀,见 `family::pinyin::first_syllable_of`。)
+    fn first_syllable(&self, pinyin: &str) -> Option<String> {
+        crate::family::pinyin::first_syllable_of(pinyin)
+    }
 
     /// Record a user pick in inputx-pinyin's L0 layer for frequency boosting.
     fn record_pick(&self, pinyin: &str, word: &str);
