@@ -28,9 +28,9 @@ models:
   - name: "qwen2.5-3b-instruct-q4_k_m"
     type: llm
     gguf: "/workspaces/gui_agent/desk-pilot/assets/models/qwen2.5-3b-instruct-q4_k_m.gguf"
-    context_size: 2048
+    context_size: 8192
     threads: 8
-    gpu_layers: 0
+    gpu_layers: 99
     batch_size: 512
 
   - name: "qwen3-asr"
@@ -39,7 +39,7 @@ models:
     mmproj: "/workspaces/gui_agent/desk-pilot/assets/models/Qwen3-ASR-1.7B-Q4_K_M-GGUF/mmproj-Qwen3-ASR-1.7B-Q4_K_M.gguf"
     context_size: 4096
     threads: 8
-    gpu_layers: 0
+    gpu_layers: 99
     batch_size: 512
 
 remote_upstream:

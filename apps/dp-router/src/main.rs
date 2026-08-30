@@ -94,9 +94,12 @@ async fn async_main() -> Result<()> {
     // 进程表
     let processes: ProcessMap = Arc::new(RwLock::new(Default::default()));
 
-    // 上游客户端(若 base_url 空则 None)
+    // 上游客户端(若 base_url 空则 None)。
+    // 转发超时:本地 LLM 长生成(CPU 上 2000 token ≈ 50-100s)会超过 60s,
+    // 原 60s 会让 router 在 llama-server 仍在生成时放弃并 502。放宽到 300s
+    // 支撑长生成;health_check 用独立的 5s 超时,不受影响。
     let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(300))
         .build()?;
     let upstream = upstream::UpstreamClient::new(cfg.remote_upstream.clone(), http.clone());
 
