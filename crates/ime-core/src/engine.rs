@@ -778,6 +778,23 @@ mod tests {
     }
 
     #[test]
+    fn compose_head_falls_back_when_no_real_words() {
+        // 嵌入词典(无 FST)下 nihao 候选全是 decomp 链 —— 造词 head 的
+        // 真词过滤必须保底收首候选,否则单字区顶到槽 1,space 变成单字
+        // 部分提交(commit_text 为空)。
+        use crate::fsm::router::{KeyKind, KeyEvent};
+        let mut e = ImeEngine::new();
+        for c in "nihao".chars() {
+            e.predict(KeyEvent { kind: KeyKind::Char(c), ctrl: false, shift: false, alt: false });
+        }
+        let cands = e.candidates();
+        assert_eq!(cands.first().map(String::as_str), Some("你好"), "head 保底: {:?}", &cands[..4.min(cands.len())]);
+        assert!(cands.iter().any(|c| c == "你"), "单字区仍在(head 之后)");
+        let v = e.predict(KeyEvent { kind: KeyKind::Space, ctrl: false, shift: false, alt: false });
+        assert_eq!(ImeView::str_field(&v.commit_text), "你好");
+    }
+
+    #[test]
     fn type_pinyin_and_commit() {
         let mut e = eng();
         for c in "nihao".chars() {

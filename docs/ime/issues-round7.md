@@ -169,3 +169,15 @@ exact 固定 0.88 不看词频:the/and 与低频词同权(同输入只有一个 
     view.candidates 槽位(用户真实可见;candidates_detailed 是独立
     镜像、不含 Layer 3 —— 探针时曾误导)
   - 测试:ime-core 157+21+2、swift-ime 7+12+15 全绿
+- **🟡 增强 ✅** 造词单字区真词头 + 槽位自适应(用户追问"单字能不能全放"):
+  - 16 槽是 view.candidates 定长 wire 协议(fcitx5 C++ 依赖),硬顶;
+    candidate_page 只是高亮推导提示,fill_view 无按页切窗 —— 真全量
+    需要翻页系统改造(fill_view 窗口滑动 + addon 翻页键 + select 语义),
+    跨 Rust/C++,单独立项
+  - 本轮:词头只收**真词**(非 decomp 链,X食品 类让位),单字区
+    动态扩大到 15;jianshipin 的"剪"从槽 13 提前到槽 10
+  - 嵌入词典回退:全 decomp 场景(nihao)head 保底收首候选,space
+    提交仍是你好(否则单字区顶到槽 1,space 变单字部分提交)
+  - 断言:ime-core compose_head_falls_back_when_no_real_words +
+    golden compose_single_char_options_reach_jian_tail(剪 ≤ 槽 10)
+  - 测试:ime-core 158+21+2、swift-ime 7+12+15 全绿

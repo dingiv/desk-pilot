@@ -1100,10 +1100,31 @@ impl StateMachine {
             if !chained && first_syl.len() < self.buffer.len() {
                 // 槽位分配(总 16,view.candidates 定长):造词场景的多字链头
                 // 大多是 decomp 垃圾链(如 jianshipin → 监视频/检视频/健食品),
-                // 真词寥寥 —— 词头 4 + 单字 12。曾用 8+8:jianshipin 造"剪视频"
-                // 时,剪在 jian 单字表第 9,刚好被截,逐字造词无法起步。
-                let max_full = 4usize.min(cands.len());
-                let max_chars = (CANDIDATE_SLOTS - max_full).min(12);
+                // 对逐字造词无价值 —— 词头只收**真词**(非 decomp 来源),
+                // 剩余槽位全给单字。曾用 8+8 定额:jianshipin 造"剪视频"时,
+                // 剪在 jian 单字表第 9,刚好被截,逐字造词无法起步。
+                let real_words: Vec<usize> = cands
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| {
+                        self.last_meta
+                            .get(*i)
+                            .map(|m| m.source != "decomp")
+                            .unwrap_or(true)
+                    })
+                    .map(|(i, _)| i)
+                    .take(4)
+                    .collect();
+                // 嵌入词典场景(无 FST 大词典):候选全是 decomp 链,"你好"
+                // 也是链 —— 过滤后 head 为空会让单字区顶到槽 1,space 提交
+                // 变成单字部分提交。保底收首候选(rank 分序的第一名)。
+                let real_words = if real_words.is_empty() {
+                    vec![0]
+                } else {
+                    real_words
+                };
+                let max_full = real_words.len();
+                let max_chars = (CANDIDATE_SLOTS - max_full).min(16);
                 // 造词单字候选:直接走 pinyin 家族的 predict(单音节输入 =
                 // single 路径,dict.lookup + 衰减排序)。修复 B2 双实例脑裂:
                 // 曾用独立的 InputxPinyin 实例(学习路径全在 family),其
@@ -1120,8 +1141,11 @@ impl StateMachine {
                     .collect();
 
                 if !char_cands.is_empty() {
-                    // Top full comps.
-                    let full_head = cands.iter().take(max_full).cloned().collect::<Vec<_>>();
+                    // Top full comps(真词)。
+                    let full_head = real_words
+                        .iter()
+                        .filter_map(|&i| cands.get(i).cloned())
+                        .collect::<Vec<_>>();
                     self.full_comp_count = full_head.len();
                     for _ in 0..full_head.len() {
                         self.partial_commit_indices.push(false);
