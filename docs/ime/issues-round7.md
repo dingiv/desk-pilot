@@ -158,3 +158,14 @@ exact 固定 0.88 不看词频:the/and 与低频词同权(同输入只有一个 
   - 断言:golden `dier_full_syllable_split_restored`(第二 top1 +
     dierge 恢复)+ lattice 单元 `greedy_die_does_not_block_exact`
   - 测试:ime-core 157+21+2、swift-ime 7+11+15 全绿
+- **🟡 HOTFIX ✅** jianshipin 无法逐字造"剪视频"(用户报告):
+  - 根因:造词单字区槽位分配 8 词头 + 8 单字 —— 剪在 jian 单字表
+    第 9,刚好被 take(8) 截掉;且 fill_view 硬截 CANDIDATE_SLOTS(16),
+    单字区即使扩也超不出 view
+  - 修复:槽位重分配 4 词头 + 12 单字 —— 造词场景的多字链头大多是
+    decomp 垃圾链(监视频/检视频/健食品),真词寥寥;16 槽内剪(第 9)
+    可达(第 13 槽)
+  - 断言 golden compose_single_char_options_reach_jian_tail:走
+    view.candidates 槽位(用户真实可见;candidates_detailed 是独立
+    镜像、不含 Layer 3 —— 探针时曾误导)
+  - 测试:ime-core 157+21+2、swift-ime 7+12+15 全绿

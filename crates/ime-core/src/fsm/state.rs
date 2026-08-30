@@ -1098,8 +1098,12 @@ impl StateMachine {
         let chained = self.buffer.contains('\'');
         if let Some(first_syl) = env.first_syllable(&self.buffer) {
             if !chained && first_syl.len() < self.buffer.len() {
-                let max_full = 8usize.min(cands.len());
-                let max_chars = (CANDIDATE_SLOTS - max_full).min(8);
+                // 槽位分配(总 16,view.candidates 定长):造词场景的多字链头
+                // 大多是 decomp 垃圾链(如 jianshipin → 监视频/检视频/健食品),
+                // 真词寥寥 —— 词头 4 + 单字 12。曾用 8+8:jianshipin 造"剪视频"
+                // 时,剪在 jian 单字表第 9,刚好被截,逐字造词无法起步。
+                let max_full = 4usize.min(cands.len());
+                let max_chars = (CANDIDATE_SLOTS - max_full).min(12);
                 // 造词单字候选:直接走 pinyin 家族的 predict(单音节输入 =
                 // single 路径,dict.lookup + 衰减排序)。修复 B2 双实例脑裂:
                 // 曾用独立的 InputxPinyin 实例(学习路径全在 family),其
