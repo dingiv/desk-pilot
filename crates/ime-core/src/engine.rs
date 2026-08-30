@@ -115,6 +115,7 @@ impl ImeEngine {
             DEFAULT_VOICE_AURA_BASE.to_string(),
             crate::io_thread::DEFAULT_IDLE_TIMEOUT_SECS,
             Vec::new(),
+            7,
         )
     }
 
@@ -150,6 +151,7 @@ impl ImeEngine {
         voice_aura_base: String,
         voice_idle_timeout_secs: u64,
         addons: Vec<crate::family::magic::AddonConfig>,
+        page_size: u32,
     ) -> Self {
         // Magic command entries are generated from the member registry (#asr, #flush,
         // #submit, #req, #date, #password …) — adding a command = one member, nothing
@@ -210,7 +212,7 @@ impl ImeEngine {
             persistence: Mutex::new(None),
             magic,
             provider,
-            page_size: 7,
+            page_size: page_size.max(1),
             candidate_meta: false,
             frontend,
             io_thread,
@@ -292,7 +294,9 @@ impl ImeEngine {
         self.dispatcher.set_english_context_aware(on);
     }
 
-    /// 候选每页条数(默认 7)。frontend 启动时调用(swift-ime.yaml → input.page_size)。
+    /// 候选每页条数 —— 运行时动态调整。构造期请传 `with_config` 的
+    /// `page_size` 参数(swift-ime.yaml → input.page_size 由 app 层读取后
+    /// 注入,ime-core 不读配置文件)。
     /// 已存在的 context 立即生效,后续新建的 context 沿用新值。
     pub fn set_page_size(&mut self, page_size: u32) {
         if page_size == 0 {
@@ -778,6 +782,26 @@ mod tests {
     }
 
     #[test]
+    fn page_size_flows_from_constructor_to_view_window() {
+        // 构造参数 page_size(swift-ime.yaml → input.page_size,app 层读取
+        // 后注入)决定翻页窗口滑动步长:页 2 首条 = merged[2×5]。
+        use crate::fsm::router::{KeyKind, KeyEvent};
+        let mut e = ImeEngine::new();
+        e.set_page_size(5);
+        e.set_page_size(5);
+        for c in "nihao".chars() {
+            e.predict(KeyEvent { kind: KeyKind::Char(c), ctrl: false, shift: false, alt: false });
+        }
+        let all = e.candidates();
+        e.predict(KeyEvent { kind: KeyKind::PageDown, ctrl: false, shift: false, alt: false });
+        e.predict(KeyEvent { kind: KeyKind::PageDown, ctrl: false, shift: false, alt: false });
+        let v = e.predict(KeyEvent { kind: KeyKind::PageDown, ctrl: false, shift: false, alt: false });
+        assert_eq!(v.candidate_page, 3);
+        let head = ImeView::str_field(&v.candidates[0].text);
+        assert_eq!(Some(head), all.get(3 * 5).map(String::as_str), "窗口按页大小 5 滑动: 页 3 首 = merged[15]");
+    }
+
+    #[test]
     fn candidate_view_pages_slide_over_merged() {
         // 翻页窗口:fill_view 装载"从当前页首起的 16 条"而非固定前 16 ——
         // 造词单字区全量放出后,merged 超过 16 的候选翻页可达。
@@ -1074,6 +1098,7 @@ mod tests {
             DEFAULT_VOICE_AURA_BASE.to_string(),
             crate::io_thread::DEFAULT_IDLE_TIMEOUT_SECS,
             Vec::new(),
+            7,
         );
         let mut e = e;
         for c in "#/hello?name=Mike".chars() {

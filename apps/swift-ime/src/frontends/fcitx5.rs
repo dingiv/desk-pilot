@@ -217,12 +217,12 @@ pub extern "C" fn swift_ime_create(
         cfg.voice.aura_base.clone(),
         cfg.voice.idle_time,
         addons,
+        cfg.input.page_size,
     ));
     // &mut 配置 —— 必须在 attach_engine(建 Weak)之前:Arc::get_mut 要求
     // strong_count==1 且 weak_count==0。先配置完,再 attach。万一不变量被破坏,
     // 降级用默认配置(不 panic,IME 里 panic 会拖垮整个 fcitx5)。
     if let Some(eng) = Arc::get_mut(&mut engine) {
-        eng.set_page_size(cfg.input.page_size);
         eng.set_context_aware(cfg.input.context_aware);
         eng.set_candidate_meta(cfg.debug.candidate_meta);
         eng.set_req_base(&cfg.magic.req_base);

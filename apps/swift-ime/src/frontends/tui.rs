@@ -146,8 +146,8 @@ pub fn build_engine(cfg: &TuiConfig) -> (ImeEngine, Arc<ime_core::voice_state::S
         cfg.voice_aura_base.clone(),
         cfg.voice_idle_time,
         addons,
+        sw_cfg.input.page_size,
     );
-    engine.set_page_size(sw_cfg.input.page_size);
     engine.set_context_aware(sw_cfg.input.context_aware);
     // 调试 meta(候选来源/分数)—— view_json / TUI 候选注释据此显示。
     engine.set_candidate_meta(sw_cfg.debug.candidate_meta);

@@ -192,3 +192,11 @@ exact 固定 0.88 不看词频:the/and 与低频词同权(同输入只有一个 
   - Layer 3 单字区全量放出(merged 不再截 12),翻页全部可达
   - 断言 candidate_view_pages_slide_over_merged(页 3 窗口首 == merged[21])
   - 测试:ime-core 159+21+2、swift-ime 7+12+15 全绿
+- **🟡 page_size 构造参数化 ✅**(用户要求:ime-core 不读配置,构造参数注入):
+  - 审计:链路本就通(yaml input.page_size → 前端 set_page_size → 引擎,
+    ime-core 零文件读取);缺的是"构造参数"形态
+  - `with_config` 加第 10 参 `page_size`(≤0 归 1);两个前端(tui/fcitx5)
+    改传构造参,删事后 setter;`set_page_size` 保留作运行时动态调整
+  - 断言 page_size_flows_from_constructor_to_view_window(页大小 5 →
+    页 3 窗口首 = merged[15])
+  - 测试:ime-core 160+21+2、swift-ime 7+12+15 全绿
