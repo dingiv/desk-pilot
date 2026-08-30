@@ -74,18 +74,21 @@ zh-en，自带标点；tokens.txt 必须保持官方"token id"两列格式）。
    threshold = 按设计应抛弃）⇒ 重置会话——微弱音频的残留（含流式幻觉复读）不得
    泄漏进下一个定稿段。真语音不受影响（停顿 ≥min_silence 即 EOS 定段重置）。
    **说话中无实时纠偏**（D2：勤快 Stage2 的 1s 路径已删除）。
-3. **段定稿**（EOS）：双路文本都为空 → 噪声段丢弃；否则 PCM 入 store、段 batch
-   （`.ok().filter(非空)` → Option）→ `Batch { window_id, segments }`（载荷即整个窗口，
-   Stage2 无状态）。
-   ⚠️ 已知限制：段级/窗口级 batch 是消费循环内的**同步**调用——远程 ASR 实测
-   ~3.5s/次，期间流式 partial 与 VAD 处理全部暂停。真实语速下 EOS 间隔天然 >1s，无感；
-   批量重放/长窗口时有可感知延迟。整改方向＝batch 移出消费线程（roadmap R5）。
+3. **段定稿**（EOS）：PCM 入 store（共享 `Arc<Vec<i16>>`）、**入队句级 batch job**（微秒级，
+   消费循环不阻塞）→ `Batch { paragraph_id, sentences }`（载荷即整段，`batch_text: None`
+   为 in-flight 态；句级 batch 结果异步经 `SentenceBatchReady` 回传）。噪声句不再 EOS
+   丢弃（异步后 EOS 时刻只有流式文本，丢弃会吞"流式空 batch 有"的真实语音）——空句由
+   段落折叠吸收，8s 停滞看门狗清幻觉。
+   ✅ 曾为同步调用（远程 ~3.5s/次，阻塞流式/VAD → 吞句 bug）；2026-08-30 已移至
+   `aura-batch` 单 worker 线程（roadmap R5 关闭，见 async-batch-design.md）。
 4. **窗口定稿**：`WindowTracker` 判边界——下一 SOS 的间隔 ≥ merge_gap（3.5s），或静默超时
-   （`check_settle`，段进行中抑制）；`emit_window_edge` 拼 PCM → 窗口 batch 重跑 →
-   `WindowEdge` → evict。merge_gap=0 → 每段独窗。**单段窗口免重跑**：窗口 batch 的
-   意义是跨段上下文重新整听——只有一段时拼接 PCM 与该段完全相同，直接复用段级
-   batch 结果（含 None，不做失败重试）；单段是常态（merge 仅发生在 <merge_gap 的
-   停顿后），故大多数窗口省掉一整次 batch 调用。
+   （`check_settle`，段进行中抑制）；`emit_paragraph_edge` 拼 PCM（段落持 `Arc`）→
+   **入段级重跑 job**（异步）→ `ParagraphEdge`（`batch_text: None` in-flight；结果经
+   `ParagraphBatchReady` 回传）→ evict。merge_gap=0 → 每段独窗。**单段窗口免重跑**：
+   只有一段时拼接 PCM 与该段完全相同，句级 batch job 已覆盖 → **不投递重跑 job**
+   （复用句级结果）；单段是常态（merge 仅发生在 <merge_gap 的停顿后），故大多数
+   窗口省掉一整次 batch 调用。定稿由 Stage2 worker 的**就绪门**触发：全句 batch 齐
+   + 重跑齐（单段免重跑）→ LLM 整流一次。
 5. **AudioStore**：`Mutex<BTreeMap<id, PCM>>`，容量按样本（10min ≈19MB），超限逐最旧。
 6. **VAD 门控流式（2026-08-19）**：sherpa `VoiceActivityDetector::detected()` 提供**实时的**
    "正在检测到语音"信号——它是流式喂帧的唯一门卫：detected() 为 true 才喂流式（accept +
@@ -98,18 +101,19 @@ zh-en，自带标点；tokens.txt 必须保持官方"token id"两列格式）。
 
 **位置**：`crates/aura-core/src/calibrator.rs`（`Stage2CalibratorImpl`）+ `prompt.rs`。
 
-**窗口状态机**：内部状态只有一个 `(当前窗口 id, 最后一次联合整流结果)` 对——每个
-Batch 整体覆盖它；WindowEdge 取走存档作为该 VadWindow 的纠偏字段并清空（= 移动左
-边界），**不再调用 LLM**（最后一个段的 Batch 到来时全窗口整流已完成）。事件在单一
-worker 线程有序到达（Batch×N → WindowEdge），状态不可能失步。跑在独立 `aura-stage2`
-worker（pipeline.rs），LLM 耗时不卡 partial。
+**无状态**（2026-08-30 batch 异步化后）：每次调用都是纯函数式的——输入是"整段全部句
+的文本"（payload 即段落），**内部不存任何段落状态**。batch 异步后末句 batch 文本可能
+晚于最后一个 `Batch` 到达，旧"存最后一次整流、定稿零 LLM 取存档"的不变式不再成立。
+跑在独立 `aura-stage2` worker（pipeline.rs），LLM 耗时不卡 partial。pipeline 的
+`Finalizer`（worker 线程内单线程独占、无锁）累积句级 batch 并做**就绪定稿**。
 
-- `calibrate_window(window_id, segments)`：全部段 `best_text()` 逐行（`PromptBuilder::
-  new_multi`，`<primary_transcript>` 信封内一行一段）联合整流 → `SegmentCalibration`（每 VAD
-  间隔一次，替换同窗口上次结果）并**覆盖窗口存档**。
-- `finalize_window(window)`：返回存档（= 最后一次 `SegmentCalibration` 的文本）→
-  `WindowCalibration`（窗口粒度定稿，D3；route_ms ≈ 0）。防御路径：无存档时回退窗口
-  best_text（理论不可达——窗口必有 Batch）。
+- `calibrate_paragraph(paragraph_id, sentences)`：全部句 `best_text()` 逐行（`PromptBuilder::
+  new_multi`，`<primary_transcript>` 信封内一行一句）联合整流 → `SentenceCalibration`（每 VAD
+  间隔一次，live 预览，替换同段上次结果）。
+- `finalize_paragraph(paragraph)`：用全句最终 `best_text()`（句级 batch 已由 pipeline
+  补齐；缺失句回退流式）**跑一次 LLM** → `ParagraphCalibration`（段粒度定稿，D3）。
+  全空段零 LLM（直接回空）。定稿时机由 pipeline 就绪门控制：全句 batch 齐 + 段级重跑
+  齐（单句段免重跑）——保证末句 batch 不会退化成流式。
 - 纠偏输入源 `llm.input`（batch/stream/both）：batch 默认（`best_text()` 权威）；both 时
   双通道信封（`<primary_transcript>` + `<secondary_transcript>`）让 LLM 补回批式丢的句首。
 - LLM 失败回退原文；用户纠正对（环形 20 条，POST /api/correct）优先级最高注入；
@@ -119,10 +123,14 @@ worker（pipeline.rs），LLM 耗时不卡 partial。
 
 | 线程 | 职责 |
 |---|---|
-| `aura-stage1-ingest` | scout TCP → AudioRing |
-| `aura-pipeline`（std 线程） | Stage1 consume loop（Condvar 事件驱动，无轮询；batch 同步调用仍是待办） |
-| `aura-stage2` | LLM 联合整流 worker（mpsc 只收 Batch/WindowEdge） |
+| `aura-stage1-ingest`（pipeline spawn） | scout TCP → AudioRing（跑 Stage1 暴露的阻塞 `run_ingest`） |
+| `aura-pipeline`（std 线程） | Stage1 consume loop（Condvar 事件驱动，无轮询，**零阻塞** —— batch 只入队 job） |
+| `aura-batch`（std） | batch worker：串行跑阻塞 `AsrProvider::recognize`（句级/段级重跑），每 job 必出结果 → `SentenceBatchReady`/`ParagraphBatchReady`（跑 Stage1 暴露的阻塞 `run_batch_worker`） |
+| `aura-stage2`（std） | LLM 联合整流 + 就绪定稿 worker（mpsc 收 Batch/ParagraphEdge/SentenceBatchReady/ParagraphBatchReady；定稿 = 全句 batch 齐 + 重跑齐 → LLM 一次） |
 | `aura-socket`（tokio） | axum SSE：数据面 `/api/asr_stream` + 控制面 `/api/stream` |
+
+> **线程归属约束**（2026-08-30）：Stage1/Stage2 模块**不 spawn 任何线程**，只暴露阻塞
+> 函数；上表四个线程全部由 `pipeline.rs` 创建。
 
 | SSE 段类型（`AsrSegment`，aura-agent/view.rs） | 键 | 语义 |
 |---|---|---|

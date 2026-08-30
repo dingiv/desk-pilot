@@ -19,7 +19,8 @@ const DURATION_SECS: f64 = 3.0;
 
 fn main() {
     eprintln!("[audio_one] connecting to PipeWire, capturing default mic…");
-    let src = match PipeWireAudioSource::new() {
+    // quantum = 1024 samples @16kHz (64ms) — 与 omni-scout 的 node.quantum 默认一致。
+    let src = match PipeWireAudioSource::new(1024) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[audio_one] connect failed: {e}");

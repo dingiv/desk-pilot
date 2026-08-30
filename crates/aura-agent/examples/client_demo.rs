@@ -1,13 +1,14 @@
 //! Demo for `audio_aura_agent::client::AuraClient` — exercises BOTH planes against a running
 //! aura-daemon:
 //! - control plane: one-shot `GET /api/state` (settings snapshot);
-//! - data plane:    `subscribe_segments()` — live recognition segments pushed directly.
+//! - data plane:    `subscribe_events()` — live recognition events (5-event boundary paradigm)
+//!   pushed directly.
 //!
 //! Run: `cargo run -p audio-aura-agent --example client_demo -- http://127.0.0.1:9091`
 //! (Start aura-daemon first.)
 
 use audio_aura_agent::client::AuraClient;
-use audio_aura_agent::AsrSegment;
+use audio_aura_agent::AsrEvent;
 use futures::StreamExt;
 
 #[tokio::main]
@@ -32,29 +33,48 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("daemon not reachable at {base} yet — data-plane stream will retry");
     }
 
-    // ── data plane: live recognition segments (low-latency push) ──
-    let segments = client.subscribe_segments();
-    tokio::pin!(segments); // the async_stream is !Unpin — pin before .next()
-    while let Some(seg) = segments.next().await {
+    // ── data plane: live recognition events (low-latency push) ──
+    let events = client.subscribe_events();
+    tokio::pin!(events); // the async_stream is !Unpin — pin before .next()
+    while let Some(ev) = events.next().await {
         let t = chrono::Local::now().format("%H:%M:%S%.3f");
-        match seg {
-            AsrSegment::StreamFragment { window_id, segment_id, text, .. } => {
-                println!("[{t}] stream    w{window_id}/s{segment_id} | {text}")
+        match ev {
+            AsrEvent::StreamFragment {
+                paragraph_id,
+                sentence_id,
+                text,
+                ..
+            } => {
+                println!("[{t}] stream    w{paragraph_id}/s{sentence_id} | {text}")
             }
-            AsrSegment::BatchSegment { window_id, segment_id, text } => {
-                println!("[{t}] batch-seg w{window_id}/s{segment_id} | {text}")
+            AsrEvent::BatchSentence {
+                paragraph_id,
+                sentence_id,
+                text,
+            } => {
+                println!("[{t}] batch-sen w{paragraph_id}/s{sentence_id} | {text}")
             }
-            AsrSegment::BatchWindow { window_id, text } => {
-                println!("[{t}] batch-win w{window_id} | {text}")
+            AsrEvent::BatchParagraph { paragraph_id, text } => {
+                println!("[{t}] batch-par w{paragraph_id} | {text}")
             }
-            AsrSegment::SegmentCalibration { window_id, calibrated } => {
-                println!("[{t}] seg-calib w{window_id} | {calibrated}")
+            AsrEvent::SentenceCalibration {
+                paragraph_id,
+                calibrated,
+            } => {
+                println!("[{t}] sen-calib w{paragraph_id} | {calibrated}")
             }
-            AsrSegment::WindowCalibration { window_id, calibrated } => {
-                println!("[{t}] FINAL     w{window_id} | {calibrated}")
+            AsrEvent::ParagraphCalibration {
+                paragraph_id,
+                calibrated,
+            } => {
+                println!("[{t}] FINAL     w{paragraph_id} | {calibrated}")
             }
-            AsrSegment::Correction { window_id, raw, corrected } => {
-                println!("[{t}] CORRECT   w{window_id} | {raw:?} → {corrected:?}");
+            AsrEvent::Correction {
+                paragraph_id,
+                raw,
+                corrected,
+            } => {
+                println!("[{t}] CORRECT   w{paragraph_id} | {raw:?} → {corrected:?}");
             }
         }
     }

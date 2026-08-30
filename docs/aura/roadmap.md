@@ -34,7 +34,7 @@
 |---|---|---|---|
 | R1 | **自适应 merge_gap** | 中 | 碎片化主体已被 SegmentMerger 解决；剩余价值=按场景自适应"一句"的窗口（命令式调小快定稿 / 长句调大） |
 | R4 | **口误自纠检测**（正则 "X 不对 Y" → Y） | 中 | 零 LLM 开销的确定性预处理 |
-| R5 | **Stage1 run() 异步化（残余：batch 移出消费线程）** | 中 | ~~睡眠轮询~~ 已除（2026-08-18：ring 挂 Condvar，无帧时挂起等 ingest notify，仅真实截止时间唤醒——settle 到点/停滞看门狗/断流喂静音；无截止时间则无限期挂起，**空闲零唤醒、零心跳**，diag 只在有活动时打印）。仍待：**batch 调用移出消费线程**——EOS/窗口定稿时的段级+窗口级 batch 是消费循环内同步调用，远程 ASR（dp-router 上的 llama.cpp multimodal qwen3-asr；旧 mloader 路径已废）实测 ~3.5s/次，期间流式 partial 与 VAD 全停；真实语速下 EOS 间隔 >1s 尚可接受，但批量重放/长窗口时有感知延迟（2026-08-17 e2e 实测记录，见 stages.md）。副作用实证：batch 阻塞期间 ring 积压，解除后追赶音频被压缩处理——**墙钟 gap 被压扁导致过度并窗**（10x 重放下 4s 间隔压成 0.4s 实测复现）。临时缓解：`asr.backend: disable` 纯流式模式直接跳过全部 batch 调用 |
+| R5 | **Stage1 run() 异步化（残余：batch 移出消费线程）** | 中 | ~~睡眠轮询~~ 已除（2026-08-18：ring 挂 Condvar，无帧时挂起等 ingest notify，仅真实截止时间唤醒——settle 到点/停滞看门狗/断流喂静音；无截止时间则无限期挂起，**空闲零唤醒、零心跳**，diag 只在有活动时打印）。~~batch 调用移出消费线程~~ **已除（2026-08-30：EOS/段定稿只入队 batch job（微秒级），阻塞 `recognize` 跑在 pipeline spawn 的 `aura-batch` 单 worker 线程；结果经 `SentenceBatchReady`/`ParagraphBatchReady` 回传，Stage2 按就绪条件定稿。消费循环零阻塞 → 吞句 bug（墙钟误切）+ 流式冻结根除；详见 async-batch-design.md / pipeline-optimization.md P0。** 历史背景：原同步调用远程 ~3.5s/次期间流式/VAD 全停，ring 积压解除后追赶音频被压缩 → 墙钟 gap 压扁导致过度并窗（10x 重放 4s→0.4s 复现） |
 | R6 | **Stage1Config::new IO 拆分** | 低 | 构造函数内嵌模型路径解析 IO，拆成独立函数（recognizer.rs TODO） |
 | R7 | **daemon 静态路径去硬编码** | 低 | `BASE` 常量 → FileLoader 机制（main.rs TODO） |
 

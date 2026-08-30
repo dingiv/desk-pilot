@@ -39,9 +39,11 @@ apps/audio-aura (daemon)     config 解析 (CLI/yaml→PipelineSpec) + socket (8
 crates/native                 napi shim (TS via VOICE_LOCAL_ROUTER)
 ```
 
-**线程模型**：`aura-stage1-ingest`（scout→ring）→ `aura-pipeline`（`Pipeline::spawn` 的
-std 线程跑 Stage1 consume loop，Condvar 事件驱动）→ `aura-stage2`（LLM worker，mpsc 收
-Batch/WindowEdge）→ `aura-socket`（主线程 tokio，axum SSE）。详见 `stages.md`。
+**线程模型**（全部由 `pipeline.rs` 创建；Stage1/Stage2 只暴露阻塞函数）：
+`aura-stage1-ingest`（scout→ring）+ `aura-pipeline`（`Pipeline::spawn` 的 std 线程跑 Stage1
+consume loop，Condvar 事件驱动，零阻塞）+ `aura-batch`（batch worker，跑阻塞 ASR
+recognize）+ `aura-stage2`（LLM 整流 + 就绪定稿 worker，mpsc 收 Batch/ParagraphEdge/
+*BatchReady）→ `aura-socket`（主线程 tokio，axum SSE）。详见 `stages.md`。
 
 ## 三阶段提交
 
@@ -165,9 +167,9 @@ CARGO_MANIFEST_DIR=$(pwd) cargo run -p aura-daemon --features asr,cuda -- 127.0.
 
 ## 代码内遗留 TODO（整改时留意）
 
-- `Stage1Recognizer::run`：batch 调用仍在消费线程同步执行（远程 ~3.5s/次会暂停流式）→
-  异步化（roadmap R5）；`Stage1Config::new` 内嵌 IO → 拆出（R6）；daemon 静态路径 `BASE`
-  硬编码 → FileLoader（R7）。
+- ~~`Stage1Recognizer::run`：batch 调用仍在消费线程同步执行~~ 已异步化（2026-08-30，R5
+  关闭：batch 跑在 `aura-batch` worker 线程，消费循环零阻塞）；`Stage1Config::new` 内嵌 IO →
+  拆出（R6）；daemon 静态路径 `BASE` 硬编码 → FileLoader（R7）。
 - dp-models `AsrBackend::Whisper`/`Qwen3Asr` 枚举变体已无构造点（死代码，可清）。
 
 ## 未完成

@@ -52,7 +52,9 @@ fn main() -> anyhow::Result<()> {
     eprintln!(
         "[load] Stage1 (Silero VAD + 流式 Zipformer + SenseVoice) + Stage2 ({router_model} via {router_endpoint}) …"
     );
-    let s1 = OnnxStage1Recognizer::new(Stage1Config::new(scout_addr.clone()))?;
+    // (s1, batch_rx):recognizer 不再自 spawn 线程 —— batch job 通道的接收端交给 Pipeline,
+    // 由它 spawn ingest / batch / stage2 三条工作线程。
+    let (s1, batch_rx) = OnnxStage1Recognizer::new(Stage1Config::new(scout_addr.clone()))?;
     let calibrator = Calibrator::load(&router_endpoint, &router_model)?;
     let _ = calibrator.calibrate_blocking("你好", None, &[]); // HTTP warmup (避免首轮冷启动)
     let corrections = Arc::new(Mutex::new(Vec::new()));
@@ -63,38 +65,35 @@ fn main() -> anyhow::Result<()> {
     let report = Arc::new(Mutex::new(fs::File::create(format!("{REPORT_DIR}/live-{epoch}.md"))?));
     writeln!(
         report.lock().unwrap(),
-        "# Stage1→Stage2 (Pipeline · 边界范式) · {epoch}\n\n\
+        "# Stage1→Stage2 (Pipeline · 边界范式 · batch 异步) · {epoch}\n\n\
          - 源: omni-scout `{scout_addr}/audio`\n\n\
-         | 段落 | 时刻(s) | 路由(ms) | 段数 | 流式(热词拼接) | 段落批式原文 | Stage2整流 |\n\
-         |---|---:|---:|---:|---|---|---|"
+         | 段落 | 定稿路由(ms) | Stage2整流(定稿) |\n\
+         |---|---:|---|"
     )?;
 
     println!("\n● Pipeline 就绪 (scout {scout_addr}/audio). Ctrl-C 结束.\n");
-    Pipeline::new(s1, Box::new(s2)).run(
+    Pipeline::new(s1, Box::new(s2), batch_rx).run(
         Arc::new(AtomicBool::new(true)),
         Arc::new((Mutex::new(()), Condvar::new())),
         move |ev| match ev {
-        TurnEvent::Interim { paragraph_id, sentence_id: _, partial, at_s } => {
-            println!("  …流式 w{paragraph_id} @{at_s:.1}s: {partial}")
+        TurnEvent::StreamFragment { paragraph_id, sentence_id: _, text, at_s } => {
+            println!("  …流式 w{paragraph_id} @{at_s:.1}s: {text}")
         }
-        TurnEvent::ParagraphCalibrated { paragraph_id, calibrated, route_ms } => {
+        TurnEvent::BatchSentence { paragraph_id, sentence_id, text } => {
+            println!("  ≈ 句批 w{paragraph_id} s{sentence_id}: {text}")
+        }
+        TurnEvent::BatchParagraph { paragraph_id, text } => {
+            println!("  ≈ 段批 w{paragraph_id}: {text}")
+        }
+        TurnEvent::SentenceCalibration { paragraph_id, calibrated, route_ms } => {
             println!("  ≈ w{paragraph_id} 整流中 @{route_ms:.0}ms: {calibrated}");
         }
-        TurnEvent::ParagraphFinal { paragraph: w, calibrated, route_ms } => {
-            println!(
-                "▶ w{} @{:.1}s ({:.1}s, {} 句) 路由 {:.0}ms\n   流式: {}\n   原文: {}\n   整流: {}\n",
-                w.id, w.start_s, w.duration_ms() / 1000.0, w.sentences.len(), route_ms,
-                w.streaming_text,
-                w.batch_text.as_deref().unwrap_or("(段落批式失败,回退句级拼接)"),
-                calibrated
-            );
+        TurnEvent::ParagraphCalibration { paragraph_id, calibrated, route_ms } => {
+            println!("\n▶ 定稿 w{paragraph_id} 路由 {route_ms:.0}ms: {calibrated}\n");
             let _ = writeln!(
                 report.lock().unwrap(),
-                "| {} | {:.1} | {:.0} | {} | {} | {} | {} |",
-                w.id, w.start_s, route_ms, w.sentences.len(),
-                cell(&w.streaming_text),
-                cell(w.batch_text.as_deref().unwrap_or("")),
-                cell(&calibrated)
+                "| {} | {:.0} | {} |",
+                paragraph_id, route_ms, cell(&calibrated)
             );
         }
     });

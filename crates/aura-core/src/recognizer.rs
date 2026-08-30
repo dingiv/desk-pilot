@@ -1,30 +1,80 @@
-//! Stage1Recognizer — encapsulates the Stage1 "noodle": the audio ring + omni-scout ingest
-//! thread + Silero VAD + per-sentence streaming sessions + per-sentence batch passes + the
-//! paragraph tracker. Owns ALL the loop state. It runs the consume loop internally and emits
-//! [`Stage1Event`]s — it does NOT touch files or run Stage2 (that's `pipeline`'s job,
-//! `audio_aura_core::Pipeline`).
+//! Stage1Recognizer — encapsulates the Stage1 "noodle": the audio ring + Silero VAD +
+//! per-sentence streaming sessions + the paragraph tracker. Owns ALL the consume-loop state and
+//! runs the consume loop internally, emitting [`Stage1Event`]s — it does NOT touch files or run
+//! Stage2 (that's `pipeline`'s job, `audio_aura_core::Pipeline`).
+//!
+//! **本 crate 不创建任何线程** —— 三条阻塞工作全部以函数暴露,线程由 `Pipeline` 创建并运行:
+//! - [`Self::run_ingest`] — scout TCP → AudioRing(阻塞,自动重连);
+//! - [`Self::run_batch_worker`] — 消费循环在 EOS/settle 经 mpsc 投递 [`BatchJob`],worker 逐个
+//!   执行**阻塞**的 `AsrProvider::recognize`,每 job 必出一次 [`BatchJobResult`](Some/None);
+//! - [`Self::run`] — 消费循环(VAD + 流式 + 边界决策),**永不被 batch 阻塞**
+//!   (batch 异步化的根因修复:见 docs/aura/async-batch-design.md)。
 //!
 //! Boundary paradigm (docs/aura/stages.md): the VAD gap (`min_silence`) closes a
-//! [`VadSentence`] (its own streaming session per D1 + one batch pass, packed as a `Batch`
-//! event); the merge paragraph (`merge_gap`) closes a [`VadParagraph`] (concatenated PCM re-run
-//! through the batch model, packed as a `ParagraphEdge` event). PCM lives in the
-//! [`AudioStore`] by id — events carry ids + texts only, plus the paragraph's shared
-//! `Arc<Vec<i16>>` assembled once at settle.
+//! [`VadSentence`] (its own streaming session per D1 + one batch JOB enqueued, packed as a
+//! `Batch` event with `batch_text: None`; the result arrives via `SentenceBatchReady`); the
+//! merge paragraph (`merge_gap`) closes a [`VadParagraph`] (concatenated PCM re-run JOB
+//! enqueued, packed as a `ParagraphEdge` with `batch_text: None`; the result arrives via
+//! `ParagraphBatchReady`). PCM lives in the [`AudioStore`] by id as a shared `Arc<Vec<i16>>` —
+//! jobs and the paragraph share the allocation; events carry ids + texts only.
 //!
 //! ```ignore
-//! let exec = OnnxStage1Recognizer::new(Stage1Config::new(scout_addr))?;
-//! exec.run(&mut |ev| match ev {
-//!     Stage1Event::StreamFragment { paragraph_id, sentence_id, text, .. } => println!("…{text}"),
-//!     Stage1Event::Batch { paragraph_id, sentences } => stage2.calibrate_paragraph(paragraph_id, &sentences),
-//!     Stage1Event::ParagraphEdge { paragraph } => stage2.calibrate_final(&paragraph),
-//! });
+//! let (s1, batch_rx) = OnnxStage1Recognizer::new(Stage1Config::new(scout_addr))?;
+//! let pipeline = Pipeline::new(s1, Box::new(stage2), batch_rx);
+//! pipeline.run(running, resume, |ev| { /* TurnEvents */ });
 //! ```
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
+
+/// A batch job the consume loop enqueues (non-blocking, microseconds); a dedicated worker
+/// thread — spawned by [`crate::pipeline::Pipeline`] — drains this channel and runs the
+/// blocking [`AsrProvider::recognize`] per job. PCM is a shared `Arc` (no copy — the
+/// [`AudioStore`] / sentence / paragraph all share the same allocation).
+///
+/// Ordering: a `Sentence` job is enqueued at the sentence's EOS (its `Batch` is emitted in the
+/// same call, BEFORE the result can exist); a `Paragraph` re-run job at settle (its
+/// `ParagraphEdge` likewise). Every job yields EXACTLY ONE [`BatchJobResult`] — failure maps to
+/// `text: None` (the legal "batch unavailable" state), never a dropped job, so the pipeline's
+/// readiness gate (all sentence batches + re-run) can always complete.
+#[derive(Debug)]
+pub enum BatchJob {
+    /// Per-sentence batch pass (at the sentence's EOS).
+    Sentence {
+        paragraph_id: ParagraphId,
+        sentence_id: SentenceId,
+        pcm: Arc<Vec<i16>>,
+        sr: u32,
+    },
+    /// Whole-paragraph re-run over the concatenated PCM (at settle; multi-sentence paragraphs
+    /// only — single-sentence ones reuse the sentence-level job).
+    Paragraph {
+        paragraph_id: ParagraphId,
+        pcm: Arc<Vec<i16>>,
+        sr: u32,
+    },
+}
+
+/// The outcome of one [`BatchJob`] — exactly one per job. `text: None` when `recognize`
+/// failed (remote network) or returned empty; consumers fall back to streaming via
+/// [`crate::VadSentence::best_text`]. `asr_ms` = the `recognize` wall-clock (perf metric).
+#[derive(Debug)]
+pub enum BatchJobResult {
+    Sentence {
+        paragraph_id: ParagraphId,
+        sentence_id: SentenceId,
+        text: Option<String>,
+        asr_ms: u64,
+    },
+    Paragraph {
+        paragraph_id: ParagraphId,
+        text: Option<String>,
+        asr_ms: u64,
+    },
+}
 
 use anyhow::{bail, Result};
 use tracing::{debug, info, warn};
@@ -228,8 +278,10 @@ impl AsrProvider for DisabledAsr {
 }
 
 /// ONNX-backed Stage1 recognizer (Silero VAD + streaming Zipformer + batch ASR via the single
-/// [`OnnxRuntimeManager`]). Thread-safe: the ring is shared with the ingest thread; the
-/// consume loop runs on the caller's thread.
+/// [`OnnxRuntimeManager`]). **Spawns no threads** — the three blocking jobs (ingest / consume
+/// loop / batch worker) are exposed as methods the `Pipeline` runs on threads it owns. The ring
+/// is shared with the ingest thread; the consume loop runs on its caller's thread; batch jobs
+/// are handed to the worker via an mpsc channel (see [`Self::new`]).
 pub struct OnnxStage1Recognizer {
     mgr: Arc<OnnxRuntimeManager>,
     /// Batch ASR as a trait object: local OnnxAsr (from `mgr`) or remote HttpAsr. Streaming/VAD
@@ -245,13 +297,24 @@ pub struct OnnxStage1Recognizer {
     running: Arc<AtomicBool>,
     /// 主动归档信号(`Stage1Config::flush_paragraph`)—— run 循环消费,见下。
     flush_paragraph: Arc<AtomicBool>,
-    /// The PCM store: sentences' clips live here by id until their paragraph settles.
+    /// The PCM store: sentences' clips live here by id (shared `Arc`) until their paragraph
+    /// settles.
     audio_store: Arc<AudioStore>,
+    /// scout 地址 — [`Self::run_ingest`] 用它建连接(ingest 线程由 Pipeline 创建)。
+    scout_addr: String,
+    /// 客户端请求 scout 的推流 cadence(ms)(`run_ingest` 用)。
+    scout_chunk_ms: Option<u64>,
+    /// 句级/段级 batch job 通道 sender — 消费循环 EOS/settle 时入队;receiver 由
+    /// [`Self::new`] 交给 `Pipeline`,后者 spawn batch worker 线程跑 [`Self::run_batch_worker`]。
+    batch_tx: mpsc::Sender<BatchJob>,
 }
 
 impl OnnxStage1Recognizer {
-    /// Build models from `cfg`, warm them, spawn the scout→ring ingest thread.
-    pub fn new(cfg: Stage1Config) -> Result<Self> {
+    /// Build models from `cfg` and warm them. **Spawns no threads** (this crate never does —
+    /// the `Pipeline` owns all of them). Returns the recognizer + the RECV end of the batch-job
+    /// channel: the consume loop sends [`BatchJob`]s (at EOS / settle) and the `Pipeline` hands
+    /// `batch_rx` to the worker thread it spawns for [`Self::run_batch_worker`].
+    pub fn new(cfg: Stage1Config) -> Result<(Self, mpsc::Receiver<BatchJob>)> {
         // Batch ASR: Local → OnnxAsr lives in the mgr; Remote → HttpAsr (mgr skips .asr());
         // batch disabled → no batch model loaded at all, DisabledAsr stands in (empty result
         // ⇒ batch_text: None, the legal fallback state).
@@ -282,29 +345,29 @@ impl OnnxStage1Recognizer {
         mgr.warm();
         let ring = Arc::new(Mutex::new(AudioRing::new(cfg.ring_cap_samples)));
         let ring_cv = Arc::new(Condvar::new());
-        spawn_ingest(
-            Arc::clone(&ring),
-            Arc::clone(&ring_cv),
-            &cfg.scout_addr,
-            Arc::clone(&cfg.active),
-            cfg.scout_chunk_ms,
-        )?;
-        Ok(Self {
-            mgr,
-            ring,
-            ring_cv,
-            merge_gap_s: cfg.merge_gap_s,
-            active: cfg.active,
-            running: cfg.running,
-            flush_paragraph: cfg.flush_paragraph,
-            audio_store: Arc::new(AudioStore::new(DEFAULT_CAP_SAMPLES)),
-            batch_asr,
-        })
+        let (batch_tx, batch_rx) = mpsc::channel();
+        Ok((
+            Self {
+                mgr,
+                ring,
+                ring_cv,
+                merge_gap_s: cfg.merge_gap_s,
+                active: cfg.active,
+                running: cfg.running,
+                flush_paragraph: cfg.flush_paragraph,
+                audio_store: Arc::new(AudioStore::new(DEFAULT_CAP_SAMPLES)),
+                batch_asr,
+                scout_addr: cfg.scout_addr.clone(),
+                scout_chunk_ms: cfg.scout_chunk_ms,
+                batch_tx,
+            },
+            batch_rx,
+        ))
     }
 
-    /// Use an already-loaded [`OnnxRuntimeManager`] (e.g. shared with another stage); spawns the
-    /// ingest thread against `cfg.scout_addr`.
-    pub fn new_with_mgr(mgr: Arc<OnnxRuntimeManager>, cfg: Stage1Config) -> Result<Self> {
+    /// Use an already-loaded [`OnnxRuntimeManager`] (e.g. shared with another stage). Same
+    /// no-thread contract as [`Self::new`]: returns `(Self, batch_rx)`.
+    pub fn new_with_mgr(mgr: Arc<OnnxRuntimeManager>, cfg: Stage1Config) -> Result<(Self, mpsc::Receiver<BatchJob>)> {
         let batch_asr: Arc<dyn AsrProvider> = match (&cfg.asr_kind, cfg.batch_enabled) {
             (_, false) => Arc::new(DisabledAsr),
             (ProviderKind::Local, _) => {
@@ -316,24 +379,24 @@ impl OnnxStage1Recognizer {
         };
         let ring = Arc::new(Mutex::new(AudioRing::new(cfg.ring_cap_samples)));
         let ring_cv = Arc::new(Condvar::new());
-        spawn_ingest(
-            Arc::clone(&ring),
-            Arc::clone(&ring_cv),
-            &cfg.scout_addr,
-            Arc::clone(&cfg.active),
-            cfg.scout_chunk_ms,
-        )?;
-        Ok(Self {
-            mgr,
-            ring,
-            ring_cv,
-            merge_gap_s: cfg.merge_gap_s,
-            active: cfg.active,
-            running: cfg.running,
-            flush_paragraph: cfg.flush_paragraph,
-            audio_store: Arc::new(AudioStore::new(DEFAULT_CAP_SAMPLES)),
-            batch_asr,
-        })
+        let (batch_tx, batch_rx) = mpsc::channel();
+        Ok((
+            Self {
+                mgr,
+                ring,
+                ring_cv,
+                merge_gap_s: cfg.merge_gap_s,
+                active: cfg.active,
+                running: cfg.running,
+                flush_paragraph: cfg.flush_paragraph,
+                audio_store: Arc::new(AudioStore::new(DEFAULT_CAP_SAMPLES)),
+                batch_asr,
+                scout_addr: cfg.scout_addr.clone(),
+                scout_chunk_ms: cfg.scout_chunk_ms,
+                batch_tx,
+            },
+            batch_rx,
+        ))
     }
 
     /// Access the underlying ONNX model manager (e.g. for diagnostics / direct ASR calls).
@@ -346,36 +409,72 @@ impl OnnxStage1Recognizer {
     pub fn audio_store(&self) -> &Arc<AudioStore> {
         &self.audio_store
     }
-}
 
-/// Spawn the scout→ring ingest thread (never blocks, never drops; reconnects on 2s backoff).
-/// `active` controls whether it connects (see [`ScoutAudioSource::with_active`]); `chunk_ms`
-/// (Some) asks scout to aggregate source buffers into ~N-ms HTTP chunks (`/audio?chunk_ms=N`).
-fn spawn_ingest(
-    ring: Arc<Mutex<AudioRing>>,
-    ring_cv: Arc<Condvar>,
-    scout_addr: &str,
-    active: Arc<AtomicBool>,
-    chunk_ms: Option<u64>,
-) -> Result<()> {
-    let src = ScoutAudioSource::with_active(scout_addr.to_string(), WINDOW, active)
-        .with_chunk_ms(chunk_ms);
-    thread::Builder::new()
-        .name("aura-stage1-ingest".into())
-        .spawn(move || {
-            src.stream(
-                move |win| {
-                    let mut g = ring.lock().unwrap();
-                    g.push(win);
-                    drop(g);
-                    // Wake the consume loop — it sleeps on the condvar between frames
-                    // (deadline-driven, no polling).
-                    ring_cv.notify_all();
-                },
-                Duration::from_secs(2),
-            );
-        })?;
-    Ok(())
+    /// Blocking ingest loop: omni-scout `/audio` (TCP) → [`AudioRing`] + condvar notify, with
+    /// auto-reconnect (2s backoff). Runs FOREVER (reconnects; `active=false` pauses the
+    /// connection). **Blocking — the `Pipeline` runs it on its own thread** (this crate spawns
+    /// none).
+    pub fn run_ingest(&self) -> ! {
+        let src = ScoutAudioSource::with_active(self.scout_addr.clone(), WINDOW, Arc::clone(&self.active))
+            .with_chunk_ms(self.scout_chunk_ms);
+        src.stream(
+            move |win| {
+                let mut g = self.ring.lock().unwrap();
+                g.push(win);
+                drop(g);
+                // Wake the consume loop — it sleeps on the condvar between frames
+                // (deadline-driven, no polling).
+                self.ring_cv.notify_all();
+            },
+            Duration::from_secs(2),
+        )
+    }
+
+    /// Blocking batch worker: drain `rx` and run each job's batch ASR (the blocking
+    /// `AsrProvider::recognize`), calling `on_result` **exactly once per job** — failure/empty
+    /// map to `text: None`, jobs are never dropped (the pipeline's readiness gate relies on
+    /// every job producing one result). **Blocking — the `Pipeline` runs it on its own thread.**
+    pub fn run_batch_worker(&self, rx: mpsc::Receiver<BatchJob>, on_result: &mut dyn FnMut(BatchJobResult)) {
+        for job in rx {
+            match job {
+                BatchJob::Sentence {
+                    paragraph_id,
+                    sentence_id,
+                    pcm,
+                    sr,
+                } => {
+                    let t0 = Instant::now();
+                    let text = self.batch_asr.recognize(&pcm, sr).ok().filter(|t| !t.trim().is_empty());
+                    let asr_ms = t0.elapsed().as_millis() as u64;
+                    debug!(
+                        paragraph_id,
+                        sentence_id,
+                        asr_ms,
+                        batch = text.as_deref().unwrap_or("(none)"),
+                        "句级 batch 完成(异步 worker)"
+                    );
+                    on_result(BatchJobResult::Sentence {
+                        paragraph_id,
+                        sentence_id,
+                        text,
+                        asr_ms,
+                    });
+                }
+                BatchJob::Paragraph { paragraph_id, pcm, sr } => {
+                    let t0 = Instant::now();
+                    let text = self.batch_asr.recognize(&pcm, sr).ok().filter(|t| !t.trim().is_empty());
+                    let asr_ms = t0.elapsed().as_millis() as u64;
+                    debug!(
+                        paragraph_id,
+                        asr_ms,
+                        batch = text.as_deref().unwrap_or("(none)"),
+                        "段落级 batch 重跑完成(异步 worker)"
+                    );
+                    on_result(BatchJobResult::Paragraph { paragraph_id, text, asr_ms });
+                }
+            }
+        }
+    }
 }
 
 /// Block until a full Silero paragraph is available in the ring (wakes on the ingest thread's
@@ -508,14 +607,6 @@ impl ParagraphTracker {
         (settled, w.paragraph_id, w.sentences.clone())
     }
 
-    /// Discard the in-progress sentence (neither pass produced text — noise). Clears `active`
-    /// without recording anything.
-    fn drop_active(&mut self) {
-        if let Some(w) = self.open.as_mut() {
-            w.active = false;
-        }
-    }
-
     /// Settle-timeout probe (call every loop tick with the current wall-clock). Closes the
     /// paragraph when it has been silent (no active speech) for ≥ `merge_gap_s` — this is how the
     /// TRAILING paragraph finalizes. Suppressed while a sentence is in progress AND while `speaking`
@@ -589,14 +680,16 @@ impl ParagraphTracker {
     }
 }
 
-/// Turn settled spans into a [`VadParagraph`] and emit `ParagraphEdge`: concat the clips from the
-/// store (once — the paragraph keeps the `Arc`), re-run the batch model over the concatenated
-/// PCM (the authoritative paragraph text), then evict the clips. An all-discarded paragraph (no
-/// sentences) emits nothing and just vanishes.
+/// Turn settled spans into a [`VadParagraph`] and emit `ParagraphEdge`: concat the clips from
+/// the store (once — the paragraph keeps the shared `Arc`), **enqueue the paragraph re-run as a
+/// batch job (async — the consume loop is never blocked by it)**, then evict the clips. The
+/// event carries `batch_text: None` (in-flight); the result arrives via
+/// [`Stage1Event::ParagraphBatchReady`]. An all-discarded paragraph (no sentences) emits nothing
+/// and just vanishes.
 fn emit_paragraph_edge(
     settled: SettledParagraph,
     store: &AudioStore,
-    batch_asr: &dyn AsrProvider,
+    batch_tx: &mpsc::Sender<BatchJob>,
     sr: u32,
     on_event: &mut dyn FnMut(Stage1Event),
 ) {
@@ -605,25 +698,14 @@ fn emit_paragraph_edge(
     }
     let ids: Vec<AudioId> = settled.sentences.iter().map(|s| s.audio_id).collect();
     let pcm = Arc::new(store.concat(&ids));
-    // ★单句段落免重跑:段落 batch 的意义是"跨段上下文重新整听"——只有一个段时拼接
-    // PCM 与该句 PCM 完全相同,句级 batch 刚刚跑过同一音频,直接复用其结果(含 None:
-    // 远程失败后立刻重试大概率仍失败,徒增 settle 延迟)。单句是常态(merge 仅发生在
-    // <merge_gap 的停顿后),此优化省掉大多数段落的一整次 batch 调用。
-    let (batch_text, asr_ms) = if settled.sentences.len() == 1 {
-        debug!("单句段落——复用句级 batch 结果,跳过整段重跑");
-        (settled.sentences[0].batch_text.clone(), 0u64)
-    } else {
-        // `asr_ms` 计时:本 commit 简单写 0(性能埋点 v1);后续可在此位置包
-        // std::time::Instant::now() / elapsed() 替换为真实墙钟,值存到 VadParagraph.batch_asr_ms
-        // 通过 paragraph 日志输出。
-        let t0 = std::time::Instant::now();
-        let text = batch_asr.recognize(&pcm, sr).ok().filter(|t| !t.trim().is_empty());
-        (text, t0.elapsed().as_millis() as u64)
-    };
+    let sentence_count = settled.sentences.len();
     let streaming_text =
         settled.sentences.iter().map(|s| s.streaming_text.as_str()).collect::<String>();
     let start_s = settled.sentences.first().map(|s| s.start_s).unwrap_or(0.0);
     let end_s = settled.sentences.last().map(|s| s.end_s).unwrap_or(0.0);
+    // ★ 顺序不变式(竞态防护,同 finalize_sentence):先发 `ParagraphEdge` 事件(占位建
+    // pending),再入队段级重跑 job —— 重跑结果(ParagraphBatchReady)必在事件之后落到同一条
+    // stage2 FIFO 通道。
     on_event(Stage1Event::ParagraphEdge {
         paragraph: VadParagraph {
             id: settled.paragraph_id,
@@ -631,12 +713,29 @@ fn emit_paragraph_edge(
             start_s,
             end_s,
             streaming_text,
-            batch_text,
-            pcm,
-            batch_asr_ms: asr_ms,
+            // ASYNC re-run: None on this event; ParagraphBatchReady patches it (pipeline).
+            batch_text: None,
+            // Wall-clock measured by the batch worker; the pipeline fills it in on
+            // ParagraphBatchReady (single-sentence paragraphs never re-run → stays 0).
+            batch_asr_ms: 0,
+            pcm: Arc::clone(&pcm),
         },
     });
-    // The paragraph's Arc PCM is now the only remaining copy — release the per-sentence clips.
+    // ★单句段落免重跑:段落 batch 的意义是"跨句上下文重新整听"——只有一句时拼接 PCM 与该句
+    // PCM 完全相同,句级 batch job 已覆盖,不再投递重跑 job(省掉大多数段落的一整次 batch
+    // 调用)。单句段落的定稿文本由 pipeline 在句级 SentenceBatchReady 到达时就绪(见
+    // pipeline.rs Finalizer:单句段落 para_done 在 ParagraphEdge 即置位)。
+    if sentence_count == 1 {
+        debug!(paragraph_id = settled.paragraph_id, "单句段落——复用句级 batch,跳过整段重跑(不投递 job)");
+    } else if let Err(e) = batch_tx.send(BatchJob::Paragraph {
+        paragraph_id: settled.paragraph_id,
+        pcm,
+        sr,
+    }) {
+        warn!(error = %e, paragraph_id = settled.paragraph_id, "batch worker gone — paragraph re-run job dropped");
+    }
+    // The paragraph's Arc PCM is now the only remaining copy — release the per-sentence clips
+    // (the re-run job shares the paragraph's Arc, so eviction is safe).
     store.evict(&ids);
 }
 
@@ -776,9 +875,13 @@ impl OnnxStage1Recognizer {
         *speech_active = v_detected;
     }
 
-    /// 定稿一个 VAD 句(EOS 臂):finalize 流式会话 → streaming_text,句 PCM 跑 batch,
-    /// emit `Batch`(及可能的 `ParagraphEdge`)。`fallback_pcm` = 流式未配置时的 VAD
-    /// edge-extended 句。返回 true = 句被丢弃(双路文本都空,噪声句)。
+    /// 定稿一个 VAD 句(EOS 臂):finalize 流式会话 → streaming_text,句 PCM 入 store(共享
+    /// `Arc`),**入队句级 batch job(异步——消费循环不阻塞)**,emit `Batch`(`batch_text: None`)
+    /// 及可能的 `ParagraphEdge`。`fallback_pcm` = 流式未配置时的 VAD edge-extended 句。
+    ///
+    /// 噪声句不再在 EOS 丢弃:batch 异步后 EOS 时刻只有流式文本,若流式空就丢弃,会丢掉
+    /// "流式没听出、batch 能听出"的真实语音(吞句的另一形态)。空句无文本贡献,由段落折叠
+    /// 自然吸收;停滞幻觉由 8s 看门狗在下一句前清掉。
     fn finalize_sentence(
         &self,
         sess: Option<ActiveSession>,
@@ -789,57 +892,45 @@ impl OnnxStage1Recognizer {
         fallback_pcm: Vec<i16>,
         fed: u32,
         on_event: &mut dyn FnMut(Stage1Event),
-    ) -> bool {
+    ) {
         // 句 PCM = 流式 session 累积的完整音频(含句首 soft onset)——与流式听到的完全一致,
         // 区别只在 batch 一次整句听(大块)vs 流式逐帧听(小块)。流式未配置时 fallback VAD 句。
-        let sentence_pcm = sess.as_ref().map(|a| a.pcm.clone()).unwrap_or(fallback_pcm);
+        // `Arc`:store / batch job 共享同一份分配,零拷贝。
+        let sentence_pcm: Arc<Vec<i16>> =
+            Arc::new(sess.as_ref().map(|a| a.pcm.clone()).unwrap_or(fallback_pcm));
         let streaming_text = match (self.mgr.streaming_asr(), sess.as_ref()) {
             (Some(asr), Some(a)) => asr.finalize_and_result(&a.stream),
             _ => String::new(),
         };
-        // One batch pass over the sentence's PCM. Err (remote network) and empty text → None.
-        // `asr_ms` 计时 batch 模型调用时长(纯 wall-clock,从进 recognize 到响应落盘),
-        // 用于性能评估:对比不同 ASR 后端(sensevoice / qwen3-asr)/不同输入长度 / GPU vs CPU。
-        let asr_t0 = std::time::Instant::now();
-        let batch_text = self
-            .batch_asr
-            .recognize(&sentence_pcm, sr)
-            .ok()
-            .filter(|t| !t.trim().is_empty());
-        let asr_ms = asr_t0.elapsed().as_millis() as u64;
-        // Neither pass produced text → noise sentence: discard entirely.
-        if streaming_text.trim().is_empty() && batch_text.is_none() {
-            debug!("sentence discarded — neither streaming nor batch produced text");
-            tracker.drop_active();
-            return true;
-        }
         // Speech onset back-derived from the PCM duration (SOS was retroactive, so its
         // wall-clock IS the EOS instant).
         let start_s = (end_s - sentence_pcm.len() as f64 / sr as f64).max(0.0);
+        let sentence_id = *cur_sentence;
         let sentence = VadSentence {
-            id: *cur_sentence,
-            audio_id: self.audio_store.insert(sentence_pcm),
+            id: sentence_id,
+            audio_id: self.audio_store.insert(Arc::clone(&sentence_pcm)),
             start_s,
             end_s,
-            streaming_text,
-            batch_text,
+            streaming_text: streaming_text.clone(),
+            // ASYNC batch: the pass runs on the batch worker thread; the result arrives via
+            // SentenceBatchReady. None here is the in-flight state (== the old "batch failed"
+            // state for consumers — best_text falls back to streaming either way).
+            batch_text: None,
         };
         let (settled, paragraph_id, sentences) = tracker.on_eos(sentence);
         // A big gap settled the previous paragraph FIRST — emit it before this sentence's Batch.
         if let Some(s) = settled {
-            emit_paragraph_edge(s, &self.audio_store, &*self.batch_asr, sr, on_event);
+            emit_paragraph_edge(s, &self.audio_store, &self.batch_tx, sr, on_event);
         }
-        // 句级日志(debug):段落/段 id、音频时长、batch 模型调用耗时、两路文本、会话喂帧数。
+        // 句级日志(debug):段落/段 id、音频时长、两路文本(异步 batch 尚未返回)、会话喂帧数。
         if let Some(s) = sentences.last() {
             debug!(
                 paragraph_id = paragraph_id,
                 sentence_id = s.id,
                 time_ms = ((s.end_s - s.start_s) * 1000.0).round() as u64,
                 fed,
-                asr_ms,
-                batch = s.batch_text.as_deref().unwrap_or("(none)"),
                 streaming = %s.streaming_text,
-                "句定稿"
+                "句定稿(句级 batch 稍后入队,异步执行)"
             );
         }
         // Final stream fragment: the sentence's DEFINITIVE streaming text (live partials only
@@ -852,8 +943,23 @@ impl OnnxStage1Recognizer {
                 at_s: end_s,
             });
         }
+        // ★ 顺序不变式(竞态防护):先把 `Batch` 事件发上 stage2 通道,再入队句级 batch job。
+        // 二者是不同 channel —— 若先入队 job,worker 可能在 `Batch` 被 Finalizer 处理前就产出
+        // `SentenceBatchReady`,Finalizer 找不到该段条目而丢弃它,`ready` 永不达 `expected` →
+        // 该段悬挂(永不就绪)。先发 `Batch`(占位建 pending)后入队 job,则结果必在 `Batch`
+        // 之后落到同一条 stage2 FIFO 通道 → 就绪计数必到齐。
         on_event(Stage1Event::Batch { paragraph_id, sentences });
-        false
+        // 入队句级 batch job(非阻塞;worker 线程跑阻塞 recognize,结果回传
+        // SentenceBatchReady)。发送失败 = batch worker 已死(极端故障)——记日志继续,
+        // 该句 batch 缺失按 None 处理(best_text 回退流式)。
+        if let Err(e) = self.batch_tx.send(BatchJob::Sentence {
+            paragraph_id,
+            sentence_id,
+            pcm: Arc::clone(&sentence_pcm),
+            sr,
+        }) {
+            warn!(error = %e, sentence_id, "batch worker gone — sentence batch job dropped");
+        }
     }
 }
 
@@ -894,9 +1000,11 @@ fn next_wake_at(
 }
 
 impl Stage1Recognizer for OnnxStage1Recognizer {
-    // TODO(R5 残余): 轮询已除(2026-08-18 —— ring 挂 Condvar,无帧时挂起等 ingest notify,
-    // 仅真实截止时间唤醒,空闲零唤醒);仍待整改:batch 调用还在消费线程内同步执行
-    // (远程 ~3.5s/次会暂停流式),以及 run 仍占用整线程的阻塞模型。
+    // R5 已整改(2026-08-30 batch 异步化): 轮询已除(ring 挂 Condvar,仅真实截止时间唤醒,
+    // 空闲零唤醒);batch 调用移出消费线程 —— EOS/settle 只入队 BatchJob(微秒级),阻塞的
+    // recognize 由 Pipeline 的 batch worker 线程执行,结果经 SentenceBatchReady /
+    // ParagraphBatchReady 回传。消费循环不再被 batch 阻塞:流式/VAD/check_settle 持续运行,
+    // 修复了"间隔 1–3.5s 首句被吞"(batch 阻塞期间墙钟越过 merge_gap 导致段落误切)。
     fn run(&self, on_event: &mut dyn FnMut(Stage1Event)) {
         let sr = 16000u32;
         let start = Instant::now();
@@ -941,7 +1049,7 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                             self.flush_paragraph.store(false, Ordering::Release);
                             info!(paragraph_id = settled.paragraph_id, sentences = settled.sentences.len(),
                                 "flush: 主动归档(跳过 merge_gap 等待)");
-                            emit_paragraph_edge(settled, &self.audio_store, &*self.batch_asr, sr, on_event);
+                            emit_paragraph_edge(settled, &self.audio_store, &self.batch_tx, sr, on_event);
                             sess = sasr.map(|asr| ActiveSession::new(asr.create_session())); // 段落边界重置会话
                         }
                         None if !tracker.has_open_paragraph() => {
@@ -952,7 +1060,7 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                 }
             }
             if let Some(settled) = tracker.check_settle(now_s, speaking) {
-                emit_paragraph_edge(settled, &self.audio_store, &*self.batch_asr, sr, on_event);
+                emit_paragraph_edge(settled, &self.audio_store, &self.batch_tx, sr, on_event);
                 sess = sasr.map(|asr| ActiveSession::new(asr.create_session())); // 段落边界重置会话
             }
             if let Some(a) = sess.as_ref() {
@@ -1004,11 +1112,9 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                         let a = sess.take();
                         let fed = a.as_ref().map(|a| a.fed).unwrap_or(0);
                         sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
-                        if self.finalize_sentence(
+                        self.finalize_sentence(
                             a, &mut tracker, &mut cur_sentence, sr, end_s, ev.pcm.clone(), fed, on_event,
-                        ) {
-                            continue; // 噪声句(双路文本都空)——丢弃
-                        }
+                        );
                     }
                 }
             }
@@ -1164,80 +1270,78 @@ mod tests {
         assert!(t.check_settle(10.5, false).is_some(), "now − end = 0 ≥ 0 → settle");
     }
 
-    /// Counting batch-ASR stub — proves the single-sentence paragraph skips the re-run.
-    struct CountingAsr(std::sync::Mutex<usize>);
-    impl AsrProvider for CountingAsr {
-        fn recognize(&self, _pcm: &[i16], _sr: u32) -> anyhow::Result<String> {
-            *self.0.lock().unwrap() += 1;
-            Ok("段落重跑".into())
-        }
-    }
-
-    fn sentence_into(store: &AudioStore, id: SentenceId, batch: Option<&str>) -> VadSentence {
+    fn sentence_into(store: &AudioStore, id: SentenceId) -> VadSentence {
         VadSentence {
             id,
-            audio_id: store.insert(vec![1i16; 1600]),
+            // 异步 batch: 消费循环入队时句的 batch_text 恒 None(结果经 SentenceBatchReady 回传)。
+            audio_id: store.insert(Arc::new(vec![1i16; 1600])),
             start_s: id as f64,
             end_s: id as f64 + 0.1,
             streaming_text: format!("流式{id}"),
-            batch_text: batch.map(|b| b.to_string()),
+            batch_text: None,
         }
     }
 
     #[test]
-    fn single_sentence_paragraph_reuses_sentence_batch_no_rerun() {
+    fn single_sentence_paragraph_enqueues_no_rerun_job() {
         let store = AudioStore::new(1_000_000);
-        let asr = CountingAsr(std::sync::Mutex::new(0));
-        let mut events = Vec::new();
-        // batch Some → propagated verbatim; None → propagates as None (no retry either).
-        for batch in [Some("句级结果"), None] {
-            events.clear();
-            let settled = SettledParagraph {
-                paragraph_id: 1,
-                sentences: vec![sentence_into(&store, 1, batch)],
-            };
-            emit_paragraph_edge(settled, &store, &asr, 16000, &mut |ev| events.push(ev));
-            assert_eq!(*asr.0.lock().unwrap(), 0, "单句段落绝不重跑 batch");
-            match &events[0] {
-                Stage1Event::ParagraphEdge { paragraph } => assert_eq!(
-                    paragraph.batch_text.as_deref(),
-                    batch,
-                    "段落 batch_text = 句级结果原样复用(含 None)"
-                ),
-                other => panic!("expected ParagraphEdge, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn multi_sentence_paragraph_reruns_batch_once() {
-        let store = AudioStore::new(1_000_000);
-        let asr = CountingAsr(std::sync::Mutex::new(0));
+        let (tx, rx) = mpsc::channel();
         let settled = SettledParagraph {
             paragraph_id: 1,
-            sentences: vec![sentence_into(&store, 1, Some("句1")), sentence_into(&store, 2, Some("句2"))],
+            sentences: vec![sentence_into(&store, 1)],
         };
         let mut events = Vec::new();
-        emit_paragraph_edge(settled, &store, &asr, 16000, &mut |ev| events.push(ev));
-        assert_eq!(*asr.0.lock().unwrap(), 1, "多句段落恰好重跑一次");
+        emit_paragraph_edge(settled, &store, &tx, 16000, &mut |ev| events.push(ev));
+        assert!(rx.try_recv().is_err(), "单句段落绝不投递重跑 job(复用句级 batch)");
         match &events[0] {
-            Stage1Event::ParagraphEdge { paragraph } => {
-                assert_eq!(paragraph.batch_text.as_deref(), Some("段落重跑"));
-            }
+            Stage1Event::ParagraphEdge { paragraph } => assert_eq!(
+                paragraph.batch_text.as_deref(),
+                None,
+                "异步模式: 事件时刻 batch_text 恒 None(单句复用句级结果,无 ParagraphBatchReady)"
+            ),
             other => panic!("expected ParagraphEdge, got {other:?}"),
         }
     }
 
     #[test]
-    fn drop_active_discards_without_recording() {
-        let mut t = ParagraphTracker::new(2.5);
-        let _ = t.on_sos(); // opens empty paragraph 0, allocates sentence 0, active=true
-        t.drop_active(); // noise → active=false, paragraph 0 stays open but empty
-        // Empty paragraph → settle timeout has nothing to close.
-        assert!(t.check_settle(100.0, false).is_none(), "no sentences → nothing to settle");
-        // The next sentence reuses the still-open paragraph.
-        let s2 = t.on_sos();
-        let (_, w, _) = t.on_eos(sentence(s2, 1.0, 1.1));
-        assert_eq!(w, 1, "paragraph reused (not re-opened) after drop_active");
+    fn multi_sentence_paragraph_enqueues_one_rerun_job() {
+        let store = AudioStore::new(1_000_000);
+        let (tx, rx) = mpsc::channel();
+        let settled = SettledParagraph {
+            paragraph_id: 1,
+            sentences: vec![sentence_into(&store, 1), sentence_into(&store, 2)],
+        };
+        let mut events = Vec::new();
+        emit_paragraph_edge(settled, &store, &tx, 16000, &mut |ev| events.push(ev));
+        // 多句段落恰好投递一次重跑 job,携拼接后的整段 PCM(1600*2)。
+        match rx.try_recv() {
+            Ok(BatchJob::Paragraph { paragraph_id, pcm, sr }) => {
+                assert_eq!(paragraph_id, 1);
+                assert_eq!(pcm.len(), 3200, "job 携整段拼接 PCM");
+                assert_eq!(sr, 16000);
+            }
+            other => panic!("expected exactly one Paragraph job, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "只投递一次");
+        match &events[0] {
+            Stage1Event::ParagraphEdge { paragraph } => assert_eq!(
+                paragraph.batch_text.as_deref(),
+                None,
+                "异步模式: 事件时刻 batch_text 恒 None(结果经 ParagraphBatchReady)"
+            ),
+            other => panic!("expected ParagraphEdge, got {other:?}"),
+        }
     }
+
+    #[test]
+    fn empty_paragraph_emits_nothing_and_sends_no_job() {
+        let store = AudioStore::new(1_000_000);
+        let (tx, rx) = mpsc::channel();
+        let settled = SettledParagraph { paragraph_id: 1, sentences: vec![] };
+        let mut events = Vec::new();
+        emit_paragraph_edge(settled, &store, &tx, 16000, &mut |ev| events.push(ev));
+        assert!(events.is_empty(), "空段落不 emit 事件");
+        assert!(rx.try_recv().is_err(), "空段落不投递 job");
+    }
+
 }

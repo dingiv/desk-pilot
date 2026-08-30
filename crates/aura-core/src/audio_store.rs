@@ -2,15 +2,17 @@
 //! Owns every clip by [`AudioId`]; pipeline entities ([`crate::VadSentence`]/[`crate::VadParagraph`])
 //! hold ids and never clone PCM around.
 //!
-//! Lifecycle: pre-settle hot store. The executor inserts each finalized sentence's PCM at EOS;
-//! at paragraph settle it `concat`s the paragraph's clips (once — the resulting `Arc<Vec<i16>>` lives
-//! on the [`crate::VadParagraph`]) and `evict`s the per-sentence clips. Memory is bounded by
-//! `cap_samples` (oldest-first eviction), so a stuck paragraph can never grow the process without
-//! limit. This is deliberately NOT the persistent archive (`aura_core::AudioArchive` handles
-//! post-settle WAV flush + retention) — nothing here ever touches disk.
+//! Lifecycle: pre-settle hot store. The executor inserts each finalized sentence's PCM at EOS
+//! (as a shared `Arc<Vec<i16>>` — the async batch job and the store share the SAME allocation,
+//! no copy); at paragraph settle it `concat`s the paragraph's clips (once — the resulting
+//! `Arc<Vec<i16>>` lives on the [`crate::VadParagraph`] and is shared with the re-run job) and
+//! `evict`s the per-sentence clips. Memory is bounded by `cap_samples` (oldest-first eviction),
+//! so a stuck paragraph can never grow the process without limit. This is deliberately NOT the
+//! persistent archive (`aura_core::AudioArchive` handles post-settle WAV flush + retention) —
+//! nothing here ever touches disk.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::AudioId;
 
@@ -19,14 +21,15 @@ pub const DEFAULT_CAP_SAMPLES: usize = 16_000 * 600;
 
 /// An id → PCM hot store with a sample-count cap. Concrete struct (single implementation —
 /// a trait here would be indirection without a second backend). Thread-safe: `&self` methods
-/// only; the executor is the sole producer, the settle path the sole reader.
+/// only; the executor is the sole producer, the settle path the sole reader. Clips are stored
+/// as `Arc<Vec<i16>>` so the async batch worker can share a clip without copying it.
 pub struct AudioStore {
     inner: Mutex<Inner>,
     cap_samples: usize,
 }
 
 struct Inner {
-    clips: BTreeMap<AudioId, Vec<i16>>,
+    clips: BTreeMap<AudioId, Arc<Vec<i16>>>,
     next_id: AudioId,
     /// Total samples currently held (for the cap check).
     total: usize,
@@ -40,7 +43,8 @@ impl AudioStore {
     /// Store a clip, return its id. Evicts oldest-first while over `cap_samples` — eviction
     /// targets the OLDEST id still held, which in the live pipeline is always a settled
     /// paragraph's leftover (normally already evicted explicitly), so this is a safety valve.
-    pub fn insert(&self, pcm: Vec<i16>) -> AudioId {
+    /// The `Arc` is shared — the caller may keep its own clone (e.g. hand it to a batch job).
+    pub fn insert(&self, pcm: Arc<Vec<i16>>) -> AudioId {
         let mut g = self.inner.lock().unwrap();
         let id = g.next_id;
         g.next_id += 1;
@@ -83,8 +87,8 @@ impl AudioStore {
 mod tests {
     use super::*;
 
-    fn pcm(n: usize) -> Vec<i16> {
-        vec![1i16; n]
+    fn pcm(n: usize) -> Arc<Vec<i16>> {
+        Arc::new(vec![1i16; n])
     }
 
     #[test]
@@ -114,5 +118,16 @@ mod tests {
         let _ = s.insert(pcm(10)); // total 30 > 25 → evict a (oldest) → total 20
         assert!(s.concat(&[a]).is_empty(), "oldest clip evicted on overflow");
         assert_eq!(s.concat(&[b]).len(), 10, "newer clips survive");
+    }
+
+    #[test]
+    fn insert_shares_allocation_with_caller() {
+        // The async batch job hands the SAME Arc to the store — no PCM copy on insert.
+        let s = AudioStore::new(1_000_000);
+        let pcm = Arc::new(vec![7i16; 100]);
+        let id = s.insert(Arc::clone(&pcm));
+        assert_eq!(Arc::strong_count(&pcm), 2, "store and caller share one allocation");
+        let joined = s.concat(&[id]);
+        assert_eq!(joined, vec![7i16; 100]);
     }
 }
