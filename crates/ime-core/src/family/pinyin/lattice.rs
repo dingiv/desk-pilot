@@ -68,6 +68,29 @@ fn greedy_parse(input: &str) -> Vec<Segment> {
 
 /// Check if a pinyin code (e.g., "guangyin sijian") matches the segment pattern.
 /// Returns true if each segment's initial matches and full segments match exactly.
+/// input 能否切成**全合法音节**序列(任意路径,DP 非贪切)。
+/// "dier" → [di,er] ✓;"dierge" → [di,er,ge] ✓;"zh" → 无 ✗。
+/// 连写 exact 查询的准入条件(见 predict 内注释)。
+fn has_valid_split(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    let n = bytes.len();
+    if n == 0 {
+        return false;
+    }
+    let mut dp = vec![false; n + 1];
+    dp[0] = true;
+    for i in 1..=n {
+        // 音节最长 6 字母;从短到长试尾段。
+        for j in i.saturating_sub(6)..i {
+            if dp[j] && inputx_pinyin::is_valid_syllable(&input[j..i]) {
+                dp[i] = true;
+                break;
+            }
+        }
+    }
+    dp[n]
+}
+
 fn pattern_match(code: &str, segments: &[Segment]) -> bool {
     // Parse code into syllables via inputx segmenter.
     let code_syls = match inputx_pinyin::segment(code).into_iter().next() {
@@ -482,22 +505,23 @@ impl LatticeDecoder {
         }
 
         let segments = greedy_parse(input);
-        if segments.is_empty() {
-            return Vec::new();
-        }
-
         let all_full = segments.iter().all(|s| matches!(s, Segment::Full(_)));
-        let all_initials = segments.iter().all(|s| matches!(s, Segment::Initial(_)));
         let match_type = if all_full {
             MatchType::Full
-        } else if all_initials {
+        } else if segments.iter().all(|s| matches!(s, Segment::Initial(_))) {
             MatchType::Initials
         } else {
             MatchType::Mixed
         };
 
-        if all_full {
-            let mut results = Vec::new();
+        // ── 连写 exact:与切分解耦(dier bug 修复)──
+        // FST key 是无分隔连写("dier" = di+er 的"第二"),exact 查询不依赖
+        // 贪切结果;只要 input 存在**任意**全合法音节切分,exact 命中就是
+        // Full。此前 exact 只在 all_full(greedy 全合法)时执行 —— dier 贪切
+        // 成 die|r(die 是合法音节挡路),exact 被整体跳过,"第二"消失,
+        // dierge/diertian 更是全军覆没(只剩 Mixed 对齐的"跌入")。
+        let mut results: Vec<LatticeResult> = Vec::new();
+        if has_valid_split(input) {
             self.fst
                 .get(input.as_bytes())
                 .into_iter()
@@ -511,6 +535,10 @@ impl LatticeDecoder {
                         });
                     }
                 });
+        }
+
+        if all_full {
+            // greedy 全合法 → has_valid_split 必真,exact 已在上面收集。
             results.sort_by(|a, b| {
                 b.freq_score
                     .partial_cmp(&a.freq_score)
@@ -520,21 +548,25 @@ impl LatticeDecoder {
             return results;
         }
 
-        let initials: String = segments.iter().map(|s| s.initial()).collect();
-        let candidates = match self.initials_index.get(&initials) {
-            Some(v) => v.clone(),
-            None => return Vec::new(),
-        };
+        if segments.is_empty() {
+            // greedy 完全失败且无 exact(如 "zh"):predict_prefix 兜底。
+            return results;
+        }
 
-        let mut results = Vec::new();
-        for (code, word, freq) in &candidates {
-            if pattern_match(code, &segments) {
-                results.push(LatticeResult {
-                    text: word.clone(),
-                    freq_score: *freq as f64,
-                    match_type,
-                    pinyin: code.clone(),
-                });
+        // ── Mixed / Initials 变体(声母对齐),与 exact 命中合并 ──
+        let initials: String = segments.iter().map(|s| s.initial()).collect();
+        if let Some(candidates) = self.initials_index.get(&initials) {
+            for (code, word, freq) in candidates {
+                if pattern_match(code, &segments)
+                    && !results.iter().any(|r| &r.text == word)
+                {
+                    results.push(LatticeResult {
+                        text: word.clone(),
+                        freq_score: *freq as f64,
+                        match_type,
+                        pinyin: code.clone(),
+                    });
+                }
             }
         }
         results.sort_by(|a, b| {
@@ -549,6 +581,37 @@ impl LatticeDecoder {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn greedy_die_does_not_block_exact() {
+        // dier bug 回归锁:贪切 die|r(die 合法音节挡路)曾让 exact 整体
+        // 跳过 —— "第二"消失。连写 exact 与切分解耦(has_valid_split)。
+        let path = format!("/tmp/swift-ime-dier-{}.fst", std::process::id());
+        let mut b = inputx_fsa::DictBuilder::new();
+        b.insert(b"dier", "第二".as_bytes(), 9390);
+        b.insert(b"dieru", "跌入".as_bytes(), 500);
+        b.insert(b"dierge", "第二个".as_bytes(), 5000);
+        std::fs::write(&path, b.finish()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let dict = inputx_fsa::Dict::new(bytes).unwrap();
+        let dec = LatticeDecoder::new(dict, &path);
+
+        let r = dec.predict("dier", 8);
+        let d2 = r.iter().find(|x| x.text == "第二").expect("第二 restored");
+        assert!(matches!(d2.match_type, MatchType::Full));
+
+        let r2 = dec.predict("dierge", 8);
+        assert!(
+            r2.iter().any(|x| x.text == "第二个"),
+            "dierge exact restored: {:?}",
+            r2.iter().map(|x| x.text.clone()).collect::<Vec<_>>()
+        );
+        // Mixed 对齐词仍在(跌入 die|ru 对齐 die|r)。
+        assert!(r.iter().any(|x| x.text == "跌入"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.idx"));
+    }
+
     use super::*;
 
     #[test]

@@ -147,3 +147,14 @@ exact 固定 0.88 不看词频:the/and 与低频词同权(同输入只有一个 
     (原 0.25/0.55 的 [0.25,0.80] 设计带会越级 english exact 合成分,弃用)
   - yaml 默认同步;断言 `viterbi_weights_differentiate_decomp_candidates`
   - 测试:ime-core 156+21+2 全绿
+- **🔴 HOTFIX ✅** dier → "第二" 消失(用户报告):
+  - 根因:`lattice.predict` 只在贪切全合法(all_full)时做 exact 查询;
+    `dier` 贪切成 die|r(die 合法音节挡路,r 被当下一音节声母)→ 判
+    Mixed → FST 里的 exact 命中(第二 9390)根本不查,dierge/diertian
+    同型全灭 —— 英文 diereses 抢占前排
+  - 修复:**连写 exact 与切分解耦** —— 新增 `has_valid_split`(DP 判定
+    任意全合法音节切分,dier=[di,er] ✓),准入即 exact 查询并以 Full
+    计分;Mixed/Initials 变体保持原逻辑,合并去重(Full 优先)
+  - 断言:golden `dier_full_syllable_split_restored`(第二 top1 +
+    dierge 恢复)+ lattice 单元 `greedy_die_does_not_block_exact`
+  - 测试:ime-core 157+21+2、swift-ime 7+11+15 全绿

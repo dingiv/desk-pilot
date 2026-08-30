@@ -191,3 +191,22 @@ fn jianpin_and_full_pinyin_agree_on_top() {
     assert_eq!(r1.first().map(|(t, _, _)| t), r2.first().map(|(t, _, _)| t),
         "jix 与 jixu 的 #1 必须一致: {r1:?} vs {r2:?}");
 }
+
+#[test]
+fn dier_full_syllable_split_restored() {
+    // dier bug:贪切 die|r(die 合法音节挡路)曾让 lattice exact 整体跳过
+    // —— "第二"消失,英文 diereses 抢占前排。修复:连写 exact 与切分解耦
+    // (has_valid_split 准入)。
+    let mut e = engine();
+    let v = rank(&mut e, "dier");
+    top1_is("dier", &v, "第二");
+    // dierge(di+er+ge 同类)不再全军覆没(独立 engine:rank 之间
+    // 共享 FSM buffer 会残留上一次的输入)。
+    let mut e2 = engine();
+    let v2 = rank(&mut e2, "dierge");
+    assert!(
+        v2.iter().any(|(t, _, s)| t == "第二个" && s == "lattice"),
+        "dierge exact restored: {:?}",
+        &v2[..5.min(v2.len())]
+    );
+}
