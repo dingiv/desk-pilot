@@ -1016,10 +1016,10 @@ impl StateMachine {
     }
 
     fn query_pinyin(&mut self, env: &dyn StepEnv) -> ImeView {
-        // ── Stage 2:家族预测(scorer 单点调用;合成段 S6 归 stage3)──
-        let ranked = env.scorer().rank_detailed(&self.comp.buffer, &self.context);
-        // ── Stage 3:后处理统一管线 ──
-        let items = self.postprocess(ranked, env);
+        // ── Stage 2:家族收集(各家族独立预测 + top_n 预过滤,未合成)──
+        let collected = env.scorer().collect(&self.comp.buffer, &self.context);
+        // ── Stage 3:后处理统一管线(合成 → 调整 → 造词重排)──
+        let items = self.postprocess(collected, env);
 
         // 三列表同源同序落位 —— fill_view 的窗口偏移 / select 的家族判定 /
         // ">" 部分提交标记全从同一 PanelItem 序列出发,不再有独立数组间的
@@ -1045,9 +1045,14 @@ impl StateMachine {
     /// → 产出与 candidates 同序的 PanelItem 序列(meta/partial 同源)。
     /// full_comp_count 经 `pending_full_comp_count` 带出(postprocess 需
     /// &mut self 读 buffer/查询家族,而 query_pinyin 的落位段统一写)。
-    fn postprocess(&mut self, ranked: Vec<crate::family::RankedCandidate>, env: &dyn StepEnv) -> Vec<PanelItem> {
-        // 1. 全局调整:单字母输入的 self/case 置顶(与 candidates_detailed
-        //    镜像同规则,见 engine.rs 同名调用)。
+    fn postprocess(
+        &mut self,
+        collected: Vec<crate::family::FamilyCandidates>,
+        env: &dyn StepEnv,
+    ) -> Vec<PanelItem> {
+        // 0. 合成(×priority / 全局排序 / 跨家族去重)—— 后处理第一步。
+        let ranked = env.scorer().merge(collected);
+        // 1. 全局调整:单字母输入的 self/case 置顶。
         let ranked = promote_single_letter(&self.comp.buffer, ranked);
         // 2. PanelItem 化:meta 与文本同源。
         let mut items: Vec<PanelItem> = ranked

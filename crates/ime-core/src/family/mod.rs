@@ -43,6 +43,15 @@ pub struct ScoredCandidate {
     pub raw_score: f64,
 }
 
+/// Stage 2 收集产物:单家族的预过滤候选(raw 分降序)+ 该家族的
+/// priority 乘数。合成(×bonus/全局排序/去重)在 stage3 的
+/// [`UnifiedScorer::merge`]。
+#[derive(Debug)]
+pub struct FamilyCandidates {
+    pub bonus: f64,
+    pub candidates: Vec<ScoredCandidate>,
+}
+
 /// A final-ranked candidate after global scoring and dedup.
 /// Returned by [`UnifiedScorer::rank_detailed`].
 #[derive(Debug, Clone)]
@@ -198,15 +207,19 @@ impl UnifiedScorer {
     }
 
     /// Rank with full detail — each result includes source and score.
-    /// This is the core ranking algorithm; `rank` / `rank_with_context`
-    /// delegate here and strip the metadata.
+    /// 便捷组合(`collect` + `merge`);三阶段管线里两段分属 stage2/stage3。
     pub fn rank_detailed(&self, input: &str, ctx: &InputContext) -> Vec<RankedCandidate> {
+        self.merge(self.collect(input, ctx))
+    }
+
+    /// Stage 2:家族收集 —— 每家 `predict`(raw 分已按家族内语义排序)+
+    /// `top_n` 引擎预过滤。**不做跨家族合成**(×priority/全局排序/去重属
+    /// stage3 后处理,见 [`merge`](Self::merge))。
+    pub fn collect(&self, input: &str, ctx: &InputContext) -> Vec<FamilyCandidates> {
         if input.is_empty() {
             return Vec::new();
         }
-
-        let mut scored: Vec<(f64, RankedCandidate)> = Vec::new();
-
+        let mut out = Vec::new();
         for family in &self.families {
             if !family.enabled() {
                 continue;
@@ -215,17 +228,27 @@ impl UnifiedScorer {
                 .priorities
                 .get(family.name())
                 .unwrap_or_else(|| family.priority());
-            let priority_bonus = priority as f64 / 100.0;
             let mut candidates = family.predict(input, ctx);
-
             candidates.sort_by(|a, b| {
                 b.raw_score
                     .partial_cmp(&a.raw_score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
+            candidates.truncate(family.top_n());
+            out.push(FamilyCandidates {
+                bonus: priority as f64 / 100.0,
+                candidates,
+            });
+        }
+        out
+    }
 
-            for c in candidates.into_iter().take(family.top_n()) {
-                let final_score = c.raw_score * priority_bonus;
+    /// Stage 3 合成(后处理第一步):×priority 乘数、全局排序、跨家族去重。
+    pub fn merge(&self, collected: Vec<FamilyCandidates>) -> Vec<RankedCandidate> {
+        let mut scored: Vec<(f64, RankedCandidate)> = Vec::new();
+        for fc in collected {
+            for c in fc.candidates {
+                let final_score = c.raw_score * fc.bonus;
                 scored.push((
                     final_score,
                     RankedCandidate {
@@ -237,7 +260,6 @@ impl UnifiedScorer {
                 ));
             }
         }
-
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut seen = HashSet::new();
