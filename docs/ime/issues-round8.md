@@ -161,6 +161,16 @@ state.rs 内部自访问。过渡策略:聚合体暴露与旧字段同形的访�
 
 ## 执行记录(状态下沉已完成)
 
+全部完成后模块图:engine → {families(含 magic), scorer(家族容器), fsm(panel/comp/magic 三聚合体)} 直连,无转发层。
+
+- **Dispatcher 裁撤 ✅**(用户判定"多此一举的封装",`2d6053d`):418 行 ~20 个方法全是单行转发,唯一实质职责 StepEnv 实现迁移到 ImeEngine;引擎直持 7 组件字段;store/manager warm_all 改收 &ImeEngine;8 个状态机交互测试迁 state.rs(TestEnv 轻量桩);dispatcher.rs 删除,模块表 -1
+- **matcher.rs 删除 ✅**(用户问"是否可以删除",`61b3772`):step()/Match trie 零消费者死代码;唯一活代码 is_trigger_prefix 等价于触发器引导符判定(# / /)→ MagicFamily::is_trigger_start 家族内聚;matcher_entries 保留(magic 自检数据源)
+- **TODO:0001 ✅ 移除 static 魔法命令**(用户判定"不要 static member,static 相关预测通通移除",`3634d7e`):MagicCommand 枚举删除 → MagicMatch 携带 LiveCommand{token,name};StaticCmd/statics/static_prediction/static_expansion/三处 Exact(Static) 分支/command_trigger 全删;#date/#password 命令移除($DATE 变量保留);附 last_meta 死代码清理(`7d0e5f1`)
+- **S5 ✅ magic 家族化**(`12ac30b`):MagicFamily::query(active, ctx, input, env) → MagicAnswer —— ensure(spawn/保活/deactivate)+ predict 内聚家族;壳 query_magic 收缩为 链式分派 → query → 落位 → rebuild(chained 路径保留壳方法,upstream 处理与普通路径不同)
+- **S6 ✅ 合成段归 stage3**(`89b207d`):rank_detailed 拆 collect(stage2 家族收集:predict+top_n 预过滤,FamilyCandidates{bonus,candidates})+ merge(stage3 合成:×priority/全局排序/去重);query_pinyin 的 stage2/3 边界 = collect → postprocess(merge→promote→造词重排)
+
+(S1/S2/S2.5/S3/S4 的执行记录见上文各节内嵌标注)
+
 - **S4 ✅** StateMachine 状态下沉(三聚合体,26 → 8 字段):
   - **S4a CandidatePanel**:items/meta/partial(同源同序)+ full_comp_count/
     highlight/page/page_size/fresh —— 面板行为(滑动窗/高亮/翻页/全局序)
