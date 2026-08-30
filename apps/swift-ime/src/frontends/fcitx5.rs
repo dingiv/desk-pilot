@@ -25,6 +25,7 @@ use std::ffi::c_void;
 use std::os::raw::c_char;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+use crate::constants;
 use ime_core::engine::ImeEngine;
 use ime_core::expander::{today_str, VariableProvider};
 use ime_core::family::magic::preview_text;
@@ -235,7 +236,7 @@ pub extern "C" fn swift_ime_create(
     // Load rime-ice FST if enabled in config.
     if cfg.dicts.rime_ice {
         let loader = shared::loader!("assets");
-        if let Some(p) = loader.resolve("DICT::rime-ice.fst") {
+        if let Some(p) = loader.resolve(constants::DICT_RIME_ICE) {
             match engine.load_dict(&p.to_string_lossy()) {
                 Ok(n) => crate::ime_log!("loaded rime-ice: {n} entries from {}", p.display()),
                 Err(e) => tracing::error!(target: "swift_ime", "loading rime-ice: {e}"),
@@ -253,7 +254,7 @@ pub extern "C" fn swift_ime_create(
     // ── Emoji keyword table (CLDR-generated) + user mapping ──
     if cfg.dicts.emoji {
         let loader = shared::loader!("assets");
-        if let Some(p) = loader.resolve("DICT::emoji.tsv") {
+        if let Some(p) = loader.resolve(constants::DICT_EMOJI) {
             match engine.load_emoji_dict(&p.to_string_lossy()) {
                 Ok(n) => crate::ime_log!("loaded emoji: {n} keyword rows from {}", p.display()),
                 Err(e) => tracing::warn!(target: "swift_ime", "emoji dict load error: {e}"),
@@ -261,7 +262,7 @@ pub extern "C" fn swift_ime_create(
         }
     }
     let loader = shared::loader!(".");
-    if let Some(p) = loader.resolve("CONF::emoji_user.tsv") {
+    if let Some(p) = loader.resolve(constants::CONF_EMOJI_USER) {
         if p.exists() {
             match engine.load_emoji_user_dict(&p.to_string_lossy()) {
                 Ok(n) => crate::ime_log!("loaded {n} emoji user rows from {}", p.display()),
@@ -272,9 +273,9 @@ pub extern "C" fn swift_ime_create(
 
     // Initialize SQLite weight store — DATA 命名空间(dev: data/, prod: ~/.desk-pilot/)。
     let data = shared::loader!(".");
-    let db = data.resolve("DATA::swift-ime.db")
+    let db = data.resolve(constants::DATA_DB)
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "data/swift-ime.db".into());
+        .unwrap_or_else(|| constants::DB_FALLBACK_PATH.into());
     engine.init_store(&db);
 
     // ── Voice input: voice listener 在 `ImeEngine::with_config` 内部启动,
@@ -282,7 +283,7 @@ pub extern "C" fn swift_ime_create(
 
     // ── English user dictionary ──
     let loader = shared::loader!(".");
-    if let Some(p) = loader.resolve("CONF::en_user.tsv") {
+    if let Some(p) = loader.resolve(constants::CONF_EN_USER) {
         match engine.load_en_user_dict(&p.to_string_lossy()) {
             Ok(n) => crate::ime_log!("loaded {n} en user words from {}", p.display()),
             Err(e) => tracing::warn!(target: "swift_ime", "en user dict load error: {e}"),

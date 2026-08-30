@@ -2,5 +2,6 @@
 //! shared Rust backend used by the binary target.
 
 pub mod config;
+pub mod constants;
 pub mod frontends;
 pub mod logger;

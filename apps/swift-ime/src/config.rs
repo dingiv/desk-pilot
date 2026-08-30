@@ -8,6 +8,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::constants;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SwiftImeConfig {
     #[serde(default)]
@@ -364,7 +366,7 @@ impl SwiftImeConfig {
     /// here, not in the loader — "no config" must not be reported as a read error.
     pub fn load() -> Self {
         let loader = shared::loader!(".");
-        match loader.resolve("CONF::swift-ime.yaml") {
+        match loader.resolve(constants::CONF_MAIN) {
             Some(path) => {
                 // First run: seed the user config from the system template.
                 if !path.exists() {

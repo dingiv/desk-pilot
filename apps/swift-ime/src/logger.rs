@@ -148,9 +148,9 @@ pub fn init_tui(level: Option<&str>) {
 fn init_resolved(default_filter: &str, tee_stderr: bool) {
     let loader = shared::loader!(".");
     let path = loader
-        .resolve("DATA::swift-ime.log")
+        .resolve(crate::constants::DATA_LOG)
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "/tmp/swift-ime.log".into());
+        .unwrap_or_else(|| crate::constants::LOG_FALLBACK_PATH.into());
     init_tracing(&path, default_filter, tee_stderr);
 }
 

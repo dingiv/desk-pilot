@@ -21,6 +21,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use clap::Parser;
+use swift_ime::constants::SOCK_PATH;
 
 #[derive(Parser)]
 #[command(name = "swift_cli", about = "swift-ime debug client: send keys, get views")]
@@ -34,7 +35,7 @@ struct Args {
     #[arg(long, default_value = "false")]
     pretty: bool,
     /// server socket 路径。
-    #[arg(long, default_value = "/tmp/swift-ime.sock")]
+    #[arg(long, default_value = SOCK_PATH)]
     sock: PathBuf,
     /// 交互模式(REPL):逐行输入命令,实时回视图;exit/quit 退出。
     #[arg(long, default_value = "false")]

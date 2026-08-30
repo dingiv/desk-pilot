@@ -9,8 +9,12 @@
 //! The caller (main.rs) parses CLI args and passes them as a [`TuiConfig`].
 
 use std::sync::Arc;
+
+/// 键盘事件轮询节拍(voice 推送 / socket 喂键 ≤50ms 内被感知)。
+const POLL_MS: u64 = 50;
 use std::time::{Duration, Instant};
 
+use crate::constants;
 use ime_core::engine::{ImeEngine, KeyEvent};
 use ime_core::ImeView;
 
@@ -150,7 +154,7 @@ pub fn build_engine(cfg: &TuiConfig) -> (ImeEngine, Arc<ime_core::voice_state::S
 
     if sw_cfg.dicts.rime_ice {
         let loader = shared::loader!("assets");
-        if let Some(p) = loader.resolve("DICT::rime-ice.fst") {
+        if let Some(p) = loader.resolve(constants::DICT_RIME_ICE) {
             match engine.load_dict(&p.to_string_lossy()) {
                 Ok(n) => crate::ime_log!("loaded {n} dict entries from {}", p.display()),
                 Err(e) => tracing::warn!(target: "swift_ime", "dict load error: {e}"),
@@ -166,7 +170,7 @@ pub fn build_engine(cfg: &TuiConfig) -> (ImeEngine, Arc<ime_core::voice_state::S
     // Emoji keyword table (CLDR-generated) + user mapping.
     if sw_cfg.dicts.emoji {
         let loader = shared::loader!("assets");
-        if let Some(p) = loader.resolve("DICT::emoji.tsv") {
+        if let Some(p) = loader.resolve(constants::DICT_EMOJI) {
             match engine.load_emoji_dict(&p.to_string_lossy()) {
                 Ok(n) => crate::ime_log!("loaded emoji: {n} keyword rows from {}", p.display()),
                 Err(e) => tracing::warn!(target: "swift_ime", "emoji dict load error: {e}"),
@@ -174,12 +178,22 @@ pub fn build_engine(cfg: &TuiConfig) -> (ImeEngine, Arc<ime_core::voice_state::S
         }
     }
     let loader = shared::loader!(".");
-    if let Some(p) = loader.resolve("CONF::emoji_user.tsv") {
+    if let Some(p) = loader.resolve(constants::CONF_EMOJI_USER) {
         if p.exists() {
             match engine.load_emoji_user_dict(&p.to_string_lossy()) {
                 Ok(n) => crate::ime_log!("loaded {n} emoji user rows from {}", p.display()),
                 Err(e) => tracing::warn!(target: "swift_ime", "emoji user dict load error: {e}"),
             }
+        }
+    }
+
+    // English user dictionary — 与 fcitx5 对齐:学过的英文自生词(en_user)
+    // 在 TUI 会话同样可见(此前只有 fcitx5 加载,TUI 学词不回显,不一致)。
+    let loader = shared::loader!(".");
+    if let Some(p) = loader.resolve(constants::CONF_EN_USER) {
+        match engine.load_en_user_dict(&p.to_string_lossy()) {
+            Ok(n) => crate::ime_log!("loaded {n} en user words from {}", p.display()),
+            Err(e) => tracing::warn!(target: "swift_ime", "en user dict load error: {e}"),
         }
     }
 
@@ -202,9 +216,9 @@ pub fn build_engine(cfg: &TuiConfig) -> (ImeEngine, Arc<ime_core::voice_state::S
 
     // SQLite weight store — DATA 命名空间(dev: data/, prod: ~/.desk-pilot/)。
     let data = shared::loader!(".");
-    let db = data.resolve("DATA::swift-ime.db")
+    let db = data.resolve(constants::DATA_DB)
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "data/swift-ime.db".into());
+        .unwrap_or_else(|| constants::DB_FALLBACK_PATH.into());
     engine.init_store(&db);
     (engine, voice_state)
 }
@@ -217,7 +231,7 @@ fn wait_for_voice(state: &ime_core::voice_state::SharedVoiceState, timeout_secs:
     let start = Instant::now();
     eprintln!("⏳ waiting for aura SSE (up to {timeout_secs}s)...");
     while state.snapshot().is_empty() && start.elapsed() < timeout {
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(constants::PROBE_POLL_MS));
     }
     if state.snapshot().is_empty() {
         eprintln!("⏰ timeout — no voice data from aura");
@@ -242,7 +256,7 @@ fn show_candidates_with_async(
         let start = Instant::now();
         eprintln!("⏳ async wait (up to {async_wait_secs}s) — polling for voice data...");
         while state.snapshot().is_empty() && start.elapsed() < timeout {
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(constants::PROBE_POLL_MS));
         }
         let elapsed = start.elapsed();
         if state.snapshot().is_empty() {
@@ -393,7 +407,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 
-const POLL_MS: u64 = 50; // 键盘事件轮询节拍(voice 推送 / socket 喂键 ≤50ms 内被感知)
 
 /// TUI 前端句柄:引擎 I/O 线程推送刷新时只记一个计数,渲染循环每帧检查并
 /// drain(`magic_tick` 拉最新视图)。TUI 是前台应用,自带渲染节奏,不做
@@ -463,7 +476,7 @@ impl SharedIme {
 /// 调试 server:同一引擎同时监听 TUI 键盘与 Unix socket。
 /// `no_tui = true` 时无界面前台运行(无 tty 环境的纯 socket 调试)。
 pub fn run_server(mut cfg: TuiConfig, sock_path: Option<String>, no_tui: bool) -> io::Result<()> {
-    let sock = sock_path.unwrap_or_else(|| "/tmp/swift-ime.sock".into());
+    let sock = sock_path.unwrap_or_else(|| constants::SOCK_PATH.into());
     if !no_tui {
         // TUI 用 alternate screen 渲染,stderr 打日志会破坏界面 → 只写文件。
         cfg.tee_stderr = false;
@@ -488,7 +501,7 @@ pub fn run_server(mut cfg: TuiConfig, sock_path: Option<String>, no_tui: bool) -
     let res = if no_tui {
         // 无 TUI:前台挂起,socket 独占调试(Ctrl-C 结束)。
         loop {
-            std::thread::sleep(Duration::from_secs(3600));
+            std::thread::sleep(Duration::from_secs(constants::IDLE_TICK_SECS));
         }
     } else {
         run_tui(&shared, &voice_state)
