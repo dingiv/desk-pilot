@@ -80,18 +80,60 @@ query_pinyin (state.rs:1081) —— 现状:stage2/stage3 无边界地混在一�
 | C | last_meta 采样在 Layer 3 重排**前** → fill_view 的 `last_meta.get(start+i)` 在重排后错位(单字区 meta 显示错的来源) | 采样移到重排后,与 merged 同序 | **真 bug 修复** | 低 |
 | D | trait 双入口 predict / predict_with_context | 合并单入口 predict(input, ctx) | trait 收敛 | 低 |
 | E | route 判定散在 match 分支 | 判定表文档化(route 头部) | 文档 | 无 |
-| F | query_magic(snippet 态)预测+视图组装混在 state.rs | **决策点**:magic 家族化纳入 stage2,或保持现状标注豁免 | 待拍板 | 中(若做) |
-| G | scorer 的合成段(×priority/sort/去重)归属模糊 | 归 stage3(合成是后处理第一步);scorer 保留为数据结构,合成逻辑移出或标注 | 边界定义 | 低 |
+| F | query_magic(snippet 态)预测+视图组装混在 state.rs | **✅ 拍板做**:magic 家族化纳入 stage2 | 家族化 | 中 |
+| G | scorer 的合成段(×priority/sort/去重)归属模糊 | **✅ 拍板**:归 stage3 —— 合成是后处理第一步;UnifiedScorer 收缩为家族容器,合成逻辑移入 stage3 | 边界定义 | 低 |
+
+## 三·五、StateMachine 状态下沉(用户点名的核心议题)
+
+现状:**26 个字段**挤在一个 struct,至少四个不相干的关注点混居。
+逐字段盘点与归属:
+
+| 关注点 | 字段 | 下沉去向 |
+|---|---|---|
+| 身份/顶层 | `ctx` / `state` | **留在 SM**(顶层状态机) |
+| 输入缓冲 | `raw_buffer` / `buffer` / `preedit` / `cursor` / `committed_text` / `committed_pinyin_buf` | **`Composition`**(一次组合会话:push/pop_backspace/consume_syllable/preedit 组装) |
+| 候选面板 | `candidates` / `candidates_fresh` / `candidate_highlight` / `candidate_page` / `candidate_page_size` / `last_meta` / `partial_commit_indices` / `full_comp_count` | **`CandidatePanel`**(items+meta 同序重建/window()滑动窗/move_highlight/change_page/全局序 select) |
+| 魔法命令 | `magic_hints` / `magic_predictions` / `active_command` / `magic_selectable` | **`MagicSession`**(snippet 态会话;S5 家族化后与 stage2 对接) |
+| 会话记忆 | `context: InputContext` | **留在 SM**(跨提交累积,非单会话) |
+| 配置 | `candidate_meta_enabled` | **留在 SM**(per-context 配置) |
+| 待删除 | `last_commit_family`(已标 FIXME) | **删除** —— panel.meta[index].family 已有此信息(E2 分派改读 meta) |
+
+**收缩后形态**(26 → 8):
+
+```rust
+pub struct StateMachine {
+    pub ctx: usize,
+    pub state: ComposeState,
+    comp: Composition,          // 文本会话(raw/buffer/preedit/cursor/committed*)
+    pub panel: CandidatePanel,  // 候选面板(items/meta/partial/page/highlight)
+    magic: MagicSession,        // snippet 态命令会话
+    pub context: InputContext,
+    candidate_meta_enabled: bool,
+}
+```
+
+**收益**:
+- `fill_view` 的窗口换算(`highlight - start`/`start+i` 偏移)内聚为
+  `panel.window()` —— meta 错位 bug(差距 C)在此自然修复(meta 与 items
+  同序重建)
+- `move_highlight`/`change_page` 挂到 panel;造词路径(部分提交/撤销)挂到
+  comp;magic 分支挂到 magic session —— route/step 的方法瘦身
+- `last_commit_family` 退役
+
+**波及面**(已核对):engine.rs ~19 处直接字段访问、router.rs 31 处、
+state.rs 内部自访问。过渡策略:聚合体暴露与旧字段同形的访问器
+(`sm.candidates` → `sm.panel.items` 的 pub 字段直读保留),分步替换。
 
 ## 四、实施计划(每步独立提交,golden 全程护航)
 
 | 步 | 内容 | 规模 | 依赖 |
 |---|---|---|---|
-| S1 | **trait 单入口**(D):predict_with_context 并入 predict(input, ctx);调用方(rank_detailed)单点调用;context_aware gate 家族内自决(已是) | 小(~50 行) | 无 |
-| S2 | **后处理抽取**(A+C):query_pinyin 拆两段;last_meta 采样移到重排后(修 C 的 meta 错位);PostProcess 单元测试 | 中(~120 行) | 无 |
-| S3 | **镜像统一**(B):candidates_detailed 改走同一条 stage3 管线(读 FSM 的 last_meta/candidates,或同一 PostProcess 重放);golden 的 rank() helper 从此与用户真实候选同源 | 中 | S2 |
-| S4 | **判定表文档化**(E)+ magic 豁免标注(F 决策) | 小 | S3 |
-| S5 | (可选)**magic 家族化**(F):query_magic 的预测段抽成 MagicFamily 的 stage2 参与 | 中 | S4 拍板 |
+| S1 | **trait 单入口**(D):predict_with_context 并入 predict(input, ctx);调用方单点调用;context_aware gate 家族内自决(已是) | 小(~50 行) | 无 |
+| S2 | **后处理抽取**(A+C):query_pinyin 拆两段;last_meta 采样移到重排后(修 C);`last_commit_family` 退役(读 meta);PostProcess 单元测试 | 中(~150 行) | 无 |
+| S3 | **镜像统一**(B):candidates_detailed 改走同一条 stage3 管线;golden rank() 与用户真实候选同源 | 中 | S2 |
+| S4 | **状态下沉**(本节):Composition / CandidatePanel / MagicSession 三聚合体,SM 收缩 26→8 字段;波及面分步替换 | 大(~400 行,机械为主) | S2 |
+| S5 | **magic 家族化**(F 拍板做):query_magic 预测段抽成 MagicFamily 参与 stage2;判定表文档化(E);MagicSession 与家族对接 | 中 | S4 |
+| S6 | **合成段归 stage3**(G 拍板):UnifiedScorer 的 ×priority/sort/去重移入后处理管线;scorer 收缩为家族容器 | 小 | S2 |
 
 ## 五、不变式(全程护航)
 
