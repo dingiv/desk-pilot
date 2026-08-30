@@ -194,6 +194,9 @@ pub struct PinyinWeightConfig {
     #[serde(default = "default_0_5")] pub stopword_penalty: f64,
     #[serde(default = "default_0_05")] pub confirm_bonus: f64,
     #[serde(default = "default_0_01")] pub short_word_bonus: f64,
+    #[serde(default = "default_0_7")] pub phrase_base: f64,
+    #[serde(default = "default_0_02")] pub phrase_step: f64,
+    #[serde(default = "default_0_95")] pub phrase_initials_ratio: f64,
     #[serde(default = "default_96")] pub large_dict_take: usize,
     #[serde(default = "default_48")] pub viterbi_take: usize,
     #[serde(default = "default_8")] pub jianpin_take: usize,
@@ -234,6 +237,9 @@ impl PinyinWeightConfig {
             stopword_penalty: self.stopword_penalty,
             confirm_bonus: self.confirm_bonus,
             short_word_bonus: self.short_word_bonus,
+            phrase_base: self.phrase_base,
+            phrase_step: self.phrase_step,
+            phrase_initials_ratio: self.phrase_initials_ratio,
             large_dict_take: self.large_dict_take,
             viterbi_take: self.viterbi_take,
             jianpin_take: self.jianpin_take,
@@ -246,6 +252,9 @@ pub struct EnglishWeightConfig {
     #[serde(default = "default_0_88")] pub exact: f64,
     #[serde(default = "default_0_6")] pub prefix_ratio: f64,
     #[serde(default = "default_1_0")] pub user_boost: f64,
+    #[serde(default = "default_0_6")] pub prefix_base: f64,
+    #[serde(default = "default_0_25")] pub prefix_quality: f64,
+    #[serde(default = "default_0_6")] pub short_word_penalty: f64,
 }
 
 fn default_1_0() -> f64 { 1.0 }
@@ -258,6 +267,9 @@ fn default_0_88() -> f64 { 0.88 }
 fn default_0_85() -> f64 { 0.85 }
 fn default_0_55() -> f64 { 0.55 }
 fn default_0_5() -> f64 { 0.5 }
+fn default_0_7() -> f64 { 0.7 }
+fn default_0_02() -> f64 { 0.02 }
+fn default_0_95() -> f64 { 0.95 }
 fn default_0_25() -> f64 { 0.25 }
 fn default_0_6() -> f64 { 0.6 }
 fn default_0_75() -> f64 { 0.75 }
@@ -278,9 +290,17 @@ impl Default for WeightsConfig {
                 phrase_book: 0.88, large_dict: 0.85, viterbi_base: 0.25, viterbi_scale: 0.55,
                 jianpin: 0.50, prefix_lookup: 0.75, single_syl_decay: 0.5, context_boost: 0.12,
                 stopword_penalty: 0.5, confirm_bonus: 0.05, short_word_bonus: 0.01,
+                phrase_base: 0.7, phrase_step: 0.02, phrase_initials_ratio: 0.95,
                 large_dict_take: 96, viterbi_take: 48, jianpin_take: 8,
             },
-            english: EnglishWeightConfig { exact: 0.88, prefix_ratio: 0.6, user_boost: 1.0 },
+            english: EnglishWeightConfig {
+                exact: 0.88,
+                prefix_ratio: 0.6,
+                user_boost: 1.0,
+                prefix_base: 0.6,
+                prefix_quality: 0.25,
+                short_word_penalty: 0.6,
+            },
             freq_scale: FreqScaleConfig { max_weight: 0.0, min_score: 0.25, max_score: 1.0 },
         }
     }

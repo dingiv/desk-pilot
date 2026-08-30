@@ -231,3 +231,30 @@ predict(input)
 
 2026-07-31(rime-ice 权重修复后):Top-1 87.5%, Top-3 100%
 (用例 `assets/testcase/tc_draft.txt`,16 条;`jishi→即使`、`chushi→初始` #2)。
+
+## 分数来源对照表(第六轮 D3)
+
+| 家族/成员 | 分数来源 | 刻度 | 代码 |
+|---|---|---|---|
+| pinyin lattice(全拼/混写/简拼/前缀) | `FreqScale` log₂ 归一:`log2(freq+1)/log2(max+1)`,clamp [0.25, 0.90];max=0 → 索引实际最大词频(auto) | 连续 [0.25, 0.90] | `lattice.rs freq_to_score` |
+| english exact | 固定 `weights.exact`(0.88),词频不参与 | 常数 | `english.rs predict` |
+| english prefix | 四档词频(`frequency_band`:0.90/0.70/0.50/0.35/0.25)× 匹配率,叠 `prefix_base + prefix_quality` | 地板+质量式 | `english.rs query_layer` |
+| pinyin 成员常数 | `PinyinWeights`(phrase_base/step 曲线、jianpin 折扣、prefix_lookup 等) | 常数表 | `pinyin/mod.rs` |
+| 跨家族合成 | `final = raw × (priority / 100)`;同文本去重取高分 | 全局 | `family/mod.rs rank_detailed` |
+
+注意:`freq_to_score` 在 lattice(log₂ 连续)与 english 的 `frequency_band`
+(四档离散)是**两套刻度**,不要混用调参。
+
+## 中英能力矩阵(第六轮 D6)
+
+| 能力 | pinyin | english | 裁决 |
+|---|---|---|---|
+| recency(近期加权) | ✅ RecentStore + SQLite 持久化 | ❌ | 刻意:英文词频词典稳定,高频词本就该在前;用户词走显式 en_user |
+| 前缀整词联想(上一词 + 输入) | ✅ last_commit → lattice words_for | ❌ | 刻意:英文无"拼音键",联想语义不成立 |
+| 自造词学习 | ✅ 造词路径 → 单词本 | ✅ Enter raw 提交 → en_user | 各自闭环 |
+| 用户词典 | ✅ PhraseBook(json/tsv) | ✅ en_user.tsv + SQLite | ✅ |
+| 上下文感知开关 | ✅ `input.context_aware` | n/a | pinyin 独有 |
+| InputContext 管道 | 管道在、未消费(见 family/mod.rs D1 标注) | 同左 | **预留**:后续 english recency / 跨 turn 联想走此管道 |
+
+哪天英文打字游戏术语想"刚打过就置顶",在 english family 接 recency
+(管道现成:record_commit 已有 dispatcher 入口)即可,不需要新架构。

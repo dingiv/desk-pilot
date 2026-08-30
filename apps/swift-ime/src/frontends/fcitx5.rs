@@ -172,6 +172,9 @@ pub extern "C" fn swift_ime_create(
         exact: cfg.weights.english.exact,
         prefix_ratio: cfg.weights.english.prefix_ratio,
         user_boost: cfg.weights.english.user_boost,
+        prefix_base: cfg.weights.english.prefix_base,
+        prefix_quality: cfg.weights.english.prefix_quality,
+        short_word_penalty: cfg.weights.english.short_word_penalty,
     };
     // 片段:SNIP 目录里的 md 片段 + 配置(yaml)片段;两者合并(重名后者覆盖)。
     use ime_core::store::snippet_md::SnippetEntry;

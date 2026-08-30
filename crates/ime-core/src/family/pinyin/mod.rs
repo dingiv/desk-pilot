@@ -14,6 +14,13 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::store::WeightStore;
+/// 链式组合(predict_chained)的引擎预过滤参数。
+pub const CHAIN_TOP_K: usize = 8;
+pub const CHAIN_BEAM: usize = 16;
+
+/// 大/小词典的加载分流阈值(字节)。超过 → LargeDict,否则 → PhraseBook。
+pub const DICT_LARGE_BYTES: u64 = 100_000;
+
 
 /// Full-pinyin prediction family.
 ///
@@ -64,7 +71,15 @@ pub struct PinyinWeights {
     pub stopword_penalty: f64, // multiplier for all-stopword compositions
     pub confirm_bonus: f64,    // bonus for dict∩viterbi confirmation
     pub short_word_bonus: f64, // bonus per 2-char word
-    // ── Take limits ──
+    // ── PhraseBook 分数曲线(自造词)──
+    /// 首次使用的基础分(低于词典精确 0.85+,不压词典词)。
+    pub phrase_base: f64,
+    /// 每次使用 +step,封顶 phrase_book —— 高频自造词逐步靠前。
+    pub phrase_step: f64,
+    /// 简拼(lzm→李正明)命中单词本时的折扣比率。
+    pub phrase_initials_ratio: f64,
+    // ── Take limits(引擎预过滤,非语义截断;yaml 字段名保持兼容)──
+    // 各数据源的查询工作量上限;语义截断唯一入口 = UnifiedScorer::top_n。
     pub large_dict_take: usize,
     pub viterbi_take: usize,
     pub jianpin_take: usize,
@@ -84,6 +99,9 @@ impl Default for PinyinWeights {
             stopword_penalty: 0.5,
             confirm_bonus: 0.05,
             short_word_bonus: 0.01,
+            phrase_base: 0.70,
+            phrase_step: 0.02,
+            phrase_initials_ratio: 0.95,
             large_dict_take: 96,
             viterbi_take: 48,
             jianpin_take: 8,
@@ -196,9 +214,7 @@ impl PinyinFamily {
         }
     }
 
-    pub fn record_pick(&self, pinyin: &str, word: &str) {
-        self.engine.dict().record_pick(pinyin, word);
-    }
+    // record_pick → 见下方「家族私有能力」区的全功能版(L0 + 前缀联想上下文)。
 
     /// 链式组合预测:`ti'an` → [`ti`][`an`] 两条链,各链独立预测取 top-K,
     /// beam 逐层组合(合成分 = 各链 raw_score 连乘,同深度组合间公平),
@@ -216,8 +232,8 @@ impl PinyinFamily {
             return Vec::new();
         }
 
-        const K: usize = 8; // 每链参与组合的候选数
-        const BEAM: usize = 16; // 组合层保留宽度
+        const K: usize = CHAIN_TOP_K; // 每链参与组合的候选数(引擎预过滤)
+        const BEAM: usize = CHAIN_BEAM; // 组合层保留宽度(引擎预过滤)
 
         let mut acc: Vec<(String, f64)> = vec![(String::new(), 1.0)];
         for chain in &chains {
@@ -340,12 +356,105 @@ impl PinyinFamily {
         }
     }
 
-    /// 自造词的使用次数 → 参与排名的基础分:首次 0.70(低于词典精确分
-    /// 0.85+,不会压过词典词),每次使用 +0.02,封顶 phrase_book 权重
-    /// (默认 0.88)—— 高频自造词随使用逐步靠前,而不是所有 phrase 词
-    /// 共享一个固定高分。
+    /// 自造词的使用次数 → 参与排名的基础分(曲线参数进 PinyinWeights:
+    /// phrase_base 起步、phrase_step 递增,封顶 phrase_book 权重)。
     fn phrase_score(&self, count: u32) -> f64 {
-        (0.70 + 0.02 * count.saturating_sub(1) as f64).min(self.weights.phrase_book)
+        (self.weights.phrase_base
+            + self.weights.phrase_step * count.saturating_sub(1) as f64)
+            .min(self.weights.phrase_book)
+    }
+
+    // ── 家族私有能力(D5 接口隔离:不在 CandidateFamily trait 上)──
+    // 学习 / 暖启 / 上下文开关,经 Dispatcher 持有的具体句柄直调。
+
+    /// Record a user pick for frequency boosting (L0) + 记录前缀整词联想
+    /// 的 (word, pinyin) 上下文。注意:**不**调 learn_phrase —— 单词本的
+    /// 唯一入口是造词路径(learn_composed_phrase);逐字选择对单字也会
+    /// record_pick,学短语会把"李"这类单字塞进单词本。
+    pub fn record_pick(&self, pinyin: &str, word: &str) {
+        self.engine.dict().record_pick(pinyin, word);
+        *self.last_commit.lock().unwrap() = (word.to_string(), pinyin.to_string());
+        // Persist the L0 user model (pins + pick counters) — same double-write
+        // cadence as recency, so the 3-pick auto-pin survives restarts.
+        if let Some(ref store) = *self.store.lock().unwrap() {
+            store.save_l0(&self.export_l0_json());
+        }
+    }
+
+    /// 学短语:已在词库(inputx 大词典 / rime-ice)的词不加入单词本 ——
+    /// phrase 是给自造词的(de→的 不该被记入)。
+    pub fn learn_phrase(&self, pinyin: &str, hanzi: &str) {
+        if self.in_dictionary(pinyin, hanzi) {
+            return;
+        }
+        self.learn_phrase_inner(pinyin, hanzi);
+    }
+
+    /// 自生词流程:多字拼音逐字选择组成的整体,无条件加入单词本。
+    pub fn learn_composed_phrase(&self, pinyin: &str, hanzi: &str) {
+        self.learn_phrase_inner(pinyin, hanzi);
+    }
+
+    /// Export L0 user model as JSON (pins + pick counters).
+    pub fn export_l0_json(&self) -> String {
+        let snap = self.engine.dict().export_l0();
+        let mut json = String::from("{\"pins\":[");
+        for (i, (py, w)) in snap.pins.iter().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!("[\"{py}\",\"{w}\"]"));
+        }
+        json.push_str("],\"picks\":[");
+        let mut first = true;
+        for (py, w, c) in &snap.pick_counts {
+            if !first {
+                json.push(',');
+            }
+            first = false;
+            json.push_str(&format!("[\"{py}\",\"{w}\",{c}]"));
+        }
+        json.push_str("]}");
+        json
+    }
+
+    /// Import L0 user model from JSON. Returns pins restored.
+    pub fn import_l0_json(&self, json: &str) -> usize {
+        #[derive(serde::Deserialize)]
+        struct L0Json {
+            pins: Vec<(String, String)>,
+            #[serde(default)]
+            picks: Vec<(String, String, u32)>,
+        }
+        if let Ok(data) = serde_json::from_str::<L0Json>(json) {
+            let snap = inputx_pinyin::L0Snapshot {
+                pins: data.pins,
+                pick_counts: data.picks,
+            };
+            self.engine.dict().import_l0(snap)
+        } else {
+            0
+        }
+    }
+
+    /// Warm the recent-member table from persisted data(过期 >3d 条目在
+    /// load_bulk 里丢弃)。
+    pub fn warm_recencies(&self, entries: Vec<(String, i64)>) {
+        if !entries.is_empty() {
+            let count = entries.len();
+            self.recency.lock().unwrap().load_bulk(entries, now_ms());
+            eprintln!("[ime-core] pinyin: warmed {count} recency entries from store");
+        }
+    }
+
+    /// 临时关闭/恢复上下文感知(swift-ime.yaml → input.context_aware)。
+    pub fn set_context_aware(&self, on: bool) {
+        *self.context_aware.lock().unwrap() = on;
+    }
+
+    /// Warm the phrase book from persisted SQLite data.
+    pub fn warm_phrases_from_store(&self) {
+        self.do_warm_phrases();
     }
 }
 
@@ -419,107 +528,23 @@ impl CandidateFamily for PinyinFamily {
         self.enabled.store(on, Ordering::Release);
     }
     fn top_n(&self) -> usize {
+        // 拼音主导中英混输:宽竞争宽度让 lattice/single 的深排序进全局榜
+        // (english 8 / emoji 4);造词单字候选也消费 family.predict 全量。
         128
     }
 
-    fn record_pick(&self, pinyin: &str, word: &str) {
-        self.engine.dict().record_pick(pinyin, word);
-        // 前缀整词联想的上下文:记录本次提交的 (word, pinyin)。
-        *self.last_commit.lock().unwrap() = (word.to_string(), pinyin.to_string());
-        // 注意:此处**不**调 learn_phrase —— 单词本的唯一入口是造词路径
-        // (learn_composed_phrase,见 state.rs select)。record_pick 在逐字
-        // 选择时对**单字**也会调用,学短语会把"李"这类单字塞进单词本。
-        // Persist the L0 user model (pins + pick counters) — same double-write
-        // cadence as recency, so the 3-pick auto-pin survives restarts.
-        if let Some(ref store) = *self.store.lock().unwrap() {
-            store.save_l0(&self.export_l0_json());
-        }
-    }
+    // ── 家族私有能力(D5 接口隔离,不在 CandidateFamily trait 上)──
+    // record_pick / learn_phrase / learn_composed_phrase / export_l0_json /
+    // import_l0_json / warm_recencies / set_context_aware /
+    // warm_phrases_from_store —— 见上方固有 impl 的 pub 方法。
 
-    fn learn_phrase(&self, pinyin: &str, hanzi: &str) {
-        // 已在词库(输入x 大词典 / rime-ice)的词不加入单词本 —— phrase 是给
-        // 自造词的(de→的 不该被记入);已学的自造词再次选中只增加使用次数,
-        // 分数随使用频率上升参与排名。
-        if self.in_dictionary(pinyin, hanzi) {
-            return;
-        }
-        self.learn_phrase_inner(pinyin, hanzi);
-    }
-
-    fn learn_composed_phrase(&self, pinyin: &str, hanzi: &str) {
-        // 自生词流程:用户输入多字拼音后通过数字键逐字选择组成的整体,
-        // 无条件加入单词本(主动造词,不因词典里恰好有该词而跳过)。
-        self.learn_phrase_inner(pinyin, hanzi);
-    }
-
-    fn export_l0_json(&self) -> String {
-        let snap = self.engine.dict().export_l0();
-        let mut json = String::from("{\"pins\":[");
-        for (i, (py, w)) in snap.pins.iter().enumerate() {
-            if i > 0 {
-                json.push(',');
-            }
-            json.push_str(&format!("[\"{py}\",\"{w}\"]"));
-        }
-        json.push_str("],\"picks\":[");
-        let mut first = true;
-        for (py, w, c) in &snap.pick_counts {
-            if !first {
-                json.push(',');
-            }
-            first = false;
-            json.push_str(&format!("[\"{py}\",\"{w}\",{c}]"));
-        }
-        json.push_str("]}");
-        json
-    }
-
-    fn import_l0_json(&self, json: &str) -> usize {
-        #[derive(serde::Deserialize)]
-        struct L0Json {
-            pins: Vec<(String, String)>,
-            #[serde(default)]
-            picks: Vec<(String, String, u32)>,
-        }
-        if let Ok(data) = serde_json::from_str::<L0Json>(json) {
-            let snap = inputx_pinyin::L0Snapshot {
-                pins: data.pins,
-                pick_counts: data.picks,
-            };
-            self.engine.dict().import_l0(snap)
-        } else {
-            0
-        }
-    }
-
-    fn warm_recencies(&self, entries: Vec<(String, i64)>) {
-        if !entries.is_empty() {
-            let count = entries.len();
-            // 加载时丢弃超过 3d 窗口的过期条目(RecentStore::load_bulk)。
-            self.recency.lock().unwrap().load_bulk(entries, now_ms());
-            eprintln!("[ime-core] pinyin: warmed {count} recency entries from store");
-        }
-    }
-
-    fn record_commit(&self, word: &str) {
-        // Delegate to the inherent impl (which pushes + persists the ring).
-        PinyinFamily::record_commit(self, word);
-    }
-
-    fn set_context_aware(&self, on: bool) {
-        *self.context_aware.lock().unwrap() = on;
-    }
-
+    /// Attach the weight store(跨家族生命周期钩子,留在 trait)。
     fn attach_store(&self, store: std::sync::Arc<WeightStore>) {
         *self.store.lock().unwrap() = Some(store);
     }
 
-    fn warm_phrases_from_store(&self) {
-        self.do_warm_phrases();
-    }
-
     fn load_dict_bytes(&self, data: &[u8]) -> usize {
-        if data.len() > 100_000 {
+        if data.len() as u64 > DICT_LARGE_BYTES {
             let n = self.large_dict.lock().unwrap().load_from_tsv_bytes(data);
             // After loading, try to build lattice from the FST.
             // LargeDict's backend stores the FST; we can't access it directly.
@@ -546,7 +571,7 @@ impl CandidateFamily for PinyinFamily {
             Ok(0) // size not tracked for FST
         } else {
             let meta = std::fs::metadata(path)?;
-            if meta.len() > 100_000 {
+            if meta.len() > DICT_LARGE_BYTES {
                 self.large_dict.lock().unwrap().load_from_tsv_file(path)
             } else {
                 self.phrase_book.lock().unwrap().load_from_tsv(path)
@@ -708,7 +733,7 @@ impl CandidateFamily for PinyinFamily {
                         text: w.clone(),
                         family: "pinyin",
                         source: "phrase_sp",
-                        raw_score: self.phrase_score(book.count(input, &w)) * 0.95,
+                        raw_score: self.phrase_score(book.count(input, &w)) * self.weights.phrase_initials_ratio,
                     });
                 }
             }
@@ -796,6 +821,44 @@ impl CandidateFamily for PinyinFamily {
 
         candidates.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap());
         candidates
+    }
+}
+
+/// Arc 共享句柄的 trait 委托(D5):Dispatcher 持 `Arc<PinyinFamily>` 直调
+/// 家族私有方法,scorer 持同一 Arc 当 trait 对象参与统一排序。
+impl CandidateFamily for Arc<PinyinFamily> {
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+    fn priority(&self) -> u32 {
+        (**self).priority()
+    }
+    fn enabled(&self) -> bool {
+        (**self).enabled()
+    }
+    fn set_family_enabled(&self, on: bool) {
+        (**self).set_family_enabled(on)
+    }
+    fn top_n(&self) -> usize {
+        (**self).top_n()
+    }
+    fn predict(&self, input: &str) -> Vec<ScoredCandidate> {
+        (**self).predict(input)
+    }
+    fn predict_with_context(&self, input: &str, ctx: &InputContext) -> Vec<ScoredCandidate> {
+        (**self).predict_with_context(input, ctx)
+    }
+    fn load_dict(&self, path: &str) -> std::io::Result<usize> {
+        (**self).load_dict(path)
+    }
+    fn load_user_dict(&self, path: &str) -> std::io::Result<usize> {
+        (**self).load_user_dict(path)
+    }
+    fn load_dict_bytes(&self, data: &[u8]) -> usize {
+        (**self).load_dict_bytes(data)
+    }
+    fn attach_store(&self, store: std::sync::Arc<WeightStore>) {
+        (**self).attach_store(store)
     }
 }
 
@@ -925,7 +988,7 @@ mod tests {
         std::fs::write(&path, b.finish()).unwrap();
         let fam = PinyinFamily::new();
         fam.load_dict(&path).unwrap();
-        CandidateFamily::record_pick(&fam, "zhong", "中");
+        fam.record_pick("zhong", "中");
         let cands = fam.predict_with_context("de", &InputContext::new());
         let di = cands.iter().find(|c| c.text == "的").expect("的 present");
         assert!(di.raw_score >= 0.68, "整词权重提升: {}", di.raw_score);
@@ -943,7 +1006,7 @@ mod tests {
         std::fs::write(&path, b.finish()).unwrap();
         let fam = PinyinFamily::new();
         fam.load_dict(&path).unwrap();
-        CandidateFamily::record_pick(&fam, "zhong", "中");
+        fam.record_pick("zhong", "中");
         fam.set_context_aware(false);
         let cands = fam.predict_with_context("de", &InputContext::new());
         let di = cands.iter().find(|c| c.text == "的").expect("的 present");
@@ -960,7 +1023,7 @@ mod tests {
         let fam = PinyinFamily::new();
         let before = fam.phrase_count();
         use crate::family::CandidateFamily;
-        CandidateFamily::record_pick(&fam, "cd", "📀");
+        fam.record_pick("cd", "📀");
         assert_eq!(
             fam.phrase_count(),
             before,

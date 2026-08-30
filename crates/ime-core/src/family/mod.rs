@@ -61,6 +61,13 @@ pub struct RankedCandidate {
 /// Short-term input context — what the user recently committed.
 /// Passed to every family's `predict` so they can adjust rankings
 /// based on what came before.
+///
+/// **状态标注(D1,2026-08-29)**:管道已铺好但**当前无家族消费** ——
+/// pinyin 的上下文来源是自身的 `last_commit`(record_pick 写入,含
+/// 拼音键,信息量比 `last_word` 大),english/emoji 未覆盖
+/// `predict_with_context`。保留原因:上下文感知是后续重点
+/// (english recency、跨 turn 联想都计划走这条管道),届时家族改为
+/// 消费 ctx,`last_commit` 退役。
 #[derive(Debug, Clone, Default)]
 pub struct InputContext {
     /// Last few committed characters (up to ~20 chars).
@@ -107,8 +114,8 @@ pub trait CandidateFamily: Send + Sync {
     /// `dicts.emoji: false` 时整个家族退出统一打分。
     fn set_family_enabled(&self, _on: bool) {}
 
-    /// How many top candidates this family sends to the inter-family
-    /// competition. Default: 8.
+    /// 跨家族竞争宽度 —— 家族候选进入统一排序的**语义截断唯一入口**
+    /// (家族内部的 take/truncate 是引擎预过滤,不是语义截断)。
     fn top_n(&self) -> usize {
         8
     }
@@ -139,58 +146,18 @@ pub trait CandidateFamily: Send + Sync {
         0
     }
 
-    /// Record a user pick for frequency boosting (per-family auto-learning).
-    fn record_pick(&self, _pinyin: &str, _word: &str) {}
-
-    /// Learn a new phrase for future recall.
-    fn learn_phrase(&self, _pinyin: &str, _word: &str) {}
-
-    /// 自生词流程的成果(多字拼音 + 数字键逐字选择组成的整体)—— 无条件加入
-    /// 单词本,不做词典存在性检查(用户主动逐字造词,词典里有没有都要记住)。
-    /// Default: 委托 [`learn_phrase`];PinyinFamily overrides to skip the
-    /// in-dictionary skip.
-    fn learn_composed_phrase(&self, pinyin: &str, word: &str) {
-        self.learn_phrase(pinyin, word);
-    }
-
-    /// Export L0 user model as JSON (pins + pick counters).
-    fn export_l0_json(&self) -> String {
-        String::new()
-    }
-
-    /// Import L0 user model from JSON. Returns pins restored.
-    fn import_l0_json(&self, _json: &str) -> usize {
-        0
-    }
-
-    /// 临时关闭/恢复上下文感知(swift-ime.yaml → input.context_aware)。
-    /// Default no-op; PinyinFamily overrides to skip recency/bigram/surrounding
-    /// boosts when off.
-    fn set_context_aware(&self, _on: bool) {}
-
-    /// Record a committed word for recency tracking. Default no-op;
-    /// PinyinFamily overrides to push to its RecencyStore.
-    fn record_commit(&self, _word: &str) {}
-
-    /// Warm the recent-member table from persisted data
-    /// (`(word, last_used_ms)` pairs). Default no-op; PinyinFamily overrides
-    /// to restore the time-decay boosts (expired >3d entries dropped on load).
-    fn warm_recencies(&self, _entries: Vec<(String, i64)>) {}
-
-    /// 学习一个英文自生词(Enter 强选 raw 文本提交时)。
-    /// Default no-op; EnglishFamily overrides.
-    fn record_learned_word(&self, _word: &str) {}
-
-    /// Warm 英文自生词 from persisted data. Default no-op.
-    fn warm_learned_words(&self, _words: &[(String, u32)]) {}
-
-    /// Attach the weight store for persisting learned phrases.
+    /// Attach the weight store for persisting learned data.
     /// Called once at startup after init_store.
     fn attach_store(&self, _store: std::sync::Arc<crate::store::WeightStore>) {}
-
-    /// Warm the phrase book from persisted SQLite data.
-    fn warm_phrases_from_store(&self) {}
 }
+
+// 家族私有能力(学习/暖启/上下文开关)**不在 trait 上** —— D5 接口隔离:
+//   pinyin:record_pick / learn_phrase / learn_composed_phrase /
+//          export_l0_json / import_l0_json / set_context_aware /
+//          record_commit / warm_recencies / warm_phrases_from_store
+//   english:record_learned_word / warm_learned_words
+// 经 [`crate::dispatcher::Dispatcher`] 持有的具体句柄(Arc<PinyinFamily> /
+// Arc<EnglishFamily>)直接调用,不再走 trait 对象的 no-op 默认实现。
 
 // ── UnifiedScorer ───────────────────────────────────────────────────────
 

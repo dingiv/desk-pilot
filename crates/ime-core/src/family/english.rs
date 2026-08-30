@@ -37,6 +37,12 @@ pub struct EnglishWeights {
     pub exact: f64,
     pub prefix_ratio: f64,
     pub user_boost: f64,
+    /// prefix 质量式的地板分(`0.60 地板`,与 emoji 前缀基础对齐)。
+    pub prefix_base: f64,
+    /// prefix 质量式的质量系数(词频 × 匹配率在 [地板, 地板+系数] 内区分)。
+    pub prefix_quality: f64,
+    /// 1~2 字母短词降权倍率(只作用词典层;用户层恒 1.0)。
+    pub short_word_penalty: f64,
 }
 
 impl Default for EnglishWeights {
@@ -45,15 +51,17 @@ impl Default for EnglishWeights {
             exact: 0.88,
             prefix_ratio: 0.60,
             user_boost: 1.0,
+            prefix_base: 0.60,
+            prefix_quality: 0.25,
+            short_word_penalty: 0.6,
         }
     }
 }
 
-/// 1~2 字母短词的降权倍率。两字母输入几乎总是中文简拼(承担/程度/成都)或
-/// 常用缩写,"a"/"an"/"cd" 这类英文短词不该压过它们 —— exact 0.88×0.6 =
-/// 0.528(经 priority 70 → 0.37),低于中文简拼 0.503。只作用于**词典层**:
-/// 用户显式学入的短词(自生词)不降权,学习语义保留。
-const SHORT_WORD_PENALTY: f64 = 0.6;
+/// 单字母输入的 prefix 层工作量上限:二分定位后要扫全部同首字母词
+/// ("a" ≈ 数千条),没有这道预过滤单键延迟会炸。**引擎预过滤**,非语义
+/// 截断 —— 语义截断唯一入口是 `UnifiedScorer` 的 `top_n`。
+const PREFILTER_TAKE: usize = 16;
 
 // ── Frequency normalization ─────────────────────────────────────────────
 
@@ -410,7 +418,10 @@ impl EnglishFamily {
 
     // ── Frequency-to-score ─────────────────────────────────────────────
 
-    fn freq_to_score(freq: u32) -> f64 {
+    /// 词频(1~10000,decile 归一化)→ 分档质量分。
+    /// 与 lattice 的 `freq_to_score`(log₂ 连续映射)是两套刻度 —— 见
+    /// weight-scoring.md 的分数来源对照表。
+    fn frequency_band(freq: u32) -> f64 {
         match freq {
             f if f >= 9000 => 0.90,
             f if f >= 7000 => 0.70,
@@ -422,20 +433,31 @@ impl EnglishFamily {
 
     // ── Query helpers ──────────────────────────────────────────────────
 
-    /// 私有查询助手(标签×2 + 分数×2 + 双入参),不对外 —— 参数数是
-    /// 刻意的展开,不值得为消 lint 引入配置结构体。
+    /// 私有查询助手(标签×2 + 双入参),不对外 —— 参数数是刻意的展开,
+    /// 不值得为消 lint 引入配置结构体。`user_layer`:exact×user_boost、
+    /// prefix_ratio×1.1、短词不降权(学习语义保留)。
     #[allow(clippy::too_many_arguments)]
     fn query_layer(
         words: &[(String, u32)],
         input: &str,
         exact_label: &'static str,
         prefix_label: &'static str,
-        exact_score: f64,
-        prefix_ratio: f64,
+        w: &EnglishWeights,
+        user_layer: bool,
         short_penalty: bool,
         seen: &mut std::collections::HashSet<String>,
         out: &mut Vec<ScoredCandidate>,
     ) {
+        let exact_score = if user_layer {
+            (w.exact * w.user_boost).min(1.0)
+        } else {
+            w.exact
+        };
+        let prefix_ratio = if user_layer {
+            w.prefix_ratio * 1.1
+        } else {
+            w.prefix_ratio
+        };
         let start = words
             .binary_search_by(|(w, _)| {
                 let wl = w.to_ascii_lowercase();
@@ -462,7 +484,7 @@ impl EnglishFamily {
 
             if wl == input {
                 let score = if short {
-                    exact_score * SHORT_WORD_PENALTY
+                    exact_score * w.short_word_penalty
                 } else {
                     exact_score
                 };
@@ -473,7 +495,7 @@ impl EnglishFamily {
                     raw_score: score,
                 });
             } else {
-                let freq_score = Self::freq_to_score(*freq);
+                let freq_score = Self::frequency_band(*freq);
                 let len_ratio = input.len() as f64 / word.len() as f64;
                 // 地板 + 质量:0.60 地板与 emoji 前缀基础对齐(英文本尊
                 // clea→clean 必须压过同名词的 emoji 关键词 clean→🧼;经
@@ -481,9 +503,10 @@ impl EnglishFamily {
                 // 0.503),词频 × 匹配率在 [0.60, 0.85] 内提供区分度 ——
                 // smile(匹配 4/5)排在 smilacaceous(4/13)前,而非全体
                 // 贴地板后退化成字母序。
-                let base = 0.60 + 0.25 * freq_score * prefix_ratio * len_ratio;
+                let base =
+                    w.prefix_base + w.prefix_quality * freq_score * prefix_ratio * len_ratio;
                 let score = if short {
-                    base * SHORT_WORD_PENALTY
+                    base * w.short_word_penalty
                 } else {
                     base
                 };
@@ -557,14 +580,13 @@ impl CandidateFamily for EnglishFamily {
 
         // Layer 1: user dict (highest priority). 自生词不降权(学习语义保留)。
         let user = self.user_words.lock().unwrap();
-        let user_exact = (self.weights.exact * self.weights.user_boost).min(1.0);
         Self::query_layer(
             &user,
             &input_lower,
             "user",
             "user_prefix",
-            user_exact,
-            self.weights.prefix_ratio * 1.1,
+            &self.weights,
+            true,
             false,
             &mut seen,
             &mut out,
@@ -577,15 +599,15 @@ impl CandidateFamily for EnglishFamily {
             &input_lower,
             "exact",
             "prefix",
-            self.weights.exact,
-            self.weights.prefix_ratio,
+            &self.weights,
+            false,
             true,
             &mut seen,
             &mut out,
         );
 
         out.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap());
-        out.truncate(16);
+        out.truncate(PREFILTER_TAKE);
         out
     }
 
@@ -597,17 +619,44 @@ impl CandidateFamily for EnglishFamily {
         *self.store.lock().unwrap() = Some(store);
     }
 
-    fn record_learned_word(&self, word: &str) {
-        // 委托 inherent 实现(dispatcher 经 trait 对象调用)。
-        EnglishFamily::record_learned_word(self, word);
-    }
-
-    fn warm_learned_words(&self, words: &[(String, u32)]) {
-        EnglishFamily::warm_learned_words(self, words);
-    }
+    // ── 家族私有能力(D5 接口隔离:不在 CandidateFamily trait 上)──
+    // record_learned_word / warm_learned_words —— 见上方固有 impl 的 pub
+    // 方法,经 Dispatcher 持有的具体句柄直调。
 
     fn load_user_dict(&self, path: &str) -> std::io::Result<usize> {
         self.load_user_dict_file(path)
+    }
+}
+
+/// Arc 共享句柄的 trait 委托(D5):Dispatcher 持 `Arc<EnglishFamily>` 直调
+/// 家族私有方法,scorer 持同一 Arc 当 trait 对象参与统一排序。
+impl CandidateFamily for std::sync::Arc<EnglishFamily> {
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+    fn priority(&self) -> u32 {
+        (**self).priority()
+    }
+    fn enabled(&self) -> bool {
+        (**self).enabled()
+    }
+    fn set_family_enabled(&self, on: bool) {
+        (**self).set_family_enabled(on)
+    }
+    fn top_n(&self) -> usize {
+        (**self).top_n()
+    }
+    fn predict(&self, input: &str) -> Vec<ScoredCandidate> {
+        (**self).predict(input)
+    }
+    fn load_dict(&self, path: &str) -> std::io::Result<usize> {
+        (**self).load_dict(path)
+    }
+    fn load_user_dict(&self, path: &str) -> std::io::Result<usize> {
+        (**self).load_user_dict(path)
+    }
+    fn attach_store(&self, store: std::sync::Arc<crate::store::WeightStore>) {
+        (**self).attach_store(store)
     }
 }
 
@@ -821,7 +870,7 @@ mod tests {
         let cands = fam.predict("cd");
         let cd = cands.iter().find(|c| c.text == "cd").expect("cd in base");
         assert!(
-            (cd.raw_score - 0.88 * super::SHORT_WORD_PENALTY).abs() < 1e-9,
+            (cd.raw_score - 0.88 * 0.6).abs() < 1e-9,
             "2-letter word penalized: {}",
             cd.raw_score,
         );

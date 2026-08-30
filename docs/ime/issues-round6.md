@@ -138,15 +138,22 @@ recency?),没有任何文档裁决。
 
 ## 规范化方向(待拍板后立项)
 
-1. **修行为 bug**:B1(加"缓存重载分数不变"回归测试)、B3(开关补齐或删接口)、
-   B2(拍板:共享引擎 or 双写 or 声明取舍)
-2. **候选生成契约**:family = `(input, config) → 有序候选`;对外截断唯一入口
-   `UnifiedScorer::top_n`;家族 take 更名 prefilter(性能语义)
-3. **InputContext 二选一**:真用(english 接 last_word 联想)或删除;
-   `last_commit` 并入唯一上下文源
-4. **权重大扫除**:D4 表格里的常数全部进 `*Weights`(yaml 一处可调)
-5. **trait 瘦身**:可选能力拆小 trait,或从 trait 下放到具体家族的固有方法
-6. **Nits 顺手清**:死分支 / eprintln / 构造器合并
+> **2026-08-29 执行记录**(B1/B2/B3 已在 fix 提交落地,本表为规范问题进展):
+
+1. **修行为 bug**:✅ B1(en_cache Passthrough + v2 头)/ B3(AtomicBool 开关)/
+   B2(方案 d:退役实例 A,造词单字候选走 family.predict)
+2. **候选生成契约**:✅ top_n 文档定性为语义截断唯一入口;
+   english truncate(16) → `PREFILTER_TAKE` 常量;pinyin takes 补预过滤定性注释
+3. **InputContext 二选一**:⏸ **拍板:保留管道**(上下文感知是后续重点)。
+   已加状态标注(family/mod.rs):ctx 当前无家族消费,真实源 = last_commit,
+   届时家族改消费 ctx、last_commit 退役
+4. **权重大扫除**:✅ english prefix_base/prefix_quality/short_word_penalty、
+   pinyin phrase_base/phrase_step/phrase_initials_ratio 全进 weights + yaml;
+   DICT_LARGE_BYTES / CHAIN_TOP_K / CHAIN_BEAM 具名常量
+5. **trait 瘦身**:✅ 11 个家族私有方法撤下 trait(pinyin 9 + english 2);
+   Dispatcher 持 `Arc<PinyinFamily>` / `Arc<EnglishFamily>` 具体句柄直调,
+   scorer 经 Arc 委托 impl 参与统一排序。trait 从 20+ 方法收敛到 11 个核心
+6. **Nits 顺手清**:⏳ 未做(predict 尾部死分支 / eprintln / 构造器合并仍在)
 
 建议顺序:1(小而独立,行为正确性)→ 2+4(动面大,一次做透)→ 3/5/6。
 B2 和 D1/D6 需要先拍板取舍再动代码。

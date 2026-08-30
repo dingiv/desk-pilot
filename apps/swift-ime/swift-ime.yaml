@@ -88,6 +88,9 @@ weights:
     stopword_penalty: 0.5   # multiplier for all-stopword compositions
     confirm_bonus: 0.05     # bonus when word appears in both dict and viterbi
     short_word_bonus: 0.01  # bonus for 2-char words
+    phrase_base: 0.7        # learned-phrase score at first use
+    phrase_step: 0.02       # per-use increment (capped at phrase_book)
+    phrase_initials_ratio: 0.95  # initials (lzm) hit ratio on phrase book
     large_dict_take: 96     # max LargeDict candidates per query
     viterbi_take: 48        # max Viterbi compositions per query
     jianpin_take: 8         # max jianpin candidates per query
@@ -97,6 +100,9 @@ weights:
     exact: 0.88             # exact word match
     prefix_ratio: 0.6       # max score for prefix match (scaled by match ratio)
     user_boost: 1.0         # user-dict words (all get max priority)
+    prefix_base: 0.6        # prefix quality floor (aligned with emoji prefix base)
+    prefix_quality: 0.25    # quality term: freq × match-ratio scale
+    short_word_penalty: 0.6 # 1~2 letter words (dict layer only)
 
   # Recent member:近期指数按距上次使用时间分档(10s→5,1h→4,5h→3,1d→2,
   # 3d→1,>3d 移出),权重合成公式固定:z = (1-a)(a+b)/8 + a —— 无需配置。

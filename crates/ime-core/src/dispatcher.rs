@@ -8,6 +8,7 @@ use crate::expander::Expander;
 use crate::family::english::EnglishFamily;
 use crate::family::magic::MagicFamily;
 use crate::family::pinyin::PinyinFamily;
+use crate::family::CandidateFamily;
 use crate::family::UnifiedScorer;
 use crate::matcher::Matcher;
 use crate::platform::ImeView;
@@ -18,6 +19,11 @@ pub struct Dispatcher {
     matcher: Matcher,
     expander: Expander,
     scorer: UnifiedScorer,
+    /// 具体家族句柄(D5 接口隔离):学习/暖启/上下文开关等家族私有方法
+    /// 走这里直调,不再经 trait 对象的 no-op 默认实现。scorer 持同一 Arc
+    /// 当 trait 对象参与统一排序(见 family/mod.rs 的 Arc 委托 impl)。
+    pinyin_family: Arc<PinyinFamily>,
+    english_family: Arc<EnglishFamily>,
     /// The magic command registry — same `Arc` the engine holds, so late resource
     /// attachment (voice buffer, req base) is visible to the FSM and the members.
     magic: Arc<MagicFamily>,
@@ -40,15 +46,17 @@ impl Dispatcher {
         // pinyin + english + emoji compete in the unified scorer (中英混输 +
         // emoji). Magic (#) and snippet (/) are routed by the FSM via the
         // matcher — their candidates never pass through the scorer.
-        let pinyin_family = PinyinFamily::with_scoring(pinyin_weights, scoring);
-        let english_family = EnglishFamily::with_default_dict()
-            .with_config(scoring.priorities.english, english_weights);
+        let pinyin_family = Arc::new(PinyinFamily::with_scoring(pinyin_weights, scoring));
+        let english_family = Arc::new(
+            EnglishFamily::with_default_dict()
+                .with_config(scoring.priorities.english, english_weights),
+        );
         let emoji_family = crate::family::emoji::EmojiFamily::new();
 
         let scorer = UnifiedScorer::new(
             vec![
-                Box::new(pinyin_family),
-                Box::new(english_family),
+                Box::new(Arc::clone(&pinyin_family)),
+                Box::new(Arc::clone(&english_family)),
                 Box::new(emoji_family),
             ],
             scoring.priorities,
@@ -58,6 +66,8 @@ impl Dispatcher {
             matcher,
             expander,
             scorer,
+            pinyin_family,
+            english_family,
             magic,
         }
     }
@@ -65,9 +75,9 @@ impl Dispatcher {
     #[cfg(test)]
     pub fn new_for_test(matcher: Matcher, expander: Expander) -> Self {
         // Minimal scorer for tests — just the pinyin family.
-        let pinyin_only = PinyinFamily::new();
+        let pinyin_family = Arc::new(PinyinFamily::new());
         let scorer = UnifiedScorer::new(
-            vec![Box::new(pinyin_only)],
+            vec![Box::new(Arc::clone(&pinyin_family))],
             crate::scoring::FamilyPriorities::default(),
         );
 
@@ -75,6 +85,8 @@ impl Dispatcher {
             matcher,
             expander,
             scorer,
+            pinyin_family,
+            english_family: Arc::new(EnglishFamily::new()),
             magic: Arc::new(MagicFamily::new()),
         }
     }
@@ -93,51 +105,36 @@ impl Dispatcher {
 
     /// Record a committed word for recency boosting.
     pub fn record_commit(&self, word: &str) {
-        if let Some(fam) = self.scorer.family("pinyin") {
-            fam.record_commit(word);
-        }
+        self.pinyin_family.record_commit(word);
     }
 
     /// Warm the pinyin family's recent-member table from persisted data
     /// (`(word, last_used_ms)` pairs).
     pub fn warm_recencies(&self, entries: Vec<(String, i64)>) {
-        if let Some(fam) = self.scorer.family("pinyin") {
-            fam.warm_recencies(entries);
-        }
+        self.pinyin_family.warm_recencies(entries);
     }
 
     /// Restore the inputx-pinyin L0 user model from persisted JSON.
     /// Returns the number of pins restored (0 if empty/invalid).
     pub fn import_l0(&self, json: &str) -> usize {
-        self.scorer
-            .family("pinyin")
-            .map(|fam| fam.import_l0_json(json))
-            .unwrap_or(0)
+        self.pinyin_family.import_l0_json(json)
     }
 
     /// Attach weight store to families for persistence (pinyin phrases +
     /// english learned words).
     pub fn set_store(&self, store: Arc<crate::store::WeightStore>) {
-        if let Some(fam) = self.scorer.family("pinyin") {
-            fam.attach_store(Arc::clone(&store));
-        }
-        if let Some(fam) = self.scorer.family("english") {
-            fam.attach_store(store);
-        }
+        self.pinyin_family.attach_store(Arc::clone(&store));
+        self.english_family.attach_store(store);
     }
 
     /// 学习英文自生词(Enter 强选 raw 文本提交时)。
     pub fn record_english_word(&self, word: &str) {
-        if let Some(fam) = self.scorer.family("english") {
-            fam.record_learned_word(word);
-        }
+        self.english_family.record_learned_word(word);
     }
 
     /// Warm the english user layer from persisted 英文自生词。
     pub fn warm_en_user(&self, words: Vec<(String, u32)>) {
-        if let Some(fam) = self.scorer.family("english") {
-            fam.warm_learned_words(&words);
-        }
+        self.english_family.warm_learned_words(&words);
     }
 
     /// 运行时启/禁某家族(`dicts.emoji: false` → "emoji" 全家族禁用)。
@@ -149,16 +146,12 @@ impl Dispatcher {
 
     /// 临时关闭/恢复 pinyin 家族的上下文感知(swift-ime.yaml → input.context_aware)。
     pub fn set_pinyin_context_aware(&self, on: bool) {
-        if let Some(fam) = self.scorer.family("pinyin") {
-            fam.set_context_aware(on);
-        }
+        self.pinyin_family.set_context_aware(on);
     }
 
     /// Warm the phrase book from persisted SQLite data.
     pub fn warm_phrases_from_store(&self) {
-        if let Some(fam) = self.scorer.family("pinyin") {
-            fam.warm_phrases_from_store();
-        }
+        self.pinyin_family.warm_phrases_from_store();
     }
 
     /// Load an English user dictionary (all words get max priority).
@@ -208,20 +201,14 @@ impl StepEnv for Dispatcher {
         &self.scorer
     }
     fn record_pick(&self, pinyin: &str, word: &str) {
-        // Route through PinyinFamily (via scorer) for per-family auto-learning.
-        if let Some(fam) = self.scorer.family("pinyin") {
-            fam.record_pick(pinyin, word);
-        }
+        // 家族私有方法(D5):经具体句柄直调 —— 学习语义只有 pinyin 有。
+        self.pinyin_family.record_pick(pinyin, word);
     }
     fn learn_phrase(&self, pinyin: &str, hanzi: &str) {
-        if let Some(fam) = self.scorer.family("pinyin") {
-            fam.learn_phrase(pinyin, hanzi);
-        }
+        self.pinyin_family.learn_phrase(pinyin, hanzi);
     }
     fn learn_composed_phrase(&self, pinyin: &str, hanzi: &str) {
-        if let Some(fam) = self.scorer.family("pinyin") {
-            fam.learn_composed_phrase(pinyin, hanzi);
-        }
+        self.pinyin_family.learn_composed_phrase(pinyin, hanzi);
     }
     fn magic(&self) -> &MagicFamily {
         &self.magic

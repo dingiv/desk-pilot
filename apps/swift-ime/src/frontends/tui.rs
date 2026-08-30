@@ -104,7 +104,10 @@ pub fn build_engine(cfg: &TuiConfig) -> (ImeEngine, Arc<ime_core::voice_state::S
         exact: sw_cfg.weights.english.exact,
         prefix_ratio: sw_cfg.weights.english.prefix_ratio,
         user_boost: sw_cfg.weights.english.user_boost,
-    };
+        prefix_base: sw_cfg.weights.english.prefix_base,
+        prefix_quality: sw_cfg.weights.english.prefix_quality,
+        short_word_penalty: sw_cfg.weights.english.short_word_penalty,
+};
     // Mock/TUI: default provider (live $DATE, empty clipboard) + SNIP md 片段
     // + 配置片段(重名后者覆盖)。
     use ime_core::store::snippet_md::SnippetEntry;
