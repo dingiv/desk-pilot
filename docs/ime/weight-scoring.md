@@ -267,12 +267,13 @@ predict(input)
 
 | 能力 | pinyin | english | 裁决 |
 |---|---|---|---|
-| recency(近期加权) | ✅ RecentStore + SQLite 持久化 | ❌ | 刻意:英文词频词典稳定,高频词本就该在前;用户词走显式 en_user |
+| recency(近期加权) | ✅ RecentStore + SQLite 持久化 | ✅ **E2**(round7):RecentStore 复用,进程内 | 同公式 z=(1-a)(a+b)/8+a;英文标识符反复输入场景受益 |
 | 前缀整词联想(上一词 + 输入) | ✅ last_commit → lattice words_for | ❌ | 刻意:英文无"拼音键",联想语义不成立 |
+| 跨提交 bigram 联想(E1) | ✅ bigram_boost(见上) | ❌ | 刻意:英文无 bigram 语料,recency 已覆盖 |
 | 自造词学习 | ✅ 造词路径 → 单词本 | ✅ Enter raw 提交 → en_user | 各自闭环 |
 | 用户词典 | ✅ PhraseBook(json/tsv) | ✅ en_user.tsv + SQLite | ✅ |
-| 上下文感知开关 | ✅ `input.context_aware` | n/a | pinyin 独有 |
-| InputContext 管道 | 管道在、未消费(见 family/mod.rs D1 标注) | 同左 | **预留**:后续 english recency / 跨 turn 联想走此管道 |
+| 上下文感知开关 | ✅ `input.context_aware` | ✅ E2 起共用同一键 | 两家 recency/联想统一 gate |
 
-哪天英文打字游戏术语想"刚打过就置顶",在 english family 接 recency
-(管道现成:record_commit 已有 dispatcher 入口)即可,不需要新架构。
+E2 的 dispatcher 分派:`record_commit(word, family)` —— 英文提交进
+english recency 表(进程内,不持久化),其余进拼音(带 SQLite 持久化)。
+

@@ -6,7 +6,7 @@ use super::{CandidateFamily, InputContext, ScoredCandidate};
 pub mod dict;
 pub mod lattice;
 pub mod phrase;
-mod recency;
+pub mod recency;
 
 use recency::RecentStore;
 
@@ -214,7 +214,7 @@ impl PinyinFamily {
     /// replace, ≤512 rows) so the time-decay survives restarts.
     pub fn record_commit(&self, word: &str) {
         let mut rec = self.recency.lock().unwrap();
-        rec.record(word, now_ms());
+        rec.record(word, super::now_ms());
         if let Some(ref store) = *self.store.lock().unwrap() {
             store.save_recency(&rec.dump());
         }
@@ -448,7 +448,7 @@ impl PinyinFamily {
     pub fn warm_recencies(&self, entries: Vec<(String, i64)>) {
         if !entries.is_empty() {
             let count = entries.len();
-            self.recency.lock().unwrap().load_bulk(entries, now_ms());
+            self.recency.lock().unwrap().load_bulk(entries, super::now_ms());
             eprintln!("[ime-core] pinyin: warmed {count} recency entries from store");
         }
     }
@@ -705,13 +705,6 @@ fn is_cjk(c: char) -> bool {
     (0x4E00..=0x9FFF).contains(&p) || (0x3400..=0x4DBF).contains(&p)
 }
 
-/// 当前 wall-clock 毫秒(unix epoch)—— recent member 的时间基准。
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
 
 
 impl CandidateFamily for PinyinFamily {
@@ -805,7 +798,7 @@ impl CandidateFamily for PinyinFamily {
         // 获得更大加成,高权重词增量趋零,z 天然 < 1(不会顶满 1.0)。
         let mut recency = self.recency.lock().unwrap();
         if !recency.is_empty() {
-            let now = now_ms();
+            let now = super::now_ms();
             for c in &mut candidates {
                 let b = recency.tier(&c.text, now);
                 if b > 0 {

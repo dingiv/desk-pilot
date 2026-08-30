@@ -92,6 +92,14 @@ impl InputContext {
     }
 }
 
+/// 当前 wall-clock 毫秒(unix epoch)—— recency 的时间基准(拼音/英文共享)。
+pub(crate) fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default()
+}
+
 // ── CandidateFamily trait ───────────────────────────────────────────────
 
 /// A pluggable prediction source. Each family is an independent engine

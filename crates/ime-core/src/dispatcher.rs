@@ -103,9 +103,14 @@ impl Dispatcher {
         sm.reset();
     }
 
-    /// Record a committed word for recency boosting.
-    pub fn record_commit(&self, word: &str) {
-        self.pinyin_family.record_commit(word);
+    /// Record a committed word for recency boosting —— 按提交家族分派(E2):
+    /// 英文候选进 english 家族的 recency 表,其余(拼音)保持原路径。
+    pub fn record_commit(&self, word: &str, family: Option<&str>) {
+        if family == Some("english") {
+            self.english_family.record_commit(word);
+        } else {
+            self.pinyin_family.record_commit(word);
+        }
     }
 
     /// Warm the pinyin family's recent-member table from persisted data
@@ -147,6 +152,11 @@ impl Dispatcher {
     /// 临时关闭/恢复 pinyin 家族的上下文感知(swift-ime.yaml → input.context_aware)。
     pub fn set_pinyin_context_aware(&self, on: bool) {
         self.pinyin_family.set_context_aware(on);
+    }
+
+    /// E2:英文家族的上下文感知开关(recency boost)。
+    pub fn set_english_context_aware(&self, on: bool) {
+        self.english_family.set_context_aware(on);
     }
 
     /// Warm the phrase book from persisted SQLite data.

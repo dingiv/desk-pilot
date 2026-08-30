@@ -28,7 +28,8 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::{CandidateFamily, ScoredCandidate};
+use super::pinyin::recency::RecentStore;
+use super::{now_ms, CandidateFamily, ScoredCandidate};
 
 // ── EnglishWeights ──────────────────────────────────────────────────────
 
@@ -179,6 +180,12 @@ pub struct EnglishFamily {
     user_words: Mutex<Vec<(String, u32)>>,
     priority: u32,
     weights: EnglishWeights,
+    /// 近期使用加权(E2):刚提交过的英文词在 prefix/exact 候选里获得
+    /// recency 合成(z = (1-a)(a+b)/8 + a,天然 <1)。复用拼音侧 RecentStore
+    /// 的五档时间指数;进程内生命周期,不持久化。
+    recency: Mutex<RecentStore>,
+    /// 上下文感知开关(`input.context_aware`,与拼音共用同一个 yaml 键)。
+    context_aware: Mutex<bool>,
     /// 持久化句柄(英文自生词 en_user 表),init_store 后由 dispatcher 注入。
     store: Mutex<Option<Arc<crate::store::WeightStore>>>,
 }
@@ -191,6 +198,8 @@ impl EnglishFamily {
             user_words: Mutex::new(Vec::new()),
             priority: 70,
             weights: EnglishWeights::default(),
+            recency: Mutex::new(RecentStore::new()),
+            context_aware: Mutex::new(true),
             store: Mutex::new(None),
         }
     }
@@ -303,6 +312,39 @@ impl EnglishFamily {
             return;
         }
         self.merge_into_user(words);
+    }
+
+    // ── E2:近期使用加权(recency)──
+
+    /// Record a committed word(引擎提交路径按家族分派到这里)。
+    pub fn record_commit(&self, word: &str) {
+        self.recency.lock().unwrap().record(word, now_ms());
+    }
+
+    /// 临时关闭/恢复上下文感知(recency boost;`input.context_aware` 与
+    /// 拼音家族共用)。
+    pub fn set_context_aware(&self, on: bool) {
+        *self.context_aware.lock().unwrap() = on;
+    }
+
+    /// 近期指数合成(z = (1-a)(a+b)/8 + a)施加到全部候选 —— 排序前调用。
+    /// 与拼音家族 Layer 1 同公式:增量与 (1-a) 成比例,z 天然 < 1。
+    fn apply_recency(&self, out: &mut [ScoredCandidate]) {
+        if !*self.context_aware.lock().unwrap() {
+            return;
+        }
+        let mut recency = self.recency.lock().unwrap();
+        if recency.is_empty() {
+            return;
+        }
+        let now = now_ms();
+        for c in out.iter_mut() {
+            let b = recency.tier(&c.text, now);
+            if b > 0 {
+                let a = c.raw_score;
+                c.raw_score = (1.0 - a) * (a + b as f64) / 8.0 + a;
+            }
+        }
     }
 
     /// Merge `words` into the user word layer(大小写不敏感去重:小写为键,
@@ -606,6 +648,9 @@ impl CandidateFamily for EnglishFamily {
             &mut out,
         );
 
+        // ── E2:近期使用加权(排序前;刚提交过的词浮上来)──
+        self.apply_recency(&mut out);
+
         out.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap());
         out.truncate(PREFILTER_TAKE);
         out
@@ -671,6 +716,44 @@ mod tests {
         let path = std::env::temp_dir().join(format!("en_test_{}_{tag}.tsv", std::process::id()));
         std::fs::write(&path, content).unwrap();
         path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn english_recency_lifts_recently_committed_word() {
+        // E2:刚提交过的词在候选里获得 recency 合成(z = (1-a)(a+b)/8 + a,
+        // 天然 <1 不顶满);关闭上下文感知后 boost 消失。
+        let fam = EnglishFamily::with_default_dict();
+        let base = fam.predict("prese");
+        let p_base = base.iter().find(|c| c.text == "present").expect("present in dict");
+        let a = p_base.raw_score;
+        assert!(a > 0.0 && a < 1.0);
+
+        fam.record_commit("present");
+        let ctx = fam.predict("prese");
+        let p_ctx = ctx.iter().find(|c| c.text == "present").unwrap();
+        assert!(
+            p_ctx.raw_score > a,
+            "recency lifts: {} → {}",
+            a, p_ctx.raw_score
+        );
+        assert!(p_ctx.raw_score < 1.0, "z < 1(不顶满): {}", p_ctx.raw_score);
+
+        // 排序影响:present 与 presented(同 band 同长度)base 时相邻,
+        // recency 后 present 应压过它。
+        let pr_base = base.iter().find(|c| c.text == "presented").unwrap().raw_score;
+        let pr_ctx = ctx.iter().find(|c| c.text == "presented").unwrap().raw_score;
+        assert!(a >= pr_base, "短词 base 更高: {} vs {}", a, pr_base);
+        assert!(
+            p_ctx.raw_score > pr_ctx,
+            "recent word outranks peer: {} vs {}",
+            p_ctx.raw_score, pr_ctx
+        );
+
+        // gate:context_aware 关闭 → 无 boost。
+        fam.set_context_aware(false);
+        let off = fam.predict("prese");
+        let p_off = off.iter().find(|c| c.text == "present").unwrap();
+        assert!((p_off.raw_score - a).abs() < 1e-9, "gate off: {}", p_off.raw_score);
     }
 
     #[test]

@@ -130,3 +130,13 @@ exact 固定 0.88 不看词频:the/and 与低频词同权(同输入只有一个 
   - 标定注记:嵌入语料 (今天,天气)=0(无此对),(非常,好)≈35k,
     (我,们)/(的,时候)=50k 封顶 —— 常见对普遍在 15k~50k 区间
   - 测试:ime-core 154+21+2、swift-ime 7+10+15 全绿
+- **E2 ✅** 英文 recency 落地:
+  - `EnglishFamily` 加 `recency: RecentStore`(复用拼音侧结构,进程内不持久化)
+    + `apply_recency`(与拼音 Layer 1 同公式 z=(1-a)(a+b)/8+a)
+  - dispatcher `record_commit(word, family)` 按提交家族分派(原硬编码只喂拼音);
+    engine 两处提交点(key_ctx/select_ctx)读 `sm.last_commit_family` 传入
+  - `input.context_aware` 现在统一 gate 两家(english 加 context_aware + setter)
+  - now_ms 上移 family/mod.rs 共享;recency 模块转 pub
+  - 断言 `english_recency_lifts_recently_committed_word`:present 提交后
+    "prese" 候选里反超同 band 同长度的 presented,gate 关闭还原
+  - 测试:ime-core 155+21+2 全绿

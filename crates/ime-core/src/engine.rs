@@ -284,10 +284,12 @@ impl ImeEngine {
         self.dispatcher.set_family_enabled(name, on);
     }
 
-    /// 临时关闭/恢复 pinyin 家族的上下文感知(swift-ime.yaml → input.context_aware)。
-    /// 关闭后 recency / 整词联想加成全部跳过,候选排序纯频率驱动。
+    /// 临时关闭/恢复上下文感知(swift-ime.yaml → input.context_aware)。
+    /// 同时作用于两个家族:拼音的 recency/整词联想/bigram,英文的 recency。
+    /// 关闭后候选排序纯频率驱动。
     pub fn set_context_aware(&mut self, on: bool) {
         self.dispatcher.set_pinyin_context_aware(on);
+        self.dispatcher.set_english_context_aware(on);
     }
 
     /// 候选每页条数(默认 7)。frontend 启动时调用(swift-ime.yaml → input.page_size)。
@@ -329,8 +331,9 @@ impl ImeEngine {
             // FIXME: 这个业务逻辑应该放在 route 内部, 放的位置太靠外了
             if !committed.is_empty() {
                 pc.text_context.update(committed);
-                // Record bigram: prev_word → committed_word (both SQLite + in-memory).
-                self.dispatcher.record_commit(committed);
+                // Record bigram / recency(E2:按提交家族分派到对应家族表)。
+                let commit_family = pc.sm.last_commit_family;
+                self.dispatcher.record_commit(committed, commit_family);
                 // `#del` 的 del_len 选项用:记录本次提交的字符数。
                 self.record_last_commit_len(committed);
                 // 提交来源是英文候选 → 已是在词典中的词,不学成自生词
@@ -367,7 +370,9 @@ impl ImeEngine {
             let committed = ImeView::str_field(&view.commit_text);
             if !committed.is_empty() {
                 pc.text_context.update(committed);
-                self.dispatcher.record_commit(committed);
+                // E2:按提交家族分派 recency 记录。
+                let commit_family = pc.sm.last_commit_family;
+                self.dispatcher.record_commit(committed, commit_family);
                 // `#del` 的 del_len 选项用:记录本次提交的字符数。
                 self.record_last_commit_len(committed);
                 // 英文候选提交 → 不学成自生词(空格/数字提交的陈旧 bug)。
