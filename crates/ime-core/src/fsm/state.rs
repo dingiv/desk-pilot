@@ -67,12 +67,8 @@ pub struct StateMachine {
     /// Cursor byte offset within preedit.
     pub cursor: usize,
 
-    /// 候选项管理
-    pub candidates: Vec<String>,
-    pub candidates_fresh: bool,
-    pub candidate_highlight: usize,
-    pub candidate_page: usize,
-    pub candidate_page_size: usize,
+    /// 候选面板(S4 下沉):items/meta/partial 同源同序 + 高亮/分页。
+    pub panel: CandidatePanel,
 
     /// **pinyin 家族**
     /// 自生词系统
@@ -80,13 +76,8 @@ pub struct StateMachine {
     pub committed_text: String,
     /// Pinyin corresponding to the committed hanzi (e.g. "lizheng").
     committed_pinyin_buf: String,
-    /// How many of the first candidates are full-word compositions
-    /// (for backward compat and UI display offset).
-    pub full_comp_count: usize,
     /// postprocess → query_pinyin 的带出槽(stage3 内部中间值,非持久状态)。
     pending_full_comp_count: usize,
-    /// Indices in `candidates` that are single-char partial-commit options.
-    partial_commit_indices: Vec<bool>,
     /// Short-term input context — accumulates recently committed text.
     pub context: crate::family::InputContext,
     /// 补全提示(输入是某命令触发串的严格前缀):候选 = [补全名…, rollback]。
@@ -102,9 +93,7 @@ pub struct StateMachine {
     /// 数字键是否用于选中候选(精确无参 / 前缀时 true;拼参数时 false)。
     magic_selectable: bool,
 
-    /// 最近一次排名的详细结果(score, family, source)——与 candidates 对齐,
-    /// 供 fill_view 填充 meta。
-    last_meta: Vec<CandMeta>,
+
 
     /// 最近一次提交的候选家族(select 时从候选元数据取)。引擎提交点据此
     /// 判断:提交的是英文候选(来源 english)则不再学成自生词。
@@ -122,6 +111,30 @@ pub(crate) struct CandMeta {
     pub source: &'static str,
 }
 
+/// 候选面板(S4 状态下沉):items/meta/partial 三列表同源同序
+/// (PanelItem 单点派生),加高亮/分页/窗口配置 —— 面板展示的全部状态
+/// 内聚一处;fill_view 的滑动窗口、move_highlight/change_page、select 的
+/// 全局序判定都是面板行为。
+#[derive(Debug, Default)]
+pub(crate) struct CandidatePanel {
+    /// 全量候选(merged;view 装其滑动窗口)。
+    pub items: Vec<String>,
+    /// 与 items 同序的元数据(fill_view meta / select 家族判定)。
+    pub meta: Vec<CandMeta>,
+    /// 与 items 同序的部分提交标记(造词单字区,">")。
+    pub partial: Vec<bool>,
+    /// 词头数(UI 显示偏移兼容)。
+    pub full_comp_count: usize,
+    /// 全局高亮(merged 序)。
+    pub highlight: usize,
+    /// 当前页(0-based;highlight 推导或翻页键设置)。
+    pub page: usize,
+    /// 每页条数(yaml page_size 构造注入)。
+    pub page_size: usize,
+    /// 候选是否与 buffer 同步(缓存标记)。
+    pub fresh: bool,
+}
+
 /// Stage 3 后处理的产出项:候选文本 + 元数据 + 部分提交标记,三者同源。
 /// candidates / last_meta / partial_commit_indices 三个列表由此单点派生
 /// (S2 规范化:消除重排后独立数组间的对齐假设)。
@@ -135,7 +148,7 @@ pub(crate) struct PanelItem {
 impl StateMachine {
     /// 最近一次排名的候选元数据(含文本,engine.view 的调试视图用)。
     pub(crate) fn last_meta(&self) -> &[CandMeta] {
-        &self.last_meta
+        &self.panel.meta
     }
 
     /// 取走并清空最近一次提交的候选家族(one-shot,引擎提交点读后置空,
@@ -147,7 +160,7 @@ impl StateMachine {
     /// 面板镜像(S3 统一):last_meta → RankedCandidate,与 candidates
     /// 同序同源 —— 用户看见什么,这里就是什么。
     pub(crate) fn detailed(&self) -> Vec<crate::family::RankedCandidate> {
-        self.last_meta
+        self.panel.meta
             .iter()
             .map(|m| crate::family::RankedCandidate {
                 text: m.text.clone(),
@@ -166,8 +179,9 @@ impl std::fmt::Debug for StateMachine {
             .field("buffer", &self.buffer)
             .field("preedit", &self.preedit)
             .field("cursor", &self.cursor)
-            .field("candidates", &self.candidates)
-            .field("candidate_highlight", &self.candidate_highlight)
+            .field("panel.items", &self.panel.items)
+            .field("panel.highlight", &self.panel.highlight)
+            .field("panel.page", &self.panel.page)
             .field(
                 "active_command",
                 &self.active_command.as_ref().map(|m| m.name()),
@@ -186,7 +200,10 @@ impl StateMachine {
     /// [`ImeEngine::set_page_size`](crate::engine::ImeEngine::set_page_size).
     pub fn with_page_size(page_size: u32) -> Self {
         StateMachine {
-            candidate_page_size: page_size.max(1) as usize,
+            panel: CandidatePanel {
+                page_size: page_size.max(1) as usize,
+                ..CandidatePanel::default()
+            },
             ..StateMachine::default()
         }
     }
@@ -580,12 +597,12 @@ impl StateMachine {
         if !is_submit {
             cands.push(self.buffer.clone()); // rollback — 最后一项
         }
-        self.candidates = cands;
-        self.candidates_fresh = true;
-        self.candidate_highlight = 0;
-        self.candidate_page = 0;
-        self.full_comp_count = self.candidates.len();
-        self.partial_commit_indices = vec![false; self.candidates.len()];
+        self.panel.items = cands;
+        self.panel.fresh = true;
+        self.panel.highlight = 0;
+        self.panel.page = 0;
+        self.panel.full_comp_count = self.panel.items.len();
+        self.panel.partial = vec![false; self.panel.items.len()];
         if let Some(head) = self.magic_predictions.first() {
             // preedit 用选项独立的预览文本(默认=展示文本)—— 允许候选行展示
             // 精简结果、文本框给完整预览。
@@ -727,16 +744,12 @@ impl StateMachine {
     /// character to [`committed_text`], shrinks the buffer by one syllable,
     /// and re-queries. The character pick is also recorded in L0.
     pub fn select(&mut self, index: usize, env: &dyn StepEnv) -> ImeView {
-        let picked = self.candidates.get(index).cloned().unwrap_or_default();
+        let picked = self.panel.items.get(index).cloned().unwrap_or_default();
         if picked.is_empty() {
             return self.make_view();
         }
 
-        let is_partial = self
-            .partial_commit_indices
-            .get(index)
-            .copied()
-            .unwrap_or(false);
+        let is_partial = self.panel.partial.get(index).copied().unwrap_or(false);
         if !is_partial {
             // Full commit: combine committed_text + selected text. 英文候选按
             // 键入的原始大小写回填(raw_buffer),汉字候选天然 no-op。
@@ -754,7 +767,8 @@ impl StateMachine {
             // 提交候选的来源家族 —— 两个家族的单词本各自闭环:
             // 拼音提交 → 拼音 L0/单词本;英文提交 → 英文家族(且词典词不学)。
             let commit_family = self
-                .last_meta
+                .panel
+                .meta
                 .iter()
                 .find(|m| m.text == picked)
                 .map(|m| m.family);
@@ -790,8 +804,8 @@ impl StateMachine {
             }
             self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
             self.cursor = self.preedit.len();
-            self.candidates_fresh = false;
-            self.candidate_highlight = 0;
+            self.panel.fresh = false;
+            self.panel.highlight = 0;
             self.query_pinyin(env)
         }
     }
@@ -803,14 +817,14 @@ impl StateMachine {
         self.raw_buffer.clear();
         self.preedit.clear();
         self.cursor = 0;
-        self.candidates.clear();
-        self.candidate_highlight = 0;
-        self.candidate_page = 0;
-        self.candidates_fresh = false;
+        self.panel.items.clear();
+        self.panel.highlight = 0;
+        self.panel.page = 0;
+        self.panel.fresh = false;
         self.committed_text.clear();
         self.committed_pinyin_buf.clear();
-        self.full_comp_count = 0;
-        self.partial_commit_indices.clear();
+        self.panel.full_comp_count = 0;
+        self.panel.partial.clear();
         self.magic_hints.clear();
         self.magic_predictions.clear();
         self.magic_selectable = false;
@@ -822,19 +836,19 @@ impl StateMachine {
     /// Is the candidate panel OPEN (non-empty candidate list)? Navigation/paging special keys
     /// only act while it's open; when closed they pass through to the application.
     pub fn candidate_panel_open(&self) -> bool {
-        !self.candidates.is_empty()
+        !self.panel.items.is_empty()
     }
 
     pub fn move_highlight(&mut self, delta: i32) {
-        if self.candidates.is_empty() {
+        if self.panel.items.is_empty() {
             return;
         }
-        let new = (self.candidate_highlight as i32 + delta)
-            .clamp(0, self.candidates.len() as i32 - 1) as usize;
-        self.candidate_highlight = new;
-        if self.candidate_page_size > 0 {
-            self.candidate_page = (new as u32)
-                .checked_div(self.candidate_page_size as u32)
+        let new = (self.panel.highlight as i32 + delta)
+            .clamp(0, self.panel.items.len() as i32 - 1) as usize;
+        self.panel.highlight = new;
+        if self.panel.page_size > 0 {
+            self.panel.page = (new as u32)
+                .checked_div(self.panel.page_size as u32)
                 .unwrap_or(0) as usize;
         }
         // 魔法命令预测:应用高亮(将提交)跟随高亮移动。
@@ -848,7 +862,7 @@ impl StateMachine {
         if self.state != ComposeState::Snippet || self.magic_predictions.is_empty() {
             return;
         }
-        let hl = self.candidate_highlight;
+        let hl = self.panel.highlight;
         if let Some(p) = self.magic_predictions.get(hl) {
             self.preedit = p.text.clone();
         } else {
@@ -898,28 +912,28 @@ impl StateMachine {
         // merged 全量候选(如造词单字区 15+ 个、全量链)翻页全部可达。
         // view.candidate_highlight 同步换算成窗口内序(addon 直接用作列表
         // 光标);candidate_page 仍是页号(addon 据此算选词的全局序)。
-        let page_size = self.candidate_page_size.max(1);
-        let start = (self.candidate_page * page_size).min(self.candidates.len());
-        let window = &self.candidates[start.min(self.candidates.len())..];
+        let page_size = self.panel.page_size.max(1);
+        let start = (self.panel.page * page_size).min(self.panel.items.len());
+        let window = &self.panel.items[start.min(self.panel.items.len())..];
         let n = window.len().min(CANDIDATE_SLOTS);
         for i in 0..n {
             ImeView::set_str(&mut view.candidates[i].text, &window[i]);
             // Mark single-char partial-commit candidates with ">" label.
-            if self.partial_commit_indices.get(start + i).copied().unwrap_or(false) {
+            if self.panel.partial.get(start + i).copied().unwrap_or(false) {
                 ImeView::set_str(&mut view.candidates[i].label, ">");
             }
             // 调试模式:候选词后附提供者与权重。
             if self.candidate_meta_enabled {
-                if let Some(m) = self.last_meta.get(start + i) {
+                if let Some(m) = self.panel.meta.get(start + i) {
                     let meta = format!("[{:.3} {}/{}]", m.score, m.family, m.source);
                     ImeView::set_str(&mut view.candidates[i].meta, &meta);
                 }
             }
         }
         view.candidate_count = n as u32;
-        view.candidate_highlight = self.candidate_highlight.saturating_sub(start) as u32;
-        view.candidate_page = self.candidate_page as u32;
-        view.candidate_page_size = self.candidate_page_size as u32;
+        view.candidate_highlight = self.panel.highlight.saturating_sub(start) as u32;
+        view.candidate_page = self.panel.page as u32;
+        view.candidate_page_size = self.panel.page_size as u32;
         // aux_up(候选框顶部)= **原始输入**(你打了什么),与 preedit_text(应用
         // 高亮,将提交的合成结果)严格区分。命令态显示 `#asr`,拼音态显示
         // 正在打的拼音(raw_buffer,保留大小写)。
@@ -995,7 +1009,7 @@ impl StateMachine {
             self.raw_buffer.push(ch);
             self.preedit = self.raw_buffer.clone();
             self.cursor = self.preedit.len();
-            self.candidates_fresh = false;
+            self.panel.fresh = false;
             return self.query_pinyin(env);
         }
         Self::passthrough_view()
@@ -1030,8 +1044,8 @@ impl StateMachine {
         // Space: commit the highlighted candidate.
         if ch == ' ' {
             let hl = self
-                .candidate_highlight
-                .min(self.candidates.len().saturating_sub(1));
+                .panel.highlight
+                .min(self.panel.items.len().saturating_sub(1));
             return self.select_magic(hl, env);
         }
 
@@ -1039,7 +1053,7 @@ impl StateMachine {
         if let d @ '1'..='9' = ch {
             if self.magic_selectable {
                 let idx = (d as u8 - b'1') as usize;
-                if idx < self.candidates.len() {
+                if idx < self.panel.items.len() {
                     return self.select_magic(idx, env);
                 }
             }
@@ -1077,7 +1091,7 @@ impl StateMachine {
                 self.raw_buffer.push('\'');
                 self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
                 self.cursor = self.preedit.len();
-                self.candidates_fresh = false;
+                self.panel.fresh = false;
                 self.query_pinyin(env)
             }
             // 链式命令:`'#` 序列开启命令链(X'#translate)。`#` 不终结组合、
@@ -1089,7 +1103,7 @@ impl StateMachine {
                 self.state = ComposeState::Snippet;
                 self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
                 self.cursor = self.preedit.len();
-                self.candidates_fresh = false;
+                self.panel.fresh = false;
                 self.query_magic(env)
             }
             c if c.is_ascii_alphabetic() => {
@@ -1097,7 +1111,7 @@ impl StateMachine {
                 self.raw_buffer.push(c);
                 self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
                 self.cursor = self.preedit.len();
-                self.candidates_fresh = false;
+                self.panel.fresh = false;
                 self.query_pinyin(env)
             }
             c => self.pinyin_terminator(c),
@@ -1113,19 +1127,19 @@ impl StateMachine {
         // 三列表同源同序落位 —— fill_view 的窗口偏移 / select 的家族判定 /
         // ">" 部分提交标记全从同一 PanelItem 序列出发,不再有独立数组间的
         // 对齐假设(修复:meta 采样曾在重排前,last_meta 与 candidates 错位)。
-        self.full_comp_count = self.pending_full_comp_count;
-        self.candidates = items.iter().map(|i| i.text.clone()).collect();
-        self.partial_commit_indices = items.iter().map(|i| i.partial).collect();
-        self.last_meta = items.iter().map(|i| i.meta.clone()).collect();
+        self.panel.full_comp_count = self.pending_full_comp_count;
+        self.panel.items = items.iter().map(|i| i.text.clone()).collect();
+        self.panel.partial = items.iter().map(|i| i.partial).collect();
+        self.panel.meta = items.iter().map(|i| i.meta.clone()).collect();
 
-        let cands = self.candidates.clone();
+        let cands = self.panel.items.clone();
         if !cands.is_empty() {
-            self.candidate_highlight = 0;
-            self.candidate_page = 0;
-            self.candidates_fresh = true;
+            self.panel.highlight = 0;
+            self.panel.page = 0;
+            self.panel.fresh = true;
         } else {
-            self.candidates.clear();
-            self.candidates_fresh = false;
+            self.panel.items.clear();
+            self.panel.fresh = false;
         }
         self.make_view()
     }
@@ -1228,7 +1242,7 @@ impl StateMachine {
             }
             self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
             self.cursor = self.preedit.len();
-            self.candidates_fresh = false;
+            self.panel.fresh = false;
             return self.query_pinyin(env);
         }
 
@@ -1236,7 +1250,7 @@ impl StateMachine {
         self.raw_buffer.pop();
         self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
         self.cursor = self.preedit.len();
-        self.candidates_fresh = false;
+        self.panel.fresh = false;
         if self.buffer.is_empty() {
             self.reset();
             ImeView::empty()
@@ -1259,40 +1273,40 @@ impl StateMachine {
     }
 
     fn pinyin_space(&mut self, env: &dyn StepEnv) -> ImeView {
-        if !self.candidates_fresh {
+        if !self.panel.fresh {
             // No candidates — commit raw (committed_text + raw_buffer)。
             let committed = std::mem::take(&mut self.committed_text);
             let raw = std::mem::take(&mut self.raw_buffer);
             let _ = std::mem::take(&mut self.buffer);
-            self.candidates.clear();
+            self.panel.items.clear();
             self.state = ComposeState::Idle;
             let text = if committed.is_empty() {
                 raw
             } else {
                 format!("{committed}{raw}")
             };
-            self.candidates_fresh = false;
+            self.panel.fresh = false;
             return Self::commit_view(&text);
         }
 
         // Fresh candidates: commit the highlighted one.
         let idx = self
-            .candidate_highlight
-            .min(self.candidates.len().saturating_sub(1));
+            .panel.highlight
+            .min(self.panel.items.len().saturating_sub(1));
         // Delegate to select() — it handles full vs partial commit correctly.
-        self.candidates_fresh = false;
+        self.panel.fresh = false;
         self.select(idx, env)
     }
 
     fn pinyin_terminator(&mut self, ch: char) -> ImeView {
-        let fresh = self.candidates_fresh;
-        let top = self.candidates.first().cloned();
+        let fresh = self.panel.fresh;
+        let top = self.panel.items.first().cloned();
         let committed = std::mem::take(&mut self.committed_text);
         let raw = std::mem::take(&mut self.raw_buffer);
         let _ = std::mem::take(&mut self.buffer);
-        self.candidates_fresh = false;
+        self.panel.fresh = false;
         self.state = ComposeState::Idle;
-        self.candidates.clear();
+        self.panel.items.clear();
 
         let prefix = if committed.is_empty() {
             String::new()

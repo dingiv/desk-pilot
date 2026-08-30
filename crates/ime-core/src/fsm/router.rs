@@ -356,9 +356,9 @@ impl StateMachineTable {
             //    不是全列表第一项);否则透传(idle 的裸数字属于应用)。
             KeyKind::Digit(n) => {
                 if flags.contains(StateFlags::PANEL_OPEN) {
-                    let base = sm.candidate_page.saturating_mul(sm.candidate_page_size);
+                    let base = sm.panel.page.saturating_mul(sm.panel.page_size);
                     let idx = base + (n - 1) as usize;
-                    if idx < sm.candidates.len() {
+                    if idx < sm.panel.items.len() {
                         sm.select(idx, env)
                     } else {
                         StateMachine::passthrough_view()
@@ -475,7 +475,7 @@ impl StateMachine {
         if self.state != ComposeState::Idle || !self.buffer.is_empty() {
             f |= StateFlags::COMPOSING;
         }
-        if !self.candidates.is_empty() {
+        if !self.panel.items.is_empty() {
             f |= StateFlags::PANEL_OPEN;
         }
         match self.state {
@@ -499,19 +499,19 @@ impl StateMachine {
 
     /// Change page by delta.
     pub fn change_page(&mut self, delta: i32) {
-        let n = self.candidates.len();
-        if n == 0 || self.candidate_page_size == 0 {
+        let n = self.panel.items.len();
+        if n == 0 || self.panel.page_size == 0 {
             return;
         }
-        let total_pages = n.div_ceil(self.candidate_page_size);
+        let total_pages = n.div_ceil(self.panel.page_size);
         if total_pages <= 1 {
             return;
         }
         let new_page =
-            (self.candidate_page as i32 + delta).clamp(0, total_pages as i32 - 1) as usize;
-        if new_page != self.candidate_page {
-            self.candidate_page = new_page;
-            self.candidate_highlight = new_page * self.candidate_page_size;
+            (self.panel.page as i32 + delta).clamp(0, total_pages as i32 - 1) as usize;
+        if new_page != self.panel.page {
+            self.panel.page = new_page;
+            self.panel.highlight = new_page * self.panel.page_size;
             self.sync_magic_preedit();
         }
     }

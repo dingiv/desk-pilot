@@ -304,7 +304,7 @@ impl ImeEngine {
         }
         self.page_size = page_size;
         for pc in self.contexts.lock().unwrap().values_mut() {
-            pc.sm.candidate_page_size = page_size as usize;
+            pc.sm.panel.page_size = page_size as usize;
         }
     }
 
@@ -415,7 +415,8 @@ impl ImeEngine {
         // 候选(英文按键入大小写回填)优先,否则提交原始输入 raw_buffer。
         let text = pc
             .sm
-            .candidates
+            .panel
+            .items
             .first()
             .map(|c| crate::fsm::state::apply_input_casing(c, &pc.sm.raw_buffer))
             .unwrap_or_else(|| pc.sm.raw_buffer.clone());
@@ -458,15 +459,15 @@ impl ImeEngine {
             .get(&DEFAULT_CTX)
             .map(|pc| {
                 let mut v = ImeView::empty();
-                v.candidate_count = pc.sm.candidates.len().min(16) as u32;
-                v.candidate_highlight = pc.sm.candidate_highlight as u32;
-                v.candidate_page = pc.sm.candidate_page as u32;
-                v.candidate_page_size = pc.sm.candidate_page_size as u32;
-                for (i, c) in pc.sm.candidates.iter().take(16).enumerate() {
+                v.candidate_count = pc.sm.panel.items.len().min(16) as u32;
+                v.candidate_highlight = pc.sm.panel.highlight as u32;
+                v.candidate_page = pc.sm.panel.page as u32;
+                v.candidate_page_size = pc.sm.panel.page_size as u32;
+                for (i, c) in pc.sm.panel.items.iter().take(16).enumerate() {
                     ImeView::set_str(&mut v.candidates[i].text, c);
                     // 调试模式:meta 与 fill_view 对齐。
                     if pc.sm.candidate_meta_enabled {
-                        if let Some(m) = pc.sm.last_meta().get(i) {
+                        if let Some(m) = pc.sm.panel.meta.get(i) {
                             ImeView::set_str(
                                 &mut v.candidates[i].meta,
                                 &format!("[{:.3} {}/{}]", m.score, m.family, m.source),
@@ -497,7 +498,7 @@ impl ImeEngine {
             .lock()
             .unwrap()
             .get(&DEFAULT_CTX)
-            .map(|pc| pc.sm.candidates.clone())
+            .map(|pc| pc.sm.panel.items.clone())
             .unwrap_or_default()
     }
 
@@ -508,7 +509,7 @@ impl ImeEngine {
             .lock()
             .unwrap()
             .get(&DEFAULT_CTX)
-            .map(|pc| pc.sm.last_meta().to_vec())
+            .map(|pc| pc.sm.panel.meta.to_vec())
             .unwrap_or_default()
     }
 
@@ -523,7 +524,7 @@ impl ImeEngine {
         };
         // Snippet state (命令组合):candidates 来自命令预测 / 补全,不是 scorer。
         // 直接返回,让 #asr 语音 / #date 日期 / 补全提示正确显示。
-        if pc.sm.state == crate::fsm::state::ComposeState::Snippet && pc.sm.candidates_fresh {
+        if pc.sm.state == crate::fsm::state::ComposeState::Snippet && pc.sm.panel.fresh {
             let family: &'static str = pc
                 .sm
                 .active_command
@@ -538,7 +539,8 @@ impl ImeEngine {
                 .unwrap_or("magic");
             return pc
                 .sm
-                .candidates
+                .panel
+                .items
                 .iter()
                 .map(|c| crate::family::RankedCandidate {
                     text: c.clone(),
