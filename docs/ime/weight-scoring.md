@@ -48,7 +48,7 @@ freq_to_score(f) = log₂(f+1) / log₂(max_freq+1)   clamp [0.25, 1.0]
 | `lattice_jp` | 纯简拼(nh→你好) | freq 分 × `jianpin`(0.50) |
 | `lattice_prefix` | **前缀联想**(naozh→闹钟) | freq 分 × `prefix_lookup`(0.75) × 距离衰减 |
 | `single` | 单音节(de→的) | **`large_dict` 为基础分**,按位衰减 × `single_syl_decay`(注意:`large_dict` 不是死参数——它正是单字候选的基础分) |
-| `decomp` | Viterbi 造词兜底 | 0.40 |
+| `decomp` | Viterbi 造词兜底 | `viterbi_base`(0.40)+ `viterbi_scale`(0.05)× norm(路径分/组内最高分),带 [0.40, 0.45](E4 激活,原平分 0.40) |
 
 ### 跨提交 bigram 联想(E1,round7)
 

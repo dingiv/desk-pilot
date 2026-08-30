@@ -61,7 +61,9 @@ pub struct PinyinWeights {
     // ── Member base scores ──
     pub phrase_book: f64,
     pub large_dict: f64,
+    /// decomp(Viterbi 造词)基础分(E4 激活:原写死 0.4)。
     pub viterbi_base: f64,
+    /// decomp 组内区分幅度:raw = base + scale × (路径分/组内最高分)。
     pub viterbi_scale: f64,
     pub jianpin: f64,
     /// 全拼前缀联想折扣(naozh → naozhong 闹钟)。
@@ -95,8 +97,8 @@ impl Default for PinyinWeights {
         PinyinWeights {
             phrase_book: 0.88,
             large_dict: 0.85,
-            viterbi_base: 0.25,
-            viterbi_scale: 0.55,
+            viterbi_base: 0.40,
+            viterbi_scale: 0.05,
             jianpin: 0.50,
             prefix_lookup: 0.75,
             bigram_weight: 1.0,
@@ -587,14 +589,25 @@ impl PinyinFamily {
             drop(lattice_guard);
 
             // Viterbi decomposition — always runs as fallback (造词).
+            // E4:激活 viterbi_base/scale —— raw = base + scale × norm,
+            // norm = 路径累计分 / 组内最高分。base 0.40 保持旧锚点位置
+            // (lattice 之下、emoji 前缀附近),scale 给组内区分幅度:
+            // "下一个"(Viterbi 高分路径)与瞎拆显式排开,不再靠 stable
+            // sort 透传内部顺序。
             let comps = dict.top_k_compositions(input, self.weights.viterbi_take);
-            for (_s, word) in comps.iter().take(16) {
+            let top_score = comps.first().map(|(s, _)| *s).unwrap_or(0.0);
+            for (s, word) in comps.iter().take(16) {
                 if !out.iter().any(|c| c.text == *word) {
+                    let norm = if top_score > 0.0 {
+                        (s / top_score).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
                     out.push(ScoredCandidate {
                         text: word.clone(),
                         family: "pinyin",
                         source: "decomp",
-                        raw_score: 0.4,
+                        raw_score: self.weights.viterbi_base + self.weights.viterbi_scale * norm,
                     });
                 }
             }
@@ -889,6 +902,32 @@ impl CandidateFamily for Arc<PinyinFamily> {
 }
 
 #[cfg(test)]
+
+    #[test]
+    fn viterbi_weights_differentiate_decomp_candidates() {
+        // E4:decomp 不再平分 0.4 —— raw = viterbi_base + viterbi_scale ×
+        // norm(路径分/组内最高分),默认带 [0.40, 0.45]:组内最高分路径
+        // (真正的"下一个")得顶,瞎拆沉底,排序显式化。
+        use crate::family::CandidateFamily;
+        let fam = PinyinFamily::new();
+        // 嵌入词典对 tianqi 无 lattice 词条(见 E1 标定)→ 候选全为 decomp。
+        let cands = fam.predict("tianqi");
+        let mut ds: Vec<f64> = cands
+            .iter()
+            .filter(|c| c.source == "decomp")
+            .map(|c| c.raw_score)
+            .collect();
+        assert!(ds.len() >= 2, "decomp candidates present: {}", ds.len());
+        ds.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        let (mx, mn) = (ds[0], *ds.last().unwrap());
+        assert!(mx > mn, "组内有区分: max={} min={}", mx, mn);
+        assert!(
+            mn >= 0.40 - 1e-9 && mx <= 0.45 + 1e-9,
+            "默认带 [0.40, 0.45]: [{}, {}]",
+            mn, mx
+        );
+    }
+
 mod tests {
 
     #[test]

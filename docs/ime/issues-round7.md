@@ -140,3 +140,10 @@ exact 固定 0.88 不看词频:the/and 与低频词同权(同输入只有一个 
   - 断言 `english_recency_lifts_recently_committed_word`:present 提交后
     "prese" 候选里反超同 band 同长度的 presented,gate 关闭还原
   - 测试:ime-core 155+21+2 全绿
+- **E4 ✅** Viterbi 死权重激活:
+  - decomp `raw = viterbi_base + viterbi_scale × norm`,norm = 路径累计分/
+    组内最高分;默认 base 0.40(旧 0.4 锚点)+ scale 0.05 → 带 [0.40, 0.45]
+  - 语义:viterbi_base = 造词基础分(原写死),viterbi_scale = 组内区分幅度
+    (原 0.25/0.55 的 [0.25,0.80] 设计带会越级 english exact 合成分,弃用)
+  - yaml 默认同步;断言 `viterbi_weights_differentiate_decomp_candidates`
+  - 测试:ime-core 156+21+2 全绿

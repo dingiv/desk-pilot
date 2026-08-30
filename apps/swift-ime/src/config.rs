@@ -187,8 +187,8 @@ impl Default for FreqScaleConfig {
 pub struct PinyinWeightConfig {
     #[serde(default = "default_0_88")] pub phrase_book: f64,
     #[serde(default = "default_0_85")] pub large_dict: f64,
-    #[serde(default = "default_0_25")] pub viterbi_base: f64,
-    #[serde(default = "default_0_55")] pub viterbi_scale: f64,
+    #[serde(default = "default_0_40")] pub viterbi_base: f64,
+    #[serde(default = "default_0_05")] pub viterbi_scale: f64,
     #[serde(default = "default_0_5")] pub jianpin: f64,
     #[serde(default = "default_0_75")] pub prefix_lookup: f64,
     #[serde(default = "default_1_0")] pub bigram_weight: f64,
@@ -275,6 +275,7 @@ fn default_0_7() -> f64 { 0.7 }
 fn default_0_02() -> f64 { 0.02 }
 fn default_0_95() -> f64 { 0.95 }
 fn default_0_25() -> f64 { 0.25 }
+fn default_0_40() -> f64 { 0.40 }
 fn default_0_6() -> f64 { 0.6 }
 fn default_0_75() -> f64 { 0.75 }
 fn default_0_12() -> f64 { 0.12 }
@@ -291,7 +292,7 @@ impl Default for WeightsConfig {
         WeightsConfig {
             family_priority: FamilyPriorityConfig::default(),
             pinyin: PinyinWeightConfig {
-                phrase_book: 0.88, large_dict: 0.85, viterbi_base: 0.25, viterbi_scale: 0.55,
+                phrase_book: 0.88, large_dict: 0.85, viterbi_base: 0.40, viterbi_scale: 0.05,
                 jianpin: 0.50, prefix_lookup: 0.75, bigram_weight: 1.0, single_syl_decay: 0.5, context_boost: 0.12,
                 stopword_penalty: 0.5, confirm_bonus: 0.05, short_word_bonus: 0.01,
                 phrase_base: 0.7, phrase_step: 0.02, phrase_initials_ratio: 0.95,
