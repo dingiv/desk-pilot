@@ -11,7 +11,7 @@ use crate::family::pinyin::PinyinFamily;
 use crate::family::CandidateFamily;
 use crate::family::UnifiedScorer;
 use crate::matcher::Matcher;
-use crate::platform::ImeView;
+use crate::frontend::ImeView;
 use crate::fsm::state::{StateMachine, StepEnv};
 use std::sync::Arc;
 

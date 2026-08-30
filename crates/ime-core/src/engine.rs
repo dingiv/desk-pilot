@@ -31,7 +31,7 @@ use crate::family::magic::{MagicFamily, ReqFetcher};
 use crate::family::InputContext;
 use crate::fsm::router::{StateFlags, StateMachineTable};
 // 统一键事件由输入路由层定义(旧名 InputEvent;构造器同名,测试平移)。
-use crate::platform::ImeView;
+use crate::frontend::ImeView;
 pub use crate::fsm::router::KeyEvent;
 use crate::fsm::state::{StateMachine, StepEnv};
 use crate::store::PersistenceManager;
@@ -319,7 +319,7 @@ impl ImeEngine {
     /// **统一键入口**:所有前端把键(含特殊键与 Ctrl/Shift/Alt 修饰状态)
     /// 忠实地转成 [`KeyEvent`] 喂到这里。输入路由层(状态机表)查表决定
     /// 这枚键属于输入法还是应用,驱动组合状态机迁移,返回带 action 位
-    /// 标志的视图 —— 外界按 [`action`](crate::platform::action) 反应即可,
+    /// 标志的视图 —— 外界按 [`action`](crate::frontend::action) 反应即可,
     /// 不再自行拦截任何键。
     pub fn key_ctx(&self, ctx: usize, key: KeyEvent) -> ImeView {
         self.with_ctx(ctx, |disp, pc| {

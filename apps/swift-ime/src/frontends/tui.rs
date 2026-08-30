@@ -550,7 +550,7 @@ fn key_event_for_token(token: &str) -> Option<KeyEvent> {
 
 /// ImeView → 一行 JSON(swift_cli 的回包)。
 fn view_json(v: &ImeView, history: &[String]) -> serde_json::Value {
-    use ime_core::platform::action;
+    use ime_core::frontend::action;
     let cands: Vec<String> = (0..v.candidate_count as usize)
         .map(|i| ImeView::str_field(&v.candidates[i].text).to_string())
         .collect();

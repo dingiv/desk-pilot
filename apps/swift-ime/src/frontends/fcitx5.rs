@@ -30,7 +30,7 @@ use ime_core::engine::ImeEngine;
 use ime_core::family::magic::expander::{today_str, VariableProvider};
 use ime_core::family::magic::preview_text;
 use ime_core::frontend::{FrontEndHandle, StateView};
-use ime_core::platform::ImeView;
+use ime_core::frontend::ImeView;
 
 // ── 前端句柄:C 回调转发(引擎 I/O 线程 → fcitx 主循环)──────────────────
 

@@ -4,7 +4,7 @@
 //! 修饰状态一律忠实地转成 [`KeyEvent`] 喂进引擎。本模块持有一张状态机表
 //! ([`StateMachineTable`]),表上是若干状态标志位([`StateFlags`])—— 一个
 //! bit 意味着"当前处于某种输入状态"。每个键事件驱动一次状态迁移
-//! ([`StateMachineTable::route`]),返回带 [`action`](crate::platform::action)
+//! ([`StateMachineTable::route`]),返回带 [`action`](crate::frontend::action)
 //! 位标志的 [`ImeView`];外界只按 action 反应:
 //!
 //! - fcitx5:`action & HANDLED == 0` → 不 `filterAndAccept`,键自然到达应用;
@@ -31,7 +31,7 @@
 //! Escape 的门控是 **COMPOSING**(而非面板开合)—— 组合中但无候选时 Esc
 //! 也应取消组合,否则 preedit 会卡在屏上。
 
-use crate::platform::{action, ImeView};
+use crate::frontend::{action, ImeView};
 use crate::state::{ComposeState, StateMachine, StepEnv};
 
 // ── KeyEvent:统一键事件 ─────────────────────────────────────────────────
@@ -523,7 +523,7 @@ impl StateMachine {
 mod tests {
     use super::*;
     use crate::engine::ImeEngine;
-    use crate::platform::action;
+    use crate::frontend::action;
 
     // -- 归一化与 keysym 解码 ------------------------------------------------
 

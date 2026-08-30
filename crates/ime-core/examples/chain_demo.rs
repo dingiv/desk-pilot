@@ -1,6 +1,6 @@
 //! 链式预测演示(整引擎链路):`cargo run -p ime-core --example chain_demo`
 use ime_core::engine::ImeEngine;
-use ime_core::platform::ImeView;
+use ime_core::frontend::ImeView;
 use ime_core::router::KeyEvent;
 
 const RIME_ICE: &str = "/workspaces/gui_agent/desk-pilot/apps/swift-ime/assets/dict/rime-ice.fst";

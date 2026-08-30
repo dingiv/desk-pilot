@@ -34,7 +34,7 @@ use crate::family::magic::{
     ChainContext, MagicCommand, MagicMatch, MagicMember, Prediction,
 };
 use crate::matcher::Matcher;
-use crate::platform::{ImeView, CANDIDATE_SLOTS};
+use crate::frontend::{ImeView, CANDIDATE_SLOTS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ComposeState {
@@ -902,7 +902,7 @@ impl StateMachine {
     pub(crate) fn make_view(&self) -> ImeView {
         let mut v = ImeView::empty();
         self.fill_view(&mut v);
-        v.action = crate::platform::action::HANDLED;
+        v.action = crate::frontend::action::HANDLED;
         v
     }
 
@@ -911,7 +911,7 @@ impl StateMachine {
         let mut v = ImeView::empty();
         ImeView::set_str(&mut v.commit_text, text);
         v.commit_cursor = ImeView::str_field(&v.commit_text).len() as u32;
-        v.action = crate::platform::action::COMMIT | crate::platform::action::HANDLED;
+        v.action = crate::frontend::action::COMMIT | crate::frontend::action::HANDLED;
         v
     }
 
@@ -923,14 +923,14 @@ impl StateMachine {
         ImeView::set_str(&mut v.commit_text, text);
         let len = ImeView::str_field(&v.commit_text).len();
         v.commit_cursor = cursor.min(len) as u32;
-        v.action = crate::platform::action::COMMIT | crate::platform::action::HANDLED;
+        v.action = crate::frontend::action::COMMIT | crate::frontend::action::HANDLED;
         v
     }
 
     /// View that passes the current key through to the application untouched.
     pub(crate) fn passthrough_view() -> ImeView {
         let mut v = ImeView::empty();
-        v.action = crate::platform::action::PASSTHROUGH;
+        v.action = crate::frontend::action::PASSTHROUGH;
         v
     }
 
@@ -939,7 +939,7 @@ impl StateMachine {
         tracing::debug!(count, "delete_view → ImeView.delete_count");
         let mut v = ImeView::empty();
         v.delete_count = count;
-        v.action = crate::platform::action::HANDLED;
+        v.action = crate::frontend::action::HANDLED;
         v
     }
 
