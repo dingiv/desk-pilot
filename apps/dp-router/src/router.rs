@@ -2,19 +2,24 @@
 //!
 //! 路由:
 //!
-//!   POST /v1/chat/completions        → 按请求里 `model` 字段路由本地子进程;未命中转发上游
-//!   GET  /v1/models                   → 本地 + 远程已知模型清单(本地子进程状态就绪后才出现)
-//!   GET  /admin/models                → 在线子进程状态 + 重启次数 + 端口
-//!   POST /admin/models/load           → 控制面:动态加载模型(SDK 主动调用)
+//!   POST /v1/chat/completions        → 按 `model` 字段路由;**未加载 → 按需加载**(spawn + 等就绪)再转发
+//!   POST /v1/audio/transcriptions    → 同上(ASR 模型)
+//!   GET  /v1/models                   → 模型目录 + 已加载模型的并集
+//!   GET  /admin/models                → 目录全集 + 运行时状态(未加载=available)+ 端口/重启次数
+//!   POST /admin/models/load           → 控制面:主动触发加载(SDK `warm()` 用);fire-and-forget 202
 //!   GET  /health                      → dp-router 自身健康
 //!
-//! 动态加载约定:SDK 拿到一个未知的 model 名时,先 GET /admin/models 查状态;
-//! 若不在表中 → POST /admin/models/load {name, ...} 让服务端在 `models_root`
-//! 下找 GGUF 并 spawn 子进程;然后轮询 /admin/models 直到 status=online 再发
-//! /v1/chat/completions。本接口是 fire-and-forget — 立即返 202,实际加载异步进行。
+//! 按需加载语义(2026-08-30 起,启动不预载):
+//!   配置 `models` 是**模型目录**("哪些模型可用"),不是"启动时加载哪些"。
+//!   客户端(经 dp-models SDK 或任意 OpenAI 兼容客户端)首次请求某模型名时,
+//!   数据面 `ensure_online` 触发加载:未加载 → 按目录/`models_root` 解析 GGUF →
+//!   spawn 子进程 → 轮询子进程 /health 直到 online → 转发本次请求。同模型并发
+//!   请求:仅首个真正 spawn(每模型一把加载锁),其余等就绪。加载中的模型对
+//!   /admin/models 显示 starting,对数据面表现为"请求阻塞到就绪"。
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::State;
@@ -28,8 +33,8 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 use crate::config::{
-    resolve_gguf_path, resolve_model_in_root, LocalModelConfig, LocalModelStatus,
-    ModelRuntimeStatus, ModelType, RouterConfig,
+    resolve_gguf_path, resolve_model_in_root, resolve_model_path, LocalModelConfig,
+    LocalModelStatus, ModelRuntimeStatus, ModelType, RouterConfig,
 };
 use crate::process::{LlamaProcess, PortAllocator, ProcessMap};
 use crate::upstream::UpstreamClient;
@@ -40,8 +45,11 @@ pub struct AppState {
     pub processes: ProcessMap,
     pub upstream: Option<UpstreamClient>,
     pub http: reqwest::Client,
-    /// 子进程端口分配器(共享,启动 + 动态加载都从这一份取端口)。
+    /// 子进程端口分配器(共享,动态加载都从这一份取端口)。
     pub port_allocator: Arc<Mutex<PortAllocator>>,
+    /// 每模型一把加载锁(模型名 → 内层 Mutex 单元):同模型并发请求只让首个真正
+    /// spawn,其余等锁后进"双重检查"分支直接复用。
+    pub load_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -94,41 +102,26 @@ async fn chat_completions(
         }
     };
 
-    // 本地命中?
-    let proc = {
-        let map = state.processes.read().await;
-        find_process(&map, &model_name)
-    };
-    if let Some(proc_lock) = proc {
-        return forward_to_local(state.http.clone(), proc_lock, body).await;
-    }
-
-    // 远程 fallback
-    if let Some(up) = &state.upstream {
-        info!("[dp-router] local miss for model={model_name}; forwarding to upstream");
-        return forward_to_upstream(state.clone(), up.clone(), headers, body).await;
-    }
-
-    (StatusCode::NOT_FOUND, format!("model '{model_name}' not loaded")).into_response()
-}
-
-async fn forward_to_local(
-    http: reqwest::Client,
-    proc_lock: Arc<RwLock<LlamaProcess>>,
-    body: axum::body::Bytes,
-) -> Response {
-    // 检查子进程在线?
-    {
-        let proc = proc_lock.read().await;
-        if proc.status != ModelRuntimeStatus::Online {
+    // 本地:按需加载(未加载 → spawn + 等就绪;已加载 → 等健康)→ 转发。
+    match ensure_online(&state, &model_name).await {
+        Ok(port) => return forward_to_local(state.http.clone(), port, body).await,
+        // 未知模型(目录 + models_root 都没有)→ 上游 fallback(若配置了)。
+        Err((StatusCode::NOT_FOUND, _)) => {
+            if let Some(up) = &state.upstream {
+                info!("[dp-router] local miss for model={model_name}; forwarding to upstream");
+                return forward_to_upstream(state.clone(), up.clone(), headers, body).await;
+            }
             return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("model '{}' not online (status={:?})", proc.model_name, proc.status),
+                StatusCode::NOT_FOUND,
+                format!("model '{model_name}' not in model catalog or models_root"),
             )
                 .into_response();
         }
+        Err((code, msg)) => return (code, msg).into_response(),
     }
-    let port = { proc_lock.read().await.port };
+}
+
+async fn forward_to_local(http: reqwest::Client, port: u16, body: axum::body::Bytes) -> Response {
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     let resp = match http.post(&url).header("content-type", "application/json").body(body).send().await {
         Ok(r) => r,
@@ -226,53 +219,22 @@ async fn audio_transcriptions(
     let file_name = file_name.unwrap_or_else(|| "audio.wav".to_string());
     let file_mime = file_mime.unwrap_or_else(|| "audio/wav".to_string());
 
-    // 2. 本地命中?
-    let proc_lock = {
-        let map = state.processes.read().await;
-        find_process(&map, &model_name)
-    };
-    if let Some(proc_lock) = proc_lock {
-        return forward_audio_to_local(
-            state.http.clone(),
-            proc_lock,
-            &model_name,
-            file_bytes,
-            &file_name,
-            &file_mime,
-            &extra_fields,
-        )
-        .await;
-    }
-
-    // 3. 未命中本地 + 有 upstream → 转发 upstream(它必须也支持 /v1/audio/transcriptions)
-    if let Some(up) = &state.upstream {
-        info!("[dp-router] audio miss for model={model_name}; forwarding to upstream");
-        return forward_audio_to_upstream(up.clone(), &model_name, file_bytes, &file_name, &file_mime, &extra_fields).await;
-    }
-
-    (StatusCode::NOT_FOUND, format!("model '{model_name}' not loaded")).into_response()
-}
-
-async fn forward_audio_to_local(
-    http: reqwest::Client,
-    proc_lock: Arc<RwLock<LlamaProcess>>,
-    model_name: &str,
-    file_bytes: axum::body::Bytes,
-    file_name: &str,
-    file_mime: &str,
-    extra_fields: &[(String, String)],
-) -> Response {
-    // 在线检查
-    let port = {
-        let proc = proc_lock.read().await;
-        if proc.status != ModelRuntimeStatus::Online {
+    // 2. 本地:按需加载(同 chat_completions)
+    let port = match ensure_online(&state, &model_name).await {
+        Ok(port) => port,
+        // 3. 未知模型 + 有 upstream → 转发 upstream(它必须也支持 /v1/audio/transcriptions)
+        Err((StatusCode::NOT_FOUND, _)) => {
+            if let Some(up) = &state.upstream {
+                info!("[dp-router] audio miss for model={model_name}; forwarding to upstream");
+                return forward_audio_to_upstream(up.clone(), &model_name, file_bytes, &file_name, &file_mime, &extra_fields).await;
+            }
             return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("model '{}' not online (status={:?})", proc.model_name, proc.status),
+                StatusCode::NOT_FOUND,
+                format!("model '{model_name}' not in model catalog or models_root"),
             )
                 .into_response();
         }
-        proc.port
+        Err((code, msg)) => return (code, msg).into_response(),
     };
 
     // 拼 multipart 转发给子进程
@@ -282,7 +244,7 @@ async fn forward_audio_to_local(
             "file",
             reqwest::multipart::Part::bytes(file_bytes.to_vec())
                 .file_name(file_name.to_string())
-                .mime_str(file_mime)
+                .mime_str(&file_mime)
                 .unwrap_or_else(|_| reqwest::multipart::Part::bytes(file_bytes.to_vec())),
         );
     for (k, v) in extra_fields {
@@ -290,7 +252,7 @@ async fn forward_audio_to_local(
     }
 
     let url = format!("http://127.0.0.1:{port}/v1/audio/transcriptions");
-    let resp = match http.post(&url).multipart(form).send().await {
+    let resp = match state.http.post(&url).multipart(form).send().await {
         Ok(r) => r,
         Err(e) => {
             warn!("[dp-router] audio forward failed: {e}");
@@ -331,7 +293,7 @@ async fn forward_audio_to_upstream(
             "file",
             reqwest::multipart::Part::bytes(file_bytes.to_vec())
                 .file_name(file_name.to_string())
-                .mime_str(file_mime)
+                .mime_str(&file_mime)
                 .unwrap_or_else(|_| reqwest::multipart::Part::bytes(file_bytes.to_vec())),
         );
     for (k, v) in extra_fields {
@@ -407,17 +369,24 @@ fn strip_asr_prefix(text: &str) -> String {
 // ── GET /v1/models ────────────────────────────────────────────────────────
 
 async fn list_models(State(state): State<SharedState>) -> Response {
-    let mut data: Vec<Value> = Vec::new();
+    // 模型目录(可用,按需加载)+ 已加载子进程(含 admin 动态加载的非目录模型)的并集。
+    let mut names: Vec<String> = Vec::new();
+    for m in &state.config.models {
+        if !names.contains(&m.name) {
+            names.push(m.name.clone());
+        }
+    }
     {
         let map = state.processes.read().await;
-        for proc_lock in map.values() {
-            let p = proc_lock.read().await;
-            if p.status == ModelRuntimeStatus::Online {
-                data.push(json!({ "id": p.model_name, "object": "model" }));
+        for name in map.keys() {
+            if !names.contains(name) {
+                names.push(name.clone());
             }
         }
     }
-    // 上游模型(可选,不展开 — 不主动拉,避免启动阻塞)
+    names.sort();
+    let data: Vec<Value> =
+        names.iter().map(|n| json!({ "id": n, "object": "model" })).collect();
     Json(json!({ "object": "list", "data": data })).into_response()
 }
 
@@ -425,6 +394,7 @@ async fn list_models(State(state): State<SharedState>) -> Response {
 
 async fn admin_list_models(State(state): State<SharedState>) -> Response {
     let mut out: Vec<LocalModelStatus> = Vec::new();
+    let mut loaded: Vec<String> = Vec::new();
     {
         let map = state.processes.read().await;
         for proc_lock in map.values() {
@@ -436,8 +406,22 @@ async fn admin_list_models(State(state): State<SharedState>) -> Response {
                 status: p.status,
                 restarts: p.restarts,
             });
+            loaded.push(p.model_name.clone());
         }
     }
+    // 配置目录里尚未加载的模型 → available(SDK warm() 或数据面首次请求会拉起)。
+    for m in &state.config.models {
+        if !loaded.contains(&m.name) {
+            out.push(LocalModelStatus {
+                name: m.name.clone(),
+                gguf: m.gguf.clone(),
+                port: 0,
+                status: ModelRuntimeStatus::Available,
+                restarts: 0,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     #[derive(Serialize)]
     struct Resp {
         router: &'static str,
@@ -509,108 +493,234 @@ async fn admin_load_model(
         }
     }
 
-    // 路径解析:body.gguf > models_root 搜索
-    let gguf_path = if let Some(raw) = &req.gguf {
-        match resolve_gguf_path(raw) {
-            Ok(p) if p.is_file() => Some(p),
-            Ok(_) => None,
-            Err(_) => None,
+    // 模型定义:目录(按名匹配)为基础;请求显式 gguf 时覆盖其路径。
+    let mut mc = resolve_model_def(&state.config, &req.name);
+    if let Some(raw) = &req.gguf {
+        match resolve_model_path(raw, state.config.models_root_resolved.as_deref()) {
+            Ok(p) if p.is_file() => {
+                mc = Some(match mc {
+                    Some(mut m) => {
+                        m.gguf = p.to_string_lossy().into_owned();
+                        m
+                    }
+                    None => LocalModelConfig {
+                        name: req.name.clone(),
+                        r#type: ModelType::Llm,
+                        gguf: p.to_string_lossy().into_owned(),
+                        mmproj: None,
+                        context_size: 4096,
+                        threads: 8,
+                        gpu_layers: 0,
+                        batch_size: 512,
+                        extra_args: vec![],
+                    },
+                });
+            }
+            _ => return gguf_not_found_response(&req.name),
         }
-    } else {
-        let models_root = state
-            .config
-            .models_root
-            .as_ref()
-            .and_then(|raw| resolve_gguf_path(raw).ok());
-        models_root.and_then(|root| resolve_model_in_root(&req.name, &root))
+    }
+    let Some(mut mc) = mc else {
+        return gguf_not_found_response(&req.name);
     };
 
-    let Some(gguf_path) = gguf_path else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": "gguf not found",
-                "name": req.name,
-                "hint": "在请求里提供 gguf 绝对路径,或在 dp-router.yaml 配置 models_root 并把模型放到该目录下"
-            })),
-        )
-            .into_response();
-    };
+    // 请求参数覆盖(目录定义 < 请求)
+    mc.context_size = req.context_size.unwrap_or(mc.context_size);
+    mc.threads = req.threads.unwrap_or(mc.threads);
+    mc.gpu_layers = req.gpu_layers.unwrap_or(mc.gpu_layers);
+    mc.batch_size = req.batch_size.unwrap_or(mc.batch_size);
 
-    // 拼 LocalModelConfig(body 参数覆盖默认)
-    let defaults = state.config.models.first().cloned().unwrap_or_else(|| LocalModelConfig {
-        name: req.name.clone(),
-        r#type: ModelType::Llm,
-        gguf: gguf_path.display().to_string(),
-        mmproj: None,
-        context_size: 4096,
-        threads: 8,
-        gpu_layers: 0,
-        batch_size: 512,
-        extra_args: vec![],
-    });
-    let mc = LocalModelConfig {
-        name: req.name.clone(),
-        // 动态加载目前默认当 LLM 启动;ASR 类型只走预加载(需 mmproj 路径,yaml 配置才能解析)
-        r#type: defaults.r#type,
-        gguf: gguf_path.display().to_string(),
-        mmproj: None,
-        context_size: req.context_size.unwrap_or(defaults.context_size),
-        threads: req.threads.unwrap_or(defaults.threads),
-        gpu_layers: req.gpu_layers.unwrap_or(defaults.gpu_layers),
-        batch_size: req.batch_size.unwrap_or(defaults.batch_size),
-        extra_args: defaults.extra_args,
-    };
+    match spawn_with_config(&state, &mc).await {
+        Ok(_port) => {
+            let snapshot = {
+                let map = state.processes.read().await;
+                match find_process(&map, &mc.name) {
+                    Some(pl) => {
+                        let p = pl.read().await;
+                        LoadModelResponse {
+                            name: p.model_name.clone(),
+                            gguf: p.config.gguf.clone(),
+                            port: p.port,
+                            status: p.status,
+                            restarts: p.restarts,
+                        }
+                    }
+                    None => LoadModelResponse {
+                        name: mc.name.clone(),
+                        gguf: mc.gguf.clone(),
+                        port: 0,
+                        status: ModelRuntimeStatus::Starting,
+                        restarts: 0,
+                    },
+                }
+            };
+            info!(
+                "[dp-router] dynamic load accepted: name={} port={} gguf={}",
+                snapshot.name, snapshot.port, snapshot.gguf
+            );
+            (StatusCode::ACCEPTED, Json(snapshot)).into_response()
+        }
+        Err((code, msg)) => (code, msg).into_response(),
+    }
+}
 
-    // 分配端口
+fn gguf_not_found_response(name: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": "gguf not found",
+            "name": name,
+            "hint": "在请求里提供 gguf 路径,把模型放到 models_root 目录下,或加入配置 models 目录"
+        })),
+    )
+        .into_response()
+}
+
+// ── 按需加载核心 ───────────────────────────────────────────────────────────
+
+/// 数据面等模型就绪的上限(秒)。覆盖 CPU 冷加载的慢场景;超时返 503,
+/// 健康循环仍在后台工作,客户端稍后重试即可。
+const LOAD_WAIT_TIMEOUT_S: u64 = 180;
+
+/// 配置目录里按名查模型定义(精确 → 剥尾部 `.gguf` 再试)。
+fn resolve_model_def(cfg: &RouterConfig, name: &str) -> Option<LocalModelConfig> {
+    cfg.models
+        .iter()
+        .find(|m| m.name == name)
+        .or_else(|| {
+            name.strip_suffix(".gguf")
+                .and_then(|n| cfg.models.iter().find(|m| m.name == n))
+        })
+        .cloned()
+}
+
+/// 进程表查模型端口(精确 → 剥 `.gguf`;与 [`find_process`] 同语义)。
+async fn lookup_port(state: &SharedState, name: &str) -> Option<u16> {
+    let map = state.processes.read().await;
+    let pl = find_process(&map, name)?;
+    let port = pl.read().await.port;
+    Some(port)
+}
+
+/// 分配端口 + spawn + 注册。不等就绪:就绪由 fire-and-forget 的 wait_ready
+/// task 驱动(数据面在 [`wait_online`] 里独立等,两条路径互不依赖)。
+async fn spawn_with_config(state: &SharedState, mc: &LocalModelConfig) -> Result<u16, (StatusCode, String)> {
     let port = {
         let mut alloc = state.port_allocator.lock().await;
-        match alloc.next() {
-            Some(p) => p,
-            None => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "port range exhausted; raise llama_server.port_range",
-                )
-                    .into_response();
-            }
-        }
+        alloc.next().ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "port range exhausted: 没有空闲内部端口加载模型".to_string(),
+            )
+        })?
     };
-
-    let llama_path = state.config.llama_server.path.clone();
-    let http = state.http.clone();
-    let mut proc = LlamaProcess::new(mc.clone(), port, http);
-    if let Err(e) = proc.spawn(&llama_path, &gguf_path).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("spawn llama-server failed: {e}"),
-        )
-            .into_response();
+    let gguf = resolve_gguf_path(&mc.gguf)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("gguf resolve failed: {e}")))?;
+    if !gguf.is_file() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("gguf file not found: {}", gguf.display()),
+        ));
     }
-    let snapshot = LoadModelResponse {
-        name: proc.model_name.clone(),
-        gguf: proc.config.gguf.clone(),
-        port: proc.port,
-        status: proc.status,
-        restarts: proc.restarts,
-    };
+    let mut proc = LlamaProcess::new(mc.clone(), port, state.http.clone());
+    proc.spawn(&state.config.llama_server.path, &gguf)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn llama-server failed: {e}")))?;
     let proc_lock = Arc::new(RwLock::new(proc));
-    {
-        let mut map = state.processes.write().await;
-        map.insert(mc.name.clone(), proc_lock.clone());
-    }
-    // fire-and-forget: 等 /health 通后状态转 Online(由 background loop 巡检兜底)
-    let proc_lock_w = proc_lock.clone();
+    state.processes.write().await.insert(mc.name.clone(), proc_lock.clone());
     tokio::spawn(async move {
-        let mut p = proc_lock_w.write().await;
-        let _ = p.wait_ready(60).await;
+        let mut p = proc_lock.write().await;
+        let _ = p.wait_ready(LOAD_WAIT_TIMEOUT_S).await;
     });
+    Ok(port)
+}
 
-    info!(
-        "[dp-router] dynamic load accepted: name={} port={} gguf={}",
-        snapshot.name, snapshot.port, snapshot.gguf
-    );
-    (StatusCode::ACCEPTED, Json(snapshot)).into_response()
+/// 等模型变 online(有界);超时返 503。
+async fn wait_online(state: &SharedState, name: &str, port: u16) -> Result<u16, (StatusCode, String)> {
+    let deadline = Instant::now() + Duration::from_secs(LOAD_WAIT_TIMEOUT_S);
+    loop {
+        let status = {
+            let map = state.processes.read().await;
+            match find_process(&map, name) {
+                Some(pl) => {
+                    let s = pl.write().await.status;
+                    s
+                }
+                None => ModelRuntimeStatus::Offline,
+            }
+        };
+        if status == ModelRuntimeStatus::Online {
+            return Ok(port);
+        }
+        if Instant::now() >= deadline {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "model '{name}' not ready after {LOAD_WAIT_TIMEOUT_S}s (status={status:?}); \
+                     健康循环仍在重试,请稍后重试请求"
+                ),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// 数据面入口:确保模型 online 并返回其端口。
+///
+/// - 已加载且 online → 直接返回
+/// - 已加载但未就绪(loading / 重启中)→ 等就绪(有界)
+/// - 未加载 → 解析定义(目录 → models_root 按名搜索)→ 每模型加载锁下 spawn → 等就绪
+/// - 找不到 → 404(调用方决定是否 fallback upstream)
+async fn ensure_online(state: &SharedState, name: &str) -> Result<u16, (StatusCode, String)> {
+    // 1) 已在进程表 → 等它变 online
+    if let Some(port) = lookup_port(state, name).await {
+        return wait_online(state, name, port).await;
+    }
+
+    // 2) 未加载 → 解析模型定义:配置目录(按名)→ models_root(按名搜索)
+    let mc = match resolve_model_def(&state.config, name) {
+        Some(mc) => mc,
+        None => match state
+            .config
+            .models_root_resolved
+            .as_deref()
+            .and_then(|root| resolve_model_in_root(name, root))
+        {
+            Some(gguf) => LocalModelConfig {
+                name: name.to_string(),
+                r#type: ModelType::Llm,
+                gguf: gguf.to_string_lossy().into_owned(),
+                mmproj: None,
+                context_size: 4096,
+                threads: 8,
+                gpu_layers: 0,
+                batch_size: 512,
+                extra_args: vec![],
+            },
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!("model '{name}' not in model catalog or models_root"),
+                ))
+            }
+        },
+    };
+
+    // 3) 每模型一把加载锁:同模型并发请求只让首个真正 spawn,其余拿锁后
+    //    进双重检查分支直接复用。
+    let lock = {
+        let mut locks = state.load_locks.lock().await;
+        locks.entry(mc.name.clone()).or_default().clone()
+    };
+    let _guard = lock.lock().await;
+
+    // 4) 双重检查:并发请求可能已 spawn
+    if let Some(port) = lookup_port(state, &mc.name).await {
+        return wait_online(state, &mc.name, port).await;
+    }
+
+    // 5) spawn + 等就绪
+    let port = spawn_with_config(state, &mc).await?;
+    wait_online(state, &mc.name, port).await
 }
 
 // ── GET /health ───────────────────────────────────────────────────────────
@@ -687,6 +797,10 @@ async fn run_once(state: &SharedState) {
                     do_restart(&mut proc, &llama_path, &ll_cfg).await;
                 }
             }
+            ModelRuntimeStatus::Available => {
+                // 进程表里不会出现(仅 /admin/models 展示用);防御性跳过
+                continue;
+            }
             ModelRuntimeStatus::Offline => {
                 if !proc.check_alive() {
                     // 进程确实没了 → 带预算重启(冷却期跳过)
@@ -731,36 +845,6 @@ async fn do_restart(
         }
         Err(e) => warn!("[dp-router] gguf resolve failed: {e}"),
     }
-}
-
-/// 启动时一次性 spawn 所有本地模型子进程(走共享的 state.port_allocator)。
-pub async fn boot_local_models(state: &SharedState) -> anyhow::Result<()> {
-    let cfg = &state.config;
-    let http = state.http.clone();
-    let llama_path = cfg.llama_server.path.clone();
-    for mc in &cfg.models {
-        let port = {
-            let mut alloc = state.port_allocator.lock().await;
-            match alloc.next() {
-                Some(p) => p,
-                None => {
-                    anyhow::bail!("port range exhausted before loading model '{}'", mc.name);
-                }
-            }
-        };
-        let gguf = resolve_gguf_path(&mc.gguf)?;
-        let mut proc = LlamaProcess::new(mc.clone(), port, http.clone());
-        proc.spawn(&llama_path, &gguf).await?;
-        let proc_lock = Arc::new(RwLock::new(proc));
-        state.processes.write().await.insert(mc.name.clone(), proc_lock.clone());
-        // fire-and-forget: wait_ready 由 health_check loop 兜底
-        let proc_lock_w = proc_lock.clone();
-        tokio::spawn(async move {
-            let mut p = proc_lock_w.write().await;
-            let _ = p.wait_ready(60).await;
-        });
-    }
-    Ok(())
 }
 
 /// 关闭所有子进程(graceful)。

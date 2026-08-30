@@ -39,8 +39,11 @@ shared = { path = "../../crates/shared" }
 # prod reads the unified config folder ~/.desk-pilot/dp-router.yaml.
 # MODELS: GGUF 模型默认目录 — dev 指向 <workspace>/assets/models,
 #         prod 指向 ~/.desk-pilot/models。
+# LLAMA:  llama-server 可执行文件目录 — dev 指向 <workspace>/thirdparty/llama.cpp 的
+#         CUDA 构建,prod 指向系统安装惯例 /usr/local/bin(可用 PATH 上的裸命令名覆盖)。
 # (Don't write the bracketed section name in comments — the loader's naive
 # scanner matches the first occurrence anywhere in the file.)
 [package.metadata.shared]
 CONF = { dev = ".", prod = "~/.desk-pilot" }
 MODELS = { dev = "../../assets/models", prod = "~/.desk-pilot/models" }
+LLAMA = { dev = "../../thirdparty/llama.cpp/build-cuda/bin", prod = "/usr/local/bin" }

@@ -34,7 +34,7 @@ fn main() -> anyhow::Result<()> {
     let resp = llm.complete("you are a test echo", "hello")?;
     println!("[llm] -> {resp}");
 
-    let asr = HttpAsr::new(&ep);
+    let asr = HttpAsr::new(&ep, &model);
     let pcm = vec![0i16; 16000]; // 1s silence
     let text = asr.recognize(&pcm, 16000)?;
     println!("[asr] -> {text}");

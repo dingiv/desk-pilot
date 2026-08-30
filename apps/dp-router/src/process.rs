@@ -177,29 +177,6 @@ impl LlamaProcess {
         }
     }
 
-    /// 等到 `/health` 通(最长 timeout_secs 秒)。返回是否就绪。
-    pub async fn wait_ready(&mut self, timeout_secs: u64) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-        while Instant::now() < deadline {
-            if self.health_check().await {
-                self.status = ModelRuntimeStatus::Online;
-                self.online_since = Some(Instant::now());
-                return true;
-            }
-            if !self.check_alive() {
-                self.status = ModelRuntimeStatus::Offline;
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        warn!(
-            "[dp-router] llama-server not ready after {timeout_secs}s: model={} port={}",
-            self.model_name, self.port
-        );
-        self.status = ModelRuntimeStatus::Offline;
-        false
-    }
-
     /// 连续在线满 60s → 清零重启预算(崩溃循环只限"连续"重启,不惩罚长期健康)。
     pub fn budget_recovery(&mut self) {
         if self.restarts > 0
@@ -221,7 +198,7 @@ impl LlamaProcess {
         llama_path: &Path,
         gguf: &Path,
         ll_cfg: &LlamaServerConfig,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let now = Instant::now();
         if self.restarts >= ll_cfg.restart_max_retries {
             if self
@@ -233,7 +210,7 @@ impl LlamaProcess {
                     self.model_name, self.restarts
                 );
                 self.status = ModelRuntimeStatus::Offline;
-                return Ok(false);
+                return Ok(());
             }
             info!(
                 "[dp-router] cooldown over, resetting restart budget: model={}",
@@ -256,9 +233,31 @@ impl LlamaProcess {
         self.child_exited = true;
         tokio::time::sleep(Duration::from_secs(delay)).await;
         self.spawn(llama_path, gguf).await?;
-        // 等待就绪(冷缓存加载可达 30s+,给 60s;超时只影响本次返回,
-        // 进程本身继续加载,健康循环会自愈回 Online)
-        Ok(self.wait_ready(60).await)
+        // 不阻塞等就绪:spawn 已置 status=Starting,健康循环负责 Starting→Online
+        // (数据面请求自己轮询子进程 /health,见 router::ensure_online)。
+        Ok(())
+    }
+
+    /// 等子进程就绪:轮询 `/health` 直到成功(置 Online)或超时。
+    /// 加载期间子进程死亡 → 立即返回 false(交给健康循环带预算重启)。
+    pub async fn wait_ready(&mut self, timeout_s: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(timeout_s);
+        loop {
+            if self.health_check().await {
+                self.status = ModelRuntimeStatus::Online;
+                self.online_since = Some(Instant::now());
+                self.failed_checks = 0;
+                return true;
+            }
+            if !self.check_alive() {
+                self.status = ModelRuntimeStatus::Offline;
+                return false;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 
     /// 优雅关闭。

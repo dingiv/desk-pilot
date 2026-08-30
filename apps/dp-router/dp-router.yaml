@@ -4,20 +4,27 @@ server:
   addr: "127.0.0.1:8080"
 
 llama_server:
-  path: "/workspaces/gui_agent/desk-pilot/thirdparty/llama.cpp/build/bin/llama-server"
+  # 可执行文件。四种写法:
+  #   "LLAMA::llama-server"  命名空间 — dev 指仓库 CUDA 构建,prod 指 /usr/local/bin(推荐)
+  #   "llama-server"         裸命令名 — 搜 $PATH(prod 装进 PATH 最省心)
+  #   "/abs" 或 "~/x"        绝对 / 家目录 — 显式覆盖
+  #   注意:build-cuda = CUDA 版(配合下方 gpu_layers);build/ 是 CPU-only 版,
+  #        用它会静默忽略 gpu_layers(日志 "no usable GPU found, ...ignored")。
+  path: "LLAMA::llama-server"
   port_range: [18001, 18099]
   health_check_interval_s: 5
   restart_max_retries: 3
   restart_backoff_base_s: 1
 
-# 默认模型搜索根目录。POST /admin/models/load 不带 gguf 字段时,服务端
-# 在此目录下按 name 寻找匹配 GGUF(规则:`${root}/${name}.gguf` →
-# `${root}/${name}/*.gguf` → 大小写不敏感前缀匹配)。
-# 支持 MODELS:: 命名空间与绝对路径。dev 默认指向仓库 assets/models/。
+# 模型仓库根目录 — 下方 gguf/mmproj 的相对路径锚点。dev 指向仓库 assets/models/,
+# prod 指向 ~/.desk-pilot/models/。POST /admin/models/load 不带 gguf 时也在其下
+# 按 name 搜索(规则:`${root}/${name}.gguf` → `${root}/${name}/*.gguf`)。
 models_root: "MODELS::"
 
-# 启动时预加载的本地模型列表(每个 spawn 一个 llama-server 子进程)。
-# 可以为空 — 所有模型通过 POST /admin/models/load 动态拉起。
+# 模型目录:声明"哪些模型可用 + 各自的启动参数"。
+# **启动时一个都不加载** — 客户端首次请求某模型名时才按需 spawn 对应
+# llama-server 子进程(数据面自动触发;SDK 也可 POST /admin/models/load 主动预热)。
+# 模型未加载前在 /admin/models 里显示 status=available。
 #
 # type 字段(llm | asr,默认 llm):
 #   llm — 文本生成,路由 /v1/chat/completions
@@ -27,7 +34,7 @@ models_root: "MODELS::"
 models:
   - name: "qwen2.5-3b-instruct-q4_k_m"
     type: llm
-    gguf: "/workspaces/gui_agent/desk-pilot/assets/models/qwen2.5-3b-instruct-q4_k_m.gguf"
+    gguf: "qwen2.5-3b-instruct-q4_k_m.gguf"   # 相对 models_root
     context_size: 8192
     threads: 8
     gpu_layers: 99
@@ -35,8 +42,8 @@ models:
 
   - name: "qwen3-asr"
     type: asr
-    gguf: "/workspaces/gui_agent/desk-pilot/assets/models/Qwen3-ASR-1.7B-Q4_K_M-GGUF/Qwen3-ASR-1.7B-Q4_K_M.gguf"
-    mmproj: "/workspaces/gui_agent/desk-pilot/assets/models/Qwen3-ASR-1.7B-Q4_K_M-GGUF/mmproj-Qwen3-ASR-1.7B-Q4_K_M.gguf"
+    gguf: "Qwen3-ASR-1.7B-Q4_K_M-GGUF/Qwen3-ASR-1.7B-Q4_K_M.gguf"
+    mmproj: "Qwen3-ASR-1.7B-Q4_K_M-GGUF/mmproj-Qwen3-ASR-1.7B-Q4_K_M.gguf"
     context_size: 4096
     threads: 8
     gpu_layers: 99

@@ -324,7 +324,8 @@ pub fn data_dir(app_key: &str) -> Result<PathBuf> {
     Ok(p)
 }
 
-fn expand_tilde(path: &str) -> PathBuf {
+/// Expand a leading `~` / `~/x` to `$HOME`. Absolute/relative paths pass through.
+pub fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
             return PathBuf::from(home).join(rest);

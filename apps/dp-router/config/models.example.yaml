@@ -8,9 +8,14 @@ server:
   addr: "127.0.0.1:8080"
 
 llama_server:
-  # `llama-server` 二进制绝对路径。dev 一般指向 thirdparty/llama.cpp/build/bin/llama-server,
-  # prod 可指向系统安装的(apt / brew / release tarball)。
-  path: "/workspaces/gui_agent/desk-pilot/thirdparty/llama.cpp/build/bin/llama-server"
+  # `llama-server` 可执行文件。四种写法(推荐前两种,配置里不出现绝对路径):
+  #   "LLAMA::llama-server"  命名空间 — dev 指仓库 CUDA 构建,prod 指 /usr/local/bin
+  #   "llama-server"         裸命令名 — 搜 $PATH(prod 装进 PATH 最省心)
+  #   "/abs" 或 "~/x"        绝对 / 家目录 — 显式覆盖
+  #   "rel/x"                相对当前工作目录
+  # 注意:build-cuda = CUDA 版(配合下方 gpu_layers);build/ 是 CPU-only 版,
+  #       用它会静默忽略 gpu_layers(日志 "no usable GPU found, ...ignored")。
+  path: "LLAMA::llama-server"
 
   # 子进程端口分配区间(避开常见应用)。
   port_range: [18001, 18099]
@@ -24,18 +29,20 @@ llama_server:
   # 重启退避基数(秒),实际等待 = base * 2^attempt。
   restart_backoff_base_s: 1
 
-# 默认模型搜索根目录。POST /admin/models/load 不带 gguf 字段时,服务端
+# 模型仓库根目录 — 下方 gguf/mmproj 相对路径的锚点。dev 指向仓库 assets/models/,
+# prod 指向 ~/.desk-pilot/models/。POST /admin/models/load 不带 gguf 字段时,服务端
 # 在此目录下按 name 寻找匹配 GGUF(规则:`${root}/${name}.gguf` →
 # `${root}/${name}/*.gguf` → 大小写不敏感前缀匹配,首个命中即返)。
-# 支持 MODELS:: 命名空间(dev: MODELS:: = assets/models/;
-# prod: 默认 ~/.desk-pilot/models/)或绝对路径。
-# 留空 = 不支持动态加载,只能从下方 `models:` 预加载列表启。
+# 支持 MODELS:: 命名空间或绝对路径。留空 = 模型路径必须写绝对路径,且不支持按名动态加载。
 models_root: "MODELS::"
 
 models:
-  # 启动时预加载的本地模型列表。每个 spawn 一个 llama-server 子进程,独占一个端口。
+  # 模型目录:声明"哪些模型可用 + 各自的启动参数"。
+  # **启动时一个都不加载**(不预载 — 避免目录一大启动就把显存/内存吃光);
+  # 客户端首次请求某模型名时才按需 spawn 对应 llama-server 子进程(独占一个端口)。
+  # 未加载的模型在 GET /admin/models 里显示 status=available;
+  # SDK 的 warm() 或 POST /admin/models/load 可主动预热,消除首次请求的加载延迟。
   # name 是 OpenAI 兼容请求里 `model` 字段的匹配键(必须唯一)。
-  # 可以为空 — 所有模型通过 POST /admin/models/load 动态拉起。
   #
   # type: llm(默认)| asr
   #   llm — 文本生成,路由 /v1/chat/completions
@@ -45,21 +52,21 @@ models:
   # 示例 1:LLM(文本生成)
   - name: "qwen2.5-3b-instruct-q4_k_m"
     type: llm
-    # GGUF 文件路径。支持 `MODELS::xxx.gguf` 命名空间(dev: assets/models/xxx.gguf;
-    # prod: ~/.desk-pilot/models/xxx.gguf)或绝对路径。
-    gguf: "MODELS::qwen2.5-3b-instruct-q4_k_m.gguf"
+    # GGUF 文件路径。推荐写**相对 models_root** 的路径(加载时拼成绝对路径);
+    # 也可用 `MODELS::xxx.gguf` 命名空间或绝对路径显式覆盖。
+    gguf: "qwen2.5-3b-instruct-q4_k_m.gguf"
     context_size: 4096
     threads: 8
     gpu_layers: 0      # CPU = 0;有 GPU 配 99 = 全部卸载(llama.cpp 自动按实际层数
-                       # clamp,无需知道确切层数;总层数见启动日志 n_layer 字段)
+                        # clamp,无需知道确切层数;总层数见启动日志 n_layer 字段)
     batch_size: 512
     # extra_args: []  # 高级自定义(直接拼到 llama-server 命令行)
 
   # 示例 2:ASR(语音转写) — 需 mmproj 多模态投影器(llama.cpp server 加载后自动启用 audio 端点)
   - name: "qwen3-asr"
     type: asr
-    gguf: "MODELS::Qwen3-ASR-1.7B-Q4_K_M-GGUF/Qwen3-ASR-1.7B-Q4_K_M.gguf"
-    mmproj: "MODELS::Qwen3-ASR-1.7B-Q4_K_M-GGUF/mmproj-Qwen3-ASR-1.7B-Q4_K_M.gguf"
+    gguf: "Qwen3-ASR-1.7B-Q4_K_M-GGUF/Qwen3-ASR-1.7B-Q4_K_M.gguf"
+    mmproj: "Qwen3-ASR-1.7B-Q4_K_M-GGUF/mmproj-Qwen3-ASR-1.7B-Q4_K_M.gguf"
     context_size: 4096
     threads: 8
     gpu_layers: 0

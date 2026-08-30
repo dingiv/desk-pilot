@@ -2,10 +2,10 @@
 //!
 //! 启动逻辑:
 //!   1. 解析 CLI 参数(配置路径 / 监听地址 / llama-server 路径)
-//!   2. 读 yaml 配置 → [`RouterConfig`]
-//!   3. spawn 所有本地模型的 llama-server 子进程
-//!   4. 启 axum 服务(默认 :8080)接收 OpenAI 兼容请求
-//!   5. 后台 health-check 循环
+//!   2. 读 yaml 配置 → [`RouterConfig`](models = 模型目录,启动不预载)
+//!   3. 启 axum 服务(默认 :8080)接收 OpenAI 兼容请求
+//!      — 模型按需加载:首次请求某模型名才 spawn 对应 llama-server 子进程
+//!   4. 后台 health-check 循环
 //!
 //! 用法:
 //!   dp-router [--config dp-router.yaml] [--addr :8080] [--llama-server /path/to/llama-server]
@@ -75,6 +75,11 @@ async fn async_main() -> Result<()> {
         cfg.llama_server.path = path.clone();
     }
 
+    // 归一化:所有路径字段(llama_server.path / models_root / gguf / mmproj)
+    // 解析成绝对路径。必须在 CLI 覆盖之后、二进制存在性检查之前。
+    cfg.resolve_paths()
+        .with_context(|| format!("resolve paths in {}", conf_path.display()))?;
+
     // sanity check
     if !tokio::fs::try_exists(&cfg.llama_server.path).await.unwrap_or(false) {
         anyhow::bail!(
@@ -84,7 +89,7 @@ async fn async_main() -> Result<()> {
     }
 
     info!(
-        "[dp-router] 启动: addr={}, llama-server={}, models={}, upstream={}",
+        "[dp-router] 启动: addr={}, llama-server={}, 模型目录={} 个(按需加载,启动不预载), upstream={}",
         cfg.server.addr,
         cfg.llama_server.path.display(),
         cfg.models.len(),
@@ -113,12 +118,11 @@ async fn async_main() -> Result<()> {
         upstream,
         http,
         port_allocator,
+        load_locks: Arc::new(tokio::sync::Mutex::new(Default::default())),
     });
 
-    // 启动所有本地模型子进程
-    if let Err(e) = router::boot_local_models(&state).await {
-        error!("[dp-router] boot_local_models failed: {e}");
-    }
+    // 按需加载模式:启动不 spawn 任何子进程 — 配置 `models` 是"模型目录"(哪些模型
+    // 可用),客户端首次请求某模型名时才拉起对应 llama-server(见 router::ensure_online)。
 
     // 启 health-check 后台循环
     router::spawn_health_loop(state.clone());

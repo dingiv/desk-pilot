@@ -12,17 +12,53 @@ pub struct RouterConfig {
     pub server: ServerConfig,
     /// `llama-server` 二进制路径 + 端口分配策略(子进程管理用)。
     pub llama_server: LlamaServerConfig,
-    /// 启动时预加载的本地模型列表(每个 spawn 一个 `llama-server` 子进程)。
+    /// 模型目录:声明"哪些模型可用 + 各自的启动参数"。**启动时一个都不加载** —
+    /// 客户端首次请求某模型名时才按需拉起对应 `llama-server` 子进程。
     #[serde(default)]
     pub models: Vec<LocalModelConfig>,
     /// 远程 OpenAI 兼容上游(未命中本地时 fallback)。
     /// `base_url` 为空 → 未命中返 404。
     #[serde(default)]
     pub remote_upstream: RemoteUpstreamConfig,
-    /// 模型仓库根目录(`/admin/models/load` 按名搜索 GGUF 用)。
-    /// 支持 `MODELS::` 命名空间。缺省 → 动态加载必须显式传 `gguf` 路径。
+    /// 模型仓库根目录(`/admin/models/load` 按名搜索 GGUF 用;`gguf`/`mmproj` 的
+    /// 相对路径锚点)。支持 `MODELS::` 命名空间。缺省 → 模型路径必须写绝对路径。
     #[serde(default)]
     pub models_root: Option<String>,
+    /// `models_root` 解析后的绝对路径(由 [`Self::resolve_paths`] 填充,非配置项)。
+    #[serde(default)]
+    pub models_root_resolved: Option<PathBuf>,
+}
+
+impl RouterConfig {
+    /// 把所有路径类字段解析成绝对路径(就地)。在反序列化 + CLI 覆盖之后调用一次:
+    ///   - `llama_server.path` → [`resolve_binary_path`](裸命令名搜 $PATH / `LLAMA::` / 绝对)
+    ///   - `models_root`       → [`resolve_model_path`]
+    ///   - 每个 `models[].gguf` / `mmproj` → [`resolve_model_path`](相对路径拼到 `models_root`)
+    ///
+    /// 归一化后,下游(process 重启、admin 端点)拿到的都是绝对路径,无需再解析。
+    pub fn resolve_paths(&mut self) -> anyhow::Result<()> {
+        let root = self
+            .models_root
+            .as_deref()
+            .map(|r| resolve_model_path(r, None))
+            .transpose()?;
+        self.models_root_resolved = root.clone();
+        let path_str = self.llama_server.path.to_string_lossy().into_owned();
+        self.llama_server.path = resolve_binary_path(&path_str)?;
+        for m in &mut self.models {
+            m.gguf = resolve_model_path(&m.gguf, root.as_deref())?
+                .to_string_lossy()
+                .into_owned();
+            if let Some(mm) = m.mmproj.clone() {
+                m.mmproj = Some(
+                    resolve_model_path(&mm, root.as_deref())?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -65,11 +101,13 @@ pub struct LocalModelConfig {
     /// 决定路由语义 + 是否需要 mmproj(见下)。
     #[serde(default)]
     pub r#type: ModelType,
-    /// GGUF 文件路径。支持 `MODELS::xxx.gguf` 命名空间(dev: `assets/models/xxx.gguf`,
-    /// prod: `~/.desk-pilot/models/xxx.gguf`)与绝对路径。
+    /// GGUF 文件路径。推荐写**相对 `models_root`** 的路径(如
+    /// `qwen2.5-3b-instruct-q4_k_m.gguf`),加载时拼成绝对路径;也支持
+    /// `MODELS::xxx.gguf` 命名空间与绝对路径显式覆盖。
     pub gguf: String,
     /// 多模态投影器路径(`type: asr` 必配;传给 llama-server `--mmproj`,
-    /// 加载后自动启用 `/v1/audio/transcriptions` 端点)。支持 `MODELS::` 命名空间。
+    /// 加载后自动启用 `/v1/audio/transcriptions` 端点)。同 `gguf`:相对
+    /// `models_root` 或 `MODELS::` / 绝对路径。
     #[serde(default)]
     pub mmproj: Option<String>,
     /// 上下文长度(传给 `-c`)。默认 4096。
@@ -116,16 +154,79 @@ pub struct RemoteUpstreamConfig {
     pub default_model: Option<String>,
 }
 
-/// 解析 GGUF 路径:支持 `MODELS::xxx` 命名空间 + 绝对/相对路径。
-pub fn resolve_gguf_path(raw: &str) -> anyhow::Result<PathBuf> {
-    if let Some(rest) = raw.strip_prefix("MODELS::") {
-        let p = shared::loader!()
-            .resolve(rest)
-            .ok_or_else(|| anyhow::anyhow!("MODELS 命名空间解析失败: {rest}"))?;
-        Ok(p)
-    } else {
-        Ok(PathBuf::from(raw))
+/// 解析"已知"路径形态(命名空间 / 绝对 / `~` 家目录)→ 绝对 [`PathBuf`]。
+/// 裸相对路径返回 `None`,由调用方决定拼到哪个根上(见 [`resolve_model_path`] /
+/// [`resolve_binary_path`])。
+fn resolve_known(raw: &str) -> Option<PathBuf> {
+    if raw.contains("::") {
+        return shared::loader!().resolve(raw);
     }
+    if raw == "~" || raw.starts_with("~/") {
+        return Some(shared::expand_tilde(raw));
+    }
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        return Some(p.to_path_buf());
+    }
+    None
+}
+
+/// 在 `$PATH` 中查找可执行文件。
+fn search_path(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&paths) {
+        let cand = dir.join(name);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// 解析 `llama_server.path`(可执行文件)。支持四种写法:
+///   - `LLAMA::llama-server` → 命名空间(dev 指仓库构建,prod 指系统安装位置)
+///   - `/abs` 或 `~/x`       → 原样
+///   - `llama-server`(不含 `/`)→ 搜 `$PATH`
+///   - `rel/x`               → 相对当前工作目录
+pub fn resolve_binary_path(raw: &str) -> anyhow::Result<PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        anyhow::bail!("llama_server.path 为空");
+    }
+    if let Some(p) = resolve_known(raw) {
+        return Ok(p);
+    }
+    if !raw.contains('/') {
+        return search_path(raw).ok_or_else(|| {
+            anyhow::anyhow!(
+                "'{raw}' 不在 $PATH 中(可写绝对路径,或用 LLAMA:: 命名空间)"
+            )
+        });
+    }
+    Ok(PathBuf::from(raw))
+}
+
+/// 解析模型文件路径(`gguf` / `mmproj`)。支持:
+///   - `MODELS::x.gguf` / `/abs` / `~/x` → 原样([`resolve_known`])
+///   - `x.gguf` / `sub/x.gguf`(相对)→ 拼到 `models_root` 下
+pub fn resolve_model_path(raw: &str, models_root: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let raw = raw.trim();
+    if let Some(p) = resolve_known(raw) {
+        return Ok(p);
+    }
+    match models_root {
+        Some(root) => Ok(root.join(raw)),
+        None => anyhow::bail!(
+            "模型路径 '{raw}' 是相对路径但未配置 models_root;\
+             请写绝对路径、用 MODELS:: 命名空间,或配置 models_root"
+        ),
+    }
+}
+
+/// 解析 GGUF 路径:命名空间 / 绝对 / `~` 原样,裸相对 → 相对 cwd(兼容旧调用点;
+/// 加载时归一化后 gguf 已是绝对路径,这里是直通)。
+pub fn resolve_gguf_path(raw: &str) -> anyhow::Result<PathBuf> {
+    Ok(resolve_known(raw).unwrap_or_else(|| PathBuf::from(raw)))
 }
 
 /// 在 `models_root` 下按模型名搜索 GGUF(`/admin/models/load` 用)。
@@ -188,4 +289,98 @@ pub enum ModelRuntimeStatus {
     Online,
     Offline,
     Starting,
+    /// 在配置目录中但尚未加载(仅 /admin/models 展示用;首次请求即拉起)。
+    Available,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn resolve_model_path_relative_joins_root() {
+        let root = Path::new("/home/u/.desk-pilot/models");
+        assert_eq!(
+            resolve_model_path("qwen.gguf", Some(root)).unwrap(),
+            root.join("qwen.gguf")
+        );
+        assert_eq!(
+            resolve_model_path("sub/m.gguf", Some(root)).unwrap(),
+            root.join("sub/m.gguf")
+        );
+    }
+
+    #[test]
+    fn resolve_model_path_absolute_passthrough() {
+        assert_eq!(
+            resolve_model_path("/abs/x.gguf", None).unwrap(),
+            PathBuf::from("/abs/x.gguf")
+        );
+    }
+
+    #[test]
+    fn resolve_model_path_relative_without_root_errors() {
+        let err = resolve_model_path("x.gguf", None).unwrap_err().to_string();
+        assert!(err.contains("models_root"), "{err}");
+    }
+
+    #[test]
+    fn resolve_binary_path_absolute_passthrough() {
+        assert_eq!(
+            resolve_binary_path("/usr/local/bin/llama-server").unwrap(),
+            PathBuf::from("/usr/local/bin/llama-server")
+        );
+    }
+
+    #[test]
+    fn resolve_binary_path_bare_name_searches_path() {
+        // `sh` is always on PATH.
+        let p = resolve_binary_path("sh").unwrap();
+        assert!(p.is_file(), "expected an existing file, got {p:?}");
+    }
+
+    #[test]
+    fn resolve_binary_path_unknown_bare_name_errors() {
+        let err = resolve_binary_path("definitely-not-a-real-bin-xyz").unwrap_err().to_string();
+        assert!(err.contains("$PATH"), "{err}");
+    }
+
+    #[test]
+    fn resolve_binary_path_empty_errors() {
+        assert!(resolve_binary_path("   ").is_err());
+    }
+
+    #[test]
+    fn resolve_gguf_path_passthrough_and_relative() {
+        assert_eq!(
+            resolve_gguf_path("/abs/x.gguf").unwrap(),
+            PathBuf::from("/abs/x.gguf")
+        );
+        // bare relative → cwd-relative (legacy behavior)
+        assert_eq!(resolve_gguf_path("rel/x.gguf").unwrap(), PathBuf::from("rel/x.gguf"));
+    }
+
+    #[test]
+    fn resolve_paths_normalizes_to_absolute() {
+        let yaml = r#"
+server: { addr: "127.0.0.1:8080" }
+llama_server: { path: "/abs/bin/llama-server" }
+models_root: "/abs/models"
+models:
+  - name: m1
+    gguf: "m1.gguf"
+  - name: m2
+    type: asr
+    gguf: "sub/m2.gguf"
+    mmproj: "sub/m2-mmproj.gguf"
+"#;
+        let mut cfg: RouterConfig = serde_yaml::from_str(yaml).unwrap();
+        cfg.resolve_paths().unwrap();
+        assert_eq!(cfg.llama_server.path, PathBuf::from("/abs/bin/llama-server"));
+        assert_eq!(cfg.models_root_resolved, Some(PathBuf::from("/abs/models")));
+        assert_eq!(cfg.models[0].gguf, "/abs/models/m1.gguf");
+        assert_eq!(cfg.models[1].gguf, "/abs/models/sub/m2.gguf");
+        assert_eq!(cfg.models[1].mmproj.as_deref(), Some("/abs/models/sub/m2-mmproj.gguf"));
+    }
 }
