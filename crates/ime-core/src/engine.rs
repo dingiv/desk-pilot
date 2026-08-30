@@ -597,14 +597,6 @@ impl ImeEngine {
         }
     }
 
-    /// Attach the voice buffer so `#asr` resolves to live voice recognition
-    /// text from the aura daemon SSE stream. Call once at startup after the SSE
-    /// client has been spawned. Routed to the magic registry's shared slot —
-    /// every per-context `VoiceMember` instance reads it.
-    pub fn set_asr_buffer(&self, buf: std::sync::Arc<crate::asr_buffer::AsrBuffer>) {
-        self.dispatcher.set_asr_buffer(buf);
-    }
-
     /// `#req` backend base URL (default `http://127.0.0.1:14555/api`).
     /// `#req/news?query=soccer` → `GET {base}/news?query=soccer`.
     pub fn set_req_base(&self, base: &str) {

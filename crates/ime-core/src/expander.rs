@@ -206,9 +206,12 @@ impl Expander {
                         .or_else(|| self.provider.resolve(&name));
                     match value {
                         Some(value) => result.push_str(&value),
-                        // 查询参数作用域下,未提供的 `$var` 渲染为空(片段命令
-                        // 的 `?name=` 是逐键注入的,键入中途不报错)。
-                        None if vars.is_some() => result.push_str(&format!("${}{}{}", "{", name, "}")),
+                        // 查询参数作用域下,未提供的 `$var` 渲染为 `${var}`
+                        // 字面量(片段命令的 `?name=` 是逐键注入的,键入中途
+                        // 不报错,用户能看见还缺哪个参数)。
+                        None if vars.is_some() => {
+                            result.push_str(&format!("${{{name}}}"));
+                        }
                         None => return Err(ExpandError::UnknownVariable(name)),
                     }
                 }
@@ -218,13 +221,6 @@ impl Expander {
         }
 
         Ok((result, cursor))
-    }
-
-    /// Return the byte position of `$CURSOR` in the template (for the caller to
-    /// compute where the cursor should go after expansion). Returns `None` if
-    /// there is no cursor variable.
-    pub fn cursor_pos_in_template(template: &str) -> Option<usize> {
-        template.find("$CURSOR")
     }
 }
 
@@ -284,13 +280,6 @@ mod tests {
     fn literal_dollar() {
         assert_eq!(expander().expand("Cost: $5").unwrap(), "Cost: $5");
         assert_eq!(expander().expand("$").unwrap(), "$");
-    }
-
-    #[test]
-    fn cursor_position() {
-        let t = "Hello $CURSOR World";
-        let pos = Expander::cursor_pos_in_template(t);
-        assert_eq!(pos, Some(6)); // byte offset of '$'
     }
 
     #[test]

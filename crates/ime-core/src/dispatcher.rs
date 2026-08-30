@@ -174,12 +174,6 @@ impl Dispatcher {
             .and_then(|f| f.load_dict(path))
     }
 
-    /// Attach the voice buffer to the magic registry's shared slot — read by the
-    /// `#asr`/`#submit` member instances.
-    pub fn set_asr_buffer(&self, buf: std::sync::Arc<crate::asr_buffer::AsrBuffer>) {
-        self.magic.set_asr_buffer(buf);
-    }
-
     /// The magic command registry.
     pub fn magic(&self) -> &MagicFamily {
         &self.magic

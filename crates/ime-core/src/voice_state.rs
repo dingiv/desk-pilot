@@ -1,6 +1,6 @@
 //! Shared voice-session state.
 //!
-//! 合并了原 [`AsrBuffer`](crate::asr_buffer::AsrBuffer) 的 candidate-surface API
+//! 合并了原 AsrBuffer(已删除的单缓冲模块)的 candidate-surface API
 //! (`set_live` / `push_final` / `voice_candidates` / `preview`) 与原 `AuraAgent`
 //! 的 per-paragraph recognition state(用于 `#asr/calc` 的预览)。
 //!
@@ -28,11 +28,10 @@
 //! 保留为 closed snapshot,迟到事件**刷新**它而不是清掉。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
 
-/// Max retained settled utterances (candidate slots). 旧版本(`AsrBuffer`) 同值;
-/// 保留以保持行为。
+/// Max retained settled utterances (candidate slots)。
 pub const MAX_FINALS: usize = 8;
 
 /// 一个段落的组装预览。`#asr` 候选首选项;`#asr/calc` 改用 `calc`。
@@ -152,7 +151,7 @@ pub struct SharedVoiceState {
     /// Mock 模式(`--asr-text` 调试):冻结 conn / finals —— listener 不连接
     /// aura、`set_conn` 不覆盖,seed 的数据稳定可见(与真实 listener 打架会让
     /// mock 候选闪没/被 sync_history 换成真实历史)。
-    mock: AtomicU8,
+    mock: AtomicBool,
 }
 
 impl SharedVoiceState {
@@ -160,19 +159,19 @@ impl SharedVoiceState {
         SharedVoiceState {
             inner: Mutex::new(Inner::default()),
             conn: AtomicU8::new(VoiceConn::Connecting as u8),
-            mock: AtomicU8::new(0),
+            mock: AtomicBool::new(false),
         }
     }
 
     /// 进入/退出 mock 模式(`--asr-text`):true 时 `set_conn` 冻结、
     /// voice listener 的 Attach 不发起真实连接。
     pub fn set_mock(&self, on: bool) {
-        self.mock.store(on as u8, Ordering::Relaxed);
+        self.mock.store(on, Ordering::Relaxed);
     }
 
     /// 是否处于 mock 模式。
     pub fn is_mock(&self) -> bool {
-        self.mock.load(Ordering::Relaxed) != 0
+        self.mock.load(Ordering::Relaxed)
     }
 
     // ── Connectivity(三态)──────────────────────────────────────────────
@@ -185,9 +184,10 @@ impl SharedVoiceState {
     }
 
     pub fn conn(&self) -> VoiceConn {
+        // 按枚举判别值还原(与 `set_conn` 的 `c as u8` 对应,无常量魔法数)。
         match self.conn.load(Ordering::Relaxed) {
-            1 => VoiceConn::Connected,
-            2 => VoiceConn::Failed,
+            x if x == VoiceConn::Connected as u8 => VoiceConn::Connected,
+            x if x == VoiceConn::Failed as u8 => VoiceConn::Failed,
             _ => VoiceConn::Connecting,
         }
     }
@@ -203,11 +203,7 @@ impl SharedVoiceState {
     /// 断连期间的旧句残留在候选里,导致 `#asr` 重新打开时首个候选不是当前句。
     pub fn reset(&self) {
         let mut g = self.inner.lock().unwrap();
-        g.live.clear();
-        g.finals.clear();
-        g.preview = None;
-        g.current_paragraph = None;
-        g.paragraphs.clear();
+        clear_locked(&mut g);
     }
 
     /// 重连后**全量同步 aura 历史定稿**(`GET /api/results`,最旧 → 最新):
@@ -215,11 +211,7 @@ impl SharedVoiceState {
     /// 数据面 SSE 是 append-only,重连收不到断连期间的历史 —— 靠这里补齐。
     pub fn sync_history(&self, history: &[(u64, String)]) {
         let mut g = self.inner.lock().unwrap();
-        g.finals.clear();
-        g.live.clear();
-        g.preview = None;
-        g.current_paragraph = None;
-        g.paragraphs.clear();
+        clear_locked(&mut g);
         // history 是最旧 → 最新;逐个头插 → 最新落在 finals[0](与"最新在前"
         // 语义一致)。
         for (_, calibrated) in history.iter() {
@@ -239,8 +231,8 @@ impl SharedVoiceState {
         g.live = text.to_string();
     }
 
-    /// 测试 / mock 用的种子 final(对应旧 `AsrBuffer::update` 语义):
-    /// 头部插入 + 截断,不等同于真实 `ParagraphCalibration` 的窗口关闭流程。
+    /// 测试 / mock 用的种子 final:头部插入 + 截断,不等同于真实
+    /// `ParagraphCalibration` 的窗口关闭流程。
     pub fn seed_final(&self, text: &str) {
         let mut g = self.inner.lock().unwrap();
         if text.is_empty() {
@@ -403,6 +395,16 @@ impl Default for SharedVoiceState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 清空全部会话状态(调用者必须已持有 inner 锁)。`reset` / `sync_history`
+/// 共用的清理核心。
+fn clear_locked(g: &mut Inner) {
+    g.live.clear();
+    g.finals.clear();
+    g.preview = None;
+    g.current_paragraph = None;
+    g.paragraphs.clear();
 }
 
 fn upsert_sentence(
