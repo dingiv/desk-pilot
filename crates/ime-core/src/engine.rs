@@ -559,6 +559,7 @@ impl ImeEngine {
 
     /// 候选元数据(与 [`candidates`](Self::candidates) 同序)—— 测试断言
     /// meta 对齐用;调试视图经 view.candidates[].meta 走 fill_view。
+    #[cfg(test)]
     pub(crate) fn last_meta(&self) -> Vec<crate::fsm::state::CandMeta> {
         self.contexts
             .lock()

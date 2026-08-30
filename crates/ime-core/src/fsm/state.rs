@@ -154,11 +154,6 @@ pub(crate) struct PanelItem {
 }
 
 impl StateMachine {
-    /// 最近一次排名的候选元数据(含文本,engine.view 的调试视图用)。
-    pub(crate) fn last_meta(&self) -> &[CandMeta] {
-        &self.panel.meta
-    }
-
     /// 取走并清空最近一次提交的候选家族(one-shot,引擎提交点读后置空,
     /// 避免残留在后续 raw 提交上)。
     pub(crate) fn take_last_commit_family(&mut self) -> Option<&'static str> {
