@@ -105,6 +105,12 @@ const STALE_SESSION_RESET: Duration = Duration::from_secs(8);
 /// VAD 门控流式的 lead-in 帧数(每帧 32ms):detected() 翻转起音时补喂最近 ~0.5s 的帧,
 /// 让 soft onset 进入流式/batch(Silero 要几帧过阈值,detected 翻转晚于真实起音)。
 const LEAD_IN_FRAMES: usize = 16;
+// batch 实时性约束(实时管线,不能死等):
+// - 每请求**硬超时** + **断链熔断**都在 `dp_models::http::HttpAsr` 内
+//   (ASR_TIMEOUT=3s,断链即窗口内不发送)—— 这里**单发不重试**:失败/超时/熔断 →
+//   立即 `None` → 整流 + 就绪定稿照常往下,绝不为了 batch 卡住定稿。
+// - 重试会成倍放大最坏等待(2×超时),与"实时"矛盾;断链由熔断快速跳过 + 窗口后自愈,
+//   不需要在 worker 里重试。
 
 /// Resolve a `MODELS::<sub-path>` model entry. A custom `models_dir` (config override) wins —
 /// the sub-path is joined onto it; otherwise the shared `MODELS` namespace resolves via
@@ -430,10 +436,37 @@ impl OnnxStage1Recognizer {
         )
     }
 
+    /// Run the blocking batch ASR **once** (no retry — real-time: a hang/timeout/circuit-trip
+    /// must NOT stall finalization). `Ok(non-empty)` → `Some`; `Ok(empty)` (noise/silence) and
+    /// `Err` (timeout / 断链 / 熔断) → `None` (caller falls back to streaming). The timeout +
+    /// 断链熔断 live in [`dp_models::http::HttpAsr`] (ASR_TIMEOUT=3s, 断链即窗口内不发送);
+    /// this just surfaces the outcome + logs the failure reason so "丢 batch" is diagnosable.
+    fn recognize_once(&self, pcm: &[i16], sr: u32, what: &str, paragraph_id: ParagraphId) -> Option<String> {
+        match self.batch_asr.recognize(pcm, sr) {
+            Ok(text) if !text.trim().is_empty() => Some(text),
+            Ok(_) => {
+                debug!(what, paragraph_id, "batch 识别成功但文本为空(噪声/静音)→ 回退流式");
+                None
+            }
+            Err(e) => {
+                // 失败/超时/熔断 —— 立即回退流式,不等、不重试。这是"丢 BatchSentence"的
+                // 唯一来源;日志区分原因(超时 3s / 断链 / 熔断窗口)。
+                warn!(
+                    error = %e,
+                    what,
+                    paragraph_id,
+                    "batch 失败(超时/断链/熔断)→ 回退流式,立即继续(实时,不等)"
+                );
+                None
+            }
+        }
+    }
+
     /// Blocking batch worker: drain `rx` and run each job's batch ASR (the blocking
-    /// `AsrProvider::recognize`), calling `on_result` **exactly once per job** — failure/empty
-    /// map to `text: None`, jobs are never dropped (the pipeline's readiness gate relies on
-    /// every job producing one result). **Blocking — the `Pipeline` runs it on its own thread.**
+    /// `AsrProvider::recognize`, **once per job** — see [`Self::recognize_once`]), calling
+    /// `on_result` **exactly once per job** — failure/empty map to `text: None`, jobs are never
+    /// dropped (the pipeline's readiness gate relies on every job producing one result).
+    /// **Blocking — the `Pipeline` runs it on its own thread.**
     pub fn run_batch_worker(&self, rx: mpsc::Receiver<BatchJob>, on_result: &mut dyn FnMut(BatchJobResult)) {
         for job in rx {
             match job {
@@ -444,7 +477,7 @@ impl OnnxStage1Recognizer {
                     sr,
                 } => {
                     let t0 = Instant::now();
-                    let text = self.batch_asr.recognize(&pcm, sr).ok().filter(|t| !t.trim().is_empty());
+                    let text = self.recognize_once(&pcm, sr, "句级", paragraph_id);
                     let asr_ms = t0.elapsed().as_millis() as u64;
                     debug!(
                         paragraph_id,
@@ -462,7 +495,7 @@ impl OnnxStage1Recognizer {
                 }
                 BatchJob::Paragraph { paragraph_id, pcm, sr } => {
                     let t0 = Instant::now();
-                    let text = self.batch_asr.recognize(&pcm, sr).ok().filter(|t| !t.trim().is_empty());
+                    let text = self.recognize_once(&pcm, sr, "段落级重跑", paragraph_id);
                     let asr_ms = t0.elapsed().as_millis() as u64;
                     debug!(
                         paragraph_id,

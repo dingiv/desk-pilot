@@ -375,6 +375,35 @@ impl PinyinFamily {
     // ── 家族私有能力(D5 接口隔离:不在 CandidateFamily trait 上)──
     // 学习 / 暖启 / 上下文开关,经 Dispatcher 持有的具体句柄直调。
 
+    /// 造词单字候选(逐字输入组词)—— 家族私有能力(D5):链式豁免 /
+    /// 多音节判定 / 首音节提取 / 单字过滤全部内聚,壳(state.rs 的
+    /// postprocess)只负责调用与面板重排。
+    /// - 链式输入(`ti'an`)返回空:部分提交按音节消耗 buffer,会把
+    ///   `'` 留在半截 buffer 里破坏链结构;链式候选只整体提交。
+    /// - 单音节 / 无合法首音节返回空:无需造词。
+    pub fn compose_single_chars(
+        &self,
+        input: &str,
+        ctx: &InputContext,
+        existing: &[String],
+        limit: usize,
+    ) -> Vec<ScoredCandidate> {
+        if input.contains('\'') {
+            return Vec::new();
+        }
+        let Some(first_syl) = first_syllable_of(input) else {
+            return Vec::new();
+        };
+        if first_syl.len() >= input.len() {
+            return Vec::new();
+        }
+        self.predict(&first_syl, ctx)
+            .into_iter()
+            .filter(|c| c.text.chars().count() == 1 && !existing.contains(&c.text))
+            .take(limit)
+            .collect()
+    }
+
     /// Record a user pick for frequency boosting (L0) + 记录前缀整词联想
     /// 的 (word, pinyin) 上下文。注意:**不**调 learn_phrase —— 单词本的
     /// 唯一入口是造词路径(learn_composed_phrase);逐字选择对单字也会
@@ -893,6 +922,24 @@ impl CandidateFamily for Arc<PinyinFamily> {
         (**self).attach_store(store)
     }
 }
+
+#[test]
+    fn compose_single_chars_encapsulates_word_building() {
+        // 造词内部逻辑家族内聚:链式豁免 / 多音节判定 / 首音节 / 单字过滤。
+        use crate::family::CandidateFamily;
+        let fam = PinyinFamily::new();
+        // jianshipin → 首音节 jian 的单字表(剪在内,不在已有候选时)。
+        let chars = fam.compose_single_chars("jianshipin", &InputContext::new(), &[], 32);
+        assert!(chars.iter().any(|c| c.text == "剪"), "剪 in compose chars: {:?}",
+            chars.iter().map(|c| c.text.clone()).collect::<Vec<_>>());
+        // 已有候选去重:剪 已在面板时不重复给出。
+        let chars2 = fam.compose_single_chars("jianshipin", &InputContext::new(), &["剪".into()], 32);
+        assert!(!chars2.iter().any(|c| c.text == "剪"));
+        // 链式豁免:' 会破坏部分提交的音节消耗。
+        assert!(fam.compose_single_chars("ti'an", &InputContext::new(), &[], 32).is_empty());
+        // 单音节无需造词。
+        assert!(fam.compose_single_chars("ni", &InputContext::new(), &[], 32).is_empty());
+    }
 
 #[cfg(test)]
 

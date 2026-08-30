@@ -6,12 +6,53 @@
 //! 控制面的预热接口——确保模型已 online 可调用。供上层(aura-daemon 启动、UI 切模型)
 //! 在首次 inference 前主动探活 + 触发动态加载,避免首次请求的 latency spike。
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 
 use crate::{AsrProvider, LlmProvider, ModelProvider, VlmProvider};
+
+// ── 实时性约束(实时管线,不能死等)────────────────────────────────────────────────
+//
+// 远程调用若**挂起**(服务端卡住但 TCP 连接还开着)会永久阻塞调用线程;aura 管线的 batch /
+// LLM 各跑在单 worker 上,一个挂起请求 = 整条 worker 卡死 = 之后所有段落定稿"死等"。
+// 两道防线:
+//   1. **每请求硬超时** —— 超时即 `Err`(失败),调用方映射成 `None` 继续往下(整流/定稿)。
+//   2. **熔断** —— 发现服务不可用(连接错误/超时)后,窗口内**直接不发送**(立即 `Err`),
+//      不拿一个已知断链的连接去等;窗口后探测,恢复即闭合。
+//
+// ASR 是实时热路径(句级 batch 在定稿关键路径上):用户要求**超过 3s 就不等**——
+// `ASR_TIMEOUT` 即该上限。⚠️ 若你的 ASR 正常就 ≥3s(如 qwen3-asr 实测 ~3.5s),正常调用会被
+// 超时、回退流式——把 `ASR_TIMEOUT` 调到略高于你的正常延迟即可(单一常量)。
+pub const ASR_TIMEOUT: Duration = Duration::from_secs(3);
+/// LLM 延迟比 ASR 大且更不稳定(1–3s 常态),给更大上限:防挂起但不误杀慢而正常的调用。
+pub const LLM_TIMEOUT: Duration = Duration::from_secs(10);
+/// 熔断窗口:一次失败后,这段时间内不发送(直接 `Err`)。窗口后自动探测。
+pub const CIRCUIT_OPEN: Duration = Duration::from_millis(1000);
+
+/// 轻量时间型熔断器:失败后开 [`CIRCUIT_OPEN`],开期内调用方跳过发送;成功即闭合。
+/// 单 worker 调用,但用 `Mutex` 保持 `&self` 可并发调用。
+#[derive(Default)]
+struct Circuit {
+    open_until: Option<Instant>,
+}
+
+impl Circuit {
+    /// 熔断中(应跳过发送)?
+    fn is_open(&self) -> bool {
+        self.open_until.is_some_and(|until| Instant::now() < until)
+    }
+    /// 打开(失败后调用)。
+    fn trip(&mut self) {
+        self.open_until = Some(Instant::now() + CIRCUIT_OPEN);
+    }
+    /// 闭合(成功后调用)。
+    fn reset(&mut self) {
+        self.open_until = None;
+    }
+}
 
 /// ASR via OpenAI `/v1/audio/transcriptions` (multipart wav)。
 pub struct HttpAsr {
@@ -20,26 +61,33 @@ pub struct HttpAsr {
     /// 服务端模型名(必传;OpenAI 规范要求 multipart form 里带 `model` 字段)。
     /// 需与目标服务的模型注册名对齐(如 dp-router.yaml `models[].name`)。
     model: String,
+    circuit: Mutex<Circuit>,
 }
 
 impl HttpAsr {
     pub fn new(endpoint: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::with_timeout(endpoint, model, ASR_TIMEOUT)
+    }
+
+    /// Like [`new`](Self::new) but with an explicit per-request timeout (a hung request is
+    /// abandoned after `timeout` → `Err`, so the caller can fall back instead of blocking forever).
+    pub fn with_timeout(
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+        timeout: Duration,
+    ) -> Self {
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::blocking::Client::builder()
+                .timeout(timeout)
+                .build()
+                .expect("build reqwest blocking client"),
             endpoint: endpoint.into(),
             model: model.into(),
+            circuit: Mutex::new(Circuit::default()),
         }
     }
-}
 
-impl ModelProvider for HttpAsr {
-    fn kind(&self) -> &'static str {
-        "remote-http"
-    }
-}
-
-impl AsrProvider for HttpAsr {
-    fn recognize(&self, pcm: &[i16], sr: u32) -> Result<String> {
+    fn do_recognize(&self, pcm: &[i16], sr: u32) -> Result<String> {
         let wav = pcm_to_wav(pcm, sr);
         let part = reqwest::blocking::multipart::Part::bytes(wav)
             .file_name("audio.wav")
@@ -58,19 +106,60 @@ impl AsrProvider for HttpAsr {
     }
 }
 
+impl ModelProvider for HttpAsr {
+    fn kind(&self) -> &'static str {
+        "remote-http"
+    }
+}
+
+impl AsrProvider for HttpAsr {
+    fn recognize(&self, pcm: &[i16], sr: u32) -> Result<String> {
+        // 熔断:已知服务不可用(断链/刚超时)→ 窗口内不发送,立即 Err(回退流式,不等)。
+        if self.circuit.lock().unwrap().is_open() {
+            return Err(anyhow!(
+                "ASR 服务不可用(熔断窗口 {}ms 内不发送)——回退流式",
+                CIRCUIT_OPEN.as_millis()
+            ));
+        }
+        let res = self.do_recognize(pcm, sr);
+        let mut c = self.circuit.lock().unwrap();
+        match &res {
+            Ok(_) => c.reset(), // 成功 → 闭合
+            Err(_) => c.trip(), // 失败(断链/超时)→ 打开窗口
+        }
+        res
+    }
+}
+
 /// LLM via OpenAI `/v1/chat/completions`。
 pub struct HttpLlm {
     client: reqwest::blocking::Client,
     endpoint: String,
     model: String,
+    circuit: Mutex<Circuit>,
 }
 
 impl HttpLlm {
     pub fn new(endpoint: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::with_timeout(endpoint, model, LLM_TIMEOUT)
+    }
+
+    /// Like [`new`](Self::new) but with an explicit per-request timeout. Bounds BOTH
+    /// `complete` (a hung LLM would stall the Stage2 worker → finalization "死等") and the
+    /// `warm` polling loop (a hung admin endpoint would block the warm-up thread forever).
+    pub fn with_timeout(
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+        timeout: Duration,
+    ) -> Self {
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::blocking::Client::builder()
+                .timeout(timeout)
+                .build()
+                .expect("build reqwest blocking client"),
             endpoint: endpoint.into(),
             model: model.into(),
+            circuit: Mutex::new(Circuit::default()),
         }
     }
 
@@ -209,6 +298,26 @@ impl ModelProvider for HttpLlm {
 
 impl LlmProvider for HttpLlm {
     fn complete(&self, system: &str, user: &str) -> Result<String> {
+        // 熔断:已知 LLM 不可用(断链/刚超时)→ 窗口内不发送,立即 Err —— 整流回退原文,
+        // 不让 Stage2 worker 卡在一个已知断链的连接上(否则定稿"死等")。
+        if self.circuit.lock().unwrap().is_open() {
+            return Err(anyhow!(
+                "LLM 服务不可用(熔断窗口 {}ms 内不发送)——整流回退原文",
+                CIRCUIT_OPEN.as_millis()
+            ));
+        }
+        let res = self.do_complete(system, user);
+        let mut c = self.circuit.lock().unwrap();
+        match &res {
+            Ok(_) => c.reset(),
+            Err(_) => c.trip(),
+        }
+        res
+    }
+}
+
+impl HttpLlm {
+    fn do_complete(&self, system: &str, user: &str) -> Result<String> {
         let body = serde_json::json!({
             "model": self.model,
             "messages": [
@@ -232,14 +341,29 @@ pub struct HttpVlm {
     client: reqwest::blocking::Client,
     endpoint: String,
     model: String,
+    circuit: Mutex<Circuit>,
 }
 
 impl HttpVlm {
     pub fn new(endpoint: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::with_timeout(endpoint, model, LLM_TIMEOUT)
+    }
+
+    /// Like [`new`](Self::new) but with an explicit per-request timeout (same "hung request
+    /// blocks the caller forever" guard as [`HttpAsr`]/[`HttpLlm`]).
+    pub fn with_timeout(
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+        timeout: Duration,
+    ) -> Self {
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::blocking::Client::builder()
+                .timeout(timeout)
+                .build()
+                .expect("build reqwest blocking client"),
             endpoint: endpoint.into(),
             model: model.into(),
+            circuit: Mutex::new(Circuit::default()),
         }
     }
 }
@@ -252,6 +376,25 @@ impl ModelProvider for HttpVlm {
 
 impl VlmProvider for HttpVlm {
     fn complete(&self, system: &str, user: &str, image_png: &[u8]) -> Result<String> {
+        // 熔断:同 HttpLlm —— 已知 VLM 不可用时窗口内不发送,立即 Err。
+        if self.circuit.lock().unwrap().is_open() {
+            return Err(anyhow!(
+                "VLM 服务不可用(熔断窗口 {}ms 内不发送)",
+                CIRCUIT_OPEN.as_millis()
+            ));
+        }
+        let res = self.do_complete(system, user, image_png);
+        let mut c = self.circuit.lock().unwrap();
+        match &res {
+            Ok(_) => c.reset(),
+            Err(_) => c.trip(),
+        }
+        res
+    }
+}
+
+impl HttpVlm {
+    fn do_complete(&self, system: &str, user: &str, image_png: &[u8]) -> Result<String> {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD.encode(image_png);
         let body = serde_json::json!({

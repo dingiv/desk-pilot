@@ -143,6 +143,20 @@ impl StateMachine {
     pub(crate) fn take_last_commit_family(&mut self) -> Option<&'static str> {
         self.last_commit_family.take()
     }
+
+    /// 面板镜像(S3 统一):last_meta → RankedCandidate,与 candidates
+    /// 同序同源 —— 用户看见什么,这里就是什么。
+    pub(crate) fn detailed(&self) -> Vec<crate::family::RankedCandidate> {
+        self.last_meta
+            .iter()
+            .map(|m| crate::family::RankedCandidate {
+                text: m.text.clone(),
+                score: m.score,
+                family: m.family,
+                source: m.source,
+            })
+            .collect()
+    }
 }
 
 impl std::fmt::Debug for StateMachine {
@@ -1139,12 +1153,11 @@ impl StateMachine {
             })
             .collect();
 
-        // 3. Layer 3 造词单字区:buffer ≥2 音节时追加首音节单字(逐字造词)。
-        //    链式输入(`ti'an`)豁免 —— 部分提交按音节消耗 buffer,会把
-        //    `'` 留在半截 buffer 里破坏链结构;链式候选只整体提交。
-        let chained = self.buffer.contains('\'');
-        if let Some(first_syl) = env.first_syllable(&self.buffer) {
-            if !chained && first_syl.len() < self.buffer.len() {
+        // 3. Layer 3 造词单字区:内部逻辑(链式豁免/多音节判定/首音节/
+        //    单字过滤)在拼音家族(compose_single_chars),壳只管调用与
+        //    面板重排 —— 家族返回空(链式/单音节)即不重排,原序直出。
+        {
+            {
                 // 词头只收**真词**(非 decomp 链:X食品 类拼接对逐字造词
                 // 无价值);嵌入词典场景全 decomp 时保底收首候选(nihao 的
                 // "你好"也是链,head 空会让单字区顶到槽 1,space 变部分提交)。
@@ -1156,23 +1169,12 @@ impl StateMachine {
                     .take(4)
                     .collect();
                 let real_words = if real_words.is_empty() { vec![0] } else { real_words };
+                let texts: Vec<String> = items.iter().map(|it| it.text.clone()).collect();
                 // 单字区全量放出:merged 可超 16 槽,fill_view 按页切窗后
                 // 翻页全部可达。
-                let max_chars = 32usize;
-                // 造词单字候选:直接走 pinyin 家族的 predict(单音节输入 =
-                // single 路径)。修复 B2 双实例脑裂:曾用独立 InputxPinyin
-                // 实例,L0 永远为空,选择历史从不影响造词候选排序。
                 let char_items: Vec<PanelItem> = env
-                    .scorer()
-                    .family("pinyin")
-                    .map(|f| f.predict(&first_syl, &self.context))
-                    .unwrap_or_default()
+                    .compose_single_chars(&self.buffer, &self.context, &texts, 32)
                     .into_iter()
-                    .filter(|c| {
-                        c.text.chars().count() == 1
-                            && !items.iter().any(|it| it.text == c.text)
-                    })
-                    .take(max_chars)
                     .map(|c| PanelItem {
                         meta: CandMeta {
                             text: c.text.clone(),
@@ -1367,6 +1369,7 @@ pub(crate) fn apply_input_casing(word: &str, raw_input: &str) -> String {
 
 /// Borrowed engine components needed by the FSM to evaluate transitions.
 pub trait StepEnv {
+    //(InputContext 经全路径引用;trait 方法签名保持与家族 API 一致)
     fn matcher(&self) -> &Matcher;
     fn expander(&self) -> &Expander;
 
@@ -1377,6 +1380,19 @@ pub trait StepEnv {
     /// (纯函数:最长合法音节前缀,见 `family::pinyin::first_syllable_of`。)
     fn first_syllable(&self, pinyin: &str) -> Option<String> {
         crate::family::pinyin::first_syllable_of(pinyin)
+    }
+
+    /// 造词单字候选(逐字输入组词)—— 拼音家族私有能力(D5):链式豁免/
+    /// 多音节判定/首音节提取/单字过滤在家族内聚,壳只管调用与面板重排。
+    /// 默认空(无拼音家族的环境)。
+    fn compose_single_chars(
+        &self,
+        input: &str,
+        ctx: &crate::family::InputContext,
+        existing: &[String],
+        limit: usize,
+    ) -> Vec<crate::family::ScoredCandidate> {
+        Vec::new()
     }
 
     /// Record a user pick in inputx-pinyin's L0 layer for frequency boosting.

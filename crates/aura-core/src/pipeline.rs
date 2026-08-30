@@ -22,12 +22,12 @@
 //! keep flowing while a paragraph is being calibrated; a `StreamFragment` for sentence N+1 can
 //! arrive BEFORE the `ParagraphCalibration` for paragraph N. The worker drains the Stage1
 //! triggers off an mpsc channel (`StreamFragment` never crosses it — it passes straight through
-//! on the consume-loop thread): `Batch` → [`Stage2Calibrator::calibrate_paragraph`] (live joint
-//! calibration) → [`TurnEvent::SentenceCalibration`]; `SentenceBatchReady` → 累积句 batch →
-//! [`TurnEvent::BatchSentence`]; `ParagraphEdge` → 开启就绪表;`ParagraphBatchReady` / 全部
-//! `SentenceBatchReady` 到齐 → [`Stage2Calibrator::finalize_paragraph`] (ONE LLM pass over the
-//! final best texts) → [`TurnEvent::BatchParagraph`] + 归档 +
-//! [`TurnEvent::ParagraphCalibration`].
+//! on the consume-loop thread): `Batch` → 累积句集 + 开就绪表(**不整流**——本句 batch 未识别);
+//! `SentenceBatchReady` → [`TurnEvent::BatchSentence`] + [`Stage2Calibrator::calibrate_paragraph`]
+//! (live joint calibration, 严格在 batch 之后)→ [`TurnEvent::SentenceCalibration`];
+//! `ParagraphEdge` → 填段落与 expected;`ParagraphBatchReady` / 全部 `SentenceBatchReady` 到齐 →
+//! [`Stage2Calibrator::finalize_paragraph`] (ONE LLM pass over the final best texts) →
+//! [`TurnEvent::BatchParagraph`] + 归档 + [`TurnEvent::ParagraphCalibration`].
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -381,14 +381,19 @@ impl Pipeline {
 // ── Finalizer:Stage2 worker 的段落累积 + 就绪定稿状态机(单线程独占,无锁)──────────────
 // batch 异步化后,段落定稿要等"全部句级 batch 到齐 + 段级重跑到齐"(单句段落免重跑)。
 // 事件在这条 worker 线上有序到达,状态不可能失步:
-//   Batch            → 累积句集(保留已到的句级 batch) + live 联合整流 + 开就绪表
-//   SentenceBatchReady → 回填句级 batch → BatchSentence + ready += 1
+//   Batch            → 累积句集(保留已到的句级 batch) + 开就绪表(**不整流** —— 此刻本句
+//                      batch 未识别,整流会退化成纯流式,导致 calibrated 早于 batch)
+//   SentenceBatchReady → 回填句级 batch → BatchSentence + **联合整流** → SentenceCalibration
+//                      + ready += 1(整流严格在 batch 之后:该句 batch + 流式都齐)
 //   ParagraphEdge    → 填入段落与 expected(单句段落 para_done 立即置位 —— 它没有重跑 job)
 //   ParagraphBatchReady → 段级重跑结果 → para_done
 //   就绪(para_done && ready == expected) → LLM 整流一次(全句 best_text)→
 //   BatchParagraph + record_final + ParagraphCalibration。
-// 顺序不变式:定稿必在全部 BatchSentence 之后(就绪计数保证);BatchParagraph 允许与部分
-// BatchSentence 交错(前端按 id 折叠,voice_state.rs 已鲁棒)。
+// 顺序不变式:每句 calibrated 必在其 BatchSentence 之后;定稿必在全部 BatchSentence 之后
+// (就绪计数保证);BatchParagraph 允许与部分 BatchSentence 交错(前端按 id 折叠,
+// voice_state.rs 已鲁棒)。
+// 注:live 整流(每句 batch 到齐一次)与定稿整流(段关闭一次)对末句是重复 LLM 调用 ——
+// 属 P1(整流去冗余)范畴,见 pipeline-optimization.md;本处只保证时序正确。
 
 struct PendingFinal {
     /// 段落本体(ParagraphEdge 填入;`sentences` 定稿时替换为累积的句级 batch 补齐版)。
@@ -440,7 +445,9 @@ impl Finalizer {
     }
 
     /// Batch(每句 EOS):累积句集(保留已到的句级 batch——SentenceBatchReady 可能已抢先回填)
-    /// → 联合 LLM 整流(live 预览,每句一次)。
+    /// + 开就绪表。**不在这里整流**——此刻本句 batch 尚未识别(Batch 事件 `batch_text: None`,
+    /// in-flight),整流会退化成纯流式文本,导致 `calibrated` 跑到 `batch` 之前。联合整流改到
+    /// [`Self::on_sentence_batch_ready`](该句 batch + 流式都齐)严格在 batch 之后触发。
     fn on_batch(&mut self, paragraph_id: ParagraphId, sentences: Vec<VadSentence>) -> Vec<TurnEvent<'static>> {
         let entry = self.sentences.entry(paragraph_id).or_default();
         for s in sentences {
@@ -457,21 +464,12 @@ impl Finalizer {
             ready: 0,
             para_done: false,
         });
-        let all = entry.clone();
-        let t = Instant::now();
-        let calibrated = self.s2.calibrate_paragraph(paragraph_id, &all);
-        let route_ms = t.elapsed().as_secs_f64() * 1000.0;
-        // 联合整流当前段落(每 VAD gap 一次)。
-        info!(
-            paragraph_id,
-            route_ms = route_ms.round() as u64,
-            calibrated = %calibrated,
-            "纠偏[sentence]"
-        );
-        vec![TurnEvent::SentenceCalibration { paragraph_id, calibrated, route_ms }]
+        Vec::new()
     }
 
-    /// SentenceBatchReady:回填句级 batch → 发 `BatchSentence`(有文本时)→ 推进就绪计数。
+    /// SentenceBatchReady:该句 batch + 流式都已齐 → 回填句级 batch → 发 `BatchSentence`(有文本时)
+    /// → **联合 LLM 整流**(此刻全句 best_text 含该句 batch 文本)→ 发 `SentenceCalibration`
+    /// → 推进就绪计数。整流严格排在 `BatchSentence` 之后,保证 `calibrated` 不早于 `batch`。
     /// 陈旧事件(段落已定稿、状态已清,或从未见过的段落)→ 忽略,无副作用。
     fn on_sentence_batch_ready(
         &mut self,
@@ -502,6 +500,21 @@ impl Finalizer {
                 asr_ms = batch_asr_ms,
                 "句级 batch 到达(就绪计数)"
             );
+        }
+        // ★ 联合整流(每句 batch 到齐后一次):用全句 best_text(该句 batch 已回填)整流当前
+        // 段落 —— live 预览。严格在 BatchSentence 之后 → calibrated 不早于 batch。
+        if let Some(entry) = self.sentences.get(&paragraph_id) {
+            let all = entry.clone();
+            let t = Instant::now();
+            let calibrated = self.s2.calibrate_paragraph(paragraph_id, &all);
+            let route_ms = t.elapsed().as_secs_f64() * 1000.0;
+            info!(
+                paragraph_id,
+                route_ms = route_ms.round() as u64,
+                calibrated = %calibrated,
+                "纠偏[sentence]"
+            );
+            out.push(TurnEvent::SentenceCalibration { paragraph_id, calibrated, route_ms });
         }
         out.extend(self.try_finalize(paragraph_id));
         out
@@ -783,83 +796,91 @@ mod tests {
         }
     }
 
-    /// 多句段落完整流程:定稿必须等"全句 batch 齐 + 重跑齐";定稿 = 1 次 LLM;
-    /// BatchParagraph 在 ParagraphCalibration 前;定稿必在所有 BatchSentence 之后。
+    /// 多句段落完整流程:每句 batch 到齐 → live 整流(calibrated 严格在 batch 之后);
+    /// 定稿必须等"全句 batch 齐 + 重跑齐"再跑 1 次 LLM;BatchParagraph 在 ParagraphCalibration
+    /// 前;定稿必在所有 BatchSentence 之后。
     #[test]
     fn finalizer_multi_sentence_ready_gate() {
         let calls = Arc::new(Mutex::new(0));
         let mut f = fin_with_llm(Arc::clone(&calls));
 
-        // 句1 EOS:Batch(句1 batch=None)+ live 整流。
+        // 句1 EOS:Batch(句1 batch=None)—— 只累积,不整流(此刻 batch 未识别)。
         let evs = f.handle(e_batch(1, vec![tsent(1, None)]));
-        assert_eq!(evs.len(), 1, "仅 live 校准");
-        assert!(!matches!(evs[0], TurnEvent::ParagraphCalibration { .. }));
-        assert_eq!(*calls.lock().unwrap(), 1, "每 Batch 一次 live LLM");
+        assert!(evs.is_empty(), "Batch 不整流");
+        assert_eq!(*calls.lock().unwrap(), 0, "Batch 时零 LLM");
 
-        // 句1 batch 先到(段落还没关)—— ready 计数,不定稿。
+        // 句1 batch 到齐 → BatchSentence + live 整流(batch+流式都齐);段落未关,不定稿。
         let evs = f.handle(e_sbr(1, 1, "句1批式"));
-        assert!(matches!(evs[0], TurnEvent::BatchSentence { .. }), "句1 BatchSentence");
-        assert_eq!(evs.len(), 1, "未就绪不定稿");
+        assert_eq!(evs.len(), 2, "BatchSentence + SentenceCalibration(未就绪不定稿)");
+        assert!(matches!(evs[0], TurnEvent::BatchSentence { .. }), "先 BatchSentence");
+        assert!(matches!(evs[1], TurnEvent::SentenceCalibration { .. }), "calibrated 在 batch 之后");
+        assert_eq!(*calls.lock().unwrap(), 1, "句1 batch 到齐 → live LLM 一次");
 
         // 段落关闭(2 句):expected=2,para_done=false(重跑 job 已投递未回)。
         let evs = f.handle(e_ped(tpar(1, vec![tsent(1, None), tsent(2, None)])));
         assert!(evs.is_empty());
 
-        // 句2 EOS:Batch(全句快照,句1 的 batch 已回填)+ live 整流。
+        // 句2 EOS:Batch(全句快照,句1 的 batch 已回填)—— 只累积,不整流。
         let evs = f.handle(e_batch(1, vec![tsent(1, None), tsent(2, None)]));
-        assert_eq!(evs.len(), 1);
-        assert_eq!(*calls.lock().unwrap(), 2);
+        assert!(evs.is_empty(), "Batch 不整流");
+        assert_eq!(*calls.lock().unwrap(), 1, "仍无新增 LLM");
 
         // 重跑先于句2 batch 完成(池并行)—— 仍不就绪(ready=1 < 2):
         // 保证定稿文本能拿到句2 的 batch,而不是退化成流式。
         let evs = f.handle(e_pbr(1, "整段批式"));
         assert!(evs.is_empty(), "重跑先到但句2 batch 未齐 → 不定稿");
 
-        // 句2 batch 到 → 就绪 → 定稿:BatchParagraph + ParagraphCalibration(定稿 LLM 第 3 次)。
+        // 句2 batch 到齐 → BatchSentence + live 整流 + 就绪 → 定稿(BatchParagraph +
+        // ParagraphCalibration,定稿 LLM 第 3 次)。
         let evs = f.handle(e_sbr(1, 2, "句2批式"));
-        assert_eq!(evs.len(), 3, "BatchSentence + BatchParagraph + ParagraphCalibration");
+        assert_eq!(evs.len(), 4, "BatchSentence + SentenceCalibration + BatchParagraph + ParagraphCalibration");
         assert!(matches!(evs[0], TurnEvent::BatchSentence { .. }));
-        assert!(matches!(evs[1], TurnEvent::BatchParagraph { .. }));
-        assert!(matches!(evs[2], TurnEvent::ParagraphCalibration { .. }));
-        assert_eq!(*calls.lock().unwrap(), 3, "定稿恰好再跑一次 LLM");
+        assert!(matches!(evs[1], TurnEvent::SentenceCalibration { .. }));
+        assert!(matches!(evs[2], TurnEvent::BatchParagraph { .. }));
+        assert!(matches!(evs[3], TurnEvent::ParagraphCalibration { .. }));
+        assert_eq!(*calls.lock().unwrap(), 3, "live 2 + 定稿 1");
         // 定稿后状态清空:再来事件无副作用。
         assert!(f.handle(e_sbr(1, 2, "句2批式")).is_empty());
     }
 
-    /// 单句段落:无重跑 job,ParagraphEdge 即 para_done;只等句级 batch → 定稿;
-    /// 无 BatchParagraph(单句复用句级结果,段落 batch_text 恒 None)。
+    /// 单句段落:无重跑 job,ParagraphEdge 即 para_done;只等句级 batch → batch 到齐 →
+    /// BatchSentence + live 整流 + 定稿;无 BatchParagraph(单句复用句级结果,段落 batch_text
+    /// 恒 None)。
     #[test]
     fn finalizer_single_sentence_reuses_sentence_batch() {
         let calls = Arc::new(Mutex::new(0));
         let mut f = fin_with_llm(Arc::clone(&calls));
 
         let evs = f.handle(e_batch(1, vec![tsent(1, None)]));
-        assert_eq!(evs.len(), 1);
+        assert!(evs.is_empty(), "Batch 不整流");
         let evs = f.handle(e_ped(tpar(1, vec![tsent(1, None)])));
         assert!(evs.is_empty(), "单句段落:batch 未到,尚不定稿");
         let evs = f.handle(e_sbr(1, 1, "句1批式"));
-        assert_eq!(evs.len(), 2, "BatchSentence + ParagraphCalibration(无 BatchParagraph)");
+        assert_eq!(evs.len(), 3, "BatchSentence + SentenceCalibration + ParagraphCalibration(无 BatchParagraph)");
         assert!(matches!(evs[0], TurnEvent::BatchSentence { .. }));
-        assert!(matches!(evs[1], TurnEvent::ParagraphCalibration { .. }));
+        assert!(matches!(evs[1], TurnEvent::SentenceCalibration { .. }));
+        assert!(matches!(evs[2], TurnEvent::ParagraphCalibration { .. }));
         assert_eq!(*calls.lock().unwrap(), 2, "live 1 + 定稿 1");
     }
 
-    /// batch 失败(结果 None):不阻塞就绪(每 job 必出结果),定稿按流式回退照常进行。
+    /// batch 失败(结果 None):不阻塞就绪(每 job 必出结果);live 整流退化为纯流式
+    /// (best_text 回退),定稿照常进行。
     #[test]
     fn finalizer_failed_batch_still_finalizes() {
         let calls = Arc::new(Mutex::new(0));
         let mut f = fin_with_llm(Arc::clone(&calls));
         f.handle(e_batch(1, vec![tsent(1, None)]));
         f.handle(e_ped(tpar(1, vec![tsent(1, None)])));
-        // 句级 batch 失败(None)—— 无 BatchSentence,但 ready 计数。
+        // 句级 batch 失败(None)—— 无 BatchSentence,但 live 整流(流式回退)+ 就绪定稿照走。
         let evs = f.handle(Stage1Event::SentenceBatchReady {
             paragraph_id: 1,
             sentence_id: 1,
             batch_text: None,
             batch_asr_ms: 99,
         });
-        assert_eq!(evs.len(), 1, "仅 ParagraphCalibration(batch 失败无 BatchSentence)");
-        assert!(matches!(evs[0], TurnEvent::ParagraphCalibration { .. }));
+        assert_eq!(evs.len(), 2, "SentenceCalibration(流式回退)+ ParagraphCalibration(batch 失败无 BatchSentence)");
+        assert!(matches!(evs[0], TurnEvent::SentenceCalibration { .. }));
+        assert!(matches!(evs[1], TurnEvent::ParagraphCalibration { .. }));
         assert_eq!(*calls.lock().unwrap(), 2);
     }
 
@@ -870,13 +891,35 @@ mod tests {
         let calls = Arc::new(Mutex::new(0));
         let mut f = fin_with_llm(Arc::clone(&calls));
         f.handle(e_batch(1, vec![tsent(1, None)]));
-        f.handle(e_sbr(1, 1, "句1批式"));
+        let evs = f.handle(e_sbr(1, 1, "句1批式"));
+        assert!(matches!(evs.last(), Some(TurnEvent::SentenceCalibration { .. })), "句1 batch → live 整流");
         f.handle(e_ped(tpar(1, vec![tsent(1, None), tsent(2, None)])));
         f.handle(e_batch(1, vec![tsent(1, None), tsent(2, None)]));
         // 重跑完成,但句2 batch 未回 —— 绝不定稿(否则末句退化成流式)。
         let evs = f.handle(e_pbr(1, "整段批式"));
         assert!(evs.is_empty(), "ready=1 < expected=2 → 不定稿");
-        assert_eq!(*calls.lock().unwrap(), 2, "没有为定稿多跑 LLM");
+        assert_eq!(*calls.lock().unwrap(), 1, "只有句1 的 live 整流,没有为定稿多跑 LLM");
+    }
+
+    /// 核心回归:calibrated 绝不早于同句的 batch —— 任意 Batch 事件不得产生 SentenceCalibration;
+    /// SentenceCalibration 只可能由 SentenceBatchReady(该句 batch 到齐)触发。
+    #[test]
+    fn calibrated_never_precedes_batch() {
+        let calls = Arc::new(Mutex::new(0));
+        let mut f = fin_with_llm(Arc::clone(&calls));
+        // 连续两个 Batch(句1、句2 的 EOS 快照),中间没有 SentenceBatchReady —— 绝不应出
+        // SentenceCalibration(旧 bug:Batch 即整流,用的是纯流式文本)。
+        let evs = f.handle(e_batch(1, vec![tsent(1, None)]));
+        assert!(evs.is_empty());
+        let evs = f.handle(e_batch(1, vec![tsent(1, None), tsent(2, None)]));
+        assert!(evs.is_empty(), "两个 Batch 之间无 batch 到齐 → 零 SentenceCalibration");
+        assert_eq!(*calls.lock().unwrap(), 0, "仅 Batch 事件不触发任何 LLM");
+        // 句1 batch 到齐 → 才有 calibrated。
+        let evs = f.handle(e_sbr(1, 1, "句1批式"));
+        assert!(
+            evs.iter().any(|e| matches!(e, TurnEvent::SentenceCalibration { .. })),
+            "SentenceBatchReady 触发 calibrated"
+        );
     }
 
     fn spec(asr: AsrSpec) -> PipelineSpec {

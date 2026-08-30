@@ -548,16 +548,12 @@ impl ImeEngine {
                 })
                 .collect();
         }
-        let ctx = pc.text_context.clone();
-        let buffer = pc.sm.buffer.clone();
-        drop(map);
-        use crate::fsm::state::StepEnv;
-        // 与状态机同序:单字母置顶规则(promote_single_letter)在这里同样
-        // 生效 —— 否则 detailed 镜像与机器候选列表顺序分叉。
-        crate::fsm::state::promote_single_letter(
-            &buffer,
-            self.dispatcher.scorer().rank_detailed(&buffer, &ctx),
-        )
+        // S3 镜像统一:直接读面板(last_meta)—— 与用户真实候选(space
+        // 提交对象)同源,含 promote_single_letter 与 Layer 3 造词单字区。
+        // 旧实现独立重算 rank_detailed + promote(无造词区),镜像与机器
+        // 候选分叉 —— 探针/调试/aura 拿到的不是用户看见的东西。
+        let detailed = pc.sm.detailed();
+        detailed
     }
 
     /// Manually set the text context (simulates pre-filled text).

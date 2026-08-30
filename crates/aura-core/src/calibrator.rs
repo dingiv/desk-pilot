@@ -27,13 +27,18 @@ use crate::prompt::PromptBuilder;
 ///   [`finalize_paragraph`](Self::finalize_paragraph) — ONE LLM pass over the paragraph's final
 ///   best texts (the last sentence's batch may have arrived after its `Batch`, so the final pass
 ///   cannot reuse a stored calibration).
+/// 门禁契约:两个方法都只在"流式或 batch 至少一路有非空文本"时才真正调用 LLM;
+/// 双路全空(纯噪声 / ASR 断链回退后流式也空)→ 零 LLM,直接回空文本。避免在无内容时
+/// 烧一次无意义的远程调用。
 pub trait Stage2Calibrator: Send {
     /// Joint calibration (per Batch, live preview). Input = ALL sentences so far (best_text,
-    /// streaming fallback). Stateless — no stored result.
+    /// streaming fallback). Stateless — no stored result. **Gated: no LLM when both streaming
+    /// and batch are empty for every sentence.**
     fn calibrate_paragraph(&mut self, paragraph_id: ParagraphId, sentences: &[VadSentence]) -> String;
     /// Finalize (per settled paragraph, once): run the LLM over the paragraph's final best texts
     /// (the pipeline patches in every sentence's batch before calling this). Falls back to the
-    /// raw joined text on LLM failure (see `joint_calibrate`).
+    /// raw joined text on LLM failure (see `joint_calibrate`). **Gated: no LLM when both
+    /// streaming and batch are empty for every sentence.**
     fn finalize_paragraph(&mut self, paragraph: &VadParagraph) -> String;
 }
 
@@ -97,9 +102,22 @@ impl Stage2CalibratorImpl {
     }
 }
 
+/// 门禁:段落(全部句)是否**有内容可整流**——至少一句的流式或 batch 有非空文本。
+/// 全空(纯噪声 / batch 与流式双路都空,常见于 ASR 断链回退后流式也听不出)→ `false`。
+/// 此时执行 LLM 只会烧一次调用换回空/噪声,毫无意义 —— 调用方应跳过 LLM。
+fn has_recognized_text(sentences: &[VadSentence]) -> bool {
+    sentences
+        .iter()
+        .any(|s| !s.streaming_text.trim().is_empty() || !s.batch_text.as_deref().unwrap_or("").trim().is_empty())
+}
+
 impl Stage2Calibrator for Stage2CalibratorImpl {
     fn calibrate_paragraph(&mut self, paragraph_id: ParagraphId, sentences: &[VadSentence]) -> String {
         let _ = paragraph_id; // stateless — the id is for the caller's bookkeeping
+        // 门禁:流式与 batch 双路全空 → 无内容可整流,零 LLM,直接回空(不烧一次无意义调用)。
+        if !has_recognized_text(sentences) {
+            return String::new();
+        }
         match self.input {
             LlmInput::Batch => {
                 // One line per sentence — the joint input IS the cross-sentence context.
@@ -129,6 +147,10 @@ impl Stage2Calibrator for Stage2CalibratorImpl {
     }
 
     fn finalize_paragraph(&mut self, paragraph: &VadParagraph) -> String {
+        // 门禁:流式与 batch 双路全空 → 无内容可整流,零 LLM,回原文(空)。
+        if !has_recognized_text(&paragraph.sentences) {
+            return String::new();
+        }
         // 定稿整流:全句 best_text(句级 batch 已由 pipeline 补齐;缺失句回退流式)。
         // batch 异步化后末句 batch 可能晚于最后一个 Batch 到达,不能复用 live 整存档 ——
         // 定稿自己跑一次 LLM。
@@ -167,7 +189,8 @@ impl Stage2CalibratorImpl {
     /// envelope), run the LLM, fall back to the raw text on failure. `streaming_ref` (Some for
     /// [`LlmInput::Both`]) adds the dual-transcript envelope so the LLM can补回 batch 丢的句首.
     fn joint_calibrate(&mut self, texts: &[&str], streaming_ref: Option<&str>) -> String {
-        // 全空(噪声段落/纯丢弃句)→ 零 LLM,直接回原文(空)。
+        // Defense-in-depth:入口门禁(has_recognized_text)已挡"双路全空";此处再按**所选
+        // 输入源**挡一次(如 Stream 模式下流式全空 → 无输入)→ 零 LLM,回原文(空)。
         if texts.is_empty() {
             return String::new();
         }
@@ -314,6 +337,51 @@ mod tests {
         p.sentences.clear();
         assert_eq!(s.finalize_paragraph(&p), "", "全空段落零 LLM,回原文(空)");
         assert_eq!(*calls.lock().unwrap(), 0, "空段落不跑 LLM");
+    }
+
+    /// 一个"双路全空"的句:streaming 与 batch 都空(纯噪声 / ASR 断链回退后流式也听不出)。
+    fn empty_sentence(id: SentenceId) -> VadSentence {
+        VadSentence {
+            id,
+            audio_id: id,
+            start_s: 0.0,
+            end_s: 0.1,
+            streaming_text: String::new(),
+            batch_text: None,
+        }
+    }
+
+    /// 门禁:双路全空 → live 整流与定稿整流都**零 LLM**(不烧无意义调用),直接回空。
+    #[test]
+    fn gate_no_llm_when_stream_and_batch_both_empty() {
+        let (mut s, calls) = s2();
+        let empty = vec![empty_sentence(1), empty_sentence(2)];
+        // live:全空 → 零 LLM,回空。
+        assert_eq!(s.calibrate_paragraph(7, &empty), "", "双路全空 live 零 LLM");
+        assert_eq!(*calls.lock().unwrap(), 0, "live 不跑 LLM");
+        // 定稿:全空段落 → 零 LLM,回空。
+        let mut p = paragraph(7);
+        p.sentences = empty.clone();
+        p.batch_text = None;
+        assert_eq!(s.finalize_paragraph(&p), "", "双路全空定稿零 LLM");
+        assert_eq!(*calls.lock().unwrap(), 0, "定稿不跑 LLM");
+    }
+
+    /// 门禁放行:只要有**一路**有输出(仅 batch 或仅流式),就正常整流(跑 LLM)。
+    #[test]
+    fn gate_passes_when_either_stream_or_batch_has_output() {
+        // 仅 batch 有输出(streaming 空)。
+        let (mut s, calls) = s2();
+        let mut only_batch = empty_sentence(1);
+        only_batch.batch_text = Some("只有批式".into());
+        assert_eq!(s.calibrate_paragraph(7, &[only_batch]), "整流OK", "仅 batch 有输出 → 整流");
+        assert_eq!(*calls.lock().unwrap(), 1, "batch 有输出 → 跑 LLM");
+        // 仅流式有输出(batch 空/None)。
+        let (mut s, calls) = s2();
+        let mut only_stream = empty_sentence(2);
+        only_stream.streaming_text = "只有流式".into();
+        assert_eq!(s.calibrate_paragraph(7, &[only_stream]), "整流OK", "仅流式有输出 → 整流");
+        assert_eq!(*calls.lock().unwrap(), 1, "流式有输出 → 跑 LLM");
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! and ranks candidates from all enabled prediction families.
 
 use crate::family::magic::expander::Expander;
+use crate::family::InputContext;
 use crate::family::english::EnglishFamily;
 use crate::family::magic::MagicFamily;
 use crate::family::pinyin::PinyinFamily;
@@ -207,6 +208,15 @@ impl StepEnv for Dispatcher {
     fn record_pick(&self, pinyin: &str, word: &str) {
         // 家族私有方法(D5):经具体句柄直调 —— 学习语义只有 pinyin 有。
         self.pinyin_family.record_pick(pinyin, word);
+    }
+    fn compose_single_chars(
+        &self,
+        input: &str,
+        ctx: &InputContext,
+        existing: &[String],
+        limit: usize,
+    ) -> Vec<crate::family::ScoredCandidate> {
+        self.pinyin_family.compose_single_chars(input, ctx, existing, limit)
     }
     fn learn_phrase(&self, pinyin: &str, hanzi: &str) {
         self.pinyin_family.learn_phrase(pinyin, hanzi);

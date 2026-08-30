@@ -184,3 +184,19 @@ state.rs 内部自访问。过渡策略:聚合体暴露与旧字段同形的访�
   - last_commit_family:降级为"注释澄清"(select 后 reset 的一次性
     通信,信息源 = panel.meta.find(text));S4 下沉时再议归属
   - 测试:ime-core 161+21+2、swift-ime 7+12+15 全绿
+- **S2.5 ✅** 造词逻辑下沉家族(用户指示:内部逻辑家族实现,壳只调用):
+  - `PinyinFamily::compose_single_chars(input, ctx, existing, limit)` ——
+    链式豁免(`'` 破坏部分提交的音节消耗)/ 多音节判定 / 首音节提取 /
+    单字过滤**全部内聚家族**
+  - `StepEnv::compose_single_chars` 默认空,Dispatcher 经具体句柄直调
+    (D5 家族私有能力风格,不上 trait)
+  - 壳的 postprocess 收缩:删 chained/first_syllable/单字过滤段,只做
+    真词头筛选 + head/chars/tail 面板重排 —— 家族返回空(链式/单音节)
+    即原序直出,豁免逻辑零壳代码
+  - 断言 compose_single_chars_encapsulates_word_building(jianshipin
+    含剪/已选去重/ti'an 空/单音节空)
+- **S3 ✅** 镜像统一:`candidates_detailed` 直接读面板(`sm.detailed()`
+  = last_meta → RankedCandidate),与 space 提交对象同源(含 promote 与
+  造词单字区);独立重算(rank_detailed + promote)退役
+  - golden rank() 从此 = 用户真实候选;snippet 态分支保留
+  - 测试:ime-core 162+21+2、swift-ime 7+12+15 全绿
