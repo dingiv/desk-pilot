@@ -494,7 +494,7 @@ impl StateMachine {
 
     /// 是否有"待确认"的选项(命令预测 / 补全提示)。
     fn has_pending_choices(&self) -> bool {
-        !self.magic_predictions.is_empty() || !self.magic_hints.is_empty()
+        !self.magic.predictions.is_empty() || !self.magic.hints.is_empty()
     }
 
     /// Change page by delta.

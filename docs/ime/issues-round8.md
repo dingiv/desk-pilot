@@ -159,7 +159,23 @@ state.rs 内部自访问。过渡策略:聚合体暴露与旧字段同形的访�
 - weight-scoring.md(stage3 合成公式的登记处,合成段移动时同步)
 - fsm/mod.rs 的路由注释表(route 判定表文档化的落点)
 
-## 执行记录
+## 执行记录(状态下沉已完成)
+
+- **S4 ✅** StateMachine 状态下沉(三聚合体,26 → 8 字段):
+  - **S4a CandidatePanel**:items/meta/partial(同源同序)+ full_comp_count/
+    highlight/page/page_size/fresh —— 面板行为(滑动窗/高亮/翻页/全局序)
+    内聚
+  - **S4b Composition**:raw_buffer/buffer/preedit/cursor/committed_text/
+    committed_pinyin —— 一次组合会话的文本状态(不变式注释随迁;
+    committed_pinyin_buf 更名 committed_pinyin)
+  - **S4c MagicSession**:hints/predictions/active/selectable —— snippet 态
+    命令会话(候选语义与 CandidatePanel 分离:非 scorer 产物,提交/改写
+    规则不同)
+  - 收缩后:`ctx / state / comp / candidate_meta_enabled / panel / context /
+    magic / last_commit_family`(最后者 = select 后 reset 的一次性通信,
+    注释已澄清,信息源 panel.meta)
+  - 波及面:state.rs/router.rs/engine.rs/req.rs/dispatcher 测试的直访点
+    全部迁移(comp./panel./magic. 前缀);外部 API 签名不变
 
 - **S1 ✅** trait 单入口:`CandidateFamily::predict(input, ctx)`(双入口合并);
   pinyin/emoji/english 实现与 Arc 委托、rank_detailed 调用点、造词链内部递归

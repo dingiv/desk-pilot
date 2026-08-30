@@ -314,7 +314,7 @@ impl ImeEngine {
         // live member(如 VoiceMember)需要显式 deactivate 才能取消后台工作。
         let mut map = self.contexts.lock().unwrap();
         if let Some(mut pc) = map.remove(&ctx) {
-            if let Some(mut m) = pc.sm.active_command.take() {
+            if let Some(mut m) = pc.sm.magic.active.take() {
                 m.deactivate(ctx);
             }
         }
@@ -526,8 +526,7 @@ impl ImeEngine {
         // 直接返回,让 #asr 语音 / #date 日期 / 补全提示正确显示。
         if pc.sm.state == crate::fsm::state::ComposeState::Snippet && pc.sm.panel.fresh {
             let family: &'static str = pc
-                .sm
-                .active_command
+                .sm.magic.active
                 .as_ref()
                 .map(|m| {
                     if m.name().is_empty() {
@@ -664,7 +663,7 @@ impl ImeEngine {
             tracing::info!(
                 ctx,
                 state = ?pc.sm.state,
-                has_member = pc.sm.active_command.is_some(),
+                has_member = pc.sm.magic.active.is_some(),
                 "magic_tick_ctx"
             );
             if pc.sm.state != ComposeState::Snippet {
@@ -672,7 +671,7 @@ impl ImeEngine {
             }
             // The member is taken out so its tick can freely mutate the state
             // machine, then put back (the member may have exited itself).
-            let mut member = pc.sm.active_command.take()?;
+            let mut member = pc.sm.magic.active.take()?;
             let new_preds = member.tick(&mut pc.sm, disp);
             // Live 成员的 tick 当前返回 None(由 listener 主动 refresh_ui 触发);
             // 但 frontend 拉 magic_tick 时仍要拿到最新候选 —— 重新调 predict 一次。
@@ -680,8 +679,8 @@ impl ImeEngine {
                 let input = pc.sm.comp.buffer.clone();
                 member.predict(ctx, &input, disp)
             });
-            pc.sm.active_command = Some(member);
-            pc.sm.magic_predictions = preds;
+            pc.sm.magic.active = Some(member);
+            pc.sm.magic.predictions = preds;
             pc.table.sync_from(&pc.sm);
             let view = pc.sm.rebuild_magic_view();
             let top = if view.candidate_count > 0 {
@@ -706,8 +705,7 @@ impl ImeEngine {
         let map = self.contexts.lock().unwrap();
         let alive = map.get(&ctx).is_some_and(|pc| {
             pc.sm.state == ComposeState::Snippet
-                && pc.sm
-                    .active_command
+                && pc.sm.magic.active
                     .as_ref()
                     .is_some_and(|m| m.name() == "asr")
         });
@@ -718,8 +716,7 @@ impl ImeEngine {
                 "other"
             };
             let member = pc
-                .sm
-                .active_command
+                .sm.magic.active
                 .as_ref()
                 .map(|m| m.name().to_string())
                 .unwrap_or_else(|| "-".into());

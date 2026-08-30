@@ -63,24 +63,12 @@ pub struct StateMachine {
     pending_full_comp_count: usize,
     /// Short-term input context — accumulates recently committed text.
     pub context: crate::family::InputContext,
-    /// 补全提示(输入是某命令触发串的严格前缀):候选 = [补全名…, rollback]。
-    /// 选中补全名 → **改写输入**(不提交)。
+    /// 魔法命令会话(S4 下沉):snippet 态的补全提示 / 预测选项 / live
+    /// 命令实例 / 数字键语义。
+    pub(crate) magic: MagicSession,
 
-    /// 魔法命令家族
-    pub(crate) magic_hints: Vec<String>,
-    /// 精确匹配命令时的预测选项(不含 rollback)。
-    pub(crate) magic_predictions: Vec<crate::family::magic::Prediction>,
-    /// 当前精确匹配的 live 命令实例(保 req 异步态等);静态命令 / 前缀 / 未知
-    /// 时为 None。
-    pub active_command: Option<Box<dyn MagicMember>>,
-    /// 数字键是否用于选中候选(精确无参 / 前缀时 true;拼参数时 false)。
-    magic_selectable: bool,
-
-
-
-    /// 最近一次提交的候选家族(select 时从候选元数据取)。引擎提交点据此
-    /// 判断:提交的是英文候选(来源 english)则不再学成自生词。
-    /// FIXME: 需要移除
+    /// 最近一次提交的候选家族(select 后 reset 的一次性通信,信息源 =
+    /// panel.meta.find(text);引擎提交点读后即清,避免残留到后续 raw 提交)。
     pub(crate) last_commit_family: Option<&'static str>,
 }
 
@@ -92,6 +80,23 @@ pub(crate) struct CandMeta {
     pub score: f64,
     pub family: &'static str,
     pub source: &'static str,
+}
+
+/// 魔法命令会话(S4 状态下沉):snippet 态(`#…`)的会话状态。
+/// hints/predictions 的候选语义与 CandidatePanel 分离 —— 命令候选不是
+/// scorer 产物(Matcher→Expander 路径),提交/改写规则也不同。
+#[derive(Default)]
+pub(crate) struct MagicSession {
+    /// 补全提示(输入是某命令触发串的严格前缀):候选 = [补全名…, rollback]。
+    /// 选中补全名 → **改写输入**(不提交)。
+    pub hints: Vec<String>,
+    /// 精确匹配命令时的预测选项(不含 rollback)。
+    pub predictions: Vec<crate::family::magic::Prediction>,
+    /// 当前精确匹配的 live 命令实例(保 req 异步态等);静态命令 / 前缀 /
+    /// 未知时为 None。
+    pub active: Option<Box<dyn MagicMember>>,
+    /// 数字键是否用于选中候选(精确无参 / 前缀时 true;拼参数时 false)。
+    pub selectable: bool,
 }
 
 /// 组合会话(S4 状态下沉):一次输入组合的文本状态 —— 原始键入、预测串、
@@ -187,7 +192,7 @@ impl std::fmt::Debug for StateMachine {
             .field("panel.page", &self.panel.page)
             .field(
                 "active_command",
-                &self.active_command.as_ref().map(|m| m.name()),
+                &self.magic.active.as_ref().map(|m| m.name()),
             )
             .finish()
     }
@@ -262,23 +267,22 @@ impl StateMachine {
             MagicMatch::Exact(cmd) => match cmd {
                 MagicCommand::Live { token, name } => {
                     self.ensure_command(name, Some(token), env);
-                    self.magic_predictions = self
-                        .active_command
+                    self.magic.predictions = self.magic.active
                         .as_mut()
                         // TODO: magic 命令调用点
                         .map(|m| m.predict(self.ctx, &match_input, env))
                         .unwrap_or_default();
-                    self.magic_hints.clear();
+                    self.magic.hints.clear();
                     // 无参数时数字用于选中;有参数(拼 `?num=` 等)时数字是文本。
-                    self.magic_selectable = match_input == format!("#{name}");
+                    self.magic.selectable = match_input == format!("#{name}");
                 }
                 MagicCommand::Static => {
                     self.clear_active_command();
                     let trigger = Self::command_trigger(&match_input);
-                    self.magic_predictions =
+                    self.magic.predictions =
                         env.magic().static_prediction(&trigger).unwrap_or_default();
-                    self.magic_hints.clear();
-                    self.magic_selectable = match_input == trigger;
+                    self.magic.hints.clear();
+                    self.magic.selectable = match_input == trigger;
                 }
             },
             // 参数输入态(`#del/1`):不调 member.predict(不自动触发),展示裸输入
@@ -286,37 +290,36 @@ impl StateMachine {
             // (匹配逻辑只对 live 成员产生 Args,静态命令不会带参数。)
             MagicMatch::Args(MagicCommand::Live { token, name }) => {
                 self.ensure_command(name, Some(token), env);
-                self.magic_predictions = vec![Prediction::submit(match_input.clone())];
-                self.magic_hints.clear();
-                self.magic_selectable = false;
+                self.magic.predictions = vec![Prediction::submit(match_input.clone())];
+                self.magic.hints.clear();
+                self.magic.selectable = false;
             }
             MagicMatch::Args(MagicCommand::Static) => {
                 self.clear_active_command();
-                self.magic_predictions.clear();
-                self.magic_hints.clear();
-                self.magic_selectable = false;
+                self.magic.predictions.clear();
+                self.magic.hints.clear();
+                self.magic.selectable = false;
             }
             MagicMatch::Prefix(hints) => {
                 self.clear_active_command();
-                self.magic_predictions.clear();
-                self.magic_hints = hints;
-                self.magic_selectable = true; // 前缀 → 数字选中补全
+                self.magic.predictions.clear();
+                self.magic.hints = hints;
+                self.magic.selectable = true; // 前缀 → 数字选中补全
             }
             MagicMatch::Snippet => {
                 self.ensure_command("", Some("__SNIPPET__"), env);
-                self.magic_predictions = self
-                    .active_command
+                self.magic.predictions = self.magic.active
                     .as_mut()
                     .map(|m| m.predict(self.ctx, &match_input, env))
                     .unwrap_or_default();
-                self.magic_hints.clear();
-                self.magic_selectable = false; // 片段路径/查询里的数字是文本
+                self.magic.hints.clear();
+                self.magic.selectable = false; // 片段路径/查询里的数字是文本
             }
             MagicMatch::Unknown => {
                 self.clear_active_command();
-                self.magic_predictions.clear();
-                self.magic_hints.clear();
-                self.magic_selectable = false;
+                self.magic.predictions.clear();
+                self.magic.hints.clear();
+                self.magic.selectable = false;
             }
         }
         self.rebuild_magic_view()
@@ -356,11 +359,10 @@ impl StateMachine {
                 let upstream = ChainContext {
                     items: chain_context_items(&upstream_buf, &upstream_cands),
                 };
-                let wants = self
-                    .active_command
+                let wants = self.magic.active
                     .as_ref()
                     .and_then(|m| m.wants_context());
-                let preds = match self.active_command.as_mut() {
+                let preds = match self.magic.active.as_mut() {
                     Some(member) => match wants {
                         Some(_) => member.predict_with_context(self.ctx, &cmd, &upstream, env),
                         None => member
@@ -377,28 +379,27 @@ impl StateMachine {
                     },
                     None => Vec::new(),
                 };
-                self.magic_predictions = preds;
-                self.magic_hints.clear();
-                self.magic_selectable = cmd == format!("#{name}");
+                self.magic.predictions = preds;
+                self.magic.hints.clear();
+                self.magic.selectable = cmd == format!("#{name}");
             }
             MagicMatch::Exact(MagicCommand::Static) => {
                 self.clear_active_command();
                 let trigger = Self::command_trigger(&cmd);
-                self.magic_predictions = env
+                self.magic.predictions = env
                     .magic()
                     .static_prediction(&trigger)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|p| p.chained_prefix(&upstream_first))
                     .collect();
-                self.magic_hints.clear();
-                self.magic_selectable = cmd == trigger;
+                self.magic.hints.clear();
+                self.magic.selectable = cmd == trigger;
             }
             // 片段命令(X'#/hello):片段展开 × 上游拼接(片段不感知上下文)。
             MagicMatch::Snippet => {
                 self.ensure_command("", Some("__SNIPPET__"), env);
-                self.magic_predictions = self
-                    .active_command
+                self.magic.predictions = self.magic.active
                     .as_mut()
                     .map(|m| m.predict(self.ctx, &cmd, env))
                     .unwrap_or_default()
@@ -411,40 +412,40 @@ impl StateMachine {
                         }
                     })
                     .collect();
-                self.magic_hints.clear();
-                self.magic_selectable = false;
+                self.magic.hints.clear();
+                self.magic.selectable = false;
             }
             MagicMatch::Args(MagicCommand::Live { token, name }) => {
                 self.ensure_command(name, Some(token), env);
                 // 参数输入态(#del/15):裸输入提交候选;提交时 force_fire 带
                 // 上游上下文强触发。
-                self.magic_predictions = vec![Prediction::submit(input.to_string())];
-                self.magic_hints.clear();
-                self.magic_selectable = false;
+                self.magic.predictions = vec![Prediction::submit(input.to_string())];
+                self.magic.hints.clear();
+                self.magic.selectable = false;
             }
             MagicMatch::Args(MagicCommand::Static) => {
                 self.clear_active_command();
-                self.magic_predictions.clear();
-                self.magic_hints.clear();
-                self.magic_selectable = false;
+                self.magic.predictions.clear();
+                self.magic.hints.clear();
+                self.magic.selectable = false;
             }
             MagicMatch::Prefix(hints) => {
                 self.clear_active_command();
-                self.magic_predictions.clear();
-                self.magic_hints = hints;
-                self.magic_selectable = true;
+                self.magic.predictions.clear();
+                self.magic.hints = hints;
+                self.magic.selectable = true;
             }
             MagicMatch::Unknown => {
                 // 命令段未知(# / #zzz):显示上游预测 —— 用户可选中上游结果
                 // 直接提交,或继续编辑命令段。
                 self.clear_active_command();
-                self.magic_predictions = upstream_cands
+                self.magic.predictions = upstream_cands
                     .iter()
                     .take(7)
                     .map(|t| Prediction::commit(t.clone()))
                     .collect();
-                self.magic_hints.clear();
-                self.magic_selectable = !self.magic_predictions.is_empty();
+                self.magic.hints.clear();
+                self.magic.selectable = !self.magic.predictions.is_empty();
             }
         }
         self.rebuild_magic_view()
@@ -565,8 +566,7 @@ impl StateMachine {
         token: Option<&'static str>,
         env: &dyn StepEnv,
     ) {
-        let keep = self
-            .active_command
+        let keep = self.magic.active
             .as_ref()
             .map(|m| m.name() == name)
             .unwrap_or(false);
@@ -575,12 +575,12 @@ impl StateMachine {
         }
         self.clear_active_command();
         if let Some(tok) = token {
-            self.active_command = env.magic().spawn(tok);
+            self.magic.active = env.magic().spawn(tok);
         }
     }
 
     fn clear_active_command(&mut self) {
-        if let Some(mut m) = self.active_command.take() {
+        if let Some(mut m) = self.magic.active.take() {
             m.deactivate(self.ctx);
         }
     }
@@ -589,14 +589,14 @@ impl StateMachine {
     /// 候选 = [预测…, 补全…, rollback];preedit = 首条预测(精确)否则输入。
     pub(crate) fn rebuild_magic_view(&mut self) -> ImeView {
         let mut cands: Vec<String> = Vec::new();
-        for p in &self.magic_predictions {
+        for p in &self.magic.predictions {
             cands.push(p.text.clone());
         }
-        for h in &self.magic_hints {
+        for h in &self.magic.hints {
             cands.push(h.clone());
         }
         // 参数输入态的裸提交候选文本 == 缓冲,不重复追加 rollback。
-        let is_submit = self.magic_predictions.first().map(|p| p.submit).unwrap_or(false);
+        let is_submit = self.magic.predictions.first().map(|p| p.submit).unwrap_or(false);
         if !is_submit {
             cands.push(self.comp.buffer.clone()); // rollback — 最后一项
         }
@@ -606,7 +606,7 @@ impl StateMachine {
         self.panel.page = 0;
         self.panel.full_comp_count = self.panel.items.len();
         self.panel.partial = vec![false; self.panel.items.len()];
-        if let Some(head) = self.magic_predictions.first() {
+        if let Some(head) = self.magic.predictions.first() {
             // preedit 用选项独立的预览文本(默认=展示文本)—— 允许候选行展示
             // 精简结果、文本框给完整预览。
             self.comp.preedit = head.preedit_value().to_string();
@@ -619,11 +619,11 @@ impl StateMachine {
 
     /// 选中候选(index):补全改写 / 预测提交(交互 or 上屏)/ rollback 提交。
     pub fn select_magic(&mut self, index: usize, env: &dyn StepEnv) -> ImeView {
-        let n_preds = self.magic_predictions.len();
-        let n_hints = self.magic_hints.len();
+        let n_preds = self.magic.predictions.len();
+        let n_hints = self.magic.hints.len();
         // 1. 精确匹配的预测选项。
         if index < n_preds {
-            let pred = self.magic_predictions[index].clone();
+            let pred = self.magic.predictions[index].clone();
             // 参数输入态的裸输入提交 → 用完整输入重新解析,忽略 `/…` 参数,
             // 前缀匹配命令并**强制触发**(predict 会用完整输入解析删除/请求)。
             if pred.submit {
@@ -631,9 +631,9 @@ impl StateMachine {
             }
             if pred.interactive {
                 // 交互式:传给命令 → 重新预测,替换选项(不上屏)。
-                if let Some(mut m) = self.active_command.take() {
+                if let Some(mut m) = self.magic.active.take() {
                     m.pick(index, &pred.text, self, env);
-                    self.active_command = Some(m);
+                    self.magic.active = Some(m);
                 }
                 return self.query_magic(env);
             }
@@ -652,9 +652,9 @@ impl StateMachine {
         }
         // 2. 补全提示:改写输入(不提交)。
         if index < n_preds + n_hints {
-            let hint = self.magic_hints[index - n_preds].clone();
+            let hint = self.magic.hints[index - n_preds].clone();
             self.comp.buffer = hint;
-            self.magic_hints.clear();
+            self.magic.hints.clear();
             return self.query_magic(env);
         }
         // 3. rollback:提交原始缓冲。
@@ -686,7 +686,7 @@ impl StateMachine {
                     &self.eval_upstream(&upstream_buf, env),
                 ),
             };
-            match self.active_command.as_mut() {
+            match self.magic.active.as_mut() {
                 Some(m) => {
                     if m.wants_context().is_some() {
                         m.predict_with_context(self.ctx, &cmd, &upstream, env)
@@ -707,7 +707,7 @@ impl StateMachine {
                 None => Vec::new(),
             }
         } else {
-            self.active_command
+            self.magic.active
                 .as_mut()
                 .map(|m| m.predict(self.ctx, &input, env))
                 .unwrap_or_default()
@@ -715,9 +715,9 @@ impl StateMachine {
         if let Some(head) = preds.first().cloned() {
             if head.interactive {
                 // 交互(如 addon 请求中…):展示为候选,等待异步落地。
-                self.magic_predictions = preds;
-                self.magic_hints.clear();
-                self.magic_selectable = false;
+                self.magic.predictions = preds;
+                self.magic.hints.clear();
+                self.magic.selectable = false;
                 return self.rebuild_magic_view();
             }
             self.clear_active_command();
@@ -828,9 +828,9 @@ impl StateMachine {
         self.comp.committed_pinyin.clear();
         self.panel.full_comp_count = 0;
         self.panel.partial.clear();
-        self.magic_hints.clear();
-        self.magic_predictions.clear();
-        self.magic_selectable = false;
+        self.magic.hints.clear();
+        self.magic.predictions.clear();
+        self.magic.selectable = false;
         // last_commit_family 在 select 之后(重置之后)设置,由引擎取走;此处
         // 清掉以防残留。select 内部会先 reset 再设,不受影响。
         self.last_commit_family = None;
@@ -862,11 +862,11 @@ impl StateMachine {
     /// 高亮在预测上 → 显示该预测;高亮在 rollback/补全上 → 显示原始输入。
     /// 拼音态不适用(拼音 preedit 是组合,不是候选)。
     pub(crate) fn sync_magic_preedit(&mut self) {
-        if self.state != ComposeState::Snippet || self.magic_predictions.is_empty() {
+        if self.state != ComposeState::Snippet || self.magic.predictions.is_empty() {
             return;
         }
         let hl = self.panel.highlight;
-        if let Some(p) = self.magic_predictions.get(hl) {
+        if let Some(p) = self.magic.predictions.get(hl) {
             self.comp.preedit = p.text.clone();
         } else {
             self.comp.preedit = self.comp.buffer.clone();
@@ -1054,7 +1054,7 @@ impl StateMachine {
 
         // 数字键:可选中时选中候选,否则作为命令文本追加(如 `?num=2`)。
         if let d @ '1'..='9' = ch {
-            if self.magic_selectable {
+            if self.magic.selectable {
                 let idx = (d as u8 - b'1') as usize;
                 if idx < self.panel.items.len() {
                     return self.select_magic(idx, env);
