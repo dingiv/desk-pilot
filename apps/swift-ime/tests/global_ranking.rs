@@ -137,6 +137,20 @@ fn single_syllable_chinese_on_top() {
     top1_is("de", &r, "的");
 }
 
+// ── 单字母:字母本尊 + 大小写互换置顶(english self/case 成员)─────────
+
+#[test]
+fn single_letter_types_itself_and_case_swap_first() {
+    let mut e = engine();
+    let r = rank(&mut e, "a");
+    assert_eq!(r[0].0, "a");
+    assert_eq!((r[0].1.as_str(), r[0].2.as_str()), ("english", "self"));
+    assert_eq!(r[1].0, "A");
+    assert_eq!((r[1].1.as_str(), r[1].2.as_str()), ("english", "case"));
+    // 其余候选(拼音 啊 / a 开头的英文词)照常跟随。
+    assert!(r.len() > 2, "1. a 2. A 3. ... — 后续候选不应为空");
+}
+
 // ── 学习边界:纯 ASCII 不进拼音单词本 ──────────────────────────────────
 
 #[test]

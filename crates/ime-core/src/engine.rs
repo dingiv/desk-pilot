@@ -532,7 +532,12 @@ impl ImeEngine {
         let buffer = pc.sm.buffer.clone();
         drop(map);
         use crate::state::StepEnv;
-        self.dispatcher.scorer().rank_detailed(&buffer, &ctx)
+        // 与状态机同序:单字母置顶规则(promote_single_letter)在这里同样
+        // 生效 —— 否则 detailed 镜像与机器候选列表顺序分叉。
+        crate::state::promote_single_letter(
+            &buffer,
+            self.dispatcher.scorer().rank_detailed(&buffer, &ctx),
+        )
     }
 
     /// Manually set the text context (simulates pre-filled text).

@@ -1074,6 +1074,7 @@ impl StateMachine {
         // Unified scorer: collects candidates from all enabled families,
         // ranks them by weighted score, returns deduplicated text list.
         let ranked = env.scorer().rank_detailed(&self.buffer, &self.context);
+        let ranked = promote_single_letter(&self.buffer, ranked);
         // 候选词自带元数据(来源家族/成员 + 权重)—— 调试 meta 与提交来源判断共用。
         self.last_meta = ranked
             .iter()
@@ -1363,6 +1364,41 @@ pub trait StepEnv {
     fn voice_cmd_tx(&self) -> Option<crate::io_thread::VoiceCmdSender> {
         self.magic().voice_cmd_tx()
     }
+}
+
+/// 单字母输入:字母本尊 + 大小写互换置顶(english family 的 self/case 成员)。
+/// 位置规则而非分数竞争 —— 跨家族打分下 english(×priority 0.70)赢不了
+/// 拼音单音节(如 啊 ~0.86),但单字母的意图几乎总是字母本身。
+///
+/// `query_pinyin`(状态机候选)与 `candidates_detailed`(engine 层重排镜像)
+/// 共用此规则,保持两处候选顺序一致。多字符 buffer 原样返回。
+pub(crate) fn promote_single_letter(
+    buffer: &str,
+    mut ranked: Vec<crate::family::RankedCandidate>,
+) -> Vec<crate::family::RankedCandidate> {
+    if buffer.len() != 1 {
+        return ranked;
+    }
+    let Some(ch) = buffer
+        .chars()
+        .next()
+        .map(|c| c.to_ascii_lowercase())
+        .filter(|c| c.is_ascii_alphabetic())
+    else {
+        return ranked;
+    };
+    let (lower, upper) = (ch.to_string(), ch.to_ascii_uppercase().to_string());
+    let is_letter = |r: &crate::family::RankedCandidate| {
+        r.family == "english" && (r.text == lower || r.text == upper)
+    };
+    let mut head: Vec<_> = ranked.iter().filter(|r| is_letter(r)).cloned().collect();
+    head.sort_by_key(|r| if r.text == lower { 0 } else { 1 });
+    if head.is_empty() {
+        return ranked;
+    }
+    ranked.retain(|r| !is_letter(r));
+    head.extend(ranked);
+    head
 }
 
 #[cfg(test)]

@@ -532,6 +532,29 @@ impl CandidateFamily for EnglishFamily {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
+        // ── Member: self/case(单字母输入)── 字母本尊 + 大小写互换,家族内
+        // 最优先。中英混输里单字母的意图几乎总是字母本身,而不是等它长成
+        // 单词。词典层对 <2 字母无 exact(词表 len<2 被裁),prefix 照常
+        // 给出 —— 单字母开头的词排其后("3. ...")。
+        if input_lower.chars().count() == 1 {
+            let ch = input_lower.chars().next().unwrap();
+            let swapped = ch.to_ascii_uppercase().to_string();
+            out.push(ScoredCandidate {
+                text: input_lower.clone(),
+                family: "english",
+                source: "self",
+                raw_score: 1.0,
+            });
+            out.push(ScoredCandidate {
+                text: swapped.clone(),
+                family: "english",
+                source: "case",
+                raw_score: 0.92,
+            });
+            seen.insert(input_lower.clone());
+            seen.insert(swapped);
+        }
+
         // Layer 1: user dict (highest priority). 自生词不降权(学习语义保留)。
         let user = self.user_words.lock().unwrap();
         let user_exact = (self.weights.exact * self.weights.user_boost).min(1.0);
@@ -628,6 +651,23 @@ mod tests {
             w099.1 < 1000,
             "last word should be in group 0, got {}",
             w099.1
+        );
+    }
+
+    #[test]
+    fn single_letter_self_and_case_lead() {
+        // 单字母输入:字母本尊 + 大小写互换置顶(self/case 成员),字典
+        // prefix 候选(单字母开头的词)排其后。
+        let fam = EnglishFamily::with_default_dict();
+        let cands = fam.predict("a");
+        assert_eq!(cands[0].text, "a");
+        assert_eq!(cands[0].source, "self");
+        assert_eq!(cands[1].text, "A");
+        assert_eq!(cands[1].source, "case");
+        assert!(cands.len() > 2, "prefix 候选照常跟随: {:?}", cands.len());
+        assert!(
+            cands[2..].iter().all(|c| c.text.to_lowercase().starts_with('a')),
+            "其余候选仍以该字母开头"
         );
     }
 
