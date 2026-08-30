@@ -1142,7 +1142,7 @@ impl StateMachine {
                 let char_cands: Vec<String> = env
                     .scorer()
                     .family("pinyin")
-                    .map(|f| f.predict(&first_syl))
+                    .map(|f| f.predict(&first_syl, &self.context))
                     .unwrap_or_default()
                     .into_iter()
                     .map(|c| c.text)

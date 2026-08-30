@@ -22,7 +22,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use super::{CandidateFamily, ScoredCandidate};
+use super::{CandidateFamily, InputContext, ScoredCandidate};
 
 /// One emoji and its keywords. `keys` are all prefix-matched against the input;
 /// duplicate keywords across entries are fine — the first hit per emoji wins.
@@ -249,7 +249,7 @@ impl CandidateFamily for EmojiFamily {
         4
     }
 
-    fn predict(&self, input: &str) -> Vec<ScoredCandidate> {
+    fn predict(&self, input: &str, _ctx: &InputContext) -> Vec<ScoredCandidate> {
         // Single-char input is skipped: with a large CLDR table, "a"/"h" would
         // match hundreds of generic keywords and flood the candidate list.
         if input.chars().count() < 2 {
@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn exact_english_keyword() {
         let fam = EmojiFamily::new();
-        let cands = fam.predict("smile");
+        let cands = fam.predict("smile", &InputContext::new());
         assert!(cands.iter().any(|c| c.text == "😊"), "{cands:?}");
         assert_eq!(cands[0].raw_score, 1.0, "exact match scores 1.0");
     }
@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn prefix_english_keyword() {
         let fam = EmojiFamily::new();
-        let cands = fam.predict("smil");
+        let cands = fam.predict("smil", &InputContext::new());
         assert!(cands.iter().any(|c| c.text == "😊"), "{cands:?}");
         // smil→smile 剩余 1(≤2 免衰减)→ 前缀基础分 0.6。
         assert_eq!(cands[0].raw_score, 0.6, "prefix match scores 0.6");
@@ -329,9 +329,9 @@ mod tests {
         // With the large CLDR table a 1-char input would match hundreds of
         // generic keywords — the family stays silent until ≥2 chars.
         let fam = EmojiFamily::new();
-        assert!(fam.predict("a").is_empty());
-        assert!(fam.predict("h").is_empty());
-        assert!(fam.predict("微").is_empty(), "even hanzi needs 2 chars");
+        assert!(fam.predict("a", &InputContext::new()).is_empty());
+        assert!(fam.predict("h", &InputContext::new()).is_empty());
+        assert!(fam.predict("微", &InputContext::new()).is_empty(), "even hanzi needs 2 chars");
     }
 
     #[test]
@@ -341,15 +341,15 @@ mod tests {
         let path = dir.join("emoji.tsv");
         std::fs::write(&path, "# comment\nrocket_emoji\t🚀\n外星人\t👽\n").unwrap();
         let fam = EmojiFamily::new();
-        assert!(fam.predict("外星人").is_empty(), "not in base");
+        assert!(fam.predict("外星人", &InputContext::new()).is_empty(), "not in base");
         let n = fam.load_tsv(path.to_str().unwrap()).unwrap();
         assert_eq!(n, 2);
         assert!(
-            fam.predict("外星人").iter().any(|c| c.text == "👽"),
+            fam.predict("外星人", &InputContext::new()).iter().any(|c| c.text == "👽"),
             "external keyword works"
         );
         assert!(
-            fam.predict("rocket_e").iter().any(|c| c.text == "🚀"),
+            fam.predict("rocket_e", &InputContext::new()).iter().any(|c| c.text == "🚀"),
             "english keyword works"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -367,11 +367,11 @@ mod tests {
         let fam = EmojiFamily::new();
         fam.load_tsv(ext.to_str().unwrap()).unwrap();
         assert!(
-            fam.predict("smile").iter().any(|c| c.text == "😀"),
+            fam.predict("smile", &InputContext::new()).iter().any(|c| c.text == "😀"),
             "external overrides base"
         );
         fam.load_tsv(user.to_str().unwrap()).unwrap();
-        let cands = fam.predict("smile");
+        let cands = fam.predict("smile", &InputContext::new());
         assert!(
             cands.iter().any(|c| c.text == "🥰"),
             "user overrides external: {cands:?}"
@@ -399,11 +399,11 @@ mod tests {
     fn pinyin_and_hanzi_keywords() {
         let fam = EmojiFamily::new();
         assert!(
-            fam.predict("weixiao").iter().any(|c| c.text == "😊"),
+            fam.predict("weixiao", &InputContext::new()).iter().any(|c| c.text == "😊"),
             "pinyin key"
         );
         assert!(
-            fam.predict("微笑").iter().any(|c| c.text == "😊"),
+            fam.predict("微笑", &InputContext::new()).iter().any(|c| c.text == "😊"),
             "hanzi key"
         );
     }
@@ -412,7 +412,7 @@ mod tests {
     fn exact_beats_prefix_in_ranking() {
         let fam = EmojiFamily::new();
         // 长关键词 exact:smile → 😊 1.0。
-        let cands = fam.predict("smile");
+        let cands = fam.predict("smile", &InputContext::new());
         assert_eq!(cands[0].text, "😊", "{cands:?}");
         assert_eq!(cands[0].raw_score, 1.0);
     }
@@ -423,7 +423,7 @@ mod tests {
         // 两字母输入几乎总是中文简拼(承担/程度/成都)或常用英文缩写,
         // emoji 不该压过它们。
         let fam = EmojiFamily::new();
-        let cands = fam.predict("ok");
+        let cands = fam.predict("ok", &InputContext::new());
         let ok = cands.iter().find(|c| c.text == "👍").unwrap();
         assert!(
             (ok.raw_score - 0.6).abs() < 1e-9,
@@ -442,7 +442,7 @@ mod tests {
         std::fs::write(&path, "weishenme\t🤌\n").unwrap();
         fam.load_tsv(&path.to_string_lossy()).unwrap();
 
-        let near = fam.predict("weishenm");
+        let near = fam.predict("weishenm", &InputContext::new());
         let e = near.iter().find(|c| c.text == "🤌").unwrap();
         assert!(
             (e.raw_score - 0.6).abs() < 1e-9,
@@ -450,7 +450,7 @@ mod tests {
             e.raw_score
         );
 
-        let far = fam.predict("weis");
+        let far = fam.predict("weis", &InputContext::new());
         let e2 = far.iter().find(|c| c.text == "🤌").unwrap();
         assert!(e2.raw_score < 0.45, "剩 5 衰减后明显更低: {}", e2.raw_score);
         let _ = std::fs::remove_file(&path);
@@ -459,14 +459,14 @@ mod tests {
     #[test]
     fn no_match_returns_empty() {
         let fam = EmojiFamily::new();
-        assert!(fam.predict("xyzzy").is_empty());
-        assert!(fam.predict("").is_empty());
+        assert!(fam.predict("xyzzy", &InputContext::new()).is_empty());
+        assert!(fam.predict("", &InputContext::new()).is_empty());
     }
 
     #[test]
     fn empty_input_returns_empty() {
         let fam = EmojiFamily::new();
-        assert!(fam.predict("").is_empty());
+        assert!(fam.predict("", &InputContext::new()).is_empty());
     }
 
     /// Unique per-test temp dict — tests run in parallel threads (same lesson
@@ -487,11 +487,11 @@ mod tests {
         let path = temp_emoji_tsv("ganlan", "ganlan\t🥦\nweixiao\t☺\n");
         assert_eq!(fam.load_tsv(&path).unwrap(), 2);
         assert!(
-            fam.predict("ganlan").iter().any(|c| c.text == "🥦"),
+            fam.predict("ganlan", &InputContext::new()).iter().any(|c| c.text == "🥦"),
             "ganlan triggers 🥦"
         );
         assert!(
-            fam.predict("weixiao").iter().any(|c| c.text == "☺"),
+            fam.predict("weixiao", &InputContext::new()).iter().any(|c| c.text == "☺"),
             "weixiao triggers ☺"
         );
         let _ = std::fs::remove_file(&path);
@@ -506,7 +506,7 @@ mod tests {
         let usr = temp_emoji_tsv("usr", "ganlan\t🥬\n");
         fam.load_tsv(&ext).unwrap();
         fam.load_tsv(&usr).unwrap();
-        let cands = fam.predict("ganlan");
+        let cands = fam.predict("ganlan", &InputContext::new());
         assert_eq!(cands[0].text, "🥬", "user dict wins: {cands:?}");
         assert_eq!(cands.len(), 1, "no duplicate entries: {cands:?}");
         let _ = std::fs::remove_file(&ext);

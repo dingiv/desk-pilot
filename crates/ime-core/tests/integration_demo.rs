@@ -56,6 +56,7 @@ fn eng_with_aura(base: &str) -> ImeEngine {
         base.to_string(),
         ime_core::io_thread::DEFAULT_IDLE_TIMEOUT_SECS,
         Vec::new(),
+        7,
     )
 }
 

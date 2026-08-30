@@ -161,4 +161,11 @@ state.rs 内部自访问。过渡策略:聚合体暴露与旧字段同形的访�
 
 ## 执行记录
 
-(待填:S1-S5 每步落地后登记提交与断言)
+- **S1 ✅** trait 单入口:`CandidateFamily::predict(input, ctx)`(双入口合并);
+  pinyin/emoji/english 实现与 Arc 委托、rank_detailed 调用点、造词链内部递归
+  (链预测传空 ctx)、state.rs 造词单字区(`f.predict(&first_syl, &self.context)`)
+  全部迁移;测试 mock 同步。
+  - **过程抓虫**:首版合并丢了 Layer 1(recency)/Layer 2(整词联想)——
+    `recency_persistence_across_sessions` 集成测试红,找回完整函数体后转绿
+    (测试护航价值实证)
+  - 测试:ime-core 160+21+2、swift-ime 7+12+15 全绿

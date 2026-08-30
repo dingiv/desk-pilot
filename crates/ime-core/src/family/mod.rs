@@ -129,15 +129,10 @@ pub trait CandidateFamily: Send + Sync {
     }
 
     /// Generate scored candidates from the raw input buffer.
-    fn predict(&self, input: &str) -> Vec<ScoredCandidate>;
-
-    /// Generate context-aware candidates. Default implementation delegates
-    /// to [`predict`]. Families that support context (e.g. PinyinFamily
-    /// boosting based on the previous character, AIFamily generating full
-    /// sentences) override this method.
-    fn predict_with_context(&self, input: &str, _ctx: &InputContext) -> Vec<ScoredCandidate> {
-        self.predict(input)
-    }
+    /// 单入口(S1 规范化):上下文经 `ctx` 传入,家族内部自决如何消费
+    /// (gate 开关、last_commit/bigram/recency 全部封装在家族内,调用方
+    /// 无需感知家族差异)。无上下文的调用点传 `&InputContext::new()`。
+    fn predict(&self, input: &str, ctx: &InputContext) -> Vec<ScoredCandidate>;
 
     /// Load an external dictionary file into this family's vocabulary.
     fn load_dict(&self, _path: &str) -> std::io::Result<usize> {
@@ -221,7 +216,7 @@ impl UnifiedScorer {
                 .get(family.name())
                 .unwrap_or_else(|| family.priority());
             let priority_bonus = priority as f64 / 100.0;
-            let mut candidates = family.predict_with_context(input, ctx);
+            let mut candidates = family.predict(input, ctx);
 
             candidates.sort_by(|a, b| {
                 b.raw_score
@@ -299,7 +294,7 @@ mod tests {
         fn priority(&self) -> u32 {
             self.priority
         }
-        fn predict(&self, _input: &str) -> Vec<ScoredCandidate> {
+        fn predict(&self, _input: &str, _ctx: &InputContext) -> Vec<ScoredCandidate> {
             self.candidates
                 .iter()
                 .map(|(t, s)| ScoredCandidate {
@@ -384,7 +379,7 @@ mod tests {
             fn enabled(&self) -> bool {
                 false
             }
-            fn predict(&self, _: &str) -> Vec<ScoredCandidate> {
+            fn predict(&self, _: &str, _: &InputContext) -> Vec<ScoredCandidate> {
                 vec![ScoredCandidate {
                     text: "nope".into(),
                     family: "disabled",

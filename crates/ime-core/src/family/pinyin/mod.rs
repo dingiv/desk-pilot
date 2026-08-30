@@ -245,7 +245,7 @@ impl PinyinFamily {
 
         let mut acc: Vec<(String, f64)> = vec![(String::new(), 1.0)];
         for chain in &chains {
-            let mut top = self.predict(chain); // 链内不含 ' → 不会递归回这里
+            let mut top = self.predict(chain, &InputContext::new()); // 链内不含 ' → 不会递归回这里
             top.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap_or(std::cmp::Ordering::Equal));
             // 同文本取高分(家族内多层可能重复出同一候选)。
             let mut seen = std::collections::HashSet::new();
@@ -721,8 +721,74 @@ fn is_cjk(c: char) -> bool {
 
 
 impl CandidateFamily for PinyinFamily {
-    fn predict(&self, input: &str) -> Vec<ScoredCandidate> {
-        self.predict_inner(input, "")
+    fn predict(&self, input: &str, ctx: &InputContext) -> Vec<ScoredCandidate> {
+        // 上下文感知开关关闭时:候选排序完全由词典频率决定,不做 recency /
+        // bigram 联想 / 整词联想加成(S1 单入口:gate 是家族内部自决)。
+        if !*self.context_aware.lock().unwrap() {
+            return self.predict_inner(input, "");
+        }
+        let _ = ctx; // D1:真实上下文源 = self.last_commit(record_pick 写入)
+        let prev_word = self.last_commit.lock().unwrap().0.clone();
+        let mut candidates = self.predict_inner(input, &prev_word);
+        if candidates.is_empty() {
+            return candidates;
+        }
+
+        // ── Layer 1: Recent member boost (近期指数 → 权重合成) ──
+        // b = 近期指数(1-5,按距上次使用时间分档;>3d 条目在查询时被移出)。
+        // 合成公式:z = (1-a)(a+b)/8 + a —— 增量与 (1-a) 成比例,低权重词
+        // 获得更大加成,高权重词增量趋零,z 天然 < 1(不会顶满 1.0)。
+        let mut recency = self.recency.lock().unwrap();
+        if !recency.is_empty() {
+            let now = super::now_ms();
+            for c in &mut candidates {
+                let b = recency.tier(&c.text, now);
+                if b > 0 {
+                    let a = c.raw_score;
+                    c.raw_score = (1.0 - a) * (a + b as f64) / 8.0 + a;
+                }
+            }
+        }
+        drop(recency);
+
+        // ── Layer 2: 前缀整词联想(替换旧的 bigram/surrounding/字符级 boost)──
+        // 上一提交词的拼音 + 当前输入拼音 → 查词典整词;整词以上一词开头的,
+        // 剩余尾字作为候选,权重 = 整词的词频权重。
+        // 例:提交 中(zhong)后输入 de → "zhongde" → 中的(9307)→ 尾字"的"以
+        // "中的"的权重出现;"shide" → 是的(350380)→ "的" 权重极高。
+        // 权重来自整词频率,不顶满 1.0,也不做加法/乘法噪声。
+        let last = self.last_commit.lock().unwrap();
+        if !last.0.is_empty() && !last.1.is_empty() {
+            let joined = format!("{}{}", last.1, input);
+            if let Some(lat) = self.lattice.lock().unwrap().as_ref() {
+                for (word, freq) in lat.words_for(&joined) {
+                    if let Some(tail) = word.strip_prefix(last.0.as_str()) {
+                        if !tail.is_empty() {
+                            let score = lat.freq_to_score(&self.freq_scale, freq);
+                            match candidates.iter_mut().find(|c| c.text == tail) {
+                                // 尾字已在候选(几乎总是):整词权重更高则提升。
+                                Some(existing) if score > existing.raw_score => {
+                                    existing.raw_score = score;
+                                    existing.source = "context_comp";
+                                }
+                                Some(_) => {}
+                                // 尾字不在候选(罕见):直接加入。
+                                None => candidates.push(ScoredCandidate {
+                                    text: tail.to_string(),
+                                    family: "pinyin",
+                                    source: "context_comp",
+                                    raw_score: score,
+                                }),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        drop(last);
+
+        candidates.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap());
+        candidates
     }
 
     fn name(&self) -> &'static str {
@@ -791,76 +857,6 @@ impl CandidateFamily for PinyinFamily {
     }
 
 
-    fn predict_with_context(&self, input: &str, _ctx: &InputContext) -> Vec<ScoredCandidate> {
-        // 上下文感知开关关闭时:候选排序完全由词典频率决定,不做 recency /
-        // bigram 联想 / 整词联想加成。
-        if !*self.context_aware.lock().unwrap() {
-            return self.predict(input);
-        }
-        // E1:上一提交词作为 bigram 上下文 —— (今天 → tianqi)时"天气"
-        // 在词频映射前获得 freq 量纲加成。
-        let prev_word = self.last_commit.lock().unwrap().0.clone();
-        let mut candidates = self.predict_inner(input, &prev_word);
-        if candidates.is_empty() {
-            return candidates;
-        }
-
-        // ── Layer 1: Recent member boost (近期指数 → 权重合成) ──
-        // b = 近期指数(1-5,按距上次使用时间分档;>3d 条目在查询时被移出)。
-        // 合成公式:z = (1-a)(a+b)/8 + a —— 增量与 (1-a) 成比例,低权重词
-        // 获得更大加成,高权重词增量趋零,z 天然 < 1(不会顶满 1.0)。
-        let mut recency = self.recency.lock().unwrap();
-        if !recency.is_empty() {
-            let now = super::now_ms();
-            for c in &mut candidates {
-                let b = recency.tier(&c.text, now);
-                if b > 0 {
-                    let a = c.raw_score;
-                    c.raw_score = (1.0 - a) * (a + b as f64) / 8.0 + a;
-                }
-            }
-        }
-        drop(recency);
-
-        // ── Layer 2: 前缀整词联想(替换旧的 bigram/surrounding/字符级 boost)──
-        // 上一提交词的拼音 + 当前输入拼音 → 查词典整词;整词以上一词开头的,
-        // 剩余尾字作为候选,权重 = 整词的词频权重。
-        // 例:提交 中(zhong)后输入 de → "zhongde" → 中的(9307)→ 尾字"的"以
-        // "中的"的权重出现;"shide" → 是的(350380)→ "的" 权重极高。
-        // 权重来自整词频率,不顶满 1.0,也不做加法/乘法噪声。
-        let last = self.last_commit.lock().unwrap();
-        if !last.0.is_empty() && !last.1.is_empty() {
-            let joined = format!("{}{}", last.1, input);
-            if let Some(lat) = self.lattice.lock().unwrap().as_ref() {
-                for (word, freq) in lat.words_for(&joined) {
-                    if let Some(tail) = word.strip_prefix(last.0.as_str()) {
-                        if !tail.is_empty() {
-                            let score = lat.freq_to_score(&self.freq_scale, freq);
-                            match candidates.iter_mut().find(|c| c.text == tail) {
-                                // 尾字已在候选(几乎总是):整词权重更高则提升。
-                                Some(existing) if score > existing.raw_score => {
-                                    existing.raw_score = score;
-                                    existing.source = "context_comp";
-                                }
-                                Some(_) => {}
-                                // 尾字不在候选(罕见):直接加入。
-                                None => candidates.push(ScoredCandidate {
-                                    text: tail.to_string(),
-                                    family: "pinyin",
-                                    source: "context_comp",
-                                    raw_score: score,
-                                }),
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        drop(last);
-
-        candidates.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap());
-        candidates
-    }
 }
 
 /// Arc 共享句柄的 trait 委托(D5):Dispatcher 持 `Arc<PinyinFamily>` 直调
@@ -881,11 +877,8 @@ impl CandidateFamily for Arc<PinyinFamily> {
     fn top_n(&self) -> usize {
         (**self).top_n()
     }
-    fn predict(&self, input: &str) -> Vec<ScoredCandidate> {
-        (**self).predict(input)
-    }
-    fn predict_with_context(&self, input: &str, ctx: &InputContext) -> Vec<ScoredCandidate> {
-        (**self).predict_with_context(input, ctx)
+    fn predict(&self, input: &str, ctx: &InputContext) -> Vec<ScoredCandidate> {
+        (**self).predict(input, ctx)
     }
     fn load_dict(&self, path: &str) -> std::io::Result<usize> {
         (**self).load_dict(path)
@@ -911,7 +904,7 @@ impl CandidateFamily for Arc<PinyinFamily> {
         use crate::family::CandidateFamily;
         let fam = PinyinFamily::new();
         // 嵌入词典对 tianqi 无 lattice 词条(见 E1 标定)→ 候选全为 decomp。
-        let cands = fam.predict("tianqi");
+        let cands = fam.predict("tianqi", &InputContext::new());
         let mut ds: Vec<f64> = cands
             .iter()
             .filter(|c| c.source == "decomp")
@@ -948,12 +941,12 @@ mod tests {
         let sc = |v: &[ScoredCandidate], t: &str| {
             v.iter().find(|c| c.text == t).map(|c| c.raw_score).unwrap_or(0.0)
         };
-        let base = fam.predict("yiqi");
+        let base = fam.predict("yiqi", &InputContext::new());
         assert!(sc(&base, "异曲") > sc(&base, "一起"), "base: 异曲 > 一起");
         // record_pick 直接写 last_commit(嵌入 lattice 无"我们"词条时
         // record_commit 查不到拼音,测试里用双参入口)。
         fam.record_pick("women", "我们");
-        let ctx = fam.predict_with_context("yiqi", &InputContext::new());
+        let ctx = fam.predict("yiqi", &InputContext::new());
         assert!(
             sc(&ctx, "一起") > sc(&ctx, "异曲"),
             "bigram(我们,一起) lifts 一起 over 异曲: {} vs {}",
@@ -1015,7 +1008,7 @@ mod tests {
     #[test]
     fn pinyin_family_nihao() {
         let fam = PinyinFamily::new();
-        let cands = fam.predict("nihao");
+        let cands = fam.predict("nihao", &InputContext::new());
         assert!(!cands.is_empty());
         assert!(cands.iter().any(|c| c.text.contains("你好")));
     }
@@ -1023,7 +1016,7 @@ mod tests {
     #[test]
     fn pinyin_family_xiayige() {
         let fam = PinyinFamily::new();
-        let cands = fam.predict("xiayige");
+        let cands = fam.predict("xiayige", &InputContext::new());
         assert!(cands.iter().any(|c| c.text == "下一个"));
     }
 
@@ -1033,7 +1026,7 @@ mod tests {
         // 这里用真正的自造词 lizhengming→李正明。
         let fam = PinyinFamily::new();
         fam.learn_phrase("lizhengming", "李正明");
-        let cands = fam.predict("lizhengming");
+        let cands = fam.predict("lizhengming", &InputContext::new());
         let p = cands
             .iter()
             .find(|c| c.text == "李正明")
@@ -1048,7 +1041,7 @@ mod tests {
         // 多次使用 → count 递增 → 分数随使用频率上升(0.70 + 0.02×2 = 0.74)。
         fam.learn_phrase("lizhengming", "李正明");
         fam.learn_phrase("lizhengming", "李正明");
-        let cands = fam.predict("lizhengming");
+        let cands = fam.predict("lizhengming", &InputContext::new());
         let p = cands.iter().find(|c| c.text == "李正明").unwrap();
         assert!(
             (p.raw_score - 0.74).abs() < 1e-9,
@@ -1070,7 +1063,7 @@ mod tests {
         let fam = PinyinFamily::new();
         fam.load_dict(&path).unwrap();
         fam.record_pick("zhong", "中");
-        let cands = fam.predict_with_context("de", &InputContext::new());
+        let cands = fam.predict("de", &InputContext::new());
         let di = cands.iter().find(|c| c.text == "的").expect("的 present");
         assert!(di.raw_score >= 0.68, "整词权重提升: {}", di.raw_score);
         let _ = std::fs::remove_file(&path);
@@ -1089,7 +1082,7 @@ mod tests {
         fam.load_dict(&path).unwrap();
         fam.record_pick("zhong", "中");
         fam.set_context_aware(false);
-        let cands = fam.predict_with_context("de", &InputContext::new());
+        let cands = fam.predict("de", &InputContext::new());
         let di = cands.iter().find(|c| c.text == "的").expect("的 present");
         assert_ne!(di.source, "context_comp", "关闭后无整词联想");
         let _ = std::fs::remove_file(&path);
@@ -1143,7 +1136,7 @@ mod tests {
     #[test]
     fn returns_scored_candidates() {
         let fam = PinyinFamily::new();
-        let cands = fam.predict("nihao");
+        let cands = fam.predict("nihao", &InputContext::new());
         for c in &cands {
             assert!(c.raw_score >= 0.0 && c.raw_score <= 1.0);
             assert_eq!(c.family, "pinyin");

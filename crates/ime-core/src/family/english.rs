@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::pinyin::recency::RecentStore;
-use super::{now_ms, CandidateFamily, ScoredCandidate};
+use super::{now_ms, CandidateFamily, InputContext, ScoredCandidate};
 
 // ── EnglishWeights ──────────────────────────────────────────────────────
 
@@ -587,7 +587,8 @@ impl CandidateFamily for EnglishFamily {
         8
     }
 
-    fn predict(&self, input: &str) -> Vec<ScoredCandidate> {
+    fn predict(&self, input: &str, _ctx: &InputContext) -> Vec<ScoredCandidate> {
+        let _ = _ctx; // recency 表是家族自有的(E2),ctx 预留给未来跨会话上下文
         // 大小写不敏感:输入(通常已是小写 buffer)归一小写后匹配。
         if input.is_empty() || !input.chars().all(|c| c.is_ascii_alphabetic()) {
             return Vec::new();
@@ -691,8 +692,8 @@ impl CandidateFamily for std::sync::Arc<EnglishFamily> {
     fn top_n(&self) -> usize {
         (**self).top_n()
     }
-    fn predict(&self, input: &str) -> Vec<ScoredCandidate> {
-        (**self).predict(input)
+    fn predict(&self, input: &str, ctx: &InputContext) -> Vec<ScoredCandidate> {
+        (**self).predict(input, ctx)
     }
     fn load_dict(&self, path: &str) -> std::io::Result<usize> {
         (**self).load_dict(path)
@@ -723,13 +724,13 @@ mod tests {
         // E2:刚提交过的词在候选里获得 recency 合成(z = (1-a)(a+b)/8 + a,
         // 天然 <1 不顶满);关闭上下文感知后 boost 消失。
         let fam = EnglishFamily::with_default_dict();
-        let base = fam.predict("prese");
+        let base = fam.predict("prese", &InputContext::new());
         let p_base = base.iter().find(|c| c.text == "present").expect("present in dict");
         let a = p_base.raw_score;
         assert!(a > 0.0 && a < 1.0);
 
         fam.record_commit("present");
-        let ctx = fam.predict("prese");
+        let ctx = fam.predict("prese", &InputContext::new());
         let p_ctx = ctx.iter().find(|c| c.text == "present").unwrap();
         assert!(
             p_ctx.raw_score > a,
@@ -751,7 +752,7 @@ mod tests {
 
         // gate:context_aware 关闭 → 无 boost。
         fam.set_context_aware(false);
-        let off = fam.predict("prese");
+        let off = fam.predict("prese", &InputContext::new());
         let p_off = off.iter().find(|c| c.text == "present").unwrap();
         assert!((p_off.raw_score - a).abs() < 1e-9, "gate off: {}", p_off.raw_score);
     }
@@ -791,7 +792,7 @@ mod tests {
         // 单字母输入:字母本尊 + 大小写互换置顶(self/case 成员),字典
         // prefix 候选(单字母开头的词)排其后。
         let fam = EnglishFamily::with_default_dict();
-        let cands = fam.predict("a");
+        let cands = fam.predict("a", &InputContext::new());
         assert_eq!(cands[0].text, "a");
         assert_eq!(cands[0].source, "self");
         assert_eq!(cands[1].text, "A");
@@ -806,7 +807,7 @@ mod tests {
     #[test]
     fn exact_match_black() {
         let fam = EnglishFamily::with_default_dict();
-        let cands = fam.predict("black");
+        let cands = fam.predict("black", &InputContext::new());
         assert!(cands
             .iter()
             .any(|c| c.text == "black" && c.raw_score > 0.85));
@@ -818,7 +819,7 @@ mod tests {
         for word in &[
             "hello", "world", "python", "code", "data", "server", "language", "computer",
         ] {
-            let cands = fam.predict(word);
+            let cands = fam.predict(word, &InputContext::new());
             assert!(
                 cands.iter().any(|c| c.text == *word),
                 "{word} should be in dict, got: {:?}",
@@ -832,7 +833,7 @@ mod tests {
         let fam = EnglishFamily::with_default_dict();
         fam.load_user_dict_file(&temp_dict("user", "github\nkubernetes\n"))
             .unwrap();
-        let cands = fam.predict("github");
+        let cands = fam.predict("github", &InputContext::new());
         assert!(cands
             .iter()
             .any(|c| c.text == "github" && c.source == "user"));
@@ -847,11 +848,11 @@ mod tests {
             "# @type: frequency\nhello\t100000\nworld\t50000\nzzz\t1\n",
         );
         fam.load_dict_file(&d).unwrap();
-        let cands = fam.predict("hello");
+        let cands = fam.predict("hello", &InputContext::new());
         // Should be in user layer now, with decile-normalized score.
         assert_eq!(cands[0].text, "hello");
         // zzz should also be loaded but with low decile score.
-        let z = fam.predict("zzz");
+        let z = fam.predict("zzz", &InputContext::new());
         assert!(!z.is_empty());
     }
 
@@ -900,13 +901,15 @@ mod tests {
 
     #[test]
     fn empty_returns_nothing() {
-        assert!(EnglishFamily::with_default_dict().predict("").is_empty());
+        assert!(EnglishFamily::with_default_dict()
+            .predict("", &InputContext::new())
+            .is_empty());
     }
 
     #[test]
     fn no_match_garbage() {
         assert!(EnglishFamily::with_default_dict()
-            .predict("zzzzz")
+            .predict("zzzzz", &InputContext::new())
             .is_empty());
     }
 
@@ -918,15 +921,15 @@ mod tests {
         fam.load_user_dict_file(&temp_dict("proper", "iPhone\nNASA\n"))
             .unwrap();
 
-        let c = fam.predict("iphone");
+        let c = fam.predict("iphone", &InputContext::new());
         assert!(
             c.iter().any(|x| x.text == "iPhone"),
             "iphone → iPhone: {c:?}"
         );
-        let n = fam.predict("nasa");
+        let n = fam.predict("nasa", &InputContext::new());
         assert!(n.iter().any(|x| x.text == "NASA"), "nasa → NASA: {n:?}");
         // 大写输入同样匹配(双向大小写不敏感)。
-        let c2 = fam.predict("IPHONE");
+        let c2 = fam.predict("IPHONE", &InputContext::new());
         assert!(
             c2.iter().any(|x| x.text == "iPhone"),
             "IPHONE → iPhone: {c2:?}"
@@ -937,7 +940,7 @@ mod tests {
     fn learned_word_preserves_case() {
         let fam = EnglishFamily::new(); // 空 base,只看 learned 层
         fam.record_learned_word("iPhone");
-        let c = fam.predict("iphone");
+        let c = fam.predict("iphone", &InputContext::new());
         assert!(
             c.iter().any(|x| x.text == "iPhone"),
             "learned iPhone matches iphone: {c:?}"
@@ -950,7 +953,7 @@ mod tests {
         // 几乎总是中文简拼,英文短词不该压过它们)。长词不受影响。
         let mut fam = EnglishFamily::new();
         fam.load_into_base(b"cd\t3000\ncat\t1000\n");
-        let cands = fam.predict("cd");
+        let cands = fam.predict("cd", &InputContext::new());
         let cd = cands.iter().find(|c| c.text == "cd").expect("cd in base");
         assert!(
             (cd.raw_score - 0.88 * 0.6).abs() < 1e-9,
@@ -958,7 +961,7 @@ mod tests {
             cd.raw_score,
         );
 
-        let cands = fam.predict("cat");
+        let cands = fam.predict("cat", &InputContext::new());
         let cat = cands.iter().find(|c| c.text == "cat").expect("cat in base");
         assert_eq!(cat.raw_score, 0.88, "long word keeps exact score");
     }
@@ -968,7 +971,7 @@ mod tests {
         // 自生词(用户层)不降权:学入 "cd" 后仍以全权重出现。
         let fam = EnglishFamily::new(); // 空 base,只看 learned 层
         fam.record_learned_word("cd");
-        let cands = fam.predict("cd");
+        let cands = fam.predict("cd", &InputContext::new());
         let c = cands
             .iter()
             .find(|x| x.text == "cd")
