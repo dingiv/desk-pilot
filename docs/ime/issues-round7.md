@@ -200,3 +200,5 @@ exact 固定 0.88 不看词频:the/and 与低频词同权(同输入只有一个 
   - 断言 page_size_flows_from_constructor_to_view_window(页大小 5 →
     页 3 窗口首 = merged[15])
   - 测试:ime-core 160+21+2、swift-ime 7+12+15 全绿
+
+> **第七轮收尾。** 预测流程规范化(三阶段管线)立项见 [第八轮 →](issues-round8.md)
