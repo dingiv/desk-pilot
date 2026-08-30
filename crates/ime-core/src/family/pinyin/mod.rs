@@ -46,7 +46,7 @@ pub struct PinyinFamily {
     freq_scale: crate::scoring::FreqScale,
     /// 上下文感知开关(swift-ime.yaml → input.context_aware,默认开)。
     /// 关闭时 `predict_with_context` 退化为纯 `predict` —— 不做 recency /
-    /// 整词联想加成,候选排序完全由词典频率决定。
+    /// bigram 联想 / 整词联想加成,候选排序完全由词典频率决定。
     /// `Mutex<bool>` 以便 trait 的 `&self` setter 写入。
     context_aware: Mutex<bool>,
     /// 上一次提交的 (word, pinyin) —— 前缀整词联想的上下文来源。
@@ -66,6 +66,10 @@ pub struct PinyinWeights {
     pub jianpin: f64,
     /// 全拼前缀联想折扣(naozh → naozhong 闹钟)。
     pub prefix_lookup: f64,
+    /// 跨提交 bigram 联想强度(E1):dict.bigram_boost(prev, next) 的
+    /// 乘数。boost 是词频量纲的加法值(cap 50k ≈ 顶部词频 1/10),加到
+    /// 候选 freq 上再过 freq_to_score;1.0 = inputx 原始设计强度。
+    pub bigram_weight: f64,
     pub single_syl_decay: f64,
     pub context_boost: f64,
     // ── Post-merge adjustments ──
@@ -95,6 +99,7 @@ impl Default for PinyinWeights {
             viterbi_scale: 0.55,
             jianpin: 0.50,
             prefix_lookup: 0.75,
+            bigram_weight: 1.0,
             single_syl_decay: 0.5,
             context_boost: 0.12,
             stopword_penalty: 0.5,
@@ -457,130 +462,11 @@ impl PinyinFamily {
     pub fn warm_phrases_from_store(&self) {
         self.do_warm_phrases();
     }
-}
-
-/// Extract initials from a raw (concatenated) pinyin string.
-/// "shengnengshengqiao" → "snsq", "nihao" → "nh".
-pub fn initials_from_pinyin(raw: &str) -> String {
-    let segs = inputx_pinyin::segment(raw);
-    segs.first()
-        .map(|seg| {
-            seg.syllables
-                .iter()
-                .filter_map(|s| s.chars().next())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// 最长合法音节前缀("lizhengming" → "li","kuifa" → "kui")。
-/// 纯函数(无实例状态)—— StepEnv::first_syllable 的实现基础。
-/// (输入需为 ASCII 小写拼音;与原 InputxPinyin::first_syllable 同语义。)
-pub fn first_syllable_of(pinyin: &str) -> Option<String> {
-    let max = pinyin.len().min(6);
-    for len in (1..=max).rev() {
-        let candidate = &pinyin[..len];
-        if inputx_pinyin::is_valid_syllable(candidate) {
-            return Some(candidate.to_string());
-        }
-    }
-    None
-}
-
-impl Default for PinyinFamily {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// 单词本只收**含汉字**的词(纯汉字或汉字+ASCII 混合,如 "Bevy引擎");
-/// 纯 ASCII 英文词(name/cd)走英文自生词体系(en_user),emoji / 符号
-/// 一律不学 —— 都不是拼音自造词。
-fn is_learnable_word(word: &str) -> bool {
-    word.chars().any(is_cjk) && word.chars().all(|c| is_cjk(c) || c.is_ascii_alphanumeric())
-}
-
-/// CJK 统一表意文字(含扩展A)。
-fn is_cjk(c: char) -> bool {
-    let p = c as u32;
-    (0x4E00..=0x9FFF).contains(&p) || (0x3400..=0x4DBF).contains(&p)
-}
-
-/// 当前 wall-clock 毫秒(unix epoch)—— recent member 的时间基准。
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
-
-impl CandidateFamily for PinyinFamily {
-    fn name(&self) -> &'static str {
-        "pinyin"
-    }
-    fn priority(&self) -> u32 {
-        100
-    }
-    fn enabled(&self) -> bool {
-        self.enabled.load(Ordering::Relaxed)
-    }
-    /// 运行时开关(修复 B3:此前默认 no-op,禁用静默无效)。
-    fn set_family_enabled(&self, on: bool) {
-        self.enabled.store(on, Ordering::Release);
-    }
-    fn top_n(&self) -> usize {
-        // 拼音主导中英混输:宽竞争宽度让 lattice/single 的深排序进全局榜
-        // (english 8 / emoji 4);造词单字候选也消费 family.predict 全量。
-        128
-    }
-
-    // ── 家族私有能力(D5 接口隔离,不在 CandidateFamily trait 上)──
-    // record_pick / learn_phrase / learn_composed_phrase / export_l0_json /
-    // import_l0_json / warm_recencies / set_context_aware /
-    // warm_phrases_from_store —— 见上方固有 impl 的 pub 方法。
-
-    /// Attach the weight store(跨家族生命周期钩子,留在 trait)。
-    fn attach_store(&self, store: std::sync::Arc<WeightStore>) {
-        *self.store.lock().unwrap() = Some(store);
-    }
-
-    fn load_dict_bytes(&self, data: &[u8]) -> usize {
-        if data.len() as u64 > DICT_LARGE_BYTES {
-            let n = self.large_dict.lock().unwrap().load_from_tsv_bytes(data);
-            // After loading, try to build lattice from the FST.
-            // LargeDict's backend stores the FST; we can't access it directly.
-            // For now, lattice is built when loading from file (load_fst_file).
-            n
-        } else {
-            self.phrase_book.lock().unwrap().load_from_tsv_bytes(data)
-        }
-    }
-
-    fn load_dict(&self, path: &str) -> std::io::Result<usize> {
-        if path.ends_with(".json") {
-            let json = std::fs::read_to_string(path)?;
-            let mut book = self.phrase_book.lock().unwrap();
-            book.load_from_json_str(&json)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        } else if path.ends_with(".fst") {
-            // FST: load and build LatticeDecoder, passing path for .idx cache.
-            let data = std::fs::read(path)?;
-            let dict = inputx_fsa::Dict::new(data).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
-            })?;
-            *self.lattice.lock().unwrap() = Some(lattice::LatticeDecoder::new(dict, path));
-            Ok(0) // size not tracked for FST
-        } else {
-            let meta = std::fs::metadata(path)?;
-            if meta.len() > DICT_LARGE_BYTES {
-                self.large_dict.lock().unwrap().load_from_tsv_file(path)
-            } else {
-                self.phrase_book.lock().unwrap().load_from_tsv(path)
-            }
-        }
-    }
-
-    fn predict(&self, input: &str) -> Vec<ScoredCandidate> {
+    /// 带跨提交上下文的预测(E1):`prev_word` 非空时,对 lattice/前缀联想
+    /// 候选施加 `dict.bigram_boost(prev, word)` 的词频量纲加成 —— 语料里
+    /// (今天,天气) 这类相邻对把"天气"抬过同侪。无 bigram 数据的候选
+    /// boost = 0,纯增益不伤现有排序。单音节表 / 造词 / 单词本不适用。
+    fn predict_inner(&self, input: &str, prev_word: &str) -> Vec<ScoredCandidate> {
         if input.is_empty() {
             return Vec::new();
         }
@@ -620,7 +506,15 @@ impl CandidateFamily for PinyinFamily {
             if let Some(ref lat) = *lattice_guard {
                 let results = lat.predict(input, self.weights.large_dict_take);
                 for r in results {
-                    let base_score = lat.freq_to_score(&self.freq_scale, r.freq_score as u64);
+                    // E1:跨提交 bigram 加成 —— 加在词频上再映射,与 Viterbi
+                    // 的用法同量纲(freq + boost),顶部词已饱和不受影响。
+                    let boosted = if prev_word.is_empty() {
+                        r.freq_score
+                    } else {
+                        r.freq_score
+                            + dict.bigram_boost(Some(prev_word), &r.text) * self.weights.bigram_weight
+                    };
+                    let base_score = lat.freq_to_score(&self.freq_scale, boosted as u64);
                     let (source, score) = match r.match_type {
                         lattice::MatchType::Full => ("lattice", base_score),
                         lattice::MatchType::Mixed => {
@@ -653,7 +547,14 @@ impl CandidateFamily for PinyinFamily {
                     // 联想版本提升之 —— 旧的"已存在则跳过"让低分 mix 挡掉
                     // 高分前缀联想,继续 0.45 挡 0.675,机械的 0.59 反超 #1)。
                     let prefix_score = {
-                        let base_score = lat.freq_to_score(&self.freq_scale, r.freq_score as u64);
+                        let boosted = if prev_word.is_empty() {
+                            r.freq_score
+                        } else {
+                            r.freq_score
+                                + dict.bigram_boost(Some(prev_word), &r.text)
+                                    * self.weights.bigram_weight
+                        };
+                        let base_score = lat.freq_to_score(&self.freq_scale, boosted as u64);
                         // 距离衰减:联想词拼音比输入长越多,越不可信。剩余
                         // ≤3 字符视为"马上打完"不衰减 —— 覆盖"半截声母到
                         // 完整音节"的典型差(zh→zhong 差 3):naozh 到 naozhong
@@ -755,14 +656,145 @@ impl CandidateFamily for PinyinFamily {
         out.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap());
         out
     }
+}
+
+/// Extract initials from a raw (concatenated) pinyin string.
+/// "shengnengshengqiao" → "snsq", "nihao" → "nh".
+pub fn initials_from_pinyin(raw: &str) -> String {
+    let segs = inputx_pinyin::segment(raw);
+    segs.first()
+        .map(|seg| {
+            seg.syllables
+                .iter()
+                .filter_map(|s| s.chars().next())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 最长合法音节前缀("lizhengming" → "li","kuifa" → "kui")。
+/// 纯函数(无实例状态)—— StepEnv::first_syllable 的实现基础。
+/// (输入需为 ASCII 小写拼音;与原 InputxPinyin::first_syllable 同语义。)
+pub fn first_syllable_of(pinyin: &str) -> Option<String> {
+    let max = pinyin.len().min(6);
+    for len in (1..=max).rev() {
+        let candidate = &pinyin[..len];
+        if inputx_pinyin::is_valid_syllable(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+impl Default for PinyinFamily {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 单词本只收**含汉字**的词(纯汉字或汉字+ASCII 混合,如 "Bevy引擎");
+/// 纯 ASCII 英文词(name/cd)走英文自生词体系(en_user),emoji / 符号
+/// 一律不学 —— 都不是拼音自造词。
+fn is_learnable_word(word: &str) -> bool {
+    word.chars().any(is_cjk) && word.chars().all(|c| is_cjk(c) || c.is_ascii_alphanumeric())
+}
+
+/// CJK 统一表意文字(含扩展A)。
+fn is_cjk(c: char) -> bool {
+    let p = c as u32;
+    (0x4E00..=0x9FFF).contains(&p) || (0x3400..=0x4DBF).contains(&p)
+}
+
+/// 当前 wall-clock 毫秒(unix epoch)—— recent member 的时间基准。
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+
+impl CandidateFamily for PinyinFamily {
+    fn predict(&self, input: &str) -> Vec<ScoredCandidate> {
+        self.predict_inner(input, "")
+    }
+
+    fn name(&self) -> &'static str {
+        "pinyin"
+    }
+    fn priority(&self) -> u32 {
+        100
+    }
+    fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+    /// 运行时开关(修复 B3:此前默认 no-op,禁用静默无效)。
+    fn set_family_enabled(&self, on: bool) {
+        self.enabled.store(on, Ordering::Release);
+    }
+    fn top_n(&self) -> usize {
+        // 拼音主导中英混输:宽竞争宽度让 lattice/single 的深排序进全局榜
+        // (english 8 / emoji 4);造词单字候选也消费 family.predict 全量。
+        128
+    }
+
+    // ── 家族私有能力(D5 接口隔离,不在 CandidateFamily trait 上)──
+    // record_pick / learn_phrase / learn_composed_phrase / export_l0_json /
+    // import_l0_json / warm_recencies / set_context_aware /
+    // warm_phrases_from_store —— 见上方固有 impl 的 pub 方法。
+
+    /// Attach the weight store(跨家族生命周期钩子,留在 trait)。
+    fn attach_store(&self, store: std::sync::Arc<WeightStore>) {
+        *self.store.lock().unwrap() = Some(store);
+    }
+
+    fn load_dict_bytes(&self, data: &[u8]) -> usize {
+        if data.len() as u64 > DICT_LARGE_BYTES {
+            let n = self.large_dict.lock().unwrap().load_from_tsv_bytes(data);
+            // After loading, try to build lattice from the FST.
+            // LargeDict's backend stores the FST; we can't access it directly.
+            // For now, lattice is built when loading from file (load_fst_file).
+            n
+        } else {
+            self.phrase_book.lock().unwrap().load_from_tsv_bytes(data)
+        }
+    }
+
+    fn load_dict(&self, path: &str) -> std::io::Result<usize> {
+        if path.ends_with(".json") {
+            let json = std::fs::read_to_string(path)?;
+            let mut book = self.phrase_book.lock().unwrap();
+            book.load_from_json_str(&json)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        } else if path.ends_with(".fst") {
+            // FST: load and build LatticeDecoder, passing path for .idx cache.
+            let data = std::fs::read(path)?;
+            let dict = inputx_fsa::Dict::new(data).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
+            })?;
+            *self.lattice.lock().unwrap() = Some(lattice::LatticeDecoder::new(dict, path));
+            Ok(0) // size not tracked for FST
+        } else {
+            let meta = std::fs::metadata(path)?;
+            if meta.len() > DICT_LARGE_BYTES {
+                self.large_dict.lock().unwrap().load_from_tsv_file(path)
+            } else {
+                self.phrase_book.lock().unwrap().load_from_tsv(path)
+            }
+        }
+    }
+
 
     fn predict_with_context(&self, input: &str, _ctx: &InputContext) -> Vec<ScoredCandidate> {
-        // 上下文感知暂时关闭(input.context_aware: false):候选排序完全由
-        // 词典频率决定,不做 recency / 整词联想加成。
+        // 上下文感知开关关闭时:候选排序完全由词典频率决定,不做 recency /
+        // bigram 联想 / 整词联想加成。
         if !*self.context_aware.lock().unwrap() {
             return self.predict(input);
         }
-        let mut candidates = self.predict(input);
+        // E1:上一提交词作为 bigram 上下文 —— (今天 → tianqi)时"天气"
+        // 在词频映射前获得 freq 量纲加成。
+        let prev_word = self.last_commit.lock().unwrap().0.clone();
+        let mut candidates = self.predict_inner(input, &prev_word);
         if candidates.is_empty() {
             return candidates;
         }
@@ -865,25 +897,41 @@ impl CandidateFamily for Arc<PinyinFamily> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
-    fn l0_picks_reorder_single_syllable_candidates() {
-        // B2 回归:造词单字候选 = family.predict(首音节),与学习路径同引擎
-        // —— record_pick 的 L0 状态必须影响候选顺序。此前双实例脑裂,造词
-        // 候选走的独立实例从不接收 pick,用户的选择历史永远不生效。
+    fn bigram_context_lifts_co_occurring_word() {
+        // E1 跨提交 bigram 联想:提交"我们"后输入 yiqi —— 嵌入 bigram 语料
+        // 的 (我们,一起) 对(count 高,boost ≈ 26.9k 词频量纲)把"一起"
+        // 的词频抬过无上下文时更高的"异曲"。三词设计:一律(130k)做
+        // max 锚,异曲(60k)/一起(50k)的 base 差距 < boost,反超可断言。
+        use crate::family::CandidateFamily;
+        let path = format!("/tmp/swift-ime-e1-{}.fst", std::process::id());
+        let mut b = inputx_fsa::DictBuilder::new();
+        b.insert(b"yiqi", "一律".as_bytes(), 130_000);
+        b.insert(b"yiqi", "异曲".as_bytes(), 60_000);
+        b.insert(b"yiqi", "一起".as_bytes(), 50_000);
+        std::fs::write(&path, b.finish()).unwrap();
         let fam = PinyinFamily::new();
-        fam.record_pick("ni", "腻");
-        fam.record_pick("ni", "腻");
-        fam.record_pick("ni", "腻"); // 3-pick 自动钉选
-        let cands = fam.predict("ni");
-        assert_eq!(
-            cands.first().map(|c| c.text.as_str()),
-            Some("腻"),
-            "3-pick 钉选后应排首位, got: {:?}",
-            cands.iter().take(5).map(|c| &c.text).collect::<Vec<_>>()
+        fam.load_dict(&path).unwrap();
+        let sc = |v: &[ScoredCandidate], t: &str| {
+            v.iter().find(|c| c.text == t).map(|c| c.raw_score).unwrap_or(0.0)
+        };
+        let base = fam.predict("yiqi");
+        assert!(sc(&base, "异曲") > sc(&base, "一起"), "base: 异曲 > 一起");
+        // record_pick 直接写 last_commit(嵌入 lattice 无"我们"词条时
+        // record_commit 查不到拼音,测试里用双参入口)。
+        fam.record_pick("women", "我们");
+        let ctx = fam.predict_with_context("yiqi", &InputContext::new());
+        assert!(
+            sc(&ctx, "一起") > sc(&ctx, "异曲"),
+            "bigram(我们,一起) lifts 一起 over 异曲: {} vs {}",
+            sc(&ctx, "一起"), sc(&ctx, "异曲")
         );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.idx"));
     }
+
+    use super::*;
 
     #[test]
     fn first_syllable_of_splits_longest_prefix() {

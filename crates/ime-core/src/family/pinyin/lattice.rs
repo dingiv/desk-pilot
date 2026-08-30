@@ -413,7 +413,9 @@ impl LatticeDecoder {
             600_000.0 // legacy cache without recorded max
         };
         let ratio = (w + 1.0).log2() / (max + 1.0).log2();
-        scale.min_score + (scale.max_score - scale.min_score) * ratio
+        // E1:bigram 加成可能把 freq 推过 recorded max,ratio > 1 会顶破
+        // max_score、污染 [0,1] 排序假定 —— clamp 封顶。
+        (scale.min_score + (scale.max_score - scale.min_score) * ratio).min(scale.max_score)
     }
 
     /// Full-pinyin exact hit? (rime-ice contains `pinyin` → `word`) — used by

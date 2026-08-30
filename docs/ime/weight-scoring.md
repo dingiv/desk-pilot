@@ -50,6 +50,24 @@ freq_to_score(f) = log₂(f+1) / log₂(max_freq+1)   clamp [0.25, 1.0]
 | `single` | 单音节(de→的) | **`large_dict` 为基础分**,按位衰减 × `single_syl_decay`(注意:`large_dict` 不是死参数——它正是单字候选的基础分) |
 | `decomp` | Viterbi 造词兜底 | 0.40 |
 
+### 跨提交 bigram 联想(E1,round7)
+
+`lattice` / `lattice_prefix` 候选在 freq→score 映射**之前**获得词频量纲
+加成(inputx `dict.bigram_boost(prev, next)`,量纲与词频一致):
+
+```
+boosted_freq = freq_score + bigram_boost(last_commit.0, 候选) × bigram_weight(1.0)
+score        = freq_to_score(boosted_freq)   # freq_to_score 已 clamp ≤ max_score
+```
+
+- bigram_boost = `50_000 × ln(1+count)/ln(1001)`(inter+intra 求和;count=30
+  → ≈25k,count≥1000 → 封顶 50k)——"抬中频候选过同侪,不压强词频差"
+- 无 bigram 数据的候选 boost=0,纯增益;`context_aware: false` 时整层关闭
+- gate 与 recency/整词联想一致;数据面 = `last_commit`(record_pick 写入)
+- 黄金断言:`bigram_context_lifts_co_occurring_word`(我们→yiqi,一起
+  0.857→0.881 反超异曲)
+
+
 ### 前缀联想距离衰减(`scoring::prefix_decay`,pinyin/emoji 共享)
 
 联想词拼音比输入长越多越不可信:剩余 **≤3 字符免费**(覆盖"半截声母到

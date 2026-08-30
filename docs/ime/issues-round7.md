@@ -119,4 +119,14 @@ exact 固定 0.88 不看词频:the/and 与低频词同权(同输入只有一个 
 
 ## 执行记录
 
-(待填:每项落地后在此登记提交与断言)
+- **E1 ✅** 跨提交 bigram 联想落地:
+  - `predict` 拆出 `predict_inner(input, prev_word)`,`lattice`/`lattice_prefix`
+    分支在 freq→score 前施加 `bigram_boost(last_commit.0, 候选) × bigram_weight`
+  - `PinyinWeights.bigram_weight`(1.0)+ yaml `weights.pinyin.bigram_weight`
+  - `freq_to_score` 加 `min(max_score)` clamp(boost 可推 freq 过 recorded max)
+  - `predict_with_context` 接线 prev_word(与 recency/整词联想同 gate)
+  - 黄金断言 `bigram_context_lifts_co_occurring_word`(mini FST 三词设计:
+    一律 130k 锚 + 异曲 60k/一起 50k,嵌入 bigram(我们,一起)≈26.9k 反超)
+  - 标定注记:嵌入语料 (今天,天气)=0(无此对),(非常,好)≈35k,
+    (我,们)/(的,时候)=50k 封顶 —— 常见对普遍在 15k~50k 区间
+  - 测试:ime-core 154+21+2、swift-ime 7+10+15 全绿
