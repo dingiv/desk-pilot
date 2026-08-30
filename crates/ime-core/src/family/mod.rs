@@ -159,7 +159,7 @@ pub trait CandidateFamily: Send + Sync {
 //          export_l0_json / import_l0_json / set_context_aware /
 //          record_commit / warm_recencies / warm_phrases_from_store
 //   english:record_learned_word / warm_learned_words
-// 经 [`crate::dispatcher::Dispatcher`] 持有的具体句柄(Arc<PinyinFamily> /
+// 经引擎直持的具体句柄(Arc<PinyinFamily> /
 // Arc<EnglishFamily>)直接调用,不再走 trait 对象的 no-op 默认实现。
 
 // ── UnifiedScorer ───────────────────────────────────────────────────────

@@ -373,7 +373,7 @@ impl PinyinFamily {
     }
 
     // ── 家族私有能力(D5 接口隔离:不在 CandidateFamily trait 上)──
-    // 学习 / 暖启 / 上下文开关,经 Dispatcher 持有的具体句柄直调。
+    // 学习 / 暖启 / 上下文开关,经引擎直持的具体句柄直调。
 
     /// 造词单字候选(逐字输入组词)—— 家族私有能力(D5):链式豁免 /
     /// 多音节判定 / 首音节提取 / 单字过滤全部内聚,壳(state.rs 的
@@ -888,7 +888,7 @@ impl CandidateFamily for PinyinFamily {
 
 }
 
-/// Arc 共享句柄的 trait 委托(D5):Dispatcher 持 `Arc<PinyinFamily>` 直调
+/// Arc 共享句柄的 trait 委托(D5):引擎持 `Arc<PinyinFamily>` 直调
 /// 家族私有方法,scorer 持同一 Arc 当 trait 对象参与统一排序。
 impl CandidateFamily for Arc<PinyinFamily> {
     fn name(&self) -> &'static str {

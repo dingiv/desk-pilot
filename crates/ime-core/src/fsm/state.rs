@@ -1504,3 +1504,247 @@ mod tests {
         assert_eq!(apply_input_casing("iPhone", ""), "iPhone");
     }
 }
+
+// ── 状态机 × StepEnv 交互测试(原 dispatcher.rs tests,转发层裁撤后迁此)──
+#[cfg(test)]
+mod step_env_tests {
+    use super::*;
+    use crate::family::magic::expander::StaticProvider;
+    use crate::family::magic::MagicFamily;
+    use crate::family::pinyin::PinyinFamily;
+    use crate::family::english::EnglishFamily;
+    use crate::family::UnifiedScorer;
+    use crate::Matcher;
+    use crate::Expander;
+    use std::sync::Arc;
+
+    /// 轻量测试桩:内嵌组件的 StepEnv(原 new_for_test Dispatcher 的替身)。
+    struct TestEnv {
+        matcher: Matcher,
+        expander: Expander,
+        scorer: UnifiedScorer,
+        magic: MagicFamily,
+    }
+
+    impl TestEnv {
+        fn new() -> Self {
+            let entries = vec![("#date".into(), "2026-07-23".into())];
+            let magic = MagicFamily::new();
+            magic.set_snippets(vec![crate::store::snippet_md::SnippetEntry {
+                name: "greet".into(),
+                comment: String::new(),
+                params: Vec::new(),
+                template: "你好,我是 AI 秘书".into(),
+            }]);
+            let pinyin = Arc::new(PinyinFamily::new());
+            let scorer = UnifiedScorer::new(
+                vec![Box::new(Arc::clone(&pinyin))],
+                crate::scoring::FamilyPriorities::default(),
+            );
+            TestEnv {
+                matcher: Matcher::new(entries),
+                expander: Expander::new(Arc::new(StaticProvider {
+                    date: "2026-07-23".into(),
+                    clipboard: String::new(),
+                })),
+                scorer,
+                magic,
+            }
+        }
+        fn process_key(&self, ch: char, sm: &mut StateMachine) -> ImeView {
+            sm.step(ch, self)
+        }
+        fn select_candidate(&self, index: usize, sm: &mut StateMachine) -> ImeView {
+            sm.select(index, self)
+        }
+        fn reset(&self, sm: &mut StateMachine) {
+            sm.reset();
+        }
+        fn magic(&self) -> &MagicFamily {
+            &self.magic
+        }
+    }
+
+    impl StepEnv for TestEnv {
+        fn matcher(&self) -> &Matcher {
+            &self.matcher
+        }
+        fn expander(&self) -> &Expander {
+            &self.expander
+        }
+        fn scorer(&self) -> &UnifiedScorer {
+            &self.scorer
+        }
+        fn magic(&self) -> &MagicFamily {
+            &self.magic
+        }
+        fn record_pick(&self, _p: &str, _w: &str) {}
+        fn learn_phrase(&self, _p: &str, _h: &str) {}
+        fn learn_composed_phrase(&self, _p: &str, _h: &str) {}
+    }
+
+    fn d() -> TestEnv {
+        TestEnv::new()
+    }
+
+    fn sm() -> StateMachine {
+        StateMachine::new()
+    }
+
+    #[test]
+    fn idle_letter_enters_pinyin() {
+        let d = d();
+        let mut s = sm();
+        let _v = d.process_key('n', &mut s);
+        assert_eq!(
+            s.state,
+            crate::fsm::state::ComposeState::Pinyin,
+            "single letter should enter pinyin state"
+        );
+        // 'n' alone is not a complete syllable; candidates depend on FST/decomp.
+        // Subsequent typing of 'i' should produce candidates.
+        let v = d.process_key('i', &mut s);
+        assert!(v.candidate_count > 0, "ni should produce candidates");
+    }
+
+    #[test]
+    fn snippet_expansion() {
+        let d = d();
+        let mut s = sm();
+        // Type #/greet — shows expansion as candidate, doesn't auto-expand.
+        let mut view = ImeView::empty();
+        for c in "#/greet".chars() {
+            view = d.process_key(c, &mut s);
+        }
+        assert!(
+            view.candidate_count > 0,
+            "should show expansion as candidate, got {view:?}"
+        );
+        // Space commits the expansion.
+        assert_eq!(
+            ImeView::str_field(&d.process_key(' ', &mut s).commit_text),
+            "你好,我是 AI 秘书"
+        );
+    }
+
+    #[test]
+    fn pinyin_space_commits_top() {
+        let d = d();
+        let mut s = sm();
+        d.process_key('n', &mut s);
+        d.process_key('i', &mut s);
+        assert_eq!(
+            ImeView::str_field(&d.process_key(' ', &mut s).commit_text),
+            "你"
+        );
+    }
+
+    #[test]
+    fn pinyin_enter_commits_raw() {
+        let d = d();
+        let mut s = sm();
+        d.process_key('h', &mut s);
+        d.process_key('e', &mut s);
+        d.process_key('l', &mut s);
+        d.process_key('l', &mut s);
+        d.process_key('o', &mut s);
+        assert_eq!(
+            ImeView::str_field(&d.process_key('\n', &mut s).commit_text),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn pinyin_and_snippet_coexist() {
+        let d = d();
+        let mut s = sm();
+        // Type #date — 静态命令预测为今天日期,space commits。
+        d.process_key('#', &mut s);
+        d.process_key('d', &mut s);
+        d.process_key('a', &mut s);
+        d.process_key('t', &mut s);
+        d.process_key('e', &mut s);
+        assert_eq!(
+            ImeView::str_field(&d.process_key(' ', &mut s).commit_text),
+            crate::family::magic::expander::today_str(),
+            "#date commits today"
+        );
+        // After magic, typing letters enters pinyin.
+        d.process_key('n', &mut s);
+        let a = d.process_key('i', &mut s);
+        assert!(
+            a.candidate_count > 0,
+            "after magic, ni should produce candidates, got {a:?}"
+        );
+    }
+
+    #[test]
+    fn select_candidate_commits_nth() {
+        let d = d();
+        let mut s = sm();
+        d.process_key('n', &mut s);
+        d.process_key('i', &mut s);
+        assert_eq!(
+            ImeView::str_field(&d.select_candidate(1, &mut s).commit_text),
+            "呢"
+        );
+    }
+
+    #[test]
+    fn snippet_cursor_places_caret_in_expanded_text() {
+        // Template with a mid-text $CURSOR marker: committing places the caret
+        // at the marker's offset in the EXPANDED text (variables before it are
+        // variable-length, so the offset is computed after expansion).
+        use crate::family::magic::expander::{Expander, VariableProvider};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct MutableDate {
+            date: Mutex<String>,
+        }
+        impl VariableProvider for MutableDate {
+            fn resolve(&self, name: &str) -> Option<String> {
+                match name {
+                    "DATE" => Some(self.date.lock().unwrap().clone()),
+                    _ => None,
+                }
+            }
+        }
+
+        let provider: std::sync::Arc<dyn VariableProvider> = std::sync::Arc::new(MutableDate {
+            date: Mutex::new("2026-08-05".into()),
+        });
+        let mut d = TestEnv::new();
+        d.matcher = Matcher::new(Vec::new());
+        d.expander = Expander::new(provider);
+        d.magic()
+            .set_snippets(vec![crate::store::snippet_md::SnippetEntry {
+                name: "note".into(),
+                comment: String::new(),
+                params: Vec::new(),
+                template: "$DATE 完成: $CURSOR 记得检查".into(),
+            }]);
+        let mut s = sm();
+        for c in "#/note".chars() {
+            d.process_key(c, &mut s);
+        }
+        let v = d.process_key(' ', &mut s);
+        let text = ImeView::str_field(&v.commit_text);
+        // "$DATE" = 10 bytes + " 完成: " = 9 → marker lands at byte 19.
+        assert_eq!(
+            text, "2026-08-05 完成:  记得检查",
+            "marker removed from text"
+        );
+        assert_eq!(v.commit_cursor, 19, "caret mid-text, after the date prefix");
+    }
+
+    #[test]
+    fn reset_clears_all() {
+        let d = d();
+        let mut s = sm();
+        d.process_key('n', &mut s);
+        d.reset(&mut s);
+        assert!(s.comp.buffer.is_empty());
+        assert_eq!(s.state, crate::fsm::state::ComposeState::Idle);
+    }
+}

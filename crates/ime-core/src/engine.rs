@@ -1,6 +1,6 @@
 //! ImeEngine — the single integration point for all frontends.
 //!
-//! Manages the [`Dispatcher`], per-context [`StateMachine`]s, and
+//! Manages per-context [`StateMachine`]s and
 //! short-term [`InputContext`]. Supports both multi-context (fcitx5,
 //! one engine per process) and single-context (mock, tests) usage.
 //!
@@ -26,7 +26,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::dispatcher::Dispatcher;
 use crate::family::magic::{MagicFamily, ReqFetcher};
 use crate::family::InputContext;
 use crate::fsm::router::{StateFlags, StateMachineTable};
@@ -68,13 +67,22 @@ pub const DEFAULT_VOICE_AURA_BASE: &str = "http://127.0.0.1:9091";
 /// Self-contained IME engine. Manages the dispatcher, per-context state
 /// machines, input context, and async waits.
 pub struct ImeEngine {
-    dispatcher: Dispatcher,
+    /// 组合表(snippet/命令触发器 trie)+ 变量展开器(原 Dispatcher 字段,
+    /// 转发层裁撤后引擎直持)。
+    matcher: crate::Matcher,
+    expander: crate::Expander,
+    /// 统一打分器(家族容器 + 合成;合成段 S6 归 stage3 后处理)。
+    scorer: crate::family::UnifiedScorer,
+    /// 具体家族句柄(D5 接口隔离):学习/暖启/上下文开关等家族私有方法
+    /// 直调,不经 trait 对象。scorer 持同一 Arc 当 trait 对象参与排序。
+    pinyin_family: std::sync::Arc<crate::family::pinyin::PinyinFamily>,
+    english_family: std::sync::Arc<crate::family::english::EnglishFamily>,
     contexts: Mutex<HashMap<usize, PerContext>>,
     /// Unified persistence manager — owns the SQLite store and coordinates all
     /// user-model persistence (recency / bigrams / phrases / L0). `None` until
     /// [`init_store`](ImeEngine::init_store).
     persistence: Mutex<Option<PersistenceManager>>,
-    /// The magic command registry — same `Arc` the dispatcher holds. The engine
+    /// The magic command registry — same `Arc` the scorer-side state uses. The engine
     /// routes late resource attachment (voice buffer, `#req` base/fetcher) here;
     /// the FSM spawns live member instances from it.
     magic: Arc<MagicFamily>,
@@ -199,15 +207,32 @@ impl ImeEngine {
         magic.set_io(Arc::clone(&io_thread), Arc::clone(&frontend));
         // `#asr` 家族经同一 sender 发 Attach/Detach 给 voice server。
         magic.set_voice_tx(io_thread.voice_tx());
+        // pinyin + english + emoji compete in the unified scorer (中英混输 +
+        // emoji). Magic (#) and snippet (/) are routed by the FSM via the
+        // matcher — their candidates never pass through the scorer.
+        let pinyin_family = Arc::new(crate::family::pinyin::PinyinFamily::with_scoring(
+            pinyin_weights,
+            scoring,
+        ));
+        let english_family = Arc::new(
+            crate::family::english::EnglishFamily::with_default_dict()
+                .with_config(scoring.priorities.english, english_weights),
+        );
+        let emoji_family = crate::family::emoji::EmojiFamily::new();
+        let scorer = crate::family::UnifiedScorer::new(
+            vec![
+                Box::new(Arc::clone(&pinyin_family)),
+                Box::new(Arc::clone(&english_family)),
+                Box::new(emoji_family),
+            ],
+            scoring.priorities,
+        );
         let engine = ImeEngine {
-            dispatcher: Dispatcher::with_config(
-                matcher,
-                expander,
-                Arc::clone(&magic),
-                pinyin_weights,
-                english_weights,
-                scoring,
-            ),
+            matcher,
+            expander,
+            scorer,
+            pinyin_family,
+            english_family,
             contexts: Mutex::new(HashMap::new()),
             persistence: Mutex::new(None),
             magic,
@@ -220,8 +245,7 @@ impl ImeEngine {
         };
         // Load embedded base dictionary (5KB, compiled into binary).
         let count = engine
-            .dispatcher
-            .scorer()
+            .scorer
             .family("pinyin")
             .map(|f| f.load_dict_bytes(Self::EMBEDDED_BASE_DICT))
             .unwrap_or(0);
@@ -262,14 +286,14 @@ impl ImeEngine {
 
     // ── ctx helpers ─────────────────────────────────────────────────────
 
-    fn with_ctx<T>(&self, ctx: usize, f: impl FnOnce(&Dispatcher, &mut PerContext) -> T) -> T {
+    fn with_ctx<T>(&self, ctx: usize, f: impl FnOnce(&ImeEngine, &mut PerContext) -> T) -> T {
         // FIXME: 一处不必要的 unwrap
         let mut map = self.contexts.lock().unwrap();
         let pc = map
             .entry(ctx)
             .or_insert_with(|| PerContext::with_page_size(self.page_size, self.candidate_meta));
         pc.sm.ctx = ctx;
-        f(&self.dispatcher, pc)
+        f(self, pc)
     }
 
     /// 调试模式:候选词后显示提供者与权重(swift-ime.yaml → debug.candidate_meta)。
@@ -283,15 +307,17 @@ impl ImeEngine {
 
     /// 运行时启/禁某家族(`dicts.emoji: false` → "emoji" 禁用,无 emoji 候选)。
     pub fn set_family_enabled(&self, name: &str, on: bool) {
-        self.dispatcher.set_family_enabled(name, on);
+        if let Some(fam) = self.scorer.family(name) {
+            fam.set_family_enabled(on);
+        }
     }
 
     /// 临时关闭/恢复上下文感知(swift-ime.yaml → input.context_aware)。
     /// 同时作用于两个家族:拼音的 recency/整词联想/bigram,英文的 recency。
     /// 关闭后候选排序纯频率驱动。
     pub fn set_context_aware(&mut self, on: bool) {
-        self.dispatcher.set_pinyin_context_aware(on);
-        self.dispatcher.set_english_context_aware(on);
+        self.pinyin_family.set_context_aware(on);
+        self.english_family.set_context_aware(on);
     }
 
     /// 候选每页条数 —— 运行时动态调整。构造期请传 `with_config` 的
@@ -337,7 +363,7 @@ impl ImeEngine {
                 pc.text_context.update(committed);
                 // Record bigram / recency(E2:按提交家族分派到对应家族表)。
                 let commit_family = pc.sm.last_commit_family;
-                self.dispatcher.record_commit(committed, commit_family);
+                self.record_commit(committed, commit_family);
                 // `#del` 的 del_len 选项用:记录本次提交的字符数。
                 self.record_last_commit_len(committed);
                 // 提交来源是英文候选 → 已是在词典中的词,不学成自生词
@@ -370,13 +396,13 @@ impl ImeEngine {
     pub fn select_ctx(&self, ctx: usize, index: usize) -> ImeView {
         self.with_ctx(ctx, |disp, pc| {
             pc.sm.context = pc.text_context.clone();
-            let view = disp.select_candidate(index, &mut pc.sm);
+            let view = pc.sm.select(index, disp);
             let committed = ImeView::str_field(&view.commit_text);
             if !committed.is_empty() {
                 pc.text_context.update(committed);
                 // E2:按提交家族分派 recency 记录。
                 let commit_family = pc.sm.last_commit_family;
-                self.dispatcher.record_commit(committed, commit_family);
+                self.record_commit(committed, commit_family);
                 // `#del` 的 del_len 选项用:记录本次提交的字符数。
                 self.record_last_commit_len(committed);
                 // 英文候选提交 → 不学成自生词(空格/数字提交的陈旧 bug)。
@@ -392,8 +418,8 @@ impl ImeEngine {
 
     /// Reset engine state for a context.
     pub fn reset_ctx(&self, ctx: usize) {
-        self.with_ctx(ctx, |disp, pc| {
-            disp.reset(&mut pc.sm);
+        self.with_ctx(ctx, |_env, pc| {
+            pc.sm.reset();
             pc.table.sync_from(&pc.sm);
         });
     }
@@ -502,6 +528,39 @@ impl ImeEngine {
             .unwrap_or_default()
     }
 
+    /// Attach weight store to families for persistence(persistence 双写路径)。
+    pub(crate) fn set_store(&self, store: Arc<crate::store::WeightStore>) {
+        use crate::family::CandidateFamily;
+        self.pinyin_family.attach_store(Arc::clone(&store));
+        self.english_family.attach_store(store);
+    }
+    /// Warm the phrase book from persisted SQLite data.
+    pub(crate) fn warm_phrases_from_store(&self) {
+        self.pinyin_family.warm_phrases_from_store();
+    }
+    /// Warm the english user layer from persisted 英文自生词。
+    pub(crate) fn warm_en_user(&self, words: Vec<(String, u32)>) {
+        self.english_family.warm_learned_words(&words);
+    }
+    /// Warm the pinyin family's recency ring from persisted data。
+    pub(crate) fn warm_recencies(&self, entries: Vec<(String, i64)>) {
+        self.pinyin_family.warm_recencies(entries);
+    }
+    /// Restore the inputx-pinyin L0 user model from persisted JSON。
+    pub(crate) fn import_l0(&self, json: &str) -> usize {
+        self.pinyin_family.import_l0_json(json)
+    }
+
+    /// Record a committed word for recency boosting —— 按提交家族分派(E2):
+    /// 英文候选进 english 家族的 recency 表,其余(拼音)保持原路径。
+    fn record_commit(&self, word: &str, family: Option<&str>) {
+        if family == Some("english") {
+            self.english_family.record_commit(word);
+        } else {
+            self.pinyin_family.record_commit(word);
+        }
+    }
+
     /// 候选元数据(与 [`candidates`](Self::candidates) 同序)—— 测试断言
     /// meta 对齐用;调试视图经 view.candidates[].meta 走 fill_view。
     pub(crate) fn last_meta(&self) -> Vec<crate::fsm::state::CandMeta> {
@@ -572,8 +631,7 @@ impl ImeEngine {
     /// Supports TSV (`pinyin\tword`) and JSON (`[{"pinyin":"...","text":"..."}]`).
     /// Returns number of entries loaded.
     pub fn load_dict(&self, path: &str) -> std::io::Result<usize> {
-        self.dispatcher
-            .scorer()
+        self.scorer
             .load_dict_to("pinyin", path)
             .unwrap_or_else(|| {
                 Err(std::io::Error::new(
@@ -589,7 +647,7 @@ impl ImeEngine {
     pub fn init_store(&self, path: &str) {
         match PersistenceManager::open(path) {
             Ok(pm) => {
-                pm.warm_all(&self.dispatcher);
+                pm.warm_all(self);
                 eprintln!(
                     "[swift-ime] weight store: {} phrases, {} en-words from {path}",
                     pm.phrase_count(),
@@ -610,7 +668,7 @@ impl ImeEngine {
     /// (英文自生词)。汉字/emoji/符号不触发。Enter 强选 raw 的主路径。
     fn learn_english_if_ascii(&self, committed: &str) {
         if !committed.is_empty() && committed.chars().all(|c| c.is_ascii_alphanumeric()) {
-            self.dispatcher.record_english_word(committed);
+            self.english_family.record_learned_word(committed);
         }
     }
 
@@ -734,14 +792,18 @@ impl ImeEngine {
     /// Load an English user dictionary from a TSV file.
     /// All words get max priority (10000).
     pub fn load_en_user_dict(&self, path: &str) -> std::io::Result<usize> {
-        self.dispatcher.load_en_user_dict(path)
+        self.scorer
+            .family("english")
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "english family not found")
+            })
+            .and_then(|f| f.load_user_dict(path))
     }
 
     /// Load the emoji keyword table (CLDR-generated `emoji.tsv`):
     /// `keyword<TAB>emoji`, overriding the embedded base for the same keyword.
     pub fn load_emoji_dict(&self, path: &str) -> std::io::Result<usize> {
-        self.dispatcher
-            .scorer()
+        self.scorer
             .load_dict_to("emoji", path)
             .unwrap_or_else(|| {
                 Err(std::io::Error::new(
@@ -754,8 +816,7 @@ impl ImeEngine {
     /// Load the user emoji mapping (`emoji_user.tsv`) — overrides everything
     /// loaded before for the same keyword.
     pub fn load_emoji_user_dict(&self, path: &str) -> std::io::Result<usize> {
-        self.dispatcher
-            .scorer()
+        self.scorer
             .load_user_dict_to("emoji", path)
             .unwrap_or_else(|| {
                 Err(std::io::Error::new(
@@ -767,13 +828,58 @@ impl ImeEngine {
 
     /// Load an external English dictionary (auto-detect type, normalize, cache).
     pub fn load_en_dict(&self, path: &str) -> std::io::Result<usize> {
-        self.dispatcher.load_en_dict(path)
+        self.scorer
+            .family("english")
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "english family not found")
+            })
+            .and_then(|f| f.load_dict(path))
     }
 }
 
 impl Default for ImeEngine {
     fn default() -> Self {
         ImeEngine::new()
+    }
+}
+
+// ── StepEnv:状态机访问家族能力的接面(原 Dispatcher 职责,转发层裁撤)──
+
+impl crate::fsm::state::StepEnv for ImeEngine {
+    fn matcher(&self) -> &crate::Matcher {
+        &self.matcher
+    }
+    fn expander(&self) -> &crate::Expander {
+        &self.expander
+    }
+    fn scorer(&self) -> &crate::family::UnifiedScorer {
+        &self.scorer
+    }
+    fn record_pick(&self, pinyin: &str, word: &str) {
+        // 家族私有方法(D5):经具体句柄直调 —— 学习语义只有 pinyin 有。
+        self.pinyin_family.record_pick(pinyin, word);
+    }
+    fn compose_single_chars(
+        &self,
+        input: &str,
+        ctx: &crate::family::InputContext,
+        existing: &[String],
+        limit: usize,
+    ) -> Vec<crate::family::ScoredCandidate> {
+        self.pinyin_family
+            .compose_single_chars(input, ctx, existing, limit)
+    }
+    fn learn_phrase(&self, pinyin: &str, hanzi: &str) {
+        self.pinyin_family.learn_phrase(pinyin, hanzi);
+    }
+    fn learn_composed_phrase(&self, pinyin: &str, hanzi: &str) {
+        self.pinyin_family.learn_composed_phrase(pinyin, hanzi);
+    }
+    fn magic(&self) -> &MagicFamily {
+        &self.magic
+    }
+    fn voice_cmd_tx(&self) -> Option<crate::io_thread::VoiceCmdSender> {
+        self.magic.voice_cmd_tx()
     }
 }
 

@@ -2,7 +2,7 @@
 //! with variable substitution, a middleware dispatch chain, and a hot-reloadable snippet store.
 //! Zero OS dependencies — cross-compilable and fully unit-testable.
 
-pub mod dispatcher;
+
 pub mod engine;
 pub mod family;
 pub mod fsm;
@@ -20,7 +20,7 @@ pub use family::magic::expander;
 pub use fsm::router;
 pub use fsm::state;
 
-pub use dispatcher::Dispatcher;
+
 pub use expander::Expander;
 pub use matcher::Matcher;
 pub use frontend::{CandidateSlot, ImeView, CANDIDATE_SLOTS};

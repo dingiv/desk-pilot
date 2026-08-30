@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use super::sqlite::WeightStore;
-use crate::dispatcher::Dispatcher;
+use crate::engine::ImeEngine;
 
 /// Unified persistence manager — the engine's single handle to the SQLite
 /// store. Clone is cheap (shared connection behind an `Arc`).
@@ -43,29 +43,29 @@ impl PersistenceManager {
     /// Startup warm: load EVERY persisted user model into the in-memory stores.
     /// Order matters — `set_store` must come first so the families' double-write
     /// path is armed before any warm reads.
-    pub fn warm_all(&self, disp: &Dispatcher) {
+    pub fn warm_all(&self, eng: &ImeEngine) {
         // Families double-write through this Arc (recency / L0 / phrases).
-        disp.set_store(self.store());
+        eng.set_store(self.store());
 
         // Phrases → PhraseBook.
-        disp.warm_phrases_from_store();
+        eng.warm_phrases_from_store();
 
         // 英文自生词 → EnglishFamily user 层。
         let en_user = self.store.load_all_en_user();
         if !en_user.is_empty() {
-            disp.warm_en_user(en_user);
+            eng.warm_en_user(en_user);
             eprintln!("[ime-core] english: warmed learned words");
         }
 
         // Recency ring (most-recent-first; the family reverses for load_bulk).
         let recency = self.store.load_recency();
         if !recency.is_empty() {
-            disp.warm_recencies(recency);
+            eng.warm_recencies(recency);
         }
 
         // L0 user model (pins + pick counters) → inputx-pinyin.
         if let Some(json) = self.store.load_l0() {
-            let pins = disp.import_l0(&json);
+            let pins = eng.import_l0(&json);
             if pins > 0 {
                 eprintln!("[ime-core] pinyin: restored {pins} L0 pins from store");
             }

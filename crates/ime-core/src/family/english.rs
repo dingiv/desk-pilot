@@ -667,14 +667,14 @@ impl CandidateFamily for EnglishFamily {
 
     // ── 家族私有能力(D5 接口隔离:不在 CandidateFamily trait 上)──
     // record_learned_word / warm_learned_words —— 见上方固有 impl 的 pub
-    // 方法,经 Dispatcher 持有的具体句柄直调。
+    // 方法,经引擎直持的具体句柄直调。
 
     fn load_user_dict(&self, path: &str) -> std::io::Result<usize> {
         self.load_user_dict_file(path)
     }
 }
 
-/// Arc 共享句柄的 trait 委托(D5):Dispatcher 持 `Arc<EnglishFamily>` 直调
+/// Arc 共享句柄的 trait 委托(D5):引擎持 `Arc<EnglishFamily>` 直调
 /// 家族私有方法,scorer 持同一 Arc 当 trait 对象参与统一排序。
 impl CandidateFamily for std::sync::Arc<EnglishFamily> {
     fn name(&self) -> &'static str {
