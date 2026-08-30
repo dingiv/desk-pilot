@@ -7,6 +7,8 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -17,6 +19,14 @@ use crate::config::{
     resolve_gguf_path, LocalModelConfig, LlamaServerConfig, ModelRuntimeStatus, ModelType,
 };
 
+/// 健康检查超时。llama-server 生成/转写繁忙时 /health 可能被延迟,2s 在高负载机器上
+/// 会造成误判(误判 → router SIGKILL 健康子进程,见 2026-08-30 事故)。
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// 连续在线健康满 60s → 清零重启预算(崩溃循环计数只限"连续",不限制一生)。
+const BUDGET_RESET_ONLINE: Duration = Duration::from_secs(60);
+/// 重启预算耗尽后的冷却时间;冷却结束清零预算,允许下一轮尝试(不再永久 offline)。
+const RESTART_COOLDOWN: Duration = Duration::from_secs(60);
+
 /// 子进程包装。持有 Child handle + 端口 + 重启计数。
 pub struct LlamaProcess {
     pub model_name: String,
@@ -25,9 +35,17 @@ pub struct LlamaProcess {
     child: Option<Child>,
     /// 实际 PID(便于诊断)。
     pub pid: Option<u32>,
-    /// 累计重启次数(成功 spawn 后清零)。
+    /// 连续重启次数(连续在线 60s 后清零;与 [`RESTART_COOLDOWN`] 配合限制崩溃循环)。
     pub restarts: u32,
     pub status: ModelRuntimeStatus,
+    /// 连续健康检查失败计数(单次失败不触发重启,防瞬时误判杀健康进程)。
+    pub failed_checks: u32,
+    /// 当前 child 已确认退出(reap 过)。tokio Child 被 reap 后 try_wait 不再可查,需自行记忆。
+    child_exited: bool,
+    /// 转为 Online 的时刻(重启预算恢复用)。
+    pub online_since: Option<Instant>,
+    /// 最近一次重启尝试时刻(冷却期判断用)。
+    last_restart: Option<Instant>,
     http: reqwest::Client,
 }
 
@@ -41,6 +59,10 @@ impl LlamaProcess {
             pid: None,
             restarts: 0,
             status: ModelRuntimeStatus::Starting,
+            failed_checks: 0,
+            child_exited: false,
+            online_since: None,
+            last_restart: None,
             http,
         }
     }
@@ -116,13 +138,40 @@ impl LlamaProcess {
         self.pid = Some(pid);
         self.child = Some(child);
         self.status = ModelRuntimeStatus::Starting;
+        self.child_exited = false;
+        self.failed_checks = 0;
+        self.online_since = None;
         Ok(pid)
+    }
+
+    /// 探测子进程是否仍存活;已退出则 reap 并记忆。
+    ///
+    /// tokio `Child` 被 reap 后 `try_wait` 不再返回退出状态,所以结果记在
+    /// `child_exited` 里供后续轮次使用(否则"已死的进程"会被误判为"活着")。
+    pub fn check_alive(&mut self) -> bool {
+        if self.child_exited {
+            return false;
+        }
+        let Some(child) = self.child.as_mut() else {
+            return false;
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                self.child_exited = true;
+                error!(
+                    "[dp-router] llama-server exited: model={} status={:?}",
+                    self.model_name, status
+                );
+                false
+            }
+            _ => true,
+        }
     }
 
     /// `/health` 探活 — llama-server 的 health endpoint 是 `/health`。
     pub async fn health_check(&self) -> bool {
         let url = format!("http://127.0.0.1:{}/health", self.port);
-        match self.http.get(&url).timeout(std::time::Duration::from_secs(2)).send().await {
+        match self.http.get(&url).timeout(HEALTH_TIMEOUT).send().await {
             Ok(r) => r.status().is_success(),
             Err(_) => false,
         }
@@ -130,24 +179,18 @@ impl LlamaProcess {
 
     /// 等到 `/health` 通(最长 timeout_secs 秒)。返回是否就绪。
     pub async fn wait_ready(&mut self, timeout_secs: u64) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-        while std::time::Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        while Instant::now() < deadline {
             if self.health_check().await {
                 self.status = ModelRuntimeStatus::Online;
+                self.online_since = Some(Instant::now());
                 return true;
             }
-            // 子进程是否已退出?
-            if let Some(child) = self.child.as_mut() {
-                if let Ok(Some(status)) = child.try_wait() {
-                    error!(
-                        "[dp-router] llama-server exited prematurely: model={} status={:?}",
-                        self.model_name, status
-                    );
-                    self.status = ModelRuntimeStatus::Offline;
-                    return false;
-                }
+            if !self.check_alive() {
+                self.status = ModelRuntimeStatus::Offline;
+                return false;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
         warn!(
             "[dp-router] llama-server not ready after {timeout_secs}s: model={} port={}",
@@ -157,36 +200,65 @@ impl LlamaProcess {
         false
     }
 
-    /// 重启子进程(指数退避)。超过 `restart_max_retries` 放弃。
+    /// 连续在线满 60s → 清零重启预算(崩溃循环只限"连续"重启,不惩罚长期健康)。
+    pub fn budget_recovery(&mut self) {
+        if self.restarts > 0
+            && self
+                .online_since
+                .is_some_and(|t| t.elapsed() >= BUDGET_RESET_ONLINE)
+        {
+            self.restarts = 0;
+        }
+    }
+
+    /// 重启子进程(指数退避)。
+    ///
+    /// 预算语义:`restarts` 连续满 `restart_max_retries` 且进程没撑过 60s 健康期 →
+    /// 进入 [`RESTART_COOLDOWN`] 冷却;冷却结束清零预算,再来一轮。不再有"永久
+    /// offline"——健康进程被误判后能自行恢复(见 `run_once` 的自愈分支)。
     pub async fn restart(
         &mut self,
         llama_path: &Path,
         gguf: &Path,
         ll_cfg: &LlamaServerConfig,
     ) -> Result<bool> {
+        let now = Instant::now();
         if self.restarts >= ll_cfg.restart_max_retries {
-            error!(
-                "[dp-router] restart budget exhausted: model={} restarts={}",
-                self.model_name, self.restarts
+            if self
+                .last_restart
+                .is_some_and(|t| now.duration_since(t) < RESTART_COOLDOWN)
+            {
+                warn!(
+                    "[dp-router] restart budget exhausted, cooling down: model={} restarts={}",
+                    self.model_name, self.restarts
+                );
+                self.status = ModelRuntimeStatus::Offline;
+                return Ok(false);
+            }
+            info!(
+                "[dp-router] cooldown over, resetting restart budget: model={}",
+                self.model_name
             );
-            self.status = ModelRuntimeStatus::Offline;
-            return Ok(false);
+            self.restarts = 0;
         }
         self.restarts += 1;
+        self.last_restart = Some(now);
         let delay = ll_cfg.restart_backoff_base_s * 2u64.pow(self.restarts.min(6));
         warn!(
             "[dp-router] restarting llama-server: model={} attempt={} delay={}s",
             self.model_name, self.restarts, delay
         );
-        // 杀旧 child
+        // 杀旧 child(SIGKILL — 进程无输出即"消失",诊断靠 check_alive 的退出状态)
         if let Some(mut child) = self.child.take() {
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
-        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+        self.child_exited = true;
+        tokio::time::sleep(Duration::from_secs(delay)).await;
         self.spawn(llama_path, gguf).await?;
-        // 等待就绪(给 30s,单次 spawn 后模型加载时间通常 < 30s)
-        Ok(self.wait_ready(30).await)
+        // 等待就绪(冷缓存加载可达 30s+,给 60s;超时只影响本次返回,
+        // 进程本身继续加载,健康循环会自愈回 Online)
+        Ok(self.wait_ready(60).await)
     }
 
     /// 优雅关闭。
@@ -195,6 +267,7 @@ impl LlamaProcess {
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
+        self.child_exited = true;
         self.status = ModelRuntimeStatus::Offline;
     }
 }

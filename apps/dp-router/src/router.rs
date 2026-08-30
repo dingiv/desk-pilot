@@ -58,6 +58,19 @@ pub fn build_router(state: SharedState) -> Router {
         .with_state(state)
 }
 
+/// 按 model 名查子进程;精确未命中时再试剥掉尾部 `.gguf` 的形式
+/// (客户端习惯把完整文件名当 model 名,如 `qwen2.5-3b-instruct-q4_k_m.gguf`)。
+fn find_process(
+    map: &HashMap<String, Arc<RwLock<LlamaProcess>>>,
+    name: &str,
+) -> Option<Arc<RwLock<LlamaProcess>>> {
+    map.get(name).cloned().or_else(|| {
+        name.strip_suffix(".gguf")
+            .and_then(|n| map.get(n))
+            .cloned()
+    })
+}
+
 // ── POST /v1/chat/completions ─────────────────────────────────────────────
 
 async fn chat_completions(
@@ -84,7 +97,7 @@ async fn chat_completions(
     // 本地命中?
     let proc = {
         let map = state.processes.read().await;
-        map.get(&model_name).cloned()
+        find_process(&map, &model_name)
     };
     if let Some(proc_lock) = proc {
         return forward_to_local(state.http.clone(), proc_lock, body).await;
@@ -216,7 +229,7 @@ async fn audio_transcriptions(
     // 2. 本地命中?
     let proc_lock = {
         let map = state.processes.read().await;
-        map.get(&model_name).cloned()
+        find_process(&map, &model_name)
     };
     if let Some(proc_lock) = proc_lock {
         return forward_audio_to_local(
@@ -621,33 +634,102 @@ pub fn spawn_health_loop(state: SharedState) {
     });
 }
 
+/// Online 状态连续健康检查失败多少次才重建(5s 间隔 × 3 = 15s 持续不健康)。
+/// 单次瞬时失败(生成繁忙 / 高负载下 5s 超时)不再触发 SIGKILL — 2026-08-30 事故根因:
+/// 旧逻辑单次失败即杀进程,健康子进程被反复误杀,日志呈现为"无输出崩溃"。
+const HEALTH_STRIKES_ONLINE: u32 = 3;
+/// Offline 状态(进程存活但无响应)容忍多少次失败才重建(约 60s — 覆盖慢速冷加载)。
+const HEALTH_STRIKES_OFFLINE: u32 = 12;
+
 async fn run_once(state: &SharedState) {
-    // 收集要重启的(name, port, gguf 路径)
-    let mut to_restart: Vec<(Arc<RwLock<LlamaProcess>>, std::path::PathBuf, std::path::PathBuf)> = Vec::new();
-    {
-        let procs = state.processes.read().await;
-        for proc_lock in procs.values() {
-            let mut proc = proc_lock.write().await;
-            if proc.status != ModelRuntimeStatus::Online {
-                continue;
-            }
-            if !proc.health_check().await {
-                warn!("[dp-router] health check failed: model={}", proc.model_name);
-                // 标记为 Offline 触发重启
-                proc.status = ModelRuntimeStatus::Offline;
-                // 解析 gguf
-                match resolve_gguf_path(&proc.config.gguf) {
-                    Ok(gguf) => {
-                        to_restart.push((proc_lock.clone(), state.config.llama_server.path.clone(), gguf));
+    // 先收集句柄,探活/重启全程不持有进程表锁(旧逻辑持读锁做秒级探活,
+    // 会阻塞 /v1/models、/admin/models 和 chat 路由的查表)。
+    let procs: Vec<Arc<RwLock<LlamaProcess>>> = {
+        let map = state.processes.read().await;
+        map.values().cloned().collect()
+    };
+
+    let llama_path = state.config.llama_server.path.clone();
+    let ll_cfg = state.config.llama_server.clone();
+
+    for proc_lock in procs {
+        let mut proc = proc_lock.write().await;
+        match proc.status {
+            ModelRuntimeStatus::Online => {
+                // 子进程真的退出(崩溃)→ 立即重启,无需攒失败次数
+                if !proc.check_alive() {
+                    warn!("[dp-router] process exited: model={}", proc.model_name);
+                    proc.status = ModelRuntimeStatus::Offline;
+                    do_restart(&mut proc, &llama_path, &ll_cfg).await;
+                    continue;
+                }
+                if proc.health_check().await {
+                    proc.failed_checks = 0;
+                    proc.budget_recovery();
+                } else {
+                    proc.failed_checks += 1;
+                    if proc.failed_checks < HEALTH_STRIKES_ONLINE {
+                        continue;
                     }
-                    Err(e) => warn!("[dp-router] gguf resolve failed: {e}"),
+                    warn!(
+                        "[dp-router] health check failed {}x in a row, rebuilding: model={}",
+                        proc.failed_checks, proc.model_name
+                    );
+                    proc.failed_checks = 0;
+                    proc.status = ModelRuntimeStatus::Offline;
+                    do_restart(&mut proc, &llama_path, &ll_cfg).await;
+                }
+            }
+            ModelRuntimeStatus::Starting => {
+                // 就绪由 wait_ready task 负责;这里只兜"加载期间子进程死亡"
+                if !proc.check_alive() {
+                    proc.status = ModelRuntimeStatus::Offline;
+                    do_restart(&mut proc, &llama_path, &ll_cfg).await;
+                }
+            }
+            ModelRuntimeStatus::Offline => {
+                if !proc.check_alive() {
+                    // 进程确实没了 → 带预算重启(冷却期跳过)
+                    do_restart(&mut proc, &llama_path, &ll_cfg).await;
+                    continue;
+                }
+                if proc.health_check().await {
+                    // 自愈:之前被误判(或慢速冷加载刚完成)→ 直接回 Online,
+                    // 不杀不重建(这正是 2026-08-30 事故中"被判死"的存活进程)
+                    info!("[dp-router] model recovered: model={}", proc.model_name);
+                    proc.status = ModelRuntimeStatus::Online;
+                    proc.online_since = Some(std::time::Instant::now());
+                    proc.failed_checks = 0;
+                } else {
+                    // 进程活着但持续无响应:可能还在慢速加载,容忍一段时间
+                    // 后才杀掉重建
+                    proc.failed_checks += 1;
+                    if proc.failed_checks < HEALTH_STRIKES_OFFLINE {
+                        continue;
+                    }
+                    warn!(
+                        "[dp-router] process unresponsive {}x in a row, killing: model={}",
+                        proc.failed_checks, proc.model_name
+                    );
+                    proc.failed_checks = 0;
+                    do_restart(&mut proc, &llama_path, &ll_cfg).await;
                 }
             }
         }
     }
-    for (proc_lock, llama_path, gguf) in to_restart {
-        let mut proc = proc_lock.write().await;
-        let _ = proc.restart(&llama_path, &gguf, &state.config.llama_server).await;
+}
+
+/// 解析 gguf 并重启;解析失败仅告警(下轮再试)。
+async fn do_restart(
+    proc: &mut LlamaProcess,
+    llama_path: &std::path::Path,
+    ll_cfg: &crate::config::LlamaServerConfig,
+) {
+    match resolve_gguf_path(&proc.config.gguf) {
+        Ok(gguf) => {
+            let _ = proc.restart(llama_path, &gguf, ll_cfg).await;
+        }
+        Err(e) => warn!("[dp-router] gguf resolve failed: {e}"),
     }
 }
 
