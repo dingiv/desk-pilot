@@ -5,7 +5,17 @@
 //! - `rx`(主线程经 [`mpsc::Sender<IoEvent>`](IoEvent) 发来的通用事件 + voice 命令);
 //! - `FuturesUnordered`(动态数据源,当前只有 voice 的 aura SSE)。
 //!
-//! ## voice server(懒惰的)
+//! ## 普适的异步能力面(round10)
+//!
+//! 异步能力是平台能力,不专属于某个魔法命令。任何成员(现有 ASR/REQ/
+//! clip,未来的任何命令)经两扇正门使用 I/O 线程:
+//! - [`IoThread::spawn_blocking`] —— 阻塞任务 → tokio 阻塞池;
+//! - [`IoThread::spawn_task`] —— 异步任务 → 事件循环(async HTTP/SSE/WS)。
+//!
+//! 两者完成后都统一 `refresh_ui(ctx)`。voice 的长连接会话
+//! ([`VoiceSession`])是框架的一个客户端;`#req` 的 async HTTP 是第二个。
+//!
+//! ## voice 会话(懒惰的)
 //!
 //! `#asr` 每次预测经 [`VoiceCmd::Attach`] 把 ctx 推给 voice server —— 它此刻才
 //! 一次性 `health()` 探针 + 建 SSE 连接;连接后每收到一个 `AsrEvent`,就"顺带"
@@ -132,13 +142,8 @@ impl IoThread {
         std::thread::Builder::new()
             .name("ime-io".into())
             .spawn(move || {
-                rt2.block_on(voice_server_main(
-                    rx,
-                    frontend,
-                    voice_base,
-                    voice_state,
-                    idle_timeout_secs,
-                ));
+                let voice = VoiceSession::new(voice_base, voice_state, idle_timeout_secs);
+                rt2.block_on(io_main(rx, frontend, voice));
             })
             .expect("spawn ime io thread");
         IoThread {
@@ -191,26 +196,214 @@ impl IoThread {
 /// SSE 事件源(FuturesUnordered 元素类型)。
 type SseSource = Pin<Box<dyn Future<Output = Option<(AsrEvent, Sse)>>>>;
 
-/// 两个 select 臂:
-/// 1. `rx` —— 主线程事件(含 voice 命令),永远在听;
-/// 2. `sources`(`FuturesUnordered`)—— 动态数据源(aura SSE),空时该臂禁用,
-///    零轮询。
-async fn voice_server_main(
-    mut rx: mpsc::Receiver<IoEvent>,
-    frontend: Weak<dyn FrontEndHandle>,
+/// ASR 语音会话 —— 通用 I/O 循环的一个**客户端**(round10 分层:框架
+/// 不含 voice 语义,voice 只是第一个把长连接挂上事件循环的会话;req 是
+/// 第二个,走 [`IoThread::spawn_task`])。
+///
+/// 状态:活跃 ctx 跟踪、连接标志、空闲断连;SSE 源集(`sources`)由
+/// 循环持有,方法经参数借用(与 `select!` 的臂借用互不重叠)。
+struct VoiceSession {
     base: String,
     state: Arc<SharedVoiceState>,
-    idle_timeout_secs: u64,
+    /// 当前有活 `#asr` 会话的 ctx;-1 = 无。
+    active_ctx: i64,
+    /// 是否持有 aura SSE 源(连接中)。
+    connected: bool,
+    /// 最近一次 ASR 使用(Attach)时刻 —— 空闲超时据此断开 aura。
+    last_activity: tokio::time::Instant,
+    /// 空闲自动断连时长;`None` = 永不主动断(配置 `voice.idle_time: 0`)。
+    idle_timeout: Option<Duration>,
+}
+
+impl VoiceSession {
+    fn new(base: String, state: Arc<SharedVoiceState>, idle_timeout_secs: u64) -> Self {
+        VoiceSession {
+            base,
+            state,
+            active_ctx: -1,
+            connected: false,
+            last_activity: tokio::time::Instant::now(),
+            idle_timeout: (idle_timeout_secs > 0).then(|| Duration::from_secs(idle_timeout_secs)),
+        }
+    }
+
+    /// `#asr` Attach:记录活跃 ctx、断连则重连(health 探针 → 历史全量
+    /// 同步 → 建流)。返回 `is_new`(新 ctx 才立即刷一次 —— 同 ctx 的重复
+    /// Attach 来自刷新驱动的重预测,是 no-op,否则 refresh → magic_tick →
+    /// predict → Attach → refresh 会乒乓循环)。
+    async fn attach(
+        &mut self,
+        ctx: usize,
+        frontend: &Weak<dyn FrontEndHandle>,
+        sources: &mut FuturesUnordered<SseSource>,
+    ) -> bool {
+        let is_new = self.active_ctx != ctx as i64;
+        self.active_ctx = ctx as i64;
+        self.last_activity = tokio::time::Instant::now();
+        tracing::info!(ctx, is_new, connected = self.connected, "voice Attach");
+        if !self.connected && !self.state.is_mock() {
+            // 断裂/未连 → 触发重连:一次性 health 探针种 is_connected
+            // (UI 显示"未连接"还是"语音识别中"),然后**总是**建流 ——
+            // 断连由流内部指数退避重试,连续失败超上限流结束(→ None →
+            // connected=false),下次 #asr Attach 重建流 = 手动重连。
+            match AuraClient::new(&self.base) {
+                Ok(client) => {
+                    let ok = client.health().await.unwrap_or(false);
+                    self.state.set_conn(if ok {
+                        crate::family::magic::voice_state::VoiceConn::Connected
+                    } else {
+                        crate::family::magic::voice_state::VoiceConn::Failed
+                    });
+                    tracing::info!(connected = ok, "voice attach → spawn stream");
+                    // **重连全量同步**:断连期间 aura 可能已定稿若干句
+                    // (数据面 SSE append-only,新订阅收不到历史)。
+                    // 先清空本地历史(避免旧句残留),再拉一次 `/api/results`
+                    // 灌入最近的定稿 —— 这样 `#asr` 重新打开时首个候选
+                    // 是断连期间说的那句话,而不是旧残留。
+                    if ok {
+                        self.state.reset();
+                        match client.results().await {
+                            Ok(history) => {
+                                self.state.sync_history(&history);
+                                tracing::info!(
+                                    count = history.len(),
+                                    "voice reconnect → synced aura history"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "voice reconnect: results sync failed");
+                            }
+                        }
+                    }
+                    // SSE 流连接状态回调:连不上/连上都要**及时**汇报
+                    // UI(用户修的 bug —— 之前流内部退避重连时,状态
+                    // 一直停在旧值,`#asr` 显示旧语音)。广播通知所有
+                    // 打开 #asr 的上下文,让它们重新 predict 拉最新状态。
+                    let st = Arc::clone(&self.state);
+                    let fe = frontend.clone();
+                    let on_conn = Box::new(move |c: audio_aura_agent::client::SseConnState| {
+                        // 连接状态变化 → 及时汇报 UI。Connected → 🎙;
+                        // 其它(Failed / 退避中的 Connecting)都视为
+                        // 连不上 → 「语音服务暂不可用」,避免闪烁。
+                        // (首次"正在连接"由 Attach 分支的 health 探针
+                        // 负责;流内部的退避重试一律按不可用处理。)
+                        use audio_aura_agent::client::SseConnState as S;
+                        let v = if c == S::Connected {
+                            crate::family::magic::voice_state::VoiceConn::Connected
+                        } else {
+                            crate::family::magic::voice_state::VoiceConn::Failed
+                        };
+                        st.set_conn(v);
+                        notify_conn(&fe, -1); // 广播:有 #asr 的 ctx 刷新
+                    });
+                    sources.push(Box::pin(poll_event(Box::pin(
+                        client.subscribe_events_owned_with_conn(Some(on_conn)),
+                    ))));
+                    self.connected = true;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, base = %self.base, "voice: AuraClient::new failed");
+                    self.state.set_conn(crate::family::magic::voice_state::VoiceConn::Failed);
+                    // 连接失败 → 及时汇报前端(否则 UI 停在"正在连接")。
+                    notify_conn(frontend, self.active_ctx);
+                }
+            }
+        }
+        is_new
+    }
+
+    /// `#asr` 会话退出(deactivate):清掉 ctx。懒惰的循环也会在下次
+    /// `try_refresh` 失败时自行放弃,Detach 只是让它放弃得更早。
+    fn detach(&mut self, ctx: usize) {
+        if self.active_ctx == ctx as i64 {
+            self.active_ctx = -1;
+        }
+    }
+
+    /// 主动归档(分字符键 `'` = "我说完了"):让 aura 立即关闭当前开放窗口并
+    /// 整窗 batch,跳过 merge_gap 剩余等待。未连接时 no-op。fire-and-forget
+    /// —— 归档结果经 SSE 数据面回流。
+    async fn flush_paragraph(&mut self) {
+        if self.connected && !self.state.is_mock() {
+            self.last_activity = tokio::time::Instant::now();
+            match AuraClient::new(&self.base) {
+                Ok(client) => {
+                    if let Err(e) = client.flush_paragraph().await {
+                        tracing::warn!(error = %e, "flush_paragraph failed");
+                    } else {
+                        tracing::info!("flush_paragraph → aura(主动归档)");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "flush_paragraph: client"),
+            }
+        }
+    }
+
+    /// SSE 段折叠 + 连通性汇报 + 活动心跳。有活跃 `#asr` 会话 → 顺带刷新
+    /// UI;无会话(后台监听)→ 只折叠不刷新。
+    fn on_sse_event(&mut self, ev: &AsrEvent, frontend: &Weak<dyn FrontEndHandle>) {
+        self.state.fold_event(ev);
+        // 收到句事件 = 已连上(即使 Attach 时 health 误判为断,段也证活)。
+        self.state
+            .set_conn(crate::family::magic::voice_state::VoiceConn::Connected);
+        // 后台语音也算活动 —— 空闲超时只在"无 #asr 且无语音"时断开。
+        self.last_activity = tokio::time::Instant::now();
+        tracing::info!(?ev, "voice event folded");
+        if self.active_ctx >= 0 {
+            try_refresh(&mut self.active_ctx, frontend);
+        }
+    }
+
+    /// SSE 流结束 → 丢源,不再 select。流断 = 语音服务暂不可用(源由循环
+    /// 丢弃;下次 `#asr` Attach 触发重连)。
+    fn on_stream_ended(&mut self, frontend: &Weak<dyn FrontEndHandle>) {
+        tracing::warn!("voice SSE stream ended → 丢源,不重连");
+        self.connected = false;
+        self.state
+            .set_conn(crate::family::magic::voice_state::VoiceConn::Failed);
+        // 流断 → 及时汇报前端,UI 从 🎙 切到「语音服务暂不可用」。
+        notify_conn(frontend, self.active_ctx);
+    }
+
+    /// 空闲超时 select 臂的 guard:配置了超时、无活跃 `#asr` 会话、仍持连接。
+    fn idle_guard(&self) -> bool {
+        self.idle_timeout.is_some() && self.active_ctx < 0 && self.connected
+    }
+
+    /// 空闲超时的 deadline(`idle_timeout = None` 时给一个极远的哨兵值,
+    /// 配合 guard 永不触发)。
+    fn idle_deadline(&self) -> tokio::time::Instant {
+        self.idle_timeout
+            .map(|t| self.last_activity + t)
+            .unwrap_or(tokio::time::Instant::now() + Duration::from_secs(86400 * 365))
+    }
+
+    /// 空闲断连:drop SSE 源关闭连接;断开 = 语音服务暂不可用,下次
+    /// `#asr` 输入时 Attach 触发重连。
+    fn idle_disconnect(
+        &mut self,
+        frontend: &Weak<dyn FrontEndHandle>,
+        sources: &mut FuturesUnordered<SseSource>,
+    ) {
+        tracing::info!("voice 空闲超过 {:?} → 主动断开 aura", self.idle_timeout);
+        sources.clear(); // drop SSE 源 → reqwest 连接关闭。
+        self.connected = false;
+        self.state
+            .set_conn(crate::family::magic::voice_state::VoiceConn::Failed);
+        // 空闲断连发生在后台(active_ctx < 0)→ 广播,让打开的 #asr
+        // 上下文从 🎙 切到「语音服务暂不可用」。
+        notify_conn(frontend, self.active_ctx);
+    }
+}
+
+/// 通用 I/O 事件循环(原 `voice_server_main` —— round10 分层:循环只认
+/// [`IoEvent`] 与会话回调,voice 语义全在 [`VoiceSession`])。
+async fn io_main(
+    mut rx: mpsc::Receiver<IoEvent>,
+    frontend: Weak<dyn FrontEndHandle>,
+    mut voice: VoiceSession,
 ) {
     let mut sources: FuturesUnordered<SseSource> = FuturesUnordered::new();
-    // 开关变量:当前有活 #asr 会话的 ctx;-1 = 无。
-    let mut active_ctx: i64 = -1;
-    // 是否持有 aura SSE 源(连接中)。
-    let mut connected = false;
-    // 最近一次 ASR 使用(Attach)时刻 —— 空闲超时据此断开 aura。
-    let mut last_activity = tokio::time::Instant::now();
-    // 空闲自动断连时长;0 = 永不主动断(配置 `voice.idle_time: 0`)。
-    let idle_timeout: Option<Duration> = (idle_timeout_secs > 0).then(|| Duration::from_secs(idle_timeout_secs));
 
     loop {
         select! {
@@ -218,107 +411,17 @@ async fn voice_server_main(
             ev = rx.recv() => {
                 match ev {
                     Some(IoEvent::Voice(VoiceCmd::Attach { ctx })) => {
-                        // 新 ctx 才立即刷一次;同 ctx 的重复 Attach(来自刷新驱动的
-                        // 重预测)是 no-op —— 否则 refresh → magic_tick → predict →
-                        // Attach → refresh 会乒乓循环。
-                        let is_new = active_ctx != ctx as i64;
-                        active_ctx = ctx as i64;
-                        last_activity = tokio::time::Instant::now();
-                        tracing::info!(ctx, is_new, connected, "voice Attach");
-                        if !connected && !state.is_mock() {
-                            // 断裂/未连 → 触发重连:一次性 health 探针种 is_connected
-                            // (UI 显示"未连接"还是"语音识别中"),然后**总是**建流 ——
-                            // 断连由流内部指数退避重试,连续失败超上限流结束(→ None →
-                            // connected=false),下次 #asr Attach 重建流 = 手动重连。
-                            match AuraClient::new(&base) {
-                                Ok(client) => {
-                                    let ok = client.health().await.unwrap_or(false);
-                                    state.set_conn(if ok {
-                                        crate::family::magic::voice_state::VoiceConn::Connected
-                                    } else {
-                                        crate::family::magic::voice_state::VoiceConn::Failed
-                                    });
-                                    tracing::info!(connected = ok, "voice attach → spawn stream");
-                                    // **重连全量同步**:断连期间 aura 可能已定稿若干句
-                                    // (数据面 SSE append-only,新订阅收不到历史)。
-                                    // 先清空本地历史(避免旧句残留),再拉一次 `/api/results`
-                                    // 灌入最近的定稿 —— 这样 `#asr` 重新打开时首个候选
-                                    // 是断连期间说的那句话,而不是旧残留。
-                                    if ok {
-                                        state.reset();
-                                        match client.results().await {
-                                            Ok(history) => {
-                                                state.sync_history(&history);
-                                                tracing::info!(
-                                                    count = history.len(),
-                                                    "voice reconnect → synced aura history"
-                                                );
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(error = %e, "voice reconnect: results sync failed");
-                                            }
-                                        }
-                                    }
-                                    // SSE 流连接状态回调:连不上/连上都要**及时**汇报
-                                    // UI(用户修的 bug —— 之前流内部退避重连时,状态
-                                    // 一直停在旧值,`#asr` 显示旧语音)。广播通知所有
-                                    // 打开 #asr 的上下文,让它们重新 predict 拉最新状态。
-                                    let st = Arc::clone(&state);
-                                    let fe = frontend.clone();
-                                    let on_conn = Box::new(move |c: audio_aura_agent::client::SseConnState| {
-                                        // 连接状态变化 → 及时汇报 UI。Connected → 🎙;
-                                        // 其它(Failed / 退避中的 Connecting)都视为
-                                        // 连不上 → 「语音服务暂不可用」,避免闪烁。
-                                        // (首次"正在连接"由 Attach 分支的 health 探针
-                                        // 负责;流内部的退避重试一律按不可用处理。)
-                                        use audio_aura_agent::client::SseConnState as S;
-                                        let v = if c == S::Connected {
-                                            crate::family::magic::voice_state::VoiceConn::Connected
-                                        } else {
-                                            crate::family::magic::voice_state::VoiceConn::Failed
-                                        };
-                                        st.set_conn(v);
-                                        notify_conn(&fe, -1); // 广播:有 #asr 的 ctx 刷新
-                                    });
-                                    sources.push(Box::pin(poll_event(Box::pin(
-                                        client.subscribe_events_owned_with_conn(Some(on_conn)),
-                                    ))));
-                                    connected = true;
-                                }
-                                Err(e) => {
-                                    tracing::error!(error = %e, base = %base, "voice: AuraClient::new failed");
-                                    state.set_conn(crate::family::magic::voice_state::VoiceConn::Failed);
-                                    // 连接失败 → 及时汇报前端(否则 UI 停在"正在连接")。
-                                    notify_conn(&frontend, active_ctx);
-                                }
-                            }
-                        }
+                        let is_new = voice.attach(ctx, &frontend, &mut sources).await;
                         if is_new {
                             // 立即刷一次(即使未连上,predict 也会显示"未连接")。
-                            try_refresh(&mut active_ctx, &frontend);
+                            try_refresh(&mut voice.active_ctx, &frontend);
                         }
                     }
                     Some(IoEvent::Voice(VoiceCmd::Detach { ctx })) => {
-                        if active_ctx == ctx as i64 {
-                            active_ctx = -1;
-                        }
+                        voice.detach(ctx);
                     }
                     Some(IoEvent::Voice(VoiceCmd::FlushParagraph)) => {
-                        // 主动归档:仅在持有 aura 流时发(未连 = 没有进行中的语音,
-                        // no-op)。fire-and-forget —— 归档结果经 SSE 数据面回流。
-                        if connected && !state.is_mock() {
-                            last_activity = tokio::time::Instant::now();
-                            match AuraClient::new(&base) {
-                                Ok(client) => {
-                                    if let Err(e) = client.flush_paragraph().await {
-                                        tracing::warn!(error = %e, "flush_paragraph failed");
-                                    } else {
-                                        tracing::info!("flush_paragraph → aura(主动归档)");
-                                    }
-                                }
-                                Err(e) => tracing::warn!(error = %e, "flush_paragraph: client"),
-                            }
-                        }
+                        voice.flush_paragraph().await;
                     }
                     Some(IoEvent::Blocking { ctx, task }) => {
                         // 阻塞任务(HTTP 拉取等)放 tokio 阻塞池执行:既不让 current_thread
@@ -357,50 +460,21 @@ async fn voice_server_main(
             ev = sources.next(), if !sources.is_empty() => {
                 match ev {
                     Some(Some((ev, s))) => {
-                        state.fold_event(&ev);
-                        // 收到句事件 = 已连上(即使 Attach 时 health 误判为断,段也证活)。
-                        state.set_conn(crate::family::magic::voice_state::VoiceConn::Connected);
-                        // 后台语音也算活动 —— 空闲超时只在"无 #asr 且无语音"时断开。
-                        last_activity = tokio::time::Instant::now();
-                        tracing::info!(?ev, "voice event folded");
-                        // 有活跃 #asr 会话 → 顺带刷新 UI;无会话(后台监听)→
-                        // 只折叠不刷新。
-                        if active_ctx >= 0 {
-                            try_refresh(&mut active_ctx, &frontend);
-                        }
+                        voice.on_sse_event(&ev, &frontend);
                         // **始终续传源**:后台监听也要保持连接、持续折叠数据 ——
                         // 不因"无会话/刷新失败"丢源(否则后台识别只收 1~3 字就断)。
                         sources.push(Box::pin(poll_event(s)));
                     }
-                    Some(None) => {
-                        // SSE 流结束 → 丢源,不再 select。流断 = 语音服务暂不可用。
-                        tracing::warn!("voice SSE stream ended → 丢源,不重连");
-                        connected = false;
-                        state.set_conn(crate::family::magic::voice_state::VoiceConn::Failed);
-                        // 流断 → 及时汇报前端,UI 从 🎙 切到「语音服务暂不可用」。
-                        notify_conn(&frontend, active_ctx);
-                    }
+                    Some(None) => voice.on_stream_ended(&frontend),
                     None => {} // sources 空(带 guard 不应发生)
                 }
             }
             // 臂 3:空闲超时 —— 无活跃 #asr 会话、仍持连接,且超过空闲时长没有
             // 新 Attach → 主动断开 aura,释放连接(长连接不常驻)。
-            // guard 带 `connected`:断开后臂禁用,避免 deadline 已过导致空转。
-            // `idle_timeout` 为 None(配置 `idle_time: 0`)→ 永不主动断。
-            _ = tokio::time::sleep_until(
-                idle_timeout.map(|t| last_activity + t).unwrap_or(tokio::time::Instant::now() + Duration::from_secs(86400 * 365)),
-            ),
-                if idle_timeout.is_some() && active_ctx < 0 && connected =>
+            _ = tokio::time::sleep_until(voice.idle_deadline()),
+                if voice.idle_guard() =>
             {
-                tracing::info!("voice 空闲超过 {:?} → 主动断开 aura", idle_timeout);
-                sources.clear(); // drop SSE 源 → reqwest 连接关闭。
-                connected = false;
-                // 断开 = 语音服务暂不可用。下次 #asr 输入时 Attach 触发重连,
-                // health 探针成功才转 🎙(已连接);失败保持「暂不可用」。
-                state.set_conn(crate::family::magic::voice_state::VoiceConn::Failed);
-                // 空闲断连发生在后台(active_ctx < 0)→ 广播,让打开的 #asr
-                // 上下文从 🎙 切到「语音服务暂不可用」。
-                notify_conn(&frontend, active_ctx);
+                voice.idle_disconnect(&frontend, &mut sources);
             }
         }
     }
