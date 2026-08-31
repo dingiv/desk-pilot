@@ -424,8 +424,7 @@ impl MagicFamily {
                 if path.len() > rp.len()
                     && path.starts_with(rp.as_str())
                     && path.as_bytes()[rp.len()] == b'/'
-                {
-                    if best.as_ref().map_or(true, |(bl, _)| rp.len() > *bl) {
+                    && best.as_ref().is_none_or(|(bl, _)| rp.len() > *bl) {
                         best = Some((
                             rp.len(),
                             LiveCommand {
@@ -434,7 +433,6 @@ impl MagicFamily {
                             },
                         ));
                     }
-                }
             }
         }
         best.map(|(_, cmd)| cmd)

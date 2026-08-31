@@ -165,6 +165,9 @@ impl IoThread {
 
 /// IoThread 主循环:多事件源 server。
 ///
+/// SSE 事件源(FuturesUnordered 元素类型)。
+type SseSource = Pin<Box<dyn Future<Output = Option<(AsrEvent, Sse)>>>>;
+
 /// 两个 select 臂:
 /// 1. `rx` —— 主线程事件(含 voice 命令),永远在听;
 /// 2. `sources`(`FuturesUnordered`)—— 动态数据源(aura SSE),空时该臂禁用,
@@ -176,8 +179,7 @@ async fn voice_server_main(
     state: Arc<SharedVoiceState>,
     idle_timeout_secs: u64,
 ) {
-    let mut sources: FuturesUnordered<Pin<Box<dyn Future<Output = Option<(AsrEvent, Sse)>>>>> =
-        FuturesUnordered::new();
+    let mut sources: FuturesUnordered<SseSource> = FuturesUnordered::new();
     // 开关变量:当前有活 #asr 会话的 ctx;-1 = 无。
     let mut active_ctx: i64 = -1;
     // 是否持有 aura SSE 源(连接中)。
@@ -300,7 +302,7 @@ async fn voice_server_main(
                         // 事件循环被卡住(否则语音段会停摆),也避免在 async 上下文里做阻塞
                         // 调用(后者在 runtime drop 时会 panic "Cannot drop a runtime in a
                         // context where blocking is not allowed")。
-                        if tokio::task::spawn_blocking(move || task()).await.is_err() {
+                        if tokio::task::spawn_blocking(task).await.is_err() {
                             tracing::warn!("io Run blocking task panicked");
                         }
                         if let Some(f) = frontend.upgrade() {
@@ -432,7 +434,6 @@ impl Drop for IoThread {
 mod tests {
     use super::*;
     use crate::frontend::FrontEndHandle;
-    use crate::family::magic::voice_state::VoiceConn;
 
     #[test]
     fn attach_drain_stores_handle() {
@@ -591,7 +592,7 @@ mod tests {
         );
         let ctxs = refresh_ctxs.lock().unwrap();
         assert!(
-            ctxs.iter().any(|c| *c == 0xCAFE),
+            ctxs.contains(&0xCAFE),
             "至少一次 refresh 定向到 Attach 的 ctx: {ctxs:?}"
         );
     }

@@ -175,7 +175,7 @@ impl MagicMember for VoiceMember {
         }
     }
 
-    fn tick(&mut self, ctx: usize, buffer: &str, env: &dyn FamilyEnv) -> Option<Vec<Prediction>> {
+    fn tick(&mut self, _ctx: usize, _buffer: &str, _env: &dyn FamilyEnv) -> Option<Vec<Prediction>> {
         // 数据变化由 voice server 主动调 `frontend.refresh_ui` 触发 —— 我们的
         // predict 已经把最新 state 算成 candidates,无需 tick 路径重建。
         None

@@ -71,7 +71,7 @@ impl MagicMember for DelMember {
         out
     }
 
-    fn tick(&mut self, ctx: usize, buffer: &str, env: &dyn FamilyEnv) -> Option<Vec<Prediction>> {
+    fn tick(&mut self, _ctx: usize, _buffer: &str, _env: &dyn FamilyEnv) -> Option<Vec<Prediction>> {
         None
     }
 }

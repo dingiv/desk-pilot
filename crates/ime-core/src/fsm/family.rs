@@ -1177,7 +1177,6 @@ mod step_env_tests {
     use crate::family::magic::expander::StaticProvider;
     use crate::family::magic::MagicFamily;
     use crate::family::pinyin::PinyinFamily;
-    use crate::family::english::EnglishFamily;
     use crate::family::UnifiedScorer;
     use crate::Expander;
     use std::sync::Arc;

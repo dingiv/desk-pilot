@@ -143,8 +143,8 @@ impl FamilyPipeline {
         let start = (self.panel.page * page_size).min(self.panel.items.len());
         let window = &self.panel.items[start.min(self.panel.items.len())..];
         let n = window.len().min(CANDIDATE_SLOTS);
-        for i in 0..n {
-            ImeView::set_str(&mut view.candidates[i].text, &window[i]);
+        for (i, text) in window.iter().take(n).enumerate() {
+            ImeView::set_str(&mut view.candidates[i].text, text);
             // Mark single-char partial-commit candidates with ">" label.
             if self.panel.partial.get(start + i).copied().unwrap_or(false) {
                 ImeView::set_str(&mut view.candidates[i].label, ">");

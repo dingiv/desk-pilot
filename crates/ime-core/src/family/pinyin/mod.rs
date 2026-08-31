@@ -298,7 +298,7 @@ impl PinyinFamily {
                         })
                 });
                 let dict_floor = tsv_words.as_ref().map(|ws| {
-                    if ws.iter().any(|w| *w == text) {
+                    if ws.contains(&text) {
                         self.weights.large_dict
                     } else {
                         0.0
@@ -926,7 +926,7 @@ impl CandidateFamily for Arc<PinyinFamily> {
 #[test]
     fn compose_single_chars_encapsulates_word_building() {
         // 造词内部逻辑家族内聚:链式豁免 / 多音节判定 / 首音节 / 单字过滤。
-        use crate::family::CandidateFamily;
+        // (compose_single_chars 有固有方法,trait 无需引入。)
         let fam = PinyinFamily::new();
         // jianshipin → 首音节 jian 的单字表(剪在内,不在已有候选时)。
         let chars = fam.compose_single_chars("jianshipin", &InputContext::new(), &[], 32);
@@ -969,6 +969,10 @@ impl CandidateFamily for Arc<PinyinFamily> {
     }
 
 mod tests {
+    // 本模块与父模块(pinyin)符号的测试入口;clippy 对「glob 提供部分
+    // 符号 + 父模块 use 再导出」的组合会误报 unused,此处显式保留。
+    #[allow(unused_imports)]
+    use super::*;
 
     #[test]
     fn bigram_context_lifts_co_occurring_word() {
@@ -1002,8 +1006,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}.idx"));
     }
-
-    use super::*;
 
     #[test]
     fn first_syllable_of_splits_longest_prefix() {
@@ -1143,7 +1145,6 @@ mod tests {
         // 关键词表,不缺这条学习路径。
         let fam = PinyinFamily::new();
         let before = fam.phrase_count();
-        use crate::family::CandidateFamily;
         fam.record_pick("cd", "📀");
         assert_eq!(
             fam.phrase_count(),

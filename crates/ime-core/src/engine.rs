@@ -147,6 +147,7 @@ impl ImeEngine {
     ///
     /// `voice_idle_timeout_secs` 是语音连接空闲自动断连时长(秒,0 = 永不主动断),
     /// 默认 [`DEFAULT_IDLE_TIMEOUT_SECS`](crate::io_thread::DEFAULT_IDLE_TIMEOUT_SECS)。
+    #[allow(clippy::too_many_arguments)] // 构造注入点:参数即依赖清单
     pub fn with_config(
         pinyin_weights: crate::family::pinyin::PinyinWeights,
         english_weights: crate::family::english::EnglishWeights,
@@ -609,8 +610,8 @@ impl ImeEngine {
         // 提交对象)同源,含 promote_single_letter 与 Layer 3 造词单字区。
         // 旧实现独立重算 rank_detailed + promote(无造词区),镜像与机器
         // 候选分叉 —— 探针/调试/aura 拿到的不是用户看见的东西。
-        let detailed = pc.pipeline.detailed();
-        detailed
+        
+        pc.pipeline.detailed()
     }
 
     /// Manually set the text context (simulates pre-filled text).
@@ -1284,46 +1285,5 @@ mod tests {
         // A should still have "ni"
         let view = e.predict_ctx(1, ' ');
         assert!(ImeView::str_field(&view.commit_text).contains("你"));
-    }
-
-    // ── #req member ──────────────────────────────────────────────────────
-
-    /// Scripted fetcher — records the requested URL and returns a canned result.
-    #[derive(Clone)]
-    struct FakeFetcher {
-        result: Result<String, String>,
-        urls: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl ReqFetcher for FakeFetcher {
-        fn post(&self, url: &str, _body: &str) -> Result<String, String> {
-            self.urls.lock().unwrap().push(url.to_string());
-            self.result.clone()
-        }
-    }
-
-    /// Poll until the worker thread's result lands (or fail). 结果可能在两种
-    /// 时刻出现:pick 后的 predict 已读到 Done(worker 太快,候选已是 body),
-    /// 或 magic_tick 检测到版本变化。两种都算落地。
-    /// Budget 30s with fine-grained polling — under full parallel test load
-    /// (150+ tests, starved CI containers) the spawned worker thread can be
-    /// delayed tens of seconds; the tests assert correctness, not speed.
-    fn wait_req_tick(e: &ImeEngine) {
-        for _ in 0..15_000 {
-            if e.magic_tick().is_some() {
-                return;
-            }
-            // 结果已在 predict 里落地(worker 快于重查)—— 候选不再是
-            // "回车请求…" / "请求中…"。
-            if e.candidates()
-                .first()
-                .map(|c| !c.contains("请求中") && !c.contains("回车请求"))
-                .unwrap_or(false)
-            {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        panic!("req result never landed");
     }
 }
