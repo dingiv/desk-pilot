@@ -3,8 +3,8 @@
 > 代码为准。本文是语音识别两个 stage 的权威梳理，含设计沿革（原 `vad-segment-model.md`
 > 的 D1-D4 决策已并入附录）。旧范式的 `Utterance`/`Batch`/`MergeBatch`/`ContextWindow`
 > 契约已删除。
-> 代码入口：Stage1 = `crates/aura-core/src/recognizer.rs`，Stage2 = `crates/aura-core/src/calibrator.rs`，
-> 组装 = `crates/aura-core/src/pipeline.rs`（`PipelineSpec` → `Pipeline::assemble` 全栈拼装 +
+> 代码入口（round23 文件夹化）：Stage1 = `crates/aura-core/src/pipeline/`（consume/recognizer/tracker/stream），Stage2 = `pipeline/calibrator.rs`，
+> 组装 = `crates/aura-core/src/pipeline/mod.rs`（`PipelineSpec` → `Pipeline::assemble` 全栈拼装 +
 > 识别日志 + 窗口归档），daemon = `apps/audio-aura/src/main.rs`（config 解析 + socket）。
 
 ## 总览：数据流
@@ -45,7 +45,7 @@ daemon on_turn 回调 → SSE 数据面 /api/asr_stream → UI（WindowCalibrati
 
 ## Stage1：音频 → 文本（ONNX 语音前端）
 
-**位置**：`crates/aura-core/src/recognizer.rs`（`OnnxStage1Recognizer`）+ 纯窗口决策核心
+**位置**：`crates/aura-core/src/pipeline/`（`recognizer.rs` 资源 + `consume.rs` 消费循环）+ 纯窗口决策核心
 `WindowTracker`（可单测，无 I/O）+ `audio_store.rs`（PCM 按 id 存管）。ONNX 语音栈在
 `dp-models::onnx`（VAD Silero + 流式 Zipformer/x-asr + 批式 SenseVoice）。
 
@@ -104,7 +104,7 @@ zh-en，自带标点；tokens.txt 必须保持官方"token id"两列格式）。
 **无状态**（2026-08-30 batch 异步化后）：每次调用都是纯函数式的——输入是"整段全部句
 的文本"（payload 即段落），**内部不存任何段落状态**。batch 异步后末句 batch 文本可能
 晚于最后一个 `Batch` 到达，旧"存最后一次整流、定稿零 LLM 取存档"的不变式不再成立。
-跑在独立 `aura-stage2` worker（pipeline.rs），LLM 耗时不卡 partial。pipeline 的
+跑在独立任务（pipeline/tasks.rs），LLM 耗时不卡 partial。pipeline 的
 `Finalizer`（worker 线程内单线程独占、无锁）累积句级 batch 并做**就绪定稿**。
 
 - `calibrate_paragraph(paragraph_id, sentences)`：全部句 `best_text()` 逐行（`PromptBuilder::
@@ -130,7 +130,7 @@ zh-en，自带标点；tokens.txt 必须保持官方"token id"两列格式）。
 | `aura-socket`（tokio） | axum SSE：数据面 `/api/asr_stream` + 控制面 `/api/stream` |
 
 > **线程归属约束**（2026-08-30）：Stage1/Stage2 模块**不 spawn 任何线程**，只暴露阻塞
-> 函数；上表四个线程全部由 `pipeline.rs` 创建。
+> 函数；上表线程/任务全部由 `pipeline/` 创建。
 
 | SSE 段类型（`AsrSegment`，aura-agent/view.rs） | 键 | 语义 |
 |---|---|---|

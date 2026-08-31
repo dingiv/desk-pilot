@@ -73,14 +73,23 @@
 >   线程)owns 流式 session + 节流解码,消费循环只转发帧指令(`Onset`/`Feed`/
 >   `Reset`/`Finalize`)。**VAD/分句/段落定稿从此与流式推理零共享执行流**;partial
 >   回传后仍由消费循环发射(两任务汇于同一事件出口,SF→BS→PC/PCal 全序不破)。
->   EOS 定稿 = 每句一次 oneshot 往返(唯一同步点,B 侧本地 finalize,几十 ms)。
->   B 侧 last_partial 状态以 `PartialMirror`(nonempty + last_change)镜像进消费
->   循环,供 speaking 抑制 / 断流喂静音 / 停滞看门狗;重置/定稿点由消费循环直接
->   清零(确定性,无竞态)。
+>   EOS 定稿 = 每句一次、**回执同通道**(`StreamOut::Finalized`,round24 起不再有
+>   per-句 oneshot —— 整个流式任务只有一对通道)。B 侧 last_partial 状态以
+>   `PartialMirror`(nonempty + last_change)镜像进消费循环,供 speaking 抑制 /
+>   断流喂静音 / 停滞看门狗;重置/定稿点由消费循环直接清零(确定性,无竞态)。
+>
+> - **round24 R4 + channel 简化**:① `select!` 两臂臂体拆出为 `on_stage1_batch` /
+>   `on_stage1_paragraph_edge` / `on_turn_batch_sentence` 处理器(共享依赖收进
+>   `Ctx`,可变账本收进 `Turns`),主循环只剩分派 + 单点 emit;② 流式任务通道
+>   简化为一对(cmd/out)—— EOS 定稿回执走 out 通道的 `Finalized` 变体
+>   (`await_finalize` 挂起等回执,途中 partial 依序先发),删掉 per-句 oneshot。
 >
 > 本文取代原"Stage1 batch 异步化设计"(该设计已落地并被 round12 取代,历史内容见 git)。
 > 代码为准。行号以当前工作区为准:
-> Stage1 = `crates/aura-core/src/recognizer.rs`,编排 = `crates/aura-core/src/pipeline.rs`,
+> Stage1 编排 = `crates/aura-core/src/pipeline/`(round23 文件夹化:mod = 编排汇点,
+> consume = 消费循环,recognizer = 资源/配置,tasks = batch/纠偏任务壳,tracker = 边界
+> 数学,stream = 流式任务,calibrator = Stage2);采音 + VAD 检测 = `pipeline/vad.rs`
+> 〔`ingest_loop` + `VadFront`〕。编排入口 = `crates/aura-core/src/pipeline/mod.rs`,
 > 契约 = `crates/aura-core/src/lib.rs`,daemon = `apps/audio-aura/src/main.rs`,
 > wire = `crates/aura-agent/src/view.rs`,客户端折叠 = `crates/aura-agent/src/transcript.rs`。
 

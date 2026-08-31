@@ -14,17 +14,14 @@
 pub mod archive;
 pub mod audio_store;
 pub mod buffer;
-pub mod calibrator;
-pub mod pipeline;
-pub mod recognizer;
 pub mod hub;
+pub mod pipeline;
 pub mod prompt;
 pub mod scout;
 pub mod tts;
-pub mod vad;
 pub mod wav;
 
-pub use calibrator::{LlmInput, PassThroughCalibrator, Stage2Calibrator, Stage2CalibratorImpl};
+pub use pipeline::calibrator::{LlmInput, PassThroughCalibrator, Stage2Calibrator, Stage2CalibratorImpl};
 pub use pipeline::{AsrSpec, LlmSpec, Pipeline, PipelineSpec, StreamSpec, TurnEvent, VadSpec};
 pub use prompt::PromptBuilder;
 pub use hub::{FinalTurn, Storage, TurnRecord};
@@ -37,7 +34,7 @@ pub use hub::{FinalTurn, Storage, TurnRecord};
 // PCM 由 [`audio_store::AudioStore`] 按 id 持有(实体/事件共享 `Arc<Vec<i16>>`)。
 // 事件 append-only + 边界标记: Batch(每句)驱动 Stage2 联合整流当前段落,ParagraphEdge
 // (段落关闭)开启定稿就绪等待。batch 识别是**异步**的(独立 worker 线程执行,消费循环
-// 不阻塞): 句级结果经 `SentenceBatchReady`、段落级重跑结果经 `ParagraphBatchReady` 回传,
+// 不阻塞):句/段 batch 结果由 pipeline 任务以 BatchSentence/BatchParagraph 事件回传,
 // 二者都**必然晚于**对应的 `Batch` / `ParagraphEdge`,且每个 job 必出一次结果(失败 =
 // `None`,显式建模——远程网络可能出问题;消费方经 `best_text` 回退流式)。
 
@@ -88,7 +85,7 @@ impl VadSentence {
 /// - `batch_text` = the paragraph-level re-run over the concatenated PCM (cross-sentence
 ///   context; the authoritative text Stage2 finalizes on). ASYNC: at `ParagraphEdge` time the
 ///   re-run is only ENQUEUED, so the field is `None` on the event — the result arrives via
-///   [`Stage1Event::ParagraphBatchReady`] and the pipeline patches it in before finalizing.
+///   the pipeline's paragraph task patches it in before finalizing.
 ///   Single-sentence paragraphs never re-run (they reuse the sentence-level batch), so for
 ///   them this stays `None` and `best_text()` falls back to the sentence batches.
 #[derive(Debug, Clone)]
@@ -107,7 +104,7 @@ pub struct VadParagraph {
     /// per-sentence clips right after; this Arc is the only remaining copy.
     pub pcm: std::sync::Arc<Vec<i16>>,
     /// Paragraph-level batch re-run wall-clock 毫秒数。batch 异步化后,`ParagraphEdge` 事件
-    /// 到达时为 0,由 pipeline 在 `ParagraphBatchReady` 到达时填入;单句段落(不投递重跑
+    /// 到达时为 0,由 pipeline 段任务在重跑完成时填入;单句段落(不重跑
     /// job)恒 0。用于性能评估:跨 ASR 后端 / 跨音频长度 / GPU vs CPU 对比。
     pub batch_asr_ms: u64,
 }
@@ -145,41 +142,20 @@ pub enum Stage1Event {
     StreamFragment { paragraph_id: ParagraphId, sentence_id: SentenceId, text: String, at_s: f64 },
     /// A VAD gap closed a sentence. `sentences` is ALL sentences of the current paragraph so far
     /// (Stage2 jointly calibrates them — the payload IS the paragraph, keeping Stage2 stateless).
-    /// ASYNC batch: the just-closed sentence's `batch_text` is `None` here (its batch job was only
-    /// enqueued; the result arrives via [`Self::SentenceBatchReady`]). Provisional until the
-    /// `ParagraphEdge`.
-    /// `sr` = 采样率(round12:Pipeline 异步任务自建 batch pass 时直调
-    /// `recognize_once(pcm, sr)` 需要;旧编排下 job 由 s1 内部投递,已自带)。
+    /// ASYNC batch: the just-closed sentence's `batch_text` is `None` here (the batch pass is
+    /// built by the pipeline's sentence task on receiving this event; the result arrives as a
+    /// `BatchSentence` turn). Provisional until the `ParagraphEdge`.
+    /// `sr` = 采样率(pipeline 句任务直调 `recognize_once(pcm, sr)` 用)。
     Batch { paragraph_id: ParagraphId, sentences: Vec<VadSentence>, sr: u32 },
-    /// The merge paragraph closed (big gap or settle-timeout). The paragraph-level batch re-run is
-    /// only ENQUEUED (async): `paragraph.batch_text` is `None` on this event and arrives via
-    /// [`Self::ParagraphBatchReady`] (multi-sentence paragraphs only — single-sentence ones reuse
-    /// the sentence-level result and never emit one). The AudioStore evicts the sentence clips
-    /// right after this event (the paragraph's `Arc` PCM is the surviving copy). Finalization
-    /// happens when BOTH all sentence batches and the re-run (or, single-sentence, the sentence
-    /// batch alone) are in — the pipeline's readiness gate.
-    /// `sr` = 采样率(round12,同 [`Self::Batch`]:段落级重跑自建时需要)。
+    /// The merge paragraph closed (big gap or settle-timeout). The paragraph-level batch re-run
+    /// is built by the pipeline's paragraph task (async): `paragraph.batch_text` is `None` on
+    /// this event (multi-sentence paragraphs re-run; single-sentence ones reuse the
+    /// sentence-level result). The AudioStore evicts the sentence clips right after this event
+    /// (the paragraph's `Arc` PCM is the surviving copy). Finalization happens when BOTH all
+    /// sentence batches and the re-run (or, single-sentence, the sentence batch alone) are in —
+    /// the pipeline's readiness gate.
+    /// `sr` = 采样率(段落级重跑任务用,同 [`Self::Batch`])。
     ParagraphEdge { paragraph: VadParagraph, sr: u32 },
-    /// A sentence-level batch job finished (the batch worker thread ran the blocking
-    /// `AsrProvider::recognize`). ALWAYS arrives after that sentence's `Batch`; `batch_text`
-    /// is `None` when the pass failed or returned empty (the legal "batch unavailable" state —
-    /// consumers fall back to streaming via [`VadSentence::best_text`]).
-    SentenceBatchReady {
-        paragraph_id: ParagraphId,
-        sentence_id: SentenceId,
-        batch_text: Option<String>,
-        /// `recognize` wall-clock 毫秒数(性能埋点)。
-        batch_asr_ms: u64,
-    },
-    /// A paragraph-level batch re-run job finished. ALWAYS arrives after the paragraph's
-    /// `ParagraphEdge`; `batch_text` is `None` on failure/empty. Single-sentence paragraphs
-    /// never emit this (no re-run job was enqueued).
-    ParagraphBatchReady {
-        paragraph_id: ParagraphId,
-        batch_text: Option<String>,
-        /// `recognize` wall-clock 毫秒数(性能埋点)。
-        batch_asr_ms: u64,
-    },
 }
 
 // ── ONNX 语音栈在 dp-models ────────────────────────────────────────────────────

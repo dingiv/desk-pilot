@@ -17,7 +17,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use audio_aura_core::recognizer::{OnnxStage1Recognizer, Stage1Config};
+use audio_aura_core::pipeline::recognizer::{OnnxStage1Recognizer, Stage1Config};
 use audio_aura_core::{Calibrator, LlmInput, Pipeline, Stage2CalibratorImpl, TurnEvent};
 
 // Repo-relative bench dir (crates/aura-core → desk-pilot/bench). Created on startup.
@@ -52,9 +52,8 @@ fn main() -> anyhow::Result<()> {
     eprintln!(
         "[load] Stage1 (Silero VAD + 流式 Zipformer + SenseVoice) + Stage2 ({router_model} via {router_endpoint}) …"
     );
-    // round12 异步化:batch 由 Pipeline 的 per-paragraph 任务自建(batch_jobs=false),
-    // s1 不再投 job —— batch_rx 直接丢弃。
-    let (s1, _batch_rx) = OnnxStage1Recognizer::new(Stage1Config::new(scout_addr.clone()))?;
+    // round12 起:batch 由 Pipeline 的任务结构自建,s1 不再持有 job 通道。
+    let s1 = OnnxStage1Recognizer::new(Stage1Config::new(scout_addr.clone()))?;
     let calibrator = Calibrator::load(&router_endpoint, &router_model)?;
     let _ = calibrator.calibrate_blocking("你好", None, &[]); // HTTP warmup (避免首轮冷启动)
     let corrections = Arc::new(Mutex::new(Vec::new()));

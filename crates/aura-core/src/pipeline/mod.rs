@@ -35,15 +35,26 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
 
 use anyhow::Result;
-use std::time::Duration;
-use tracing::{info, warn};
+use tracing::info;
 
-use crate::calibrator::{LlmInput, PassThroughCalibrator, Stage2Calibrator, Stage2CalibratorImpl};
-use crate::hub::{FinalTurn, Storage};
-use crate::recognizer::{OnnxStage1Recognizer, Stage1Config};
+use calibrator::{LlmInput, PassThroughCalibrator, Stage2Calibrator, Stage2CalibratorImpl};
+
+// round23:流水线环节文件集中在 pipeline/ 模块文件夹(mod = 编排,其余 = 环节)。
+pub mod calibrator;
+pub mod consume;
+pub mod vad;
+pub mod tasks;
+pub mod recognizer;
+pub mod stream;
+pub mod tracker;
+use crate::hub::Storage;
+use recognizer::{OnnxStage1Recognizer, Stage1Config};
+use tasks::{
+    emit_turn, live_calibration_task, paragraph_task, sentence_task, ParagraphWaits,
+    RunParagraphBatch, SentenceOutcome,
+};
 use crate::{ParagraphId, SentenceId, Stage1Event, VadParagraph, VadSentence};
 use dp_models::http::HttpLlm;
 
@@ -205,6 +216,109 @@ pub enum TurnEvent<'a> {
     ParagraphCalibration { paragraph_id: u64, calibrated: String, route_ms: f64 },
 }
 
+// ── select! 两臂的处理器(round24 R4:臂体拆出,循环只剩分派)─────────────────
+// 状态账本(三张表)与处理器分离:循环 = 事件分派,处理器 = 各事件的编排语义。
+
+/// select! 处理器的共享依赖(run 存续期不变;round24:收进一个结构,处理器签名不再长参)。
+struct Ctx<F> {
+    s1: Arc<OnnxStage1Recognizer>,
+    s2: Arc<Mutex<Box<dyn Stage2Calibrator>>>,
+    storage: Option<Arc<Storage>>,
+    turn: tasks::TurnTx,
+    on_turn: Arc<F>,
+}
+
+/// 主循环的可变编排状态:每段①句任务 handles(Batch 入,ParagraphEdge 移交段任务
+/// join)②live 整流链尾(SC 串行序)③已回填句集(Batch 快照为底 + BS patch,
+/// round16b —— live SC 的输入带上前句 batch)。
+#[derive(Default)]
+struct Turns {
+    pending: HashMap<ParagraphId, Vec<tokio::task::JoinHandle<SentenceOutcome>>>,
+    live_chain: HashMap<ParagraphId, tokio::task::JoinHandle<()>>,
+    open_sents: HashMap<ParagraphId, Vec<VadSentence>>,
+}
+
+/// s1 臂:`Batch`(句 EOS)—— 只为 just-closed 句(载荷最后一个)投句任务(载荷是
+/// 该段全部句快照,为无状态 Stage2 设计;全量重投 = N² ASR/LLM,§7-D 回归已修);
+/// 再以 Batch 快照为底**合并** open_sents —— 保留 BS 已回填的句 batch(快照来自
+/// tracker 副本,batch_text 恒 None,直接覆写会把 batch 冲掉,SC 输入退回全流式)。
+/// live SC 的触发点**不在这里**(round17b:架构要求 batch 完成 → 之后纠偏,触发点在
+/// 该句 BS 到达时,见 [`on_turn_batch_sentence`])。
+fn on_stage1_batch<F: Fn(TurnEvent)>(
+    ctx: &Ctx<F>,
+    turns: &mut Turns,
+    paragraph_id: ParagraphId,
+    sentences: &[VadSentence],
+    sr: u32,
+) {
+    let entry = turns.pending.entry(paragraph_id).or_default();
+    if let Some(s) = sentences.last() {
+        entry.push(tokio::spawn(sentence_task(
+            Arc::clone(&ctx.s1), paragraph_id, s.id, s.audio_id, sr, ctx.turn.clone(),
+        )));
+    }
+    let entry = turns.open_sents.entry(paragraph_id).or_default();
+    for s in sentences {
+        if let Some(prev) = entry.iter_mut().find(|p| p.id == s.id) {
+            let keep = prev.batch_text.clone();
+            *prev = s.clone();
+            prev.batch_text = keep.or(s.batch_text.clone());
+        } else {
+            entry.push(s.clone());
+        }
+    }
+}
+
+/// s1 臂:`ParagraphEdge`(段关闭)—— 先 emit `ParagraphClosed`(边界时序 round11 S3:
+/// PC 先于下一段任何事件 —— s1 通道 FIFO + 主循环按序 emit,结构保证),再投段任务
+/// (join 等待集 + live 链尾 → 段重跑 → 定稿 → 归档)。
+fn on_stage1_paragraph_edge<F: Fn(TurnEvent)>(
+    ctx: &Ctx<F>,
+    turns: &mut Turns,
+    paragraph: VadParagraph,
+    sr: u32,
+) {
+    emit_turn(&*ctx.on_turn, TurnEvent::ParagraphClosed { paragraph_id: paragraph.id });
+    turns.open_sents.remove(&paragraph.id);
+    let waits = ParagraphWaits {
+        sentences: turns.pending.remove(&paragraph.id).unwrap_or_default(),
+        live: turns.live_chain.remove(&paragraph.id),
+    };
+    let s1c = Arc::clone(&ctx.s1);
+    let run_batch: RunParagraphBatch =
+        Arc::new(move |pcm, sr, pid| s1c.recognize_once(pcm, sr, "段落级重跑", pid));
+    tokio::spawn(paragraph_task(
+        paragraph, sr, waits, Arc::clone(&ctx.s2), run_batch, ctx.storage.clone(),
+        ctx.turn.clone(),
+    ));
+}
+
+/// turn 臂:`BatchSentence` 到达(round17b:架构需求"batch 完成 → 之后纠偏,先后
+/// 明确")—— 回填该段句集,段仍开放则链式触发一次联合整流(SC 严格在该句 BS 之后,
+/// 输入带上它的 batch)。链式串行 → SC 顺序 = 段落生长顺序。段已关闭(迟到 BS)不
+/// 触发 —— PCal 已由段任务回填该 batch,迟到的 SC 会破坏"PCal 是该段最后事件"的契约。
+fn on_turn_batch_sentence<F: Fn(TurnEvent)>(
+    ctx: &Ctx<F>,
+    turns: &mut Turns,
+    paragraph_id: ParagraphId,
+    sentence_id: SentenceId,
+    text: &str,
+) {
+    if let Some(v) = turns.open_sents.get_mut(&paragraph_id) {
+        if let Some(s) = v.iter_mut().find(|s| s.id == sentence_id) {
+            s.batch_text = Some(text.to_string());
+        }
+        let texts = v.clone();
+        let prev = turns.live_chain.remove(&paragraph_id);
+        turns.live_chain.insert(
+            paragraph_id,
+            tokio::spawn(live_calibration_task(
+                prev, paragraph_id, sentence_id, texts, Arc::clone(&ctx.s2), ctx.turn.clone(),
+            )),
+        );
+    }
+}
+
 pub struct Pipeline {
     s1: OnnxStage1Recognizer,
     /// Stage2 校准器(round12:Mutex 串行化 —— 段任务并发,LLM 调用保持单飞,
@@ -237,11 +351,9 @@ impl Pipeline {
         storage: Option<Arc<Storage>>,
     ) -> Result<Self> {
         info!("loading Stage1 (ONNX) + Stage2 (Qwen calibrator) …");
-        // round12 异步化:batch pass 由 pipeline 的 per-paragraph 任务自建
-        // (recognize_once 直调),s1 不再投 job 给 batch worker。
-        let mut cfg = stage1_config(spec, active, running, flush_paragraph)?;
-        cfg.batch_jobs = false;
-        let (s1, _batch_rx) = OnnxStage1Recognizer::new(cfg)?;
+        // round12 起:batch pass 由 pipeline 的任务结构自建(recognize_once 直调)。
+        let cfg = stage1_config(spec, active, running, flush_paragraph)?;
+        let s1 = OnnxStage1Recognizer::new(cfg)?;
         let s2 = stage2_calibrator(spec, hotwords, corrections)?;
         Ok(Self { s1, s2: Arc::new(Mutex::new(s2)), storage })
     }
@@ -308,22 +420,15 @@ impl Pipeline {
             });
         }
 
-        // ── 主循环(本 future):select 两源,单点 emit ──
-        // 每段的句任务 handles(Batch/EOS 时入;ParagraphEdge 时移交段任务 join)。
-        let mut pending: HashMap<ParagraphId, Vec<tokio::task::JoinHandle<SentenceOutcome>>> =
-            HashMap::new();
-        // 每段 live 整流链尾(Batch → SC,段内按 Batch 顺序串行;
-        // ParagraphEdge 时移交段任务收尾 —— 保证 SC 先于 PCal)。
-        let mut live_chain: HashMap<ParagraphId, tokio::task::JoinHandle<()>> = HashMap::new();
-        // 每段**已回填**句集(round16b):Batch 事件刷新快照,BatchSentence 到达即
-        // patch 对应句 —— live SC 的输入不再停留全流式(前句的 batch 已到就能用)。
-        let mut open_sents: HashMap<ParagraphId, Vec<VadSentence>> = HashMap::new();
+        // ── 主循环(本 future):select 两源,单点 emit;臂体在上方 on_* 处理器 ──
+        let ctx = Ctx { s1: stage1, s2, storage, turn: turn_tx, on_turn };
+        let mut turns = Turns::default();
         loop {
             tokio::select! {
                 ev = s1_rx.recv() => match ev {
                     Some(Stage1Event::StreamFragment { paragraph_id, sentence_id, text, at_s }) => {
-                        // 高频(说话中 ~0.5s/条)—— debug;直通低延迟路径。
-                        emit_turn(&*on_turn, TurnEvent::StreamFragment {
+                        // 高频(说话中 ~0.3s/条)—— 直通低延迟路径。
+                        emit_turn(&*ctx.on_turn, TurnEvent::StreamFragment {
                             paragraph_id,
                             sentence_id,
                             text: &text,
@@ -331,86 +436,22 @@ impl Pipeline {
                         });
                     }
                     Some(Stage1Event::Batch { paragraph_id, sentences, sr }) => {
-                        // 只为 just-closed 句(载荷最后一个)投句任务 —— 载荷是该段
-                        // 全部句快照(为无状态 Stage2 设计),全量重投 = N² ASR/LLM
-                        // (§7-D 回归,已修)。
-                        let entry = pending.entry(paragraph_id).or_default();
-                        if let Some(s) = sentences.last() {
-                            let s1c = Arc::clone(&stage1);
-                            let turn = turn_tx.clone();
-                            entry.push(tokio::spawn(sentence_task(
-                                s1c, paragraph_id, s.id, s.audio_id, sr, turn,
-                            )));
-                        }
-                        // 维护段内句集(open_sents):以 Batch 快照为底**合并** —— 保留
-                        // BS 已回填的句 batch(快照来自 tracker 副本,batch_text 恒 None,
-                        // 直接覆写会把 batch 冲掉,SC 输入退回全流式)。live SC 的触发
-                        // 点**不在这里**(round17b:架构要求 batch 完成 → 之后纠偏,
-                        // 触发点移到该句 BS 到达时,见 turn_rx 臂)。
-                        {
-                            let entry = open_sents.entry(paragraph_id).or_default();
-                            for s in &sentences {
-                                if let Some(prev) = entry.iter_mut().find(|p| p.id == s.id) {
-                                    let keep = prev.batch_text.clone();
-                                    *prev = s.clone();
-                                    prev.batch_text = keep.or(s.batch_text.clone());
-                                } else {
-                                    entry.push(s.clone());
-                                }
-                            }
-                        }
+                        on_stage1_batch(&ctx, &mut turns, paragraph_id, &sentences, sr);
                     }
                     Some(Stage1Event::ParagraphEdge { paragraph, sr }) => {
-                        // 边界时序(round11 S3):ParagraphClosed 先于下一段
-                        // 任何事件 —— s1 通道 FIFO + 主循环按序 emit,结构保证。
-                        emit_turn(&*on_turn, TurnEvent::ParagraphClosed { paragraph_id: paragraph.id });
-                        // 段任务:join 等待集(就绪门)→ 段重跑 →
-                        // 定稿 → 归档。
-                        open_sents.remove(&paragraph.id);
-                        let waits = ParagraphWaits {
-                            sentences: pending.remove(&paragraph.id).unwrap_or_default(),
-                            live: live_chain.remove(&paragraph.id),
-                        };
-                        let s1c = Arc::clone(&stage1);
-                        let s2c = Arc::clone(&s2);
-                        let turn = turn_tx.clone();
-                        let run_batch: RunParagraphBatch =
-                            Arc::new(move |pcm, sr, pid| s1c.recognize_once(pcm, sr, "段落级重跑", pid));
-                        tokio::spawn(paragraph_task(
-                            paragraph, sr, waits, s2c, run_batch, storage.clone(), turn,
-                        ));
+                        on_stage1_paragraph_edge(&ctx, &mut turns, paragraph, sr);
                     }
-                    // batch_jobs=false 下不再产生(旧编排变体,防御 no-op)。
-                    Some(Stage1Event::SentenceBatchReady { .. } | Stage1Event::ParagraphBatchReady { .. }) => {}
                     None => {} // s1 线程深睡后 channel 仍存活,不会 None;防御。
                 },
                 ev = turn_rx.recv() => {
                     // None = 全部任务结束才会发生;任务随 select 循环存续,防御。
                     if let Some(t) = ev {
-                        // ★ live SC 的触发点(round17b:架构需求"batch 完成 → 之后
-                        // 纠偏,先后明确")—— 每句 BS 到达时:回填该段句集,段仍开放
-                        // 则链式触发一次联合整流(SC 严格在该句 BS 之后,输入带上
-                        // 它的 batch)。链式串行 → SC 顺序 = 段落生长顺序。段已关闭
-                        // (迟到 BS)不触发 —— PCal 已由段任务回填该 batch,迟到的
-                        // SC 会破坏"PCal 是该段最后事件"的契约。
                         if let TurnEvent::BatchSentence { paragraph_id, sentence_id, text } = &t {
-                            if let Some(v) = open_sents.get_mut(paragraph_id) {
-                                if let Some(s) = v.iter_mut().find(|s| s.id == *sentence_id) {
-                                    s.batch_text = Some(text.clone());
-                                }
-                                let texts = v.clone();
-                                let prev = live_chain.remove(paragraph_id);
-                                let s2c = Arc::clone(&s2);
-                                let turn2 = turn_tx.clone();
-                                live_chain.insert(
-                                    *paragraph_id,
-                                    tokio::spawn(live_calibration_task(
-                                        prev, *paragraph_id, *sentence_id, texts, s2c, turn2,
-                                    )),
-                                );
-                            }
+                            on_turn_batch_sentence(
+                                &ctx, &mut turns, *paragraph_id, *sentence_id, text,
+                            );
                         }
-                        emit_turn(&*on_turn, t);
+                        emit_turn(&*ctx.on_turn, t);
                     }
                 }
             }
@@ -443,247 +484,6 @@ impl Pipeline {
     }
 }
 
-// ── round12 异步化:per-sentence / per-paragraph 任务(替代 Finalizer 状态机)────────
-//
-// 编排模型(与 ime-core IoThread 同构):s1 消费循环(阻塞线程)产 Stage1Event →
-// tokio channel;主循环 select! 单点 emit;batch 由任务自建(spawn_blocking 直调
-// `recognize_once`)。时序不变式不再靠手写计数门,而是任务结构本身:
-//
-//   句任务(Batch/EOS 触发,只投 just-closed 句)→ 完成即回传 BatchSentence;
-//   live 整流任务(BS 到达触发 = 该句 batch 完成后,段内链式串行)→
-//   SentenceCalibration——架构需求
-//   "1s 空白 → Batch 识别,stage2 紧跟纠偏,先后明确"在段开放期间持续发生;
-//   段任务(ParagraphEdge 触发)→ join 全部句任务(就绪门)+ live 链尾 →
-//   段级重跑(多句;单句复用句级)→ BatchParagraph → 定稿整流一次 → 归档 +
-//   ParagraphCalibration。live 链尾在定稿前收束 → 该段全部 SC 先于 PCal(契约)。
-//
-// 跨段乱序(段 N 定稿 vs 段 N+1 流式)是物理现实 —— 客户端按 paragraph_id 修订。
-
-/// 段级重跑闭包:_blocking recognize(生产 = `s1.recognize_once`;测试注入 stub)。
-type RunParagraphBatch = Arc<dyn Fn(&[i16], u32, ParagraphId) -> Option<String> + Send + Sync>;
-
-/// 单行事件摘要(统一发射留痕用)。段落 id 是时间戳微秒 —— 日志里的 p 值本身即
-/// 段落创建时刻,时序对表时直接可比大小。
-fn describe_turn(ev: &TurnEvent) -> String {
-    match ev {
-        TurnEvent::StreamFragment { paragraph_id, sentence_id, text, at_s } => {
-            format!("stream p{paragraph_id} s{sentence_id} @{at_s:.2} {text:?}")
-        }
-        TurnEvent::ParagraphClosed { paragraph_id } => {
-            format!("paragraph_closed p{paragraph_id}")
-        }
-        TurnEvent::BatchSentence { paragraph_id, sentence_id, text } => {
-            format!("batch_sentence p{paragraph_id} s{sentence_id} {text:?}")
-        }
-        TurnEvent::BatchParagraph { paragraph_id, text } => {
-            format!("batch_paragraph p{paragraph_id} {text:?}")
-        }
-        TurnEvent::SentenceCalibration { paragraph_id, sentence_id, calibrated, route_ms } => {
-            format!("sentence_calibration p{paragraph_id} s{sentence_id} {route_ms:.0}ms {calibrated:?}")
-        }
-        TurnEvent::ParagraphCalibration { paragraph_id, calibrated, route_ms } => {
-            format!("paragraph_calibration p{paragraph_id} {route_ms:.0}ms {calibrated:?}")
-        }
-    }
-}
-
-/// **统一发射留痕(round16 调试)**:主循环是 on_turn 的唯一调用者(单点发射),
-/// 每一条即将发往前端的事件先记一条 info 再发 —— 前后端时序错位排查时,以这条
-/// 序列为权威对表(server 侧实际发出的顺序/内容)。
-fn emit_turn<F>(on_turn: &F, ev: TurnEvent<'_>)
-where
-    F: Fn(TurnEvent),
-{
-    info!(event = %describe_turn(&ev), "emit→前端");
-    on_turn(ev);
-}
-/// 任务产出回传通道(pipeline 内部;主循环 drain → 单点 emit)。
-type TurnTx = tokio::sync::mpsc::UnboundedSender<TurnEvent<'static>>;
-/// 段级重跑的兜底超时:HttpAsr 自带请求级超时,这里保证"重跑无论挂死/panic,
-/// 段定稿链(PCal/归档)必然继续"—— PCal 必发是客户端 REPLACED 语义的契约前提。
-const PARAGRAPH_RERUN_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// 句任务的产出:batch 识别结果(回填段落句集,供 live/定稿整流)。
-struct SentenceOutcome {
-    sentence_id: SentenceId,
-    batch_text: Option<String>,
-    #[allow(dead_code)]
-    asr_ms: u64,
-}
-
-/// 句任务:取句 clip(AudioStore,EOS → 段关闭之间存活)→ 阻塞 recognize → 回传
-/// `BatchSentence`(经 turn 通道回主循环 emit,单点)。失败/空文本 = 合法 None
-/// (消费端回退流式)。
-async fn sentence_task(
-    s1: Arc<OnnxStage1Recognizer>,
-    paragraph_id: ParagraphId,
-    sentence_id: SentenceId,
-    audio_id: crate::AudioId,
-    sr: u32,
-    turn: TurnTx,
-) -> SentenceOutcome {
-    let out = tokio::task::spawn_blocking(move || {
-        let pcm = s1.audio_store().concat(&[audio_id]);
-        let t0 = Instant::now();
-        let text = s1.recognize_once(&pcm, sr, "句级", paragraph_id);
-        (text, t0.elapsed().as_millis() as u64)
-    })
-    .await
-    .unwrap_or((None, 0));
-    let (text, asr_ms) = out;
-    if let Some(text) = &text {
-        let _ = turn.send(TurnEvent::BatchSentence {
-            paragraph_id,
-            sentence_id,
-            text: text.clone(),
-        });
-    }
-    SentenceOutcome { sentence_id, batch_text: text, asr_ms }
-}
-
-/// live 联合整流任务(每句 batch 完成后一次 —— BS 到达时由主循环触发;架构需求
-/// "batch 完成 → 之后纠偏,先后明确")。`prev` = 本段
-/// 上一次 live 任务句柄 —— 链式 await 保证段内 SC 按 Batch 顺序(段落生长序)串行,
-/// 后到的 SC 覆盖更早的(REPLACED)。阻塞 LLM 在 `spawn_blocking` + 校准器 Mutex 串行。
-async fn live_calibration_task(
-    prev: Option<tokio::task::JoinHandle<()>>,
-    paragraph_id: ParagraphId,
-    // 触发本次纠偏的句 id(BS 到达的那句)—— 随事件带给前端:SC 是段落级快照,
-    // 覆盖上界就是它;前端零派生状态即可知道"该覆盖谁"(round20b)。
-    up_to: SentenceId,
-    sentences: Vec<VadSentence>,
-    calibrate: Arc<Mutex<Box<dyn Stage2Calibrator>>>,
-    turn: TurnTx,
-) {
-    if let Some(h) = prev {
-        let _ = h.await;
-    }
-    let t = Instant::now();
-    let calibrated = tokio::task::spawn_blocking(move || {
-        calibrate.lock().unwrap().calibrate_paragraph(paragraph_id, &sentences)
-    })
-    .await
-    .unwrap_or_default();
-    let route_ms = t.elapsed().as_secs_f64() * 1000.0;
-    info!(paragraph_id, route_ms = route_ms.round() as u64, calibrated = %calibrated, "纠偏[sentence]");
-    let _ = turn.send(TurnEvent::SentenceCalibration {
-        paragraph_id,
-        sentence_id: up_to,
-        calibrated,
-        route_ms,
-    });
-}
-
-/// 段任务的等待集(就绪门):句任务 handles(回填句 batch)+ live 整流链尾
-/// (该段全部 SC 先于 PCal 的契约保证)。
-struct ParagraphWaits {
-    sentences: Vec<tokio::task::JoinHandle<SentenceOutcome>>,
-    live: Option<tokio::task::JoinHandle<()>>,
-}
-
-/// 段任务:join 等待集(就绪门,回填句 batch;SC 先于 PCal)→ 段级重跑(多句段落)→
-/// 定稿整流一次 → 归档 → `ParagraphCalibration`。全部阻塞调用(LLM/ASR/文件 IO)
-/// 都在 `spawn_blocking` 里,任务并发不占事件循环。
-async fn paragraph_task(
-    paragraph: VadParagraph,
-    sr: u32,
-    waits: ParagraphWaits,
-    calibrate: Arc<Mutex<Box<dyn Stage2Calibrator>>>,
-    run_paragraph_batch: RunParagraphBatch,
-    storage: Option<Arc<Storage>>,
-    turn: TurnTx,
-) {
-    let paragraph_id = paragraph.id;
-    let mut acc: Vec<VadSentence> = paragraph.sentences.clone();
-
-    // 就绪门 = join!:回填各句 batch(定稿整流的输入)。live 整流已在 Batch 臂持续
-    // 完成(live_calibration_task),这里等链尾收束 —— 该段全部 SC 必先于 PCal。
-    for h in waits.sentences {
-        let Ok(out) = h.await else { continue };
-        if let Some(s) = acc.iter_mut().find(|s| s.id == out.sentence_id) {
-            s.batch_text = out.batch_text;
-        }
-    }
-    if let Some(live) = waits.live {
-        let _ = live.await;
-    }
-
-    // ★ 回填写回段落实体(round16b 修复):ParagraphEdge 快照里各句 `batch_text` 恒
-    // None(tracker 的副本从不更新)。不写回则定稿/归档的 `best_text` 静默回退**流式**
-    // —— PassThrough 下 PCal 直接发出流式拼接,经 REPLACED 把 finals 里已到手的
-    // batch 占位换回流式文本(实测"batch 后退回流式"的服务端根因;单句段落无 BP
-    // 掩盖,完全裸露)。round12 之前的 Finalizer 有此 patch,tokio 重写时丢失。
-    let mut paragraph = paragraph;
-    paragraph.sentences = acc;
-
-    // 段级重跑(权威 raw):多句段落才跑(单句的拼接 PCM 与句级完全相同,复用句级 batch)。
-    // ★ 必须 spawn_blocking(round17 实测 panic 根因):HttpAsr 是 reqwest::blocking
-    // (内部持 runtime),裸调在 async 上下文触发 "Cannot drop a runtime …" panic →
-    // 段任务崩死,PCal/归档永久丢失(前端:某段永远等不到定稿)。超时兜底:重跑
-    // 挂死/panic 也保证定稿链继续(None 回退句级 batch)—— "PCal 必发"是契约。
-    if paragraph.sentences.len() > 1 {
-        let pcm = Arc::clone(&paragraph.pcm);
-        let run = Arc::clone(&run_paragraph_batch);
-        let batch_text = match tokio::time::timeout(
-            PARAGRAPH_RERUN_TIMEOUT,
-            tokio::task::spawn_blocking(move || run(&pcm, sr, paragraph_id)),
-        )
-        .await
-        {
-            Ok(Ok(t)) => t,
-            Ok(Err(e)) => {
-                warn!(error = %e, paragraph_id, "段级重跑任务 panic → 回退句级 batch");
-                None
-            }
-            Err(_) => {
-                warn!(paragraph_id, "段级重跑超时 → 回退句级 batch(阻塞线程残留,无碍)");
-                None
-            }
-        };
-        paragraph.batch_asr_ms = 0; // 计时在闭包外拿不到 —— 保留事件字段语义,见下
-        if let Some(text) = batch_text {
-            paragraph.batch_text = Some(text.clone());
-            let _ = turn.send(TurnEvent::BatchParagraph { paragraph_id, text });
-        }
-    }
-
-    // 定稿整流:一次 LLM(全句 best_text —— 句级 batch 已全部回填,live 整流给不了的)。
-    let t = Instant::now();
-    let calibrated = {
-        let cal = Arc::clone(&calibrate);
-        let para = paragraph.clone();
-        tokio::task::spawn_blocking(move || cal.lock().unwrap().finalize_paragraph(&para))
-            .await
-            .unwrap_or_default()
-    };
-    let route_ms = t.elapsed().as_secs_f64() * 1000.0;
-    info!(
-        paragraph_id = paragraph.id,
-        at_s = (paragraph.start_s * 10.0).round() / 10.0,
-        sentences = paragraph.sentences.len(),
-        batch = %paragraph.batch_text.clone().unwrap_or_default(),
-        streaming = %paragraph.streaming_text,
-        calibrated = %calibrated,
-        "纠偏[paragraph]"
-    );
-    // 归档:段落 PCM → audio archive,三份文本 → day log + ring。阻塞文件 IO
-    // 同样进 spawn_blocking(与重跑同类:不得占/崩 async 执行器)。
-    if let Some(storage) = &storage {
-        let record = FinalTurn {
-            paragraph_id: paragraph.id,
-            at_s: paragraph.start_s,
-            duration_ms: paragraph.duration_ms(),
-            raw_text: paragraph.best_text().into_owned(),
-            streaming_text: paragraph.streaming_text.clone(),
-            calibrated: calibrated.clone(),
-            route_ms,
-            pcm: (*paragraph.pcm).clone(),
-        };
-        let st = Arc::clone(storage);
-        let _ = tokio::task::spawn_blocking(move || st.record_final(record)).await;
-    }
-    let _ = turn.send(TurnEvent::ParagraphCalibration { paragraph_id, calibrated, route_ms });
-}
 
 /// 纯映射(除 Stage1Config::new 的路径解析 R6 TODO 外无重 IO):spec → Stage1Config。
 /// ASR 后端选择分支与全部模型选择日志都在这里;流式引擎/未知选型在这里报错。
@@ -786,6 +586,7 @@ fn stage2_calibrator(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tasks::describe_turn;
     use crate::{VadSentence, VadParagraph};
     use dp_models::onnx::AsrBackend;
     use dp_models::ProviderKind;
@@ -827,7 +628,8 @@ mod tests {
     // ── round12:paragraph_task(异步定稿管线)单测 ─────────────────────────
     // 句任务用"立即就绪"的伪造 handles(batch 识别本身要真模型,不在单测范围);
     // 断言点:事件顺序(BatchSentence → … → BatchParagraph → ParagraphCalibration;
-    // live SC 已移至 Batch 臂的 live_calibration_task,不再由段任务发)。
+    // live SC 由 BS 到达时的 live_calibration_task 发(round17b:turn 臂触发,
+    // 不归段任务)。
 
     /// describe_turn(统一发射留痕)的格式快照 —— 日志序列是前后端时序对表的
     /// 契约,六种事件各一行,格式变更需有意识地改这里。
@@ -870,8 +672,8 @@ mod tests {
         let para = tpar(1, vec![tsent(1, None), tsent(2, None)]);
         let run_batch: RunParagraphBatch = Arc::new(|_pcm, _sr, _pid| Some("整段批式".into()));
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        // 收 4 个事件:2×BatchSentence + BatchParagraph + ParagraphCalibration(SC 在
-        // Batch 臂的 live 任务里,不归段任务)。
+        // 收 4 个事件:2×BatchSentence + BatchParagraph + ParagraphCalibration(SC 由
+        // BS 到达触发(turn 臂 live 链),不归段任务)。
         let mut events = Vec::new();
         rt.block_on(async {
             // 伪造句任务(真实 recognize 需 ONNX 模型,不在单测范围),但模拟真实
@@ -914,7 +716,7 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(*calls.lock().unwrap(), 1, "段任务只跑定稿整流 1 次(live 在 Batch 臂)");
+        assert_eq!(*calls.lock().unwrap(), 1, "段任务只跑定稿整流 1 次(live 在 turn 臂)");
     }
 
     /// 单句段落:无段级重跑(无 BatchParagraph);定稿 1 次 LLM。
