@@ -1,7 +1,7 @@
 //! VoiceMember — `#asr`: voice prediction provider.
 //!
 //! 纯读路径:voice server 在引擎 I/O 线程上后台拉 SSE,折叠 AsrEvent 到
-//! [`SharedVoiceState`](super::voice_state::SharedVoiceState)。本成员只读这个
+//! [`SharedTranscript`](super::SharedTranscript)。本成员只读这个
 //! shared state 来产生候选 —— 不再有任何轮询 / 异步状态。
 //!
 //! 预测模型下,`#asr` 精确匹配时提供语音结果预测(最多 4 条:流式 live +
@@ -26,7 +26,7 @@ use super::member::{CommandArgs, MagicMember, Prediction};
 use super::MagicResources;
 use crate::io_thread::{VoiceCmd, VoiceCmdSender};
 use super::FamilyEnv;
-use super::voice_state::SharedVoiceState;
+use super::SharedTranscript;
 
 const MAX_SUBMIT: usize = 4;
 
@@ -41,7 +41,7 @@ impl VoiceMember {
     }
 
     /// 取共享 voice state(未注入时 None —— 测试场景)。
-    fn state(&self) -> Option<Arc<SharedVoiceState>> {
+    fn state(&self) -> Option<Arc<SharedTranscript>> {
         self.resources.voice_state()
     }
 
@@ -62,7 +62,7 @@ impl VoiceMember {
     /// 提交语音队列里最新的 `n` 条定稿(换行拼接)。不足 `n` 条提交现有。
     fn commit_last_n(&self, n: usize) -> Option<String> {
         let state = self.state()?;
-        let (finals, _) = state.voice_candidates();
+        let finals = state.finals();
         if finals.is_empty() {
             return None;
         }
@@ -70,21 +70,24 @@ impl VoiceMember {
         Some(finals[..take].join("\n"))
     }
 
-    /// 语音结果预测:流式 live(有则)在前,定稿次之,最多 4 条。
-    fn voice_predictions(&self, state: &SharedVoiceState) -> Vec<Prediction> {
+    /// 语音结果预测:首选组合预览(未定稿段拼接),定稿次之,最多 4 条。
+    fn voice_predictions(&self, state: &SharedTranscript) -> Vec<Prediction> {
         if !state.is_connected() {
             return Vec::new();
         }
-        let (finals, live) = state.voice_candidates();
+        let finals = state.finals();
         let mut out = Vec::new();
-        // 首选 = 当前窗口的组装预览:小停顿产生新 batch 后继续说话,预览是
-        // 前段 Batch + 当前段流式("第一句第二句"),而不是只有当前段流式。
-        // 无预览时回退到原始 live。
-        let composed = state
-            .preview()
-            .map(|p| p.plain)
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| live.clone());
+        // 首选 = 未定稿段落的组装预览:小停顿产生新 batch 后继续说话,预览是
+        // 前段 Batch + 当前段流式("第一句第二句")—— 跨段乱序(前段定稿迟到)
+        // 旧句也不会消失(round11:id 即顺序)。空则回退原始 live。
+        let composed = {
+            let p = state.plain_preview();
+            if p.is_empty() {
+                state.live()
+            } else {
+                p
+            }
+        };
         if !composed.is_empty() {
             // 三文本独立:候选行展示 🎙+文本,preedit 显示纯文本(不带图标),
             // 提交纯文本。
@@ -138,7 +141,7 @@ impl MagicMember for VoiceMember {
         // - Connecting → 正在连接语音服务(不可提交);
         // - Failed     → 语音服务暂不可用(不可提交);
         // - Connected  → 继续走语音结果预测。
-        use crate::family::magic::voice_state::VoiceConn;
+        use crate::family::magic::VoiceConn;
         match state.conn() {
             VoiceConn::Connecting => return vec![Prediction::interactive("正在连接语音服务")],
             VoiceConn::Failed => return vec![Prediction::interactive("语音服务暂不可用")],
@@ -158,10 +161,9 @@ impl MagicMember for VoiceMember {
 
         // `/calc` → 校准优先预览。
         if args.has_path("calc") {
-            if let Some(p) = state.preview() {
-                if !p.calc.is_empty() {
-                    return vec![Prediction::commit(p.calc)];
-                }
+            let calc = state.calc_preview();
+            if !calc.is_empty() {
+                return vec![Prediction::commit(calc)];
             }
         }
 

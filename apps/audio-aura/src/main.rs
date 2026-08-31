@@ -612,6 +612,11 @@ fn main() -> Result<()> {
                         at_s,
                     })
                 }
+                // 段落边界:server 保证的时序信号 —— 必先于下一段的任何事件
+                // (pipeline 线程同线直发,round11 S3)。
+                TurnEvent::ParagraphClosed { paragraph_id } => {
+                    Some(AsrEvent::ParagraphClosed { paragraph_id })
+                }
                 TurnEvent::BatchSentence { paragraph_id, sentence_id, text } => {
                     Some(AsrEvent::BatchSentence { paragraph_id, sentence_id, text })
                 }

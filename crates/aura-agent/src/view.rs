@@ -80,6 +80,17 @@ pub enum AsrEvent {
         text: String,
         at_s: f64,
     },
+    /// 段落边界关闭(VAD 大停顿/整段超时;round11 S3)—— **时序保证**:本
+    /// 事件先于下一段落的任何事件到达(server 在同一 pipeline 线程按 VAD
+    /// 顺序直发)。客户端收到即知道该段文本已定格:可立即进定稿历史(以
+    /// 流式/拼接文本占位),后续 `batch_window` / `window_calibration` 按
+    /// `window_id` 修订替换。旧消费者(web SPA)不认识新 tag 会忽略 ——
+    /// 不破坏既有客户端。
+    #[serde(rename = "paragraph_closed")]
+    ParagraphClosed {
+        #[serde(rename = "window_id")]
+        paragraph_id: u64,
+    },
     /// Stage1's per-sentence batch pass for the just-closed sentence (at its EOS).
     #[serde(rename = "batch_segment")]
     BatchSentence {

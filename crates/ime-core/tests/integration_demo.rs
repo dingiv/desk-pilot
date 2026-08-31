@@ -450,7 +450,7 @@ fn asr_command_with_buffer_commits_voice_text() {
     let base = mock_aura();
     let mut eng = eng_with_aura(&base);
     // 直接写 shared voice state(真实 SSE 由 voice server 折叠;这里是测试 mock)。
-    eng.voice_state().set_conn(ime_core::family::magic::voice_state::VoiceConn::Connected);
+    eng.voice_state().set_conn(ime_core::family::magic::VoiceConn::Connected);
     eng.voice_state().seed_final("今天天气不错");
 
     // Type #asr
@@ -477,7 +477,7 @@ fn asr_magic_tick_refreshes_real_ctx_after_voice_advance() {
     let base = mock_aura();
     let eng = eng_with_aura(&base);
     let ctx: usize = 0xCAFE; // fcitx 下 = 真实 InputContext 指针,非 0
-    eng.voice_state().set_conn(ime_core::family::magic::voice_state::VoiceConn::Connected);
+    eng.voice_state().set_conn(ime_core::family::magic::VoiceConn::Connected);
 
     // 在真实 ctx 输入 #asr → Snippet 态,VoiceMember 激活,候选是占位提示。
     let mut before = ImeView::empty();
@@ -562,7 +562,7 @@ fn voice_reconnect_syncs_aura_history() {
     // 给 io 线程时间处理 Attach / health / results。
     std::thread::sleep(Duration::from_millis(300));
 
-    let (finals, _) = eng.voice_state().voice_candidates();
+    let finals = eng.voice_state().finals();
     eprintln!("reconnect finals: {finals:?}");
     assert!(
         finals.iter().any(|f| f.contains("断连期间说的第二句")),

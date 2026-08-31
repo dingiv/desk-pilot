@@ -1,9 +1,11 @@
 //! audio-aura-agent — async HTTP / SSE client SDK for the aura daemon.
 //!
-//! 仅保留 [`AuraClient`] + 共享数据类型。原先的 `AuraAgent` managed-state facade
-//! 已被 ime-core 内部的 voice listener + `SharedVoiceState` 取代 ——
-//! engine 构造时启动 voice listener 长期持有 `AuraClient`,在 IoThread 的
-// tokio runtime 上 await SSE 数据面 + 健康探针。
+//! [`AuraClient`] + 共享数据类型 + **识别事件折叠状态机**
+//! ([`transcript::SharedTranscript`] —— 五类 `AsrEvent` 的段落组装细节收拢在
+//! 此,上层只读高级状态)。原先的 `AuraAgent` managed-state facade 已被
+//! ime-core 内部的 voice listener + `SharedTranscript` 取代 —— engine 构造时
+//! 启动 voice listener 长期持有 `AuraClient`,在 IoThread 的 tokio runtime 上
+//! await SSE 数据面 + 健康探针。
 //!
 //! Stage3 capability trait / rule trigger 见 `capability.rs` / `rules.rs`(保留)。
 
@@ -11,6 +13,7 @@ pub mod capability;
 pub mod client;
 pub mod rules;
 pub mod tool;
+pub mod transcript;
 pub mod view;
 
 pub use capability::{
@@ -26,4 +29,5 @@ pub use rules::{looks_like_concat, stage3_rule_trigger};
 // Light on purpose (no mistralrs/asr): upper layers (desktop-pet, visual-rover, …) depend on
 // THIS crate to talk to the aura-daemon without pulling the GPU inference stack.
 pub use client::AuraClient;
+pub use transcript::{SharedTranscript, Transcript, VoiceConn};
 pub use view::{AsrEvent, AuraStateView, ConfigView, CorrectionView, VadView};

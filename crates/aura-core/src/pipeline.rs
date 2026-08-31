@@ -171,6 +171,15 @@ pub enum TurnEvent<'a> {
     /// Live streaming output for the CURRENT sentence (raw, uncalibrated). Straight from the
     /// consume-loop thread — NOT a Stage2 input (D2: no live-partial calibration).
     StreamFragment { paragraph_id: u64, sentence_id: u64, text: &'a str, at_s: f64 },
+    /// 段落边界关闭(VAD 大停顿/整段超时,consume-loop 线程直发)。
+    ///
+    /// **时序不变式(round11 S3)**:本事件与下一段落的第一个 `StreamFragment`
+    /// 同在 `aura-pipeline` 线程直发、按 VAD 顺序产出 → wire 上**严格有序**:
+    /// `ParagraphClosed(N)` 必先于段落 N+1 的任何事件。客户端收到即知道该段
+    /// 文本已定格 —— 边界时序由 server 保证;此后的 `BatchSentence` /
+    /// `BatchParagraph` / `ParagraphCalibration`(stage2 线程,可能乱序迟到)
+    /// 是按 `paragraph_id` 定位的**修订**,不再是时序依赖。
+    ParagraphClosed { paragraph_id: u64 },
     /// A sentence's batch result (per-sentence batch). ASYNC — arrives AFTER that sentence's
     /// `Batch` (when the batch worker finishes; seconds later for remote ASR).
     BatchSentence { paragraph_id: u64, sentence_id: u64, text: String },
@@ -342,6 +351,12 @@ impl Pipeline {
                     });
                 }
                 ev @ (Stage1Event::Batch { .. } | Stage1Event::ParagraphEdge { .. }) => {
+                    // 段落边界 → **先**在本线程直发 ParagraphClosed(与下一段的
+                    // StreamFragment 同线程,时序不变式成立),**再**转 stage2
+                    // 慢速定稿通道。
+                    if let Stage1Event::ParagraphEdge { paragraph } = &ev {
+                        on_turn(TurnEvent::ParagraphClosed { paragraph_id: paragraph.id });
+                    }
                     if tx.send(ev).is_err() {
                         tracing::error!("stage2 worker gone — dropping event");
                     }

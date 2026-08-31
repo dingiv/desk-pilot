@@ -47,6 +47,9 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 println!("[{t}] stream    w{paragraph_id}/s{sentence_id} | {text}")
             }
+            AsrEvent::ParagraphClosed { paragraph_id } => {
+                println!("[{t}] CLOSED    w{paragraph_id} | (边界:文本定格,定稿修订稍后)")
+            }
             AsrEvent::BatchSentence {
                 paragraph_id,
                 sentence_id,

@@ -14,10 +14,13 @@ mod clip;
 mod concat;
 mod del;
 mod member;
-pub mod voice_state;
-pub use voice_state::SharedVoiceState;
 pub mod expander;
 mod req;
+
+// 语音识别事件折叠已归位 aura-agent(round11):五类 AsrEvent 的段落组装是
+// aura 协议细节,上层只读高级状态。此处 re-export 供 ime-core 内部引用。
+pub use audio_aura_agent::VoiceConn;
+pub use audio_aura_agent::SharedTranscript;
 mod snippet;
 mod translate;
 mod voice;
@@ -42,17 +45,17 @@ use req::ReqMember;
 
 use crate::store::snippet_md::SnippetEntry;
 
-/// SharedVoiceState 槽 —— voice listener task 在 IoThread 上折叠 SSE 段写入,
+/// SharedTranscript 槽 —— voice listener task 在 IoThread 上折叠 SSE 段写入,
 /// 魔法成员 (`#asr` / `#submit`) 同步读。引擎构造时一次性注入。
 #[derive(Default)]
-pub struct VoiceStateSlot(Mutex<Option<Arc<voice_state::SharedVoiceState>>>);
+pub struct VoiceStateSlot(Mutex<Option<Arc<SharedTranscript>>>);
 
 impl VoiceStateSlot {
-    pub fn set(&self, state: Arc<voice_state::SharedVoiceState>) {
+    pub fn set(&self, state: Arc<SharedTranscript>) {
         *self.0.lock().unwrap() = Some(state);
     }
 
-    pub fn get(&self) -> Option<Arc<voice_state::SharedVoiceState>> {
+    pub fn get(&self) -> Option<Arc<SharedTranscript>> {
         self.0.lock().unwrap().clone()
     }
 }
@@ -96,7 +99,7 @@ impl MagicResources {
     }
 
     /// 取 shared voice state(未注入时 None —— 测试 / 未接线场景)。
-    pub fn voice_state(&self) -> Option<Arc<voice_state::SharedVoiceState>> {
+    pub fn voice_state(&self) -> Option<Arc<SharedTranscript>> {
         self.voice_state.get()
     }
 
@@ -440,7 +443,7 @@ impl MagicFamily {
 
     /// Attach the shared voice state — voice listener task 与魔法成员都通过它
     /// 读 / 写。引擎构造时自动调一次(随 `with_config`),外部不需要再调。
-    pub fn set_voice_state(&self, state: Arc<voice_state::SharedVoiceState>) {
+    pub fn set_voice_state(&self, state: Arc<SharedTranscript>) {
         self.resources.voice_state.set(state);
     }
 
@@ -618,7 +621,7 @@ mod tests {
         // the same voice state / req base after a late set_* call.
         let fam = MagicFamily::new();
         let clone = fam.clone();
-        let state = Arc::new(voice_state::SharedVoiceState::new());
+        let state = Arc::new(SharedTranscript::new());
         fam.set_voice_state(Arc::clone(&state));
         assert!(clone.resources().voice_state.get().is_some(), "voice state shared");
         fam.set_req_base("http://example.test:9/x");

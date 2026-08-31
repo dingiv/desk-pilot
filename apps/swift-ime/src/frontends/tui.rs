@@ -84,7 +84,7 @@ pub fn run_input_mode(cfg: &TuiConfig) {
 
 /// Build the IME engine with all config applied. Returns the engine and the shared voice state
 /// (for callers that want to inspect / seed voice data — TUI mocks can `seed_final` here).
-pub fn build_engine(cfg: &TuiConfig) -> (ImeEngine, Arc<ime_core::family::magic::SharedVoiceState>) {
+pub fn build_engine(cfg: &TuiConfig) -> (ImeEngine, Arc<ime_core::family::magic::SharedTranscript>) {
     let sw_cfg = if let Some(ref path) = cfg.config {
         match std::fs::read_to_string(path) {
             Ok(yaml) => match serde_yaml::from_str::<crate::config::SwiftImeConfig>(&yaml) {
@@ -200,7 +200,7 @@ pub fn build_engine(cfg: &TuiConfig) -> (ImeEngine, Arc<ime_core::family::magic:
     let voice_state = engine.voice_state();
     if let Some(ref text) = cfg.asr_text {
         // mock:先种状态再冻结(listener 不连 aura、conn 不被覆盖),seed 稳定可见。
-        voice_state.set_conn(ime_core::family::magic::voice_state::VoiceConn::Connected);
+        voice_state.set_conn(ime_core::family::magic::VoiceConn::Connected);
         voice_state.set_mock(true);
         voice_state.seed_final(text);
         crate::ime_log!("asr mock text: {text}");
@@ -225,7 +225,7 @@ pub fn build_engine(cfg: &TuiConfig) -> (ImeEngine, Arc<ime_core::family::magic:
 
 // ── Async wait ─────────────────────────────────────────────────────────
 
-fn wait_for_voice(state: &ime_core::family::magic::SharedVoiceState, timeout_secs: u64) {
+fn wait_for_voice(state: &ime_core::family::magic::SharedTranscript, timeout_secs: u64) {
     if !state.snapshot().is_empty() { return; }
     let timeout = Duration::from_secs(timeout_secs);
     let start = Instant::now();
@@ -243,7 +243,7 @@ fn wait_for_voice(state: &ime_core::family::magic::SharedVoiceState, timeout_sec
 // ── Candidate display ──────────────────────────────────────────────────
 
 fn show_candidates_with_async(
-    engine: &mut ImeEngine, state: &ime_core::family::magic::SharedVoiceState, input: &str,
+    engine: &mut ImeEngine, state: &ime_core::family::magic::SharedTranscript, input: &str,
     top_n: usize, verbose: bool, async_wait_secs: u64,
 ) -> Vec<String> {
     for c in input.chars() { engine.predict(KeyEvent::char(c)); }
@@ -399,7 +399,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::ExecutableCommand;
 use ime_core::fsm::state::KeyKind;
-use ime_core::family::magic::SharedVoiceState;
+use ime_core::family::magic::SharedTranscript;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -620,7 +620,7 @@ fn socket_loop(listener: UnixListener, shared: Arc<SharedIme>) {
 // ── TUI rendering loop(共享引擎)───────────────────────────────────────
 
 /// TUI 主循环(engine 由 socket 共享)。Ctrl+Q / Ctrl+C 退出。
-fn run_tui(shared: &Arc<SharedIme>, voice_state: &SharedVoiceState) -> io::Result<()> {
+fn run_tui(shared: &Arc<SharedIme>, voice_state: &SharedTranscript) -> io::Result<()> {
     enable_raw_mode()?;
     io::stdout().execute(crossterm::terminal::EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -633,7 +633,7 @@ fn run_tui(shared: &Arc<SharedIme>, voice_state: &SharedVoiceState) -> io::Resul
 fn tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     shared: &Arc<SharedIme>,
-    voice_state: &SharedVoiceState,
+    voice_state: &SharedTranscript,
 ) -> io::Result<()> {
     draw_once(terminal, shared, voice_state)?;
 
@@ -681,7 +681,7 @@ fn tui_loop(
 fn draw_once(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     shared: &Arc<SharedIme>,
-    voice_state: &SharedVoiceState,
+    voice_state: &SharedTranscript,
 ) -> io::Result<()> {
     let view = shared.current_view();
     let (detailed, flags) = shared.render_meta();
@@ -724,7 +724,7 @@ fn render(
     f: &mut Frame,
     view: &ImeView,
     history: &[String],
-    voice_state: &SharedVoiceState,
+    voice_state: &SharedTranscript,
     detailed: &[ime_core::family::RankedCandidate],
     flags: ime_core::fsm::state::StateFlags,
 ) {
@@ -824,7 +824,7 @@ fn render_history(f: &mut Frame, area: Rect, history: &[String]) {
 fn render_status(
     f: &mut Frame,
     area: Rect,
-    voice_state: &SharedVoiceState,
+    voice_state: &SharedTranscript,
     flags: ime_core::fsm::state::StateFlags,
 ) {
     let voice = voice_state.snapshot();

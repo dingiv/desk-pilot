@@ -36,7 +36,7 @@ use tokio::select;
 use tokio::sync::mpsc;
 
 use crate::frontend::{FrontEndHandle, StateView};
-use crate::family::magic::SharedVoiceState;
+use crate::family::magic::SharedTranscript;
 
 /// 魔法命令发给 I/O 线程的异步工作请求。
 ///
@@ -126,7 +126,7 @@ impl IoThread {
     pub fn spawn(
         frontend: Weak<dyn FrontEndHandle>,
         voice_base: String,
-        voice_state: Arc<SharedVoiceState>,
+        voice_state: Arc<SharedTranscript>,
         idle_timeout_secs: u64,
     ) -> Self {
         let rt = Arc::new(
@@ -204,7 +204,7 @@ type SseSource = Pin<Box<dyn Future<Output = Option<(AsrEvent, Sse)>>>>;
 /// 循环持有,方法经参数借用(与 `select!` 的臂借用互不重叠)。
 struct VoiceSession {
     base: String,
-    state: Arc<SharedVoiceState>,
+    state: Arc<SharedTranscript>,
     /// 当前有活 `#asr` 会话的 ctx;-1 = 无。
     active_ctx: i64,
     /// 是否持有 aura SSE 源(连接中)。
@@ -216,7 +216,7 @@ struct VoiceSession {
 }
 
 impl VoiceSession {
-    fn new(base: String, state: Arc<SharedVoiceState>, idle_timeout_secs: u64) -> Self {
+    fn new(base: String, state: Arc<SharedTranscript>, idle_timeout_secs: u64) -> Self {
         VoiceSession {
             base,
             state,
@@ -250,9 +250,9 @@ impl VoiceSession {
                 Ok(client) => {
                     let ok = client.health().await.unwrap_or(false);
                     self.state.set_conn(if ok {
-                        crate::family::magic::voice_state::VoiceConn::Connected
+                        crate::family::magic::VoiceConn::Connected
                     } else {
-                        crate::family::magic::voice_state::VoiceConn::Failed
+                        crate::family::magic::VoiceConn::Failed
                     });
                     tracing::info!(connected = ok, "voice attach → spawn stream");
                     // **重连全量同步**:断连期间 aura 可能已定稿若干句
@@ -289,9 +289,9 @@ impl VoiceSession {
                         // 负责;流内部的退避重试一律按不可用处理。)
                         use audio_aura_agent::client::SseConnState as S;
                         let v = if c == S::Connected {
-                            crate::family::magic::voice_state::VoiceConn::Connected
+                            crate::family::magic::VoiceConn::Connected
                         } else {
-                            crate::family::magic::voice_state::VoiceConn::Failed
+                            crate::family::magic::VoiceConn::Failed
                         };
                         st.set_conn(v);
                         notify_conn(&fe, -1); // 广播:有 #asr 的 ctx 刷新
@@ -303,7 +303,7 @@ impl VoiceSession {
                 }
                 Err(e) => {
                     tracing::error!(error = %e, base = %self.base, "voice: AuraClient::new failed");
-                    self.state.set_conn(crate::family::magic::voice_state::VoiceConn::Failed);
+                    self.state.set_conn(crate::family::magic::VoiceConn::Failed);
                     // 连接失败 → 及时汇报前端(否则 UI 停在"正在连接")。
                     notify_conn(frontend, self.active_ctx);
                 }
@@ -345,7 +345,7 @@ impl VoiceSession {
         self.state.fold_event(ev);
         // 收到句事件 = 已连上(即使 Attach 时 health 误判为断,段也证活)。
         self.state
-            .set_conn(crate::family::magic::voice_state::VoiceConn::Connected);
+            .set_conn(crate::family::magic::VoiceConn::Connected);
         // 后台语音也算活动 —— 空闲超时只在"无 #asr 且无语音"时断开。
         self.last_activity = tokio::time::Instant::now();
         tracing::info!(?ev, "voice event folded");
@@ -360,7 +360,7 @@ impl VoiceSession {
         tracing::warn!("voice SSE stream ended → 丢源,不重连");
         self.connected = false;
         self.state
-            .set_conn(crate::family::magic::voice_state::VoiceConn::Failed);
+            .set_conn(crate::family::magic::VoiceConn::Failed);
         // 流断 → 及时汇报前端,UI 从 🎙 切到「语音服务暂不可用」。
         notify_conn(frontend, self.active_ctx);
     }
@@ -389,7 +389,7 @@ impl VoiceSession {
         sources.clear(); // drop SSE 源 → reqwest 连接关闭。
         self.connected = false;
         self.state
-            .set_conn(crate::family::magic::voice_state::VoiceConn::Failed);
+            .set_conn(crate::family::magic::VoiceConn::Failed);
         // 空闲断连发生在后台(active_ctx < 0)→ 广播,让打开的 #asr
         // 上下文从 🎙 切到「语音服务暂不可用」。
         notify_conn(frontend, self.active_ctx);
@@ -543,7 +543,7 @@ mod tests {
     fn attach_drain_stores_handle() {
         // smoke: spawn 不 panic。
         let front: Arc<dyn FrontEndHandle> = Arc::new(crate::frontend::NoopFrontend::default());
-        let state = Arc::new(SharedVoiceState::new());
+        let state = Arc::new(SharedTranscript::new());
         let io = IoThread::spawn(
             Arc::downgrade(&front),
             "http://127.0.0.1:1".into(),
@@ -665,7 +665,7 @@ mod tests {
             refresh_count.clone(),
             refresh_ctxs.clone(),
         ));
-        let state = Arc::new(SharedVoiceState::new());
+        let state = Arc::new(SharedTranscript::new());
         let base = format!("http://127.0.0.1:{port}");
         let io = IoThread::spawn(
             Arc::downgrade(&front),
@@ -680,7 +680,7 @@ mod tests {
         // 等 voice server 连上并折叠 stream_fragment → "你好"。
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let (_, live) = state.voice_candidates();
+            let live = state.live();
             if live == "你好" {
                 break;
             }

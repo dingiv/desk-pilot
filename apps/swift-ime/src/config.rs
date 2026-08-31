@@ -269,7 +269,6 @@ fn default_70() -> u32 { 70 }
 fn default_60() -> u32 { 60 }
 fn default_0_88() -> f64 { 0.88 }
 fn default_0_85() -> f64 { 0.85 }
-fn default_0_55() -> f64 { 0.55 }
 fn default_0_5() -> f64 { 0.5 }
 fn default_0_7() -> f64 { 0.7 }
 fn default_0_02() -> f64 { 0.02 }

@@ -131,11 +131,40 @@ aura 端 `paragraph_id` 单调递增,它是比"到达顺序"更强的顺序信�
 sync_history/is_mock)、`magic/voice.rs`(候选构建)、`engine.rs`(mock
 接线)—— 只改 use 路径与 API 名,逻辑不动。
 
-### S3 — daemon 保序手术(暂缓,留观)
+### S3 — daemon 保序:边界信号与慢速定稿解耦(已实施,S2 实测后立项)
 
-pipeline 出口加全局序号 / 跨段握手。S2 的 id 全序让客户端**不再依赖**
-到达顺序,S3 大概率永远不必做。若后续发现 aura 端其他消费者(web SPA)
-也受失序之苦再立项。
+> S2 初版实测暴露"未定稿段堆叠拼接"缺陷(修订为"首选只跟活动段 +
+> 关闭即进 finals")后,用户进一步指出:**客户端补漏是补不完的,server
+> 必须从一开始就发出正确的时序** —— 本节据此立项实施。
+
+**正确的时序 ≠ 全局串行**。定稿(LLM 整流)物理上就是秒级慢路径,若要求
+段 N 定稿发出后才能发段 N+1 的流式,流式显示会被卡死。真正必须由 server
+保证的是**边界时序**:
+
+> **段落边界信号必须在下一段落的任何事件之前到达客户端。**
+
+实施前,客户端只能靠 `BatchParagraph` 推断段落关闭 —— 而它压着句级
+batch + LLM 整流,从 `aura-stage2` 线程发出,与 `aura-pipeline` 线程
+直发的下一段 `StreamFragment` 是竞态。而 VAD 的段落关闭
+(`Stage1Event::ParagraphEdge`)**本来就在 pipeline 线程上、时间上先于段
+N+1 的所有事件** —— 有序发射点天然存在,只是没变成 wire 事件。
+
+**修法(语义解耦,四点一线)**:
+
+| 层 | 改动 |
+|---|---|
+| `aura-core/pipeline.rs` | `TurnEvent::ParagraphClosed { paragraph_id }`(新);消费循环在 `ParagraphEdge` 处**先**本线程直发该事件、**再**转 stage2 慢速定稿通道 —— 与下一段 `StreamFragment` 同线程,VAD 顺序产出 → **wire 上严格有序** |
+| `aura-agent/view.rs` | `AsrEvent::ParagraphClosed`(wire tag `paragraph_closed`,wire key `window_id`;旧 SPA 未知 tag 忽略,不破坏既有客户端) |
+| `apps/audio-aura/main.rs` | TurnEvent → AsrEvent 映射 |
+| `aura-agent/transcript.rs` | fold `ParagraphClosed` → 该段关闭:finals 立即以流式拼接占位;`BatchParagraph`(整窗)→ `ParagraphCalibration`(校准)按 id 三级修订替换 |
+
+**语义分层(最终形态)**:
+
+- **server 保证边界时序**(用户的诉求):`ParagraphClosed(N)` 必先于
+  段落 N+1 的任何事件 —— 同线程直发,不是约定而是结构保证;
+- **客户端处理迟到修订**(物理必然):batch/校准事件天然异步乱序,按
+  `paragraph_id` 定位修订替换 —— id 全序逻辑保留,但从"猜测边界"降级
+  为"处理修订",不再是时序依赖。
 
 ## 四、测试与验收
 
@@ -153,3 +182,5 @@ pipeline 出口加全局序号 / 跨段握手。S2 的 id 全序让客户端**�
 | 0 | 本文档 | `docs(aura): round11 立项 — ASR 显示 bug 调查与 transcript 归位` |
 | S1 | client.rs 字节级分帧 + 撕裂回归测试 | `fix(aura-agent): SSE 字节级分帧 — 中文跨 chunk 不再撕裂` |
 | S2 | transcript.rs 归位 + id 全序 + 消费者接线 | `refactor(ime): 语音事件折叠归位 aura-agent — id 全序,跨段乱序鲁棒` |
+| S2 修订 | 实测重复混乱 → 首选只跟活动段 + 关闭即进 finals | `fix(aura-agent): 首选只跟活动段 + 段落关闭即进 finals` |
+| S3 | server 边界时序:ParagraphClosed 解耦(见上) | `feat(aura): ParagraphClosed 边界信号 — server 保证段落时序` |

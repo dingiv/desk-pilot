@@ -213,14 +213,24 @@ impl AuraClient {
                             cb(SseConnState::Connected);
                         }
                         let mut bytes = resp.bytes_stream();
-                        let mut buf = String::new();
+                        let mut buf: Vec<u8> = Vec::new();
                         // Drive this connection until it ends/errors, then fall through to reconnect.
                         while let Some(Ok(chunk)) = bytes.next().await {
-                            // SSE frames are ASCII (JSON pings / keep-alive comments) —
-                            // lossy utf8 is safe and never splits a multi-byte char mid-frame.
-                            buf.push_str(&String::from_utf8_lossy(&chunk));
-                            while let Some(idx) = buf.find("\n\n") {
-                                let frame: String = buf.drain(..idx + 2).collect();
+                            // 字节级缓冲:**完整帧**才做 UTF-8 解码。识别文本是
+                            // 中文(多字节),TCP 分片会把字符拦腰斩断 —— 逐
+                            // chunk lossy 解码会把半截字符变 U+FFFD(显示缺字)。
+                            // 帧分隔 `\n\n` 是 ASCII(0x0A),不可能出现在多字节
+                            // 序列中间(续字节 ≥ 0x80),字节级搜索安全。
+                            buf.extend_from_slice(&chunk);
+                            while let Some(idx) = buf.windows(2).position(|w| w == b"\n\n") {
+                                let frame: Vec<u8> = buf.drain(..idx + 2).collect();
+                                let frame = String::from_utf8_lossy(&frame);
+                                // broadcast 欠载标记(round11 审计):server 丢帧后
+                                // 只发 `: lagged` comment —— 若不留痕,客户端根本
+                                // 不知道中间缺了事件(苦等"永远不来的结束事件")。
+                                if frame.lines().any(|l| l.trim_start().starts_with(": lagged")) {
+                                    tracing::warn!("aura SSE lagged — server 丢弃了积压事件,本地序列有空洞");
+                                }
                                 for payload in data_payloads(&frame) {
                                     yield payload.to_string();
                                 }
@@ -287,8 +297,9 @@ impl AuraClient {
             let data = self.sse_data(url, None);
             tokio::pin!(data);
             while let Some(payload) = data.next().await {
-                if let Ok(seg) = serde_json::from_str::<AsrEvent>(&payload) {
-                    yield seg;
+                match parse_event(&payload) {
+                    Some(seg) => yield seg,
+                    None => continue,
                 }
             }
         }
@@ -313,8 +324,9 @@ impl AuraClient {
             let data = self.sse_data(url, on_conn);
             tokio::pin!(data);
             while let Some(payload) = data.next().await {
-                if let Ok(seg) = serde_json::from_str::<AsrEvent>(&payload) {
-                    yield seg;
+                match parse_event(&payload) {
+                    Some(seg) => yield seg,
+                    None => continue,
                 }
             }
         }
@@ -330,9 +342,24 @@ fn data_payloads(frame: &str) -> impl Iterator<Item = &str> {
         .filter(|s| !s.is_empty())
 }
 
+/// 解析一个 data payload 为 [`AsrEvent`]。解析失败**不静默**:round11 审计
+/// 发现 `if let Ok` 会把不匹配的事件(unknown tag / wire 字段变化)无声扔掉
+/// —— 前端苦等 sentence/paragraph 结束事件的头号嫌疑。丢弃必须留痕。
+fn parse_event(payload: &str) -> Option<AsrEvent> {
+    match serde_json::from_str::<AsrEvent>(payload) {
+        Ok(seg) => Some(seg),
+        Err(e) => {
+            let head: String = payload.chars().take(120).collect();
+            tracing::warn!(error = %e, payload = %head, "aura SSE 事件解析失败,已丢弃(wire 契约不匹配?)");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::data_payloads;
+    use crate::view::AsrEvent;
 
     #[test]
     fn extracts_data_payloads() {
@@ -347,5 +374,40 @@ mod tests {
         // keep-alive comments (axum KeepAlive) and event/id lines carry no data.
         assert_eq!(data_payloads(": keep-alive\n").collect::<Vec<_>>(), Vec::<&str>::new());
         assert_eq!(data_payloads("event: ping\ndata:\n").collect::<Vec<_>>(), Vec::<&str>::new());
+    }
+
+    /// 回归(round11 Bug 1):中文跨 TCP chunk 撕裂不得产生 U+FFFD。
+    /// 逐字节喂入 —— 任何"逐 chunk 解码"的实现都会把多字节字符斩断。
+    #[test]
+    fn multibyte_text_split_across_chunks_survives() {
+        let json = serde_json::json!({
+            "type": "stream_fragment",
+            "window_id": 1,
+            "segment_id": 1,
+            "text": "你好世界,语音识别文本",
+            "at_s": 1.5
+        })
+        .to_string();
+        let frame = format!("data: {json}\n\n");
+        let bytes = frame.as_bytes();
+
+        // 逐字节过一遍与 sse_data 相同的分帧逻辑,重组 payload。
+        let mut buf: Vec<u8> = Vec::new();
+        let mut payloads = Vec::new();
+        for b in bytes {
+            buf.push(*b);
+            while let Some(idx) = buf.windows(2).position(|w| w == b"\n\n") {
+                let frame: Vec<u8> = buf.drain(..idx + 2).collect();
+                let frame = String::from_utf8_lossy(&frame);
+                payloads.extend(data_payloads(&frame).map(str::to_string));
+            }
+        }
+        assert_eq!(payloads.len(), 1);
+        let ev: AsrEvent = serde_json::from_str(&payloads[0]).expect("valid AsrEvent json");
+        match ev {
+            AsrEvent::StreamFragment { text, .. } => assert_eq!(text, "你好世界,语音识别文本"),
+            other => panic!("wrong event: {other:?}"),
+        }
+        assert!(!payloads[0].contains('\u{FFFD}'), "no replacement chars");
     }
 }
