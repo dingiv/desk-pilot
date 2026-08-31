@@ -217,7 +217,7 @@ fn compose_single_char_options_reach_jian_tail() {
     // 断言走 view.candidates(用户真实可见的槽位,非 candidates_detailed
     // 镜像 —— 后者不含 Layer 3 造词单字区)。
     use ime_core::frontend::ImeView;
-    use ime_core::fsm::router::{KeyKind, KeyEvent};
+    use ime_core::fsm::state::{KeyKind, KeyEvent};
     let mut e = engine();
     let mut v = ImeView::empty();
     for ch in "jianshipin".chars() {

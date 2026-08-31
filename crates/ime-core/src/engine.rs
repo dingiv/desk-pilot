@@ -1,6 +1,6 @@
 //! ImeEngine — the single integration point for all frontends.
 //!
-//! Manages per-context [`StateMachine`]s and
+//! Manages per-context [`FamilyPipeline`]s and
 //! short-term [`InputContext`]. Supports both multi-context (fcitx5,
 //! one engine per process) and single-context (mock, tests) usage.
 //!
@@ -28,30 +28,31 @@ use std::sync::{Arc, Mutex};
 
 use crate::family::magic::{MagicFamily, ReqFetcher};
 use crate::family::InputContext;
-use crate::fsm::router::{StateFlags, StateMachineTable};
+use crate::fsm::family::FamilyPipeline;
+use crate::fsm::family::StepEnv;
 // 统一键事件由输入路由层定义(旧名 InputEvent;构造器同名,测试平移)。
+pub use crate::fsm::state::{KeyEvent, StateFlags};
+use crate::fsm::state::StateMachine;
 use crate::frontend::ImeView;
-pub use crate::fsm::router::KeyEvent;
-use crate::fsm::state::{StateMachine, StepEnv};
 use crate::store::PersistenceManager;
 use crate::store::snippet_md::*;
 
 // ── PerContext ──────────────────────────────────────────────────────────
 
 struct PerContext {
-    sm: StateMachine,
+    pipeline: FamilyPipeline,
     /// 输入路由层的状态机表(标志位寄存器)—— 每键路由后同步。
-    table: StateMachineTable,
+    table: StateMachine,
     text_context: InputContext,
 }
 
 impl PerContext {
     fn with_page_size(page_size: u32, candidate_meta: bool) -> Self {
-        let mut sm = StateMachine::with_page_size(page_size);
-        sm.candidate_meta_enabled = candidate_meta;
+        let mut pipeline = FamilyPipeline::with_page_size(page_size);
+        pipeline.candidate_meta_enabled = candidate_meta;
         PerContext {
-            sm,
-            table: StateMachineTable::new(),
+            pipeline,
+            table: StateMachine::new(),
             text_context: InputContext::new(),
         }
     }
@@ -88,7 +89,7 @@ pub struct ImeEngine {
     /// `set_variable` writes through it so `$CLIPBOARD`-style templates resolve fresh.
     provider: Arc<dyn crate::family::magic::expander::VariableProvider>,
     /// 候选每页条数(swift-ime.yaml → input.page_size;默认 7)。传给每个新建的
-    /// StateMachine —— 之前写死在 `StateMachine::new` 里(FIXME)。
+    /// FamilyPipeline —— 之前写死在 `FamilyPipeline::new` 里(FIXME)。
     page_size: u32,
     /// 调试模式:候选词显示提供者与权重(swift-ime.yaml → debug.candidate_meta)。
     candidate_meta: bool,
@@ -288,7 +289,7 @@ impl ImeEngine {
         let pc = map
             .entry(ctx)
             .or_insert_with(|| PerContext::with_page_size(self.page_size, self.candidate_meta));
-        pc.sm.ctx = ctx;
+        pc.pipeline.ctx = ctx;
         f(self, pc)
     }
 
@@ -297,7 +298,7 @@ impl ImeEngine {
     pub fn set_candidate_meta(&mut self, on: bool) {
         self.candidate_meta = on;
         for pc in self.contexts.lock().unwrap().values_mut() {
-            pc.sm.candidate_meta_enabled = on;
+            pc.pipeline.candidate_meta_enabled = on;
         }
     }
 
@@ -326,7 +327,7 @@ impl ImeEngine {
         }
         self.page_size = page_size;
         for pc in self.contexts.lock().unwrap().values_mut() {
-            pc.sm.panel.page_size = page_size as usize;
+            pc.pipeline.panel.page_size = page_size as usize;
         }
     }
 
@@ -336,7 +337,7 @@ impl ImeEngine {
         // live member(如 VoiceMember)需要显式 deactivate 才能取消后台工作。
         let mut map = self.contexts.lock().unwrap();
         if let Some(mut pc) = map.remove(&ctx) {
-            if let Some(mut m) = pc.sm.magic.active.take() {
+            if let Some(mut m) = pc.pipeline.magic.active.take() {
                 m.deactivate(ctx);
             }
         }
@@ -351,20 +352,20 @@ impl ImeEngine {
     /// 不再自行拦截任何键。
     pub fn key_ctx(&self, ctx: usize, key: KeyEvent) -> ImeView {
         self.with_ctx(ctx, |disp, pc| {
-            pc.sm.context = pc.text_context.clone();
-            let view = pc.table.route(&mut pc.sm, key, disp);
+            pc.pipeline.context = pc.text_context.clone();
+            let view = pc.table.step(&mut pc.pipeline, key, disp);
             let committed = ImeView::str_field(&view.commit_text);
             // FIXME: 这个业务逻辑应该放在 route 内部, 放的位置太靠外了
             if !committed.is_empty() {
                 pc.text_context.update(committed);
                 // Record bigram / recency(E2:按提交家族分派到对应家族表)。
-                let commit_family = pc.sm.last_commit_family;
+                let commit_family = pc.pipeline.last_commit_family;
                 self.record_commit(committed, commit_family);
                 // `#del` 的 del_len 选项用:记录本次提交的字符数。
                 self.record_last_commit_len(committed);
                 // 提交来源是英文候选 → 已是在词典中的词,不学成自生词
                 // (空格/数字提交英文候选的陈旧 bug)。
-                if pc.sm.take_last_commit_family() != Some("english") {
+                if pc.pipeline.take_last_commit_family() != Some("english") {
                     self.learn_english_if_ascii(committed);
                 }
             }
@@ -391,23 +392,23 @@ impl ImeEngine {
     /// Select a candidate by index for a given context.
     pub fn select_ctx(&self, ctx: usize, index: usize) -> ImeView {
         self.with_ctx(ctx, |disp, pc| {
-            pc.sm.context = pc.text_context.clone();
-            let view = pc.sm.select(index, disp);
+            pc.pipeline.context = pc.text_context.clone();
+            let view = pc.pipeline.select(index, disp);
             let committed = ImeView::str_field(&view.commit_text);
             if !committed.is_empty() {
                 pc.text_context.update(committed);
                 // E2:按提交家族分派 recency 记录。
-                let commit_family = pc.sm.last_commit_family;
+                let commit_family = pc.pipeline.last_commit_family;
                 self.record_commit(committed, commit_family);
                 // `#del` 的 del_len 选项用:记录本次提交的字符数。
                 self.record_last_commit_len(committed);
                 // 英文候选提交 → 不学成自生词(空格/数字提交的陈旧 bug)。
-                if pc.sm.take_last_commit_family() != Some("english") {
+                if pc.pipeline.take_last_commit_family() != Some("english") {
                     self.learn_english_if_ascii(committed);
                 }
             }
-            // 路由之外的 sm 变更 —— 状态机表重新同步。
-            pc.table.sync_from(&pc.sm);
+            // 路由之外的 pipeline 变更 —— 状态机表重新同步。
+            pc.table.sync_from(&pc.pipeline);
             view
         })
     }
@@ -415,8 +416,8 @@ impl ImeEngine {
     /// Reset engine state for a context.
     pub fn reset_ctx(&self, ctx: usize) {
         self.with_ctx(ctx, |_env, pc| {
-            pc.sm.reset();
-            pc.table.sync_from(&pc.sm);
+            pc.pipeline.reset();
+            pc.table.sync_from(&pc.pipeline);
         });
     }
 
@@ -436,12 +437,12 @@ impl ImeEngine {
         };
         // 候选(英文按键入大小写回填)优先,否则提交原始输入 raw_buffer。
         let text = pc
-            .sm
+            .pipeline
             .panel
             .items
             .first()
-            .map(|c| crate::fsm::state::apply_input_casing(c, &pc.sm.comp.raw_buffer))
-            .unwrap_or_else(|| pc.sm.comp.raw_buffer.clone());
+            .map(|c| crate::fsm::family::apply_input_casing(c, &pc.pipeline.comp.raw_buffer))
+            .unwrap_or_else(|| pc.pipeline.comp.raw_buffer.clone());
         let mut v = ImeView::empty();
         if !text.is_empty() {
             ImeView::set_str(&mut v.commit_text, &text);
@@ -481,15 +482,15 @@ impl ImeEngine {
             .get(&DEFAULT_CTX)
             .map(|pc| {
                 let mut v = ImeView::empty();
-                v.candidate_count = pc.sm.panel.items.len().min(16) as u32;
-                v.candidate_highlight = pc.sm.panel.highlight as u32;
-                v.candidate_page = pc.sm.panel.page as u32;
-                v.candidate_page_size = pc.sm.panel.page_size as u32;
-                for (i, c) in pc.sm.panel.items.iter().take(16).enumerate() {
+                v.candidate_count = pc.pipeline.panel.items.len().min(16) as u32;
+                v.candidate_highlight = pc.pipeline.panel.highlight as u32;
+                v.candidate_page = pc.pipeline.panel.page as u32;
+                v.candidate_page_size = pc.pipeline.panel.page_size as u32;
+                for (i, c) in pc.pipeline.panel.items.iter().take(16).enumerate() {
                     ImeView::set_str(&mut v.candidates[i].text, c);
                     // 调试模式:meta 与 fill_view 对齐。
-                    if pc.sm.candidate_meta_enabled {
-                        if let Some(m) = pc.sm.panel.meta.get(i) {
+                    if pc.pipeline.candidate_meta_enabled {
+                        if let Some(m) = pc.pipeline.panel.meta.get(i) {
                             ImeView::set_str(
                                 &mut v.candidates[i].meta,
                                 &format!("[{:.3} {}/{}]", m.score, m.family, m.source),
@@ -497,8 +498,8 @@ impl ImeEngine {
                         }
                     }
                 }
-                ImeView::set_str(&mut v.preedit_text, &pc.sm.comp.preedit);
-                v.preedit_cursor = pc.sm.comp.cursor as u32;
+                ImeView::set_str(&mut v.preedit_text, &pc.pipeline.comp.preedit);
+                v.preedit_cursor = pc.pipeline.comp.cursor as u32;
                 v
             })
             .unwrap_or_else(ImeView::empty)
@@ -510,7 +511,7 @@ impl ImeEngine {
             .lock()
             .unwrap()
             .get(&DEFAULT_CTX)
-            .map(|pc| pc.sm.comp.buffer.clone())
+            .map(|pc| pc.pipeline.comp.buffer.clone())
             .unwrap_or_default()
     }
 
@@ -520,7 +521,7 @@ impl ImeEngine {
             .lock()
             .unwrap()
             .get(&DEFAULT_CTX)
-            .map(|pc| pc.sm.panel.items.clone())
+            .map(|pc| pc.pipeline.panel.items.clone())
             .unwrap_or_default()
     }
 
@@ -560,12 +561,12 @@ impl ImeEngine {
     /// 候选元数据(与 [`candidates`](Self::candidates) 同序)—— 测试断言
     /// meta 对齐用;调试视图经 view.candidates[].meta 走 fill_view。
     #[cfg(test)]
-    pub(crate) fn last_meta(&self) -> Vec<crate::fsm::state::CandMeta> {
+    pub(crate) fn last_meta(&self) -> Vec<crate::fsm::family::CandMeta> {
         self.contexts
             .lock()
             .unwrap()
             .get(&DEFAULT_CTX)
-            .map(|pc| pc.sm.panel.meta.to_vec())
+            .map(|pc| pc.pipeline.panel.meta.to_vec())
             .unwrap_or_default()
     }
 
@@ -580,9 +581,9 @@ impl ImeEngine {
         };
         // Snippet state (命令组合):candidates 来自命令预测 / 补全,不是 scorer。
         // 直接返回,让 #asr 语音 / 命令补全提示正确显示。
-        if pc.sm.state == crate::fsm::state::ComposeState::Snippet && pc.sm.panel.fresh {
+        if pc.pipeline.state == crate::fsm::family::ComposeState::Snippet && pc.pipeline.panel.fresh {
             let family: &'static str = pc
-                .sm.magic.active
+                .pipeline.magic.active
                 .as_ref()
                 .map(|m| {
                     if m.name().is_empty() {
@@ -593,7 +594,7 @@ impl ImeEngine {
                 })
                 .unwrap_or("magic");
             return pc
-                .sm
+                .pipeline
                 .panel
                 .items
                 .iter()
@@ -609,7 +610,7 @@ impl ImeEngine {
         // 提交对象)同源,含 promote_single_letter 与 Layer 3 造词单字区。
         // 旧实现独立重算 rank_detailed + promote(无造词区),镜像与机器
         // 候选分叉 —— 探针/调试/aura 拿到的不是用户看见的东西。
-        let detailed = pc.sm.detailed();
+        let detailed = pc.pipeline.detailed();
         detailed
     }
 
@@ -713,32 +714,32 @@ impl ImeEngine {
 
     pub fn magic_tick_ctx(&self, ctx: usize) -> Option<ImeView> {
         self.with_ctx(ctx, |disp, pc| {
-            use crate::fsm::state::ComposeState;
+            use crate::fsm::family::ComposeState;
             // 排查流式不刷新:每个 drain 是否到这里、state/has_member 是否正常。
             tracing::info!(
                 ctx,
-                state = ?pc.sm.state,
-                has_member = pc.sm.magic.active.is_some(),
+                state = ?pc.pipeline.state,
+                has_member = pc.pipeline.magic.active.is_some(),
                 "magic_tick_ctx"
             );
-            if pc.sm.state != ComposeState::Snippet {
+            if pc.pipeline.state != ComposeState::Snippet {
                 return None; // not composing a command for this ctx — common
             }
             // The member is taken out so its tick can freely mutate the state
             // machine, then put back (the member may have exited itself).
-            let mut member = pc.sm.magic.active.take()?;
+            let mut member = pc.pipeline.magic.active.take()?;
             let new_preds =
-                member.tick(pc.sm.ctx, &pc.sm.comp.buffer.clone(), disp);
+                member.tick(pc.pipeline.ctx, &pc.pipeline.comp.buffer.clone(), disp);
             // Live 成员的 tick 当前返回 None(由 listener 主动 refresh_ui 触发);
             // 但 frontend 拉 magic_tick 时仍要拿到最新候选 —— 重新调 predict 一次。
             let preds = new_preds.unwrap_or_else(|| {
-                let input = pc.sm.comp.buffer.clone();
+                let input = pc.pipeline.comp.buffer.clone();
                 member.predict(ctx, &input, disp)
             });
-            pc.sm.magic.active = Some(member);
-            pc.sm.magic.predictions = preds;
-            pc.table.sync_from(&pc.sm);
-            let view = pc.sm.rebuild_magic_view();
+            pc.pipeline.magic.active = Some(member);
+            pc.pipeline.magic.predictions = preds;
+            pc.table.sync_from(&pc.pipeline);
+            let view = pc.pipeline.rebuild_magic_view();
             let top = if view.candidate_count > 0 {
                 ImeView::str_field(&view.candidates[0].text)
             } else {
@@ -757,22 +758,22 @@ impl ImeEngine {
     ///
     /// 线程安全:`contexts` 由 `Mutex` 保护,主线程写、I/O 线程读,无竞争。
     pub fn is_voice_ctx_alive(&self, ctx: usize) -> bool {
-        use crate::fsm::state::ComposeState;
+        use crate::fsm::family::ComposeState;
         let map = self.contexts.lock().unwrap();
         let alive = map.get(&ctx).is_some_and(|pc| {
-            pc.sm.state == ComposeState::Snippet
-                && pc.sm.magic.active
+            pc.pipeline.state == ComposeState::Snippet
+                && pc.pipeline.magic.active
                     .as_ref()
                     .is_some_and(|m| m.name() == "asr")
         });
         let detail = map.get(&ctx).map(|pc| {
-            let state = if pc.sm.state == ComposeState::Snippet {
+            let state = if pc.pipeline.state == ComposeState::Snippet {
                 "Snippet"
             } else {
                 "other"
             };
             let member = pc
-                .sm.magic.active
+                .pipeline.magic.active
                 .as_ref()
                 .map(|m| m.name().to_string())
                 .unwrap_or_else(|| "-".into());
@@ -872,7 +873,7 @@ impl crate::family::FamilyEnv for ImeEngine {
     }
 }
 
-impl crate::fsm::state::StepEnv for ImeEngine {
+impl crate::fsm::family::StepEnv for ImeEngine {
     fn scorer(&self) -> &crate::family::UnifiedScorer {
         &self.scorer
     }
@@ -895,7 +896,7 @@ mod tests {
     fn meta_aligns_with_candidates_after_compose_rerank() {
         // S2:Layer 3 造词重排后,last_meta 与 candidates 必须同序同源 ——
         // 曾在重排前采样,单字区的 meta 错位显示别人的来源。
-        use crate::fsm::router::{KeyKind, KeyEvent};
+        use crate::fsm::state::{KeyKind, KeyEvent};
         let mut e = ImeEngine::new();
         for c in "nihao".chars() {
             e.predict(KeyEvent { kind: KeyKind::Char(c), ctrl: false, shift: false, alt: false });
@@ -916,7 +917,7 @@ mod tests {
     fn page_size_flows_from_constructor_to_view_window() {
         // 构造参数 page_size(swift-ime.yaml → input.page_size,app 层读取
         // 后注入)决定翻页窗口滑动步长:页 2 首条 = merged[2×5]。
-        use crate::fsm::router::{KeyKind, KeyEvent};
+        use crate::fsm::state::{KeyKind, KeyEvent};
         let mut e = ImeEngine::new();
         e.set_page_size(5);
         e.set_page_size(5);
@@ -937,7 +938,7 @@ mod tests {
         // 翻页窗口:fill_view 装载"从当前页首起的 16 条"而非固定前 16 ——
         // 造词单字区全量放出后,merged 超过 16 的候选翻页可达。
         // nihao(嵌入词典):merged = [你好] + 单字区 + 链尾,页大小 7。
-        use crate::fsm::router::{KeyKind, KeyEvent};
+        use crate::fsm::state::{KeyKind, KeyEvent};
         let mut e = ImeEngine::new();
         for c in "nihao".chars() {
             e.predict(KeyEvent { kind: KeyKind::Char(c), ctrl: false, shift: false, alt: false });
@@ -965,7 +966,7 @@ mod tests {
         // 嵌入词典(无 FST)下 nihao 候选全是 decomp 链 —— 造词 head 的
         // 真词过滤必须保底收首候选,否则单字区顶到槽 1,space 变成单字
         // 部分提交(commit_text 为空)。
-        use crate::fsm::router::{KeyKind, KeyEvent};
+        use crate::fsm::state::{KeyKind, KeyEvent};
         let mut e = ImeEngine::new();
         for c in "nihao".chars() {
             e.predict(KeyEvent { kind: KeyKind::Char(c), ctrl: false, shift: false, alt: false });

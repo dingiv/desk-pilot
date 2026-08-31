@@ -114,6 +114,22 @@ engine.key_ctx(key)
 
 ## 执行记录
 
+- **R1 ✅ 纯改名落地**:
+  - 文件:`router.rs → state.rs`、`state.rs → family.rs`(git mv 保历史)
+  - 类型:`StateMachineTable → StateMachine`;原 `StateMachine → FamilyPipeline`
+  - 方法:`route/route_inner → step/step_inner`;PerContext 字段
+    `sm → pipeline`(table 字段名保持)
+  - 引用面:engine.rs / fsm::{state,family} / lib.rs 导出
+    (`pub use fsm::state::{KeyEvent, KeyKind, StateFlags, StateMachine}`;
+    顶层 router/state 别名删除 —— apps 用全路径,且顶层 family 名已被
+    家族模块占用,fsm::family 不做顶层别名)/ apps swift-ime(tui/fcitx5
+    的 fsm::router:: → fsm::state::)/ examples / tests 全量同步
+  - 过程修正:全局替换的顺序坑(Table→StateMachine 又被
+    StateMachine→FamilyPipeline 吞掉;state.rs 内 Table 的 impl 误改)
+    逐一回改;PerContext.table 类型、sync_from/step 参数类型、
+    FamilyPipeline 关联函数(passthrough_view 等)前缀对齐
+  - 测试:ime-core 157+21+2、swift-ime 7+12+15 全绿
+
 - **R4 ✅ 依赖单向化**(用户点名先做,提前于 R1-R3):
   - **`FamilyEnv` trait 定义在 family/mod.rs**(family 需要什么,family
     自己说了算):expander / voice_cmd_tx(默认 None)/ record_pick /

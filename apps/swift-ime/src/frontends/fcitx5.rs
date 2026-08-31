@@ -329,7 +329,7 @@ pub extern "C" fn swift_ime_key(
 ) -> i32 {
     if engine.is_null() || out_view.is_null() || ev.is_null() { return 0; }
     let ev = unsafe { *ev };
-    let key = ime_core::fsm::router::KeyEvent::from_fcitx(
+    let key = ime_core::fsm::state::KeyEvent::from_fcitx(
         ev.sym, ev.unicode,
         ev.ctrl != 0, ev.shift != 0, ev.alt != 0,
     );
