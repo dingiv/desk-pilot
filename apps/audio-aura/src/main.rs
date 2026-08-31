@@ -15,7 +15,7 @@
 //! hotword) bump a global `version: AtomicU64` (the **control plane** — `/api/stream` pings
 //! `state_changed`, clients re-GET `/api/state`). Recognition events do NOT bump `version`.
 //!
-//! Run: cargo run -p aura-daemon --features asr,cuda -- 127.0.0.1:7879
+//! Run: cargo run -p aura-daemon -- 127.0.0.1:7879
 //! Config precedence: CLI (high-frequency knobs, see `Cli`) > `aura.yaml` (full surface, dev:
 //! this crate's dir, prod: ~/.desk-pilot/) > built-in defaults. No env vars — except `RUST_LOG`,
 //! which overrides the `log_level` setting as the standard tracing escape hatch.

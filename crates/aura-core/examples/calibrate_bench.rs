@@ -2,7 +2,7 @@
 //! 每个用例模拟真实的 ASR 输出(同音错字、无标点、英文混入等)，看 Stage2 能否纠正。
 //!
 //! Run:
-//!   cargo run -p audio-aura-core --example calibrate_bench --features asr
+//!   cargo run -p audio-aura-core --example calibrate_bench
 //!
 //! 通过环境变量覆盖默认 endpoint / model:
 //!   DP_ROUTER_ENDPOINT (默认 http://127.0.0.1:8080)

@@ -2,7 +2,7 @@
 //! the "phone input method" correction effect (earlier text changes as more audio arrives).
 //! Doubles as the streaming-engine A/B tool (zipformer vs x-asr).
 //!
-//! Run: cargo run -p audio-aura-core --features asr --example streaming_asr -- [wav_path] [engine]
+//! Run: cargo run -p audio-aura-core --example streaming_asr -- [wav_path] [engine]
 //!   engine: "zipformer" (default) | "x-asr"
 
 use std::path::Path;

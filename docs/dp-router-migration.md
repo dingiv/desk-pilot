@@ -179,8 +179,8 @@
   - `aura-core` 启动时不再自动加载 GGUF;由外部保证 dp-router 已就绪
   - `aura.yaml` 中 LLM 配置默认 `llm.backend: remote` + `endpoint: http://127.0.0.1:8080`
 - **验证**:
-  - `cargo build -p audio-aura --features asr` 通过
-  - `cargo build -p audio-aura-core --features asr` 通过
+  - `cargo build -p audio-aura` 通过
+  - `cargo build -p audio-aura-core` 通过
   - aura daemon 启动后用 `HttpLlm` 调 dp-router 的 `/v1/chat/completions` 端到端烟测(沿用 `crates/dp-models/examples/remote.rs` 模式)
 
 ### 阶段 6 — 文档更新

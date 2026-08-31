@@ -4,7 +4,7 @@
 //! namespace (`assets/models/qwen3-asr/`).
 //!
 //! Run:
-//!   cargo run -p audio-aura-core --features asr --example qwen3_asr -- [wav]...
+//!   cargo run -p audio-aura-core --example qwen3_asr -- [wav]...
 //! (no args → transcribes the bundled `testwavs/zh-standard-0.wav` + `en.wav`)
 
 use std::path::Path;

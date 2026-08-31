@@ -6,7 +6,7 @@
 //! Stage3 is NOT exercised here (this is the S1→S2 behavior benchmark). The Stage3 feedback loop
 //! lives in the `daemon` crate.
 //!
-//! Run: cargo run -p audio-aura-core --example stage12_live --features asr -- 127.0.0.1:7879
+//! Run: cargo run -p audio-aura-core --example stage12_live -- 127.0.0.1:7879
 //!
 //! dp-router endpoint / model 可由 DP_ROUTER_ENDPOINT / DP_ROUTER_MODEL 覆盖(默认
 //! http://127.0.0.1:8080 / qwen2.5-3b-instruct-q4_k_m)。

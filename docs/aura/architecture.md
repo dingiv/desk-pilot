@@ -147,7 +147,7 @@ storage: { retention_days: 7 }  # + recordings_dir 可选
 
 ```bash
 # dev (assets/models + CARGO_MANIFEST_DIR)
-CARGO_MANIFEST_DIR=$(pwd) cargo run -p aura-daemon --features asr,cuda -- 127.0.0.1:7879 -p 9091
+CARGO_MANIFEST_DIR=$(pwd) cargo run -p aura-daemon -- 127.0.0.1:7879 -p 9091
 ```
 
 ## 已验证（2026-08 里程碑）

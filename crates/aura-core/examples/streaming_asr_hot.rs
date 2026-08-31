@@ -1,7 +1,7 @@
 //! Test streaming ASR: feed zh.wav chunk-by-chunk, print partial results at intervals to see
 //! the "phone input method" correction effect (earlier text changes as more audio arrives).
 //!
-//! Run: cargo run -p audio-aura-core --features asr --example streaming_asr -- [wav_path]
+//! Run: cargo run -p audio-aura-core --example streaming_asr -- [wav_path]
 
 use std::path::Path;
 use std::time::Instant;
