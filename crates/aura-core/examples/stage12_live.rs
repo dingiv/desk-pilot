@@ -52,9 +52,9 @@ fn main() -> anyhow::Result<()> {
     eprintln!(
         "[load] Stage1 (Silero VAD + 流式 Zipformer + SenseVoice) + Stage2 ({router_model} via {router_endpoint}) …"
     );
-    // (s1, batch_rx):recognizer 不再自 spawn 线程 —— batch job 通道的接收端交给 Pipeline,
-    // 由它 spawn ingest / batch / stage2 三条工作线程。
-    let (s1, batch_rx) = OnnxStage1Recognizer::new(Stage1Config::new(scout_addr.clone()))?;
+    // round12 异步化:batch 由 Pipeline 的 per-paragraph 任务自建(batch_jobs=false),
+    // s1 不再投 job —— batch_rx 直接丢弃。
+    let (s1, _batch_rx) = OnnxStage1Recognizer::new(Stage1Config::new(scout_addr.clone()))?;
     let calibrator = Calibrator::load(&router_endpoint, &router_model)?;
     let _ = calibrator.calibrate_blocking("你好", None, &[]); // HTTP warmup (避免首轮冷启动)
     let corrections = Arc::new(Mutex::new(Vec::new()));
@@ -72,10 +72,13 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     println!("\n● Pipeline 就绪 (scout {scout_addr}/audio). Ctrl-C 结束.\n");
-    Pipeline::new(s1, Box::new(s2), batch_rx).run(
+    Pipeline::new(s1, Box::new(s2)).run(
         Arc::new(AtomicBool::new(true)),
         Arc::new((Mutex::new(()), Condvar::new())),
         move |ev| match ev {
+        TurnEvent::ParagraphClosed { paragraph_id } => {
+            println!("  ●段关闭 w{paragraph_id}(文本定格,定稿修订稍后)")
+        }
         TurnEvent::StreamFragment { paragraph_id, sentence_id: _, text, at_s } => {
             println!("  …流式 w{paragraph_id} @{at_s:.1}s: {text}")
         }

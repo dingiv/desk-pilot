@@ -46,10 +46,11 @@ default = []
 # Stage1 local ASR (Silero VAD + streaming/batch via dp-models' sherpa-onnx wrapper) + the
 # executor/composer modules. Default build stays light (contract + storage).
 # Stage2 LLM 走 dp-router(http),不再需要 cuda / mistral 重依赖。
-asr = ["dp-models/speech"]
+asr = ["dp-models/speech", "dep:tokio"]
 
 [dependencies]
 dp-models = { workspace = true }
+tokio = { version = "1", optional = true, features = ["rt", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shared = { path = "../shared", features = ["log"] }

@@ -148,7 +148,9 @@ pub enum Stage1Event {
     /// ASYNC batch: the just-closed sentence's `batch_text` is `None` here (its batch job was only
     /// enqueued; the result arrives via [`Self::SentenceBatchReady`]). Provisional until the
     /// `ParagraphEdge`.
-    Batch { paragraph_id: ParagraphId, sentences: Vec<VadSentence> },
+    /// `sr` = 采样率(round12:Pipeline 异步任务自建 batch pass 时直调
+    /// `recognize_once(pcm, sr)` 需要;旧编排下 job 由 s1 内部投递,已自带)。
+    Batch { paragraph_id: ParagraphId, sentences: Vec<VadSentence>, sr: u32 },
     /// The merge paragraph closed (big gap or settle-timeout). The paragraph-level batch re-run is
     /// only ENQUEUED (async): `paragraph.batch_text` is `None` on this event and arrives via
     /// [`Self::ParagraphBatchReady`] (multi-sentence paragraphs only — single-sentence ones reuse
@@ -156,7 +158,8 @@ pub enum Stage1Event {
     /// right after this event (the paragraph's `Arc` PCM is the surviving copy). Finalization
     /// happens when BOTH all sentence batches and the re-run (or, single-sentence, the sentence
     /// batch alone) are in — the pipeline's readiness gate.
-    ParagraphEdge { paragraph: VadParagraph },
+    /// `sr` = 采样率(round12,同 [`Self::Batch`]:段落级重跑自建时需要)。
+    ParagraphEdge { paragraph: VadParagraph, sr: u32 },
     /// A sentence-level batch job finished (the batch worker thread ran the blocking
     /// `AsrProvider::recognize`). ALWAYS arrives after that sentence's `Batch`; `batch_text`
     /// is `None` when the pass failed or returned empty (the legal "batch unavailable" state —

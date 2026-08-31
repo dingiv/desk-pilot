@@ -158,6 +158,11 @@ pub struct Stage1Config {
     /// "batch unavailable" state; consumers fall back to streaming text by design).
     /// Streaming + VAD unaffected. Defaults to true.
     pub batch_enabled: bool,
+    /// batch job 自管开关(round12 异步化):`false` → 消费循环**不投** `BatchJob`
+    /// (句 EOS / 段 settle 都只发事件)—— batch pass 由 Pipeline 的 per-paragraph
+    /// 异步任务经 [`Self::recognize_once`] 自建。默认 `true`(投递给 batch worker,
+    /// 旧编排);`Pipeline::assemble` 置 `false`。
+    pub batch_jobs: bool,
     /// Shared connection toggle (see [`ScoutAudioSource::with_active`]). Flip to false to stop
     /// ingesting from scout (does NOT kill scout). Defaults to true.
     pub active: Arc<AtomicBool>,
@@ -213,6 +218,7 @@ impl Stage1Config {
             asr_kind: ProviderKind::Local,
             merge_gap_s: 5.0,
             batch_enabled: true,
+            batch_jobs: true,
             active: Arc::new(AtomicBool::new(true)),
             running: Arc::new(AtomicBool::new(true)),
             flush_paragraph: Arc::new(AtomicBool::new(false)),
@@ -312,7 +318,10 @@ pub struct OnnxStage1Recognizer {
     scout_chunk_ms: Option<u64>,
     /// 句级/段级 batch job 通道 sender — 消费循环 EOS/settle 时入队;receiver 由
     /// [`Self::new`] 交给 `Pipeline`,后者 spawn batch worker 线程跑 [`Self::run_batch_worker`]。
+    /// `batch_jobs = false`(round12:Pipeline 异步任务自管 batch)时**不投递**。
     batch_tx: mpsc::Sender<BatchJob>,
+    /// [`Stage1Config::batch_jobs`] 快照 —— 消费循环 enqueue guard。
+    batch_jobs: bool,
 }
 
 impl OnnxStage1Recognizer {
@@ -366,6 +375,7 @@ impl OnnxStage1Recognizer {
                 scout_addr: cfg.scout_addr.clone(),
                 scout_chunk_ms: cfg.scout_chunk_ms,
                 batch_tx,
+                batch_jobs: cfg.batch_jobs,
             },
             batch_rx,
         ))
@@ -400,6 +410,7 @@ impl OnnxStage1Recognizer {
                 scout_addr: cfg.scout_addr.clone(),
                 scout_chunk_ms: cfg.scout_chunk_ms,
                 batch_tx,
+                batch_jobs: cfg.batch_jobs,
             },
             batch_rx,
         ))
@@ -441,7 +452,7 @@ impl OnnxStage1Recognizer {
     /// `Err` (timeout / 断链 / 熔断) → `None` (caller falls back to streaming). The timeout +
     /// 断链熔断 live in [`dp_models::http::HttpAsr`] (ASR_TIMEOUT=3s, 断链即窗口内不发送);
     /// this just surfaces the outcome + logs the failure reason so "丢 batch" is diagnosable.
-    fn recognize_once(&self, pcm: &[i16], sr: u32, what: &str, paragraph_id: ParagraphId) -> Option<String> {
+    pub fn recognize_once(&self, pcm: &[i16], sr: u32, what: &str, paragraph_id: ParagraphId) -> Option<String> {
         match self.batch_asr.recognize(pcm, sr) {
             Ok(text) if !text.trim().is_empty() => Some(text),
             Ok(_) => {
@@ -724,6 +735,7 @@ fn emit_paragraph_edge(
     store: &AudioStore,
     batch_tx: &mpsc::Sender<BatchJob>,
     sr: u32,
+    batch_jobs: bool,
     on_event: &mut dyn FnMut(Stage1Event),
 ) {
     if settled.sentences.is_empty() {
@@ -753,13 +765,18 @@ fn emit_paragraph_edge(
             batch_asr_ms: 0,
             pcm: Arc::clone(&pcm),
         },
+        sr,
     });
     // ★单句段落免重跑:段落 batch 的意义是"跨句上下文重新整听"——只有一句时拼接 PCM 与该句
     // PCM 完全相同,句级 batch job 已覆盖,不再投递重跑 job(省掉大多数段落的一整次 batch
     // 调用)。单句段落的定稿文本由 pipeline 在句级 SentenceBatchReady 到达时就绪(见
     // pipeline.rs Finalizer:单句段落 para_done 在 ParagraphEdge 即置位)。
+    // round12:`batch_jobs = false`(Pipeline 异步任务自管 batch)→ 不投递,段落重跑由
+    // pipeline 段任务经 recognize_once(paragraph.pcm) 自建。
     if sentence_count == 1 {
         debug!(paragraph_id = settled.paragraph_id, "单句段落——复用句级 batch,跳过整段重跑(不投递 job)");
+    } else if !batch_jobs {
+        debug!(paragraph_id = settled.paragraph_id, "batch_jobs=false — 段落重跑由 pipeline 段任务自建(不投递 job)");
     } else if let Err(e) = batch_tx.send(BatchJob::Paragraph {
         paragraph_id: settled.paragraph_id,
         pcm,
@@ -953,7 +970,7 @@ impl OnnxStage1Recognizer {
         let (settled, paragraph_id, sentences) = tracker.on_eos(sentence);
         // A big gap settled the previous paragraph FIRST — emit it before this sentence's Batch.
         if let Some(s) = settled {
-            emit_paragraph_edge(s, &self.audio_store, &self.batch_tx, sr, on_event);
+            emit_paragraph_edge(s, &self.audio_store, &self.batch_tx, sr, self.batch_jobs, on_event);
         }
         // 句级日志(debug):段落/段 id、音频时长、两路文本(异步 batch 尚未返回)、会话喂帧数。
         if let Some(s) = sentences.last() {
@@ -981,17 +998,22 @@ impl OnnxStage1Recognizer {
         // `SentenceBatchReady`,Finalizer 找不到该段条目而丢弃它,`ready` 永不达 `expected` →
         // 该段悬挂(永不就绪)。先发 `Batch`(占位建 pending)后入队 job,则结果必在 `Batch`
         // 之后落到同一条 stage2 FIFO 通道 → 就绪计数必到齐。
-        on_event(Stage1Event::Batch { paragraph_id, sentences });
+        on_event(Stage1Event::Batch { paragraph_id, sentences, sr });
         // 入队句级 batch job(非阻塞;worker 线程跑阻塞 recognize,结果回传
         // SentenceBatchReady)。发送失败 = batch worker 已死(极端故障)——记日志继续,
         // 该句 batch 缺失按 None 处理(best_text 回退流式)。
-        if let Err(e) = self.batch_tx.send(BatchJob::Sentence {
-            paragraph_id,
-            sentence_id,
-            pcm: Arc::clone(&sentence_pcm),
-            sr,
-        }) {
-            warn!(error = %e, sentence_id, "batch worker gone — sentence batch job dropped");
+        // round12:`batch_jobs = false`(Pipeline 异步任务自管 batch)→ 不投递,
+        // pipeline 在 `Batch` 事件处理时从 audio_store 取 clip 自建任务。
+        if self.batch_jobs {
+            let job = BatchJob::Sentence {
+                paragraph_id,
+                sentence_id,
+                pcm: Arc::clone(&sentence_pcm),
+                sr,
+            };
+            if let Err(e) = self.batch_tx.send(job) {
+                warn!(error = %e, sentence_id, "batch worker gone — sentence batch job dropped");
+            }
         }
     }
 }
@@ -1075,25 +1097,23 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
             // 用户侧主动归档(IME 分字符 = "我说完了"):跳过 merge_gap 剩余等待立即整段
             // batch。说话中(EOS 未到)保持挂起下一 tick 重试 —— 立即切段会截断尾音;
             // 无段落则消费掉标记(空按,不让陈旧 flush 影响之后的语音)。
-            if self.flush_paragraph.load(Ordering::Acquire) {
-                if !speaking {
-                    match tracker.force_settle() {
-                        Some(settled) => {
-                            self.flush_paragraph.store(false, Ordering::Release);
-                            info!(paragraph_id = settled.paragraph_id, sentences = settled.sentences.len(),
-                                "flush: 主动归档(跳过 merge_gap 等待)");
-                            emit_paragraph_edge(settled, &self.audio_store, &self.batch_tx, sr, on_event);
-                            sess = sasr.map(|asr| ActiveSession::new(asr.create_session())); // 段落边界重置会话
-                        }
-                        None if !tracker.has_open_paragraph() => {
-                            self.flush_paragraph.store(false, Ordering::Release);
-                        }
-                        None => {} // 句进行中 → 挂起,等 EOS 后下一 tick 强制定稿
+            if self.flush_paragraph.load(Ordering::Acquire) && !speaking {
+                match tracker.force_settle() {
+                    Some(settled) => {
+                        self.flush_paragraph.store(false, Ordering::Release);
+                        info!(paragraph_id = settled.paragraph_id, sentences = settled.sentences.len(),
+                            "flush: 主动归档(跳过 merge_gap 等待)");
+                        emit_paragraph_edge(settled, &self.audio_store, &self.batch_tx, sr, self.batch_jobs, on_event);
+                        sess = sasr.map(|asr| ActiveSession::new(asr.create_session())); // 段落边界重置会话
                     }
+                    None if !tracker.has_open_paragraph() => {
+                        self.flush_paragraph.store(false, Ordering::Release);
+                    }
+                    None => {} // 句进行中 → 挂起,等 EOS 后下一 tick 强制定稿
                 }
             }
             if let Some(settled) = tracker.check_settle(now_s, speaking) {
-                emit_paragraph_edge(settled, &self.audio_store, &self.batch_tx, sr, on_event);
+                emit_paragraph_edge(settled, &self.audio_store, &self.batch_tx, sr, self.batch_jobs, on_event);
                 sess = sasr.map(|asr| ActiveSession::new(asr.create_session())); // 段落边界重置会话
             }
             if let Some(a) = sess.as_ref() {
@@ -1324,10 +1344,10 @@ mod tests {
             sentences: vec![sentence_into(&store, 1)],
         };
         let mut events = Vec::new();
-        emit_paragraph_edge(settled, &store, &tx, 16000, &mut |ev| events.push(ev));
+        emit_paragraph_edge(settled, &store, &tx, 16000, true, &mut |ev| events.push(ev));
         assert!(rx.try_recv().is_err(), "单句段落绝不投递重跑 job(复用句级 batch)");
         match &events[0] {
-            Stage1Event::ParagraphEdge { paragraph } => assert_eq!(
+            Stage1Event::ParagraphEdge { paragraph, .. } => assert_eq!(
                 paragraph.batch_text.as_deref(),
                 None,
                 "异步模式: 事件时刻 batch_text 恒 None(单句复用句级结果,无 ParagraphBatchReady)"
@@ -1345,7 +1365,7 @@ mod tests {
             sentences: vec![sentence_into(&store, 1), sentence_into(&store, 2)],
         };
         let mut events = Vec::new();
-        emit_paragraph_edge(settled, &store, &tx, 16000, &mut |ev| events.push(ev));
+        emit_paragraph_edge(settled, &store, &tx, 16000, true, &mut |ev| events.push(ev));
         // 多句段落恰好投递一次重跑 job,携拼接后的整段 PCM(1600*2)。
         match rx.try_recv() {
             Ok(BatchJob::Paragraph { paragraph_id, pcm, sr }) => {
@@ -1357,7 +1377,7 @@ mod tests {
         }
         assert!(rx.try_recv().is_err(), "只投递一次");
         match &events[0] {
-            Stage1Event::ParagraphEdge { paragraph } => assert_eq!(
+            Stage1Event::ParagraphEdge { paragraph, .. } => assert_eq!(
                 paragraph.batch_text.as_deref(),
                 None,
                 "异步模式: 事件时刻 batch_text 恒 None(结果经 ParagraphBatchReady)"
@@ -1372,7 +1392,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let settled = SettledParagraph { paragraph_id: 1, sentences: vec![] };
         let mut events = Vec::new();
-        emit_paragraph_edge(settled, &store, &tx, 16000, &mut |ev| events.push(ev));
+        emit_paragraph_edge(settled, &store, &tx, 16000, true, &mut |ev| events.push(ev));
         assert!(events.is_empty(), "空段落不 emit 事件");
         assert!(rx.try_recv().is_err(), "空段落不投递 job");
     }
