@@ -98,7 +98,7 @@ pub struct ImeEngine {
     io_thread: Arc<crate::io_thread::IoThread>,
     /// 共享语音会话状态 —— voice server(IoThread)折叠 SSE 段写入,
     /// VoiceMember 在主线程同步读。
-    voice_state: Arc<crate::voice_state::SharedVoiceState>,
+    voice_state: Arc<crate::family::magic::SharedVoiceState>,
 }
 
 impl ImeEngine {
@@ -190,7 +190,7 @@ impl ImeEngine {
         let provider: Arc<dyn crate::family::magic::expander::VariableProvider> = Arc::from(provider);
         let expander = crate::Expander::new(Arc::clone(&provider));
         // 共享 voice state(voice server 折叠写入、#asr 成员同步读)。
-        let voice_state = Arc::new(crate::voice_state::SharedVoiceState::new());
+        let voice_state = Arc::new(crate::family::magic::SharedVoiceState::new());
         magic.set_voice_state(Arc::clone(&voice_state));
         // 单条 tokio I/O 线程 = 多事件源 server(通用 rx + voice server)。
         // voice server 按需(#asr Attach)才连 aura,engine drop → io_thread
@@ -271,7 +271,7 @@ impl ImeEngine {
     }
 
     /// 共享 voice state 句柄。voice listener task 与魔法成员都通过它读 / 写。
-    pub fn voice_state(&self) -> Arc<crate::voice_state::SharedVoiceState> {
+    pub fn voice_state(&self) -> Arc<crate::family::magic::SharedVoiceState> {
         Arc::clone(&self.voice_state)
     }
 

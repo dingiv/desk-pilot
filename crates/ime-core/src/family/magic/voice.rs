@@ -1,7 +1,7 @@
 //! VoiceMember — `#asr`: voice prediction provider.
 //!
 //! 纯读路径:voice server 在引擎 I/O 线程上后台拉 SSE,折叠 AsrEvent 到
-//! [`SharedVoiceState`](crate::voice_state::SharedVoiceState)。本成员只读这个
+//! [`SharedVoiceState`](super::voice_state::SharedVoiceState)。本成员只读这个
 //! shared state 来产生候选 —— 不再有任何轮询 / 异步状态。
 //!
 //! 预测模型下,`#asr` 精确匹配时提供语音结果预测(最多 4 条:流式 live +
@@ -26,7 +26,7 @@ use super::member::{CommandArgs, MagicMember, Prediction};
 use super::MagicResources;
 use crate::io_thread::{VoiceCmd, VoiceCmdSender};
 use super::FamilyEnv;
-use crate::voice_state::SharedVoiceState;
+use super::voice_state::SharedVoiceState;
 
 const MAX_SUBMIT: usize = 4;
 
@@ -138,7 +138,7 @@ impl MagicMember for VoiceMember {
         // - Connecting → 正在连接语音服务(不可提交);
         // - Failed     → 语音服务暂不可用(不可提交);
         // - Connected  → 继续走语音结果预测。
-        use crate::voice_state::VoiceConn;
+        use crate::family::magic::voice_state::VoiceConn;
         match state.conn() {
             VoiceConn::Connecting => return vec![Prediction::interactive("正在连接语音服务")],
             VoiceConn::Failed => return vec![Prediction::interactive("语音服务暂不可用")],

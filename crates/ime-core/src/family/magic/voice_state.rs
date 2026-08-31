@@ -1,4 +1,4 @@
-//! Shared voice-session state.
+//! Shared voice-session state(归属 magic:为 `#asr` / `#asr/calc` 成员供数)。
 //!
 //! 合并了原 AsrBuffer(已删除的单缓冲模块)的 candidate-surface API
 //! (`set_live` / `push_final` / `voice_candidates` / `preview`) 与原 `AuraAgent`

@@ -26,7 +26,7 @@ use tokio::select;
 use tokio::sync::mpsc;
 
 use crate::frontend::{FrontEndHandle, StateView};
-use crate::voice_state::SharedVoiceState;
+use crate::family::magic::SharedVoiceState;
 
 /// 魔法命令发给 I/O 线程的异步工作请求。
 pub enum IoEvent {
@@ -209,9 +209,9 @@ async fn voice_server_main(
                                 Ok(client) => {
                                     let ok = client.health().await.unwrap_or(false);
                                     state.set_conn(if ok {
-                                        crate::voice_state::VoiceConn::Connected
+                                        crate::family::magic::voice_state::VoiceConn::Connected
                                     } else {
-                                        crate::voice_state::VoiceConn::Failed
+                                        crate::family::magic::voice_state::VoiceConn::Failed
                                     });
                                     tracing::info!(connected = ok, "voice attach → spawn stream");
                                     // **重连全量同步**:断连期间 aura 可能已定稿若干句
@@ -248,9 +248,9 @@ async fn voice_server_main(
                                         // 负责;流内部的退避重试一律按不可用处理。)
                                         use audio_aura_agent::client::SseConnState as S;
                                         let v = if c == S::Connected {
-                                            crate::voice_state::VoiceConn::Connected
+                                            crate::family::magic::voice_state::VoiceConn::Connected
                                         } else {
-                                            crate::voice_state::VoiceConn::Failed
+                                            crate::family::magic::voice_state::VoiceConn::Failed
                                         };
                                         st.set_conn(v);
                                         notify_conn(&fe, -1); // 广播:有 #asr 的 ctx 刷新
@@ -262,7 +262,7 @@ async fn voice_server_main(
                                 }
                                 Err(e) => {
                                     tracing::error!(error = %e, base = %base, "voice: AuraClient::new failed");
-                                    state.set_conn(crate::voice_state::VoiceConn::Failed);
+                                    state.set_conn(crate::family::magic::voice_state::VoiceConn::Failed);
                                     // 连接失败 → 及时汇报前端(否则 UI 停在"正在连接")。
                                     notify_conn(&frontend, active_ctx);
                                 }
@@ -327,7 +327,7 @@ async fn voice_server_main(
                     Some(Some((ev, s))) => {
                         state.fold_event(&ev);
                         // 收到句事件 = 已连上(即使 Attach 时 health 误判为断,段也证活)。
-                        state.set_conn(crate::voice_state::VoiceConn::Connected);
+                        state.set_conn(crate::family::magic::voice_state::VoiceConn::Connected);
                         // 后台语音也算活动 —— 空闲超时只在"无 #asr 且无语音"时断开。
                         last_activity = tokio::time::Instant::now();
                         tracing::info!(?ev, "voice event folded");
@@ -344,7 +344,7 @@ async fn voice_server_main(
                         // SSE 流结束 → 丢源,不再 select。流断 = 语音服务暂不可用。
                         tracing::warn!("voice SSE stream ended → 丢源,不重连");
                         connected = false;
-                        state.set_conn(crate::voice_state::VoiceConn::Failed);
+                        state.set_conn(crate::family::magic::voice_state::VoiceConn::Failed);
                         // 流断 → 及时汇报前端,UI 从 🎙 切到「语音服务暂不可用」。
                         notify_conn(&frontend, active_ctx);
                     }
@@ -365,7 +365,7 @@ async fn voice_server_main(
                 connected = false;
                 // 断开 = 语音服务暂不可用。下次 #asr 输入时 Attach 触发重连,
                 // health 探针成功才转 🎙(已连接);失败保持「暂不可用」。
-                state.set_conn(crate::voice_state::VoiceConn::Failed);
+                state.set_conn(crate::family::magic::voice_state::VoiceConn::Failed);
                 // 空闲断连发生在后台(active_ctx < 0)→ 广播,让打开的 #asr
                 // 上下文从 🎙 切到「语音服务暂不可用」。
                 notify_conn(&frontend, active_ctx);
@@ -432,7 +432,7 @@ impl Drop for IoThread {
 mod tests {
     use super::*;
     use crate::frontend::FrontEndHandle;
-    use crate::voice_state::VoiceConn;
+    use crate::family::magic::voice_state::VoiceConn;
 
     #[test]
     fn attach_drain_stores_handle() {

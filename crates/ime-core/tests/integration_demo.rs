@@ -450,7 +450,7 @@ fn asr_command_with_buffer_commits_voice_text() {
     let base = mock_aura();
     let mut eng = eng_with_aura(&base);
     // 直接写 shared voice state(真实 SSE 由 voice server 折叠;这里是测试 mock)。
-    eng.voice_state().set_conn(ime_core::voice_state::VoiceConn::Connected);
+    eng.voice_state().set_conn(ime_core::family::magic::voice_state::VoiceConn::Connected);
     eng.voice_state().seed_final("今天天气不错");
 
     // Type #asr
@@ -477,7 +477,7 @@ fn asr_magic_tick_refreshes_real_ctx_after_voice_advance() {
     let base = mock_aura();
     let eng = eng_with_aura(&base);
     let ctx: usize = 0xCAFE; // fcitx 下 = 真实 InputContext 指针,非 0
-    eng.voice_state().set_conn(ime_core::voice_state::VoiceConn::Connected);
+    eng.voice_state().set_conn(ime_core::family::magic::voice_state::VoiceConn::Connected);
 
     // 在真实 ctx 输入 #asr → Snippet 态,VoiceMember 激活,候选是占位提示。
     let mut before = ImeView::empty();

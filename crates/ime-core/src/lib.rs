@@ -10,7 +10,6 @@ pub mod frontend;
 pub mod io_thread;
 
 pub mod store;
-pub mod voice_state;
 
 // ── 兼容别名(旧路径;新代码请用规范路径)────────────────────────────
 // expander → family::magic::expander(snippet/魔法命令的模板展开器,归位)
