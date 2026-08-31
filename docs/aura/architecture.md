@@ -1,4 +1,4 @@
-# aura 架构（as-built 2026-08-19）
+# aura 架构（as-built 2026-08-31）
 
 > 现状权威文档。代码为准。北极星：系统级 AI 秘书（desk-pilot）。
 > 三阶段流程细节见 **`stages.md`**；路线图见 **`roadmap.md`**。
@@ -26,31 +26,38 @@ dp-models       (通用模型提供库) — ModelProvider 伞形 + 能力 trait 
   ├─ onnx     本地语音栈 (feature speech): VAD Silero + 流式 Zipformer/x-asr + 批式 SenseVoice
   ├─ mistral  本地 LLM (feature mistral): MistralLlm (mistral.rs GGUF)
   └─ http     远程: HttpAsr/HttpLlm/HttpVlm (OpenAI 兼容, reqwest::blocking)
-aura-core       (全栈流程)
-  ├─ recognizer Stage1 (feature asr): Silero VAD + 流式 + 批式 + WindowTracker + AudioStore
-  ├─ pipeline   组装 (PipelineSpec→assemble 全栈) + Stage2 worker + 识别日志/窗口归档
-  ├─ calibrator Stage2CalibratorImpl (窗口状态机) + Stage2Calibrator trait
+aura-core       (全栈流程;round23 起 pipeline/ 文件夹化)
+  ├─ pipeline/  流水线环节全家:
+  │    mod.rs        编排汇点(select! 主循环 + Ctx/Turns + on_* 处理器 + assemble)
+  │    consume.rs    消费循环(run/wait_frame/finalize_sentence/emit_paragraph_edge)
+  │    recognizer.rs 资源+配置+生命周期(mgr/ring/store、run_ingest、recognize_once)
+  │    vad.rs        音频前端(ingest_loop 采音 + VadFront 检测)
+  │    stream.rs     流式识别任务(独立 tokio::task,一对通道)
+  │    tracker.rs    ParagraphTracker 纯边界数学(可单测)
+  │    tasks.rs      batch/纠偏任务壳(sentence/live_calibration/paragraph)
+  │    calibrator.rs Stage2CalibratorImpl + Stage2Calibrator trait
   ├─ prompt     PromptBuilder (单句指令 + 多段联合 + 双通道信封)
-  ├─ lib.rs     Calibrator 封装层 (持有 dp_models::MistralLlm, 附加 prompt 组装)
+  ├─ lib.rs     契约(Stage1Event/TurnEvent/VadSentence/VadParagraph)+ Calibrator 封装层
   ├─ hub        Storage: AudioArchive + TurnLog + recent ring
-  ├─ archive / wav / tts / buffer / vad / scout  辅件
+  ├─ archive / wav / tts / buffer / scout  辅件
 aura-agent      (Stage3+SDK) 能力 trait + HotwordManager + rules + view (线协议) + AuraClient SDK
 apps/audio-aura (daemon)     config 解析 (CLI/yaml→PipelineSpec) + socket (8 routes) + SSE双面
 crates/native                 napi shim (TS via VOICE_LOCAL_ROUTER)
 ```
 
-**线程模型**（全部由 `pipeline.rs` 创建；Stage1/Stage2 只暴露阻塞函数）：
-`aura-stage1-ingest`（scout→ring）+ `aura-pipeline`（`Pipeline::spawn` 的 std 线程跑 Stage1
-consume loop，Condvar 事件驱动，零阻塞）+ `aura-batch`（batch worker，跑阻塞 ASR
-recognize）+ `aura-stage2`（LLM 整流 + 就绪定稿 worker，mpsc 收 Batch/ParagraphEdge/
-*BatchReady）→ `aura-socket`（主线程 tokio，axum SSE）。详见 `stages.md`。
+**执行模型**（round12+ 任务结构，round21 流式独立，round24 通道收敛；常驻线程只有采音）：
+`spawn_blocking` 采音线程（scout→ring，自动重连）+ 异步任务（消费循环：VAD/分句/段落
+决策，Notify 唤醒零轮询；流式识别任务：一对通道，与消费循环零共享执行流）+ 按需任务
+（每句 batch / live 纠偏 / 段重跑+定稿+归档，内部 `spawn_blocking` 干 `reqwest::blocking`
+真活）+ `select!` 主循环（**唯一发射点**，统一留痕）→ 主线程 tokio（axum SSE）。
+详见 `stages.md` / `pipeline.md` §5。
 
 ## 三阶段提交
 
 | 阶段       | 职责                                                                  | crate             | 抽象                                                   |
 | ---------- | --------------------------------------------------------------------- | ----------------- | ------------------------------------------------------ |
-| **Stage1** | 录音→VAD→段级流式+段级batch→窗口定稿（边界范式 VadSegment/VadWindow） | aura-core (`asr`) | Stage1Recognizer（发 StreamFragment/Batch/WindowEdge） |
-| **Stage2** | 窗口内多句联合整流，无状态                                            | aura-core         | Stage2Calibrator（calibrate_window / finalize_window） |
+| **Stage1** | 录音→VAD→句级流式+句级batch→段定稿（边界范式 VadSentence/VadParagraph） | aura-core (`asr`) | OnnxStage1Recognizer::run（async,发 StreamFragment/Batch/ParagraphEdge） |
+| **Stage2** | 段内多句联合整流，无状态（BS 到达触发；定稿一次）                 | aura-core         | Stage2Calibrator（calibrate_paragraph / finalize_paragraph） |
 | **Stage3** | 可选工具：热词 / 用户纠偏                                             | aura-agent        | HotwordManager + rules 规则触发器                      |
 
 Stage1 的 **VAD + 流式模型本地跑**（实时 partial 要低延迟）；批式 ASR / Stage2 LLM
@@ -139,8 +146,9 @@ storage: { retention_days: 7 }  # + recordings_dir 可选
 （默认 MODELS 命名空间）；VAD 挂 `asr.vad`；`scout_chunk_ms` 是网络层聚合（消费侧照旧
 重切 32ms 窗）。**deny_unknown_fields**：拼错/过时键 → parse 失败 → Malformed warn + 默认。
 
-日志分级：**info 只出 final**（每定稿一句一条，含 batch/streaming/calibrated 三层）；
-流式 partial 与纠偏碎片为 **debug**（调管线时 `log_level: "debug"`）。
+日志分级（round25 整理）：**info = batch 与纠偏**（句级 batch / 段重跑 / 纠偏[sentence] /
+纠偏[paragraph],各带 start/end 墙钟 + 耗时）+ 边界事件留痕;**debug = 流式**（partial
+发射留痕、句定稿细节、断流喂静音、diag;调管线时 `log_level: "debug"`）。
 优先级：CLI > aura.yaml > 内置默认（aura.json 仅向下兼容 fallback）。
 
 ## 运行
@@ -153,8 +161,9 @@ CARGO_MANIFEST_DIR=$(pwd) cargo run -p aura-daemon -- 127.0.0.1:7879 -p 9091
 ## 已验证（2026-08 里程碑）
 
 - crate 合并全绿（aura-core 收编 dcl/store + 并入 aura-asr/aura-tts，~3250 行 + 单测）。
-- 边界范式（VadSegment/VadWindow）+ 5 事件协议（stream_fragment/batch_segment/batch_window/
-  segment_calibration/window_calibration）：aura-core/agent/daemon/swift-ime/geek-familiar 切换完成。
+- 边界范式（现名 VadSentence/VadParagraph;wire 字段冻结旧词汇）+ 5 事件数据面协议
+  （stream_fragment/batch_sentence/batch_paragraph/sentence_calibration/
+  paragraph_calibration）:aura-core/agent/daemon/swift-ime/geek-familiar 切换完成。
 - **x-asr** 流式引擎（`asr.stream.model: x-asr`，2026-08-18）：chunk-480ms 官方导出，
   自带标点；可与 zipformer A/B。tokens.txt 必须官方"token id"两列格式。
 - **VAD 门控流式**（2026-08-19）：`detected()` 实时信号门控流式喂帧——空闲零流式 CPU；
@@ -167,9 +176,9 @@ CARGO_MANIFEST_DIR=$(pwd) cargo run -p aura-daemon -- 127.0.0.1:7879 -p 9091
 
 ## 代码内遗留 TODO（整改时留意）
 
-- ~~`Stage1Recognizer::run`：batch 调用仍在消费线程同步执行~~ 已异步化（2026-08-30，R5
-  关闭：batch 跑在 `aura-batch` worker 线程，消费循环零阻塞）；`Stage1Config::new` 内嵌 IO →
-  拆出（R6）；daemon 静态路径 `BASE` 硬编码 → FileLoader（R7）。
+- ~~batch 调用在消费线程同步执行~~ R5 已关闭(round12 任务结构 + round21 流式独立,
+  消费循环零阻塞);`Stage1Config::new` 内嵌 IO → 拆出(R6);daemon 静态路径 `BASE`
+  硬编码 → FileLoader(R7)。
 - dp-models `AsrBackend::Whisper`/`Qwen3Asr` 枚举变体已无构造点（死代码，可清）。
 
 ## 未完成

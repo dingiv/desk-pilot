@@ -1,7 +1,7 @@
 # 真实场景语音听写：问题与设计
 
 > 目标：让 aura 三层管道在真实对话中达到"听写级"体验。北极星：系统级 AI 秘书。
-> 范式：**边界范式**（VadSegment/VadWindow，2026-08-17 起）——本文是"问题 → 处理层 →
+> 范式：**边界范式**（实体现名 VadSentence/VadParagraph，2026-08-17 起）——本文是"问题 → 处理层 →
 > 方案"的清单；已实现的方案细节以 `stages.md` 为准。
 
 ## 处理优先级矩阵
@@ -26,8 +26,8 @@
 
 **方案（边界范式）**：`min_silence`（切段）与 `merge_gap`（合并窗口上界）**解耦**——
 - 停顿 ≥min_silence → EOS 切段，段级 batch + `Batch` 事件（低阈值保响应）；
-- 段间静音 < merge_gap → 并入同一 `VadWindow`（窗口级 batch 重跑出权威文本）；
-  ≥ merge_gap → 窗口定稿 `WindowEdge`。
+- 句间静音 < merge_gap → 并入同一 `VadParagraph`（段级 batch 重跑出权威文本）；
+  ≥ merge_gap → 段定稿 `ParagraphEdge`。
 - merge_gap=0 → 每段独窗；单段窗口免重跑（复用段级 batch）。
 - **段边界损失**（句首/尾掉字）：`edge_margin`（0.3s）扩展段头/段尾真实音频。
 

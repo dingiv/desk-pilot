@@ -5,10 +5,10 @@
 ## ✅ 已完成
 
 - [x] crate 合并（aura-core + aura-dcl + aura-store + aura-asr + aura-tts → 一个 aura-core）
-- [x] **边界范式**（2026-08-17）：VadSegment/VadWindow 一等实体 + append-only 事件
-  （Batch/WindowEdge），替代旧 Utterance/MergeBatch"就地修改"契约；PCM 由 AudioStore
+- [x] **边界范式**（2026-08-17,实体现名 VadSentence/VadParagraph）：一等实体 + append-only 事件
+  （Batch/ParagraphEdge），替代旧 Utterance/MergeBatch"就地修改"契约；PCM 由 AudioStore
   按 id 持有，batch 失败显式 Option。
-- [x] **5 事件数据面协议**（2026-08-18）：stream_fragment / batch_segment / batch_window /
+- [x] **5 事件数据面协议**（2026-08-18;wire 名后随实体更名）：stream_fragment / batch_sentence / batch_paragraph /
   segment_calibration / window_calibration + correction；aura-core/agent/daemon/swift-ime/
   geek-familiar 已切换，devtools 待迁。
 - [x] dp-models 通用模型提供库：ModelProvider 伞形 trait + Asr/Llm/Vlm 能力 trait +
@@ -34,7 +34,7 @@
 |---|---|---|---|
 | R1 | **自适应 merge_gap** | 中 | 碎片化主体已被 SegmentMerger 解决；剩余价值=按场景自适应"一句"的窗口（命令式调小快定稿 / 长句调大） |
 | R4 | **口误自纠检测**（正则 "X 不对 Y" → Y） | 中 | 零 LLM 开销的确定性预处理 |
-| R5 | **Stage1 run() 异步化（残余：batch 移出消费线程）** | 中 | ~~睡眠轮询~~ 已除（2026-08-18：ring 挂 Condvar，无帧时挂起等 ingest notify，仅真实截止时间唤醒——settle 到点/停滞看门狗/断流喂静音；无截止时间则无限期挂起，**空闲零唤醒、零心跳**，diag 只在有活动时打印）。~~batch 调用移出消费线程~~ **已除（2026-08-30：EOS/段定稿只入队 batch job（微秒级），阻塞 `recognize` 跑在 pipeline spawn 的 `aura-batch` 单 worker 线程；结果经 `SentenceBatchReady`/`ParagraphBatchReady` 回传，Stage2 按就绪条件定稿。消费循环零阻塞 → 吞句 bug（墙钟误切）+ 流式冻结根除；详见 async-batch-design.md / pipeline-optimization.md P0。** 历史背景：原同步调用远程 ~3.5s/次期间流式/VAD 全停，ring 积压解除后追赶音频被压缩 → 墙钟 gap 压扁导致过度并窗（10x 重放 4s→0.4s 复现） |
+| R5 | **Stage1 run() 异步化（残余：batch 移出消费线程）** | 中 | ~~睡眠轮询~~ 已除（2026-08-18：ring 挂 Condvar，无帧时挂起等 ingest notify，仅真实截止时间唤醒——settle 到点/停滞看门狗/断流喂静音；无截止时间则无限期挂起，**空闲零唤醒、零心跳**，diag 只在有活动时打印）。~~batch 调用移出消费线程~~ **已除（2026-08-30，round12 任务结构：EOS/段定稿只发事件，batch 由 pipeline 句/段任务 `spawn_blocking(recognize_once)` 自建，结果以 `BatchSentence`/`BatchParagraph` 回传。消费循环零阻塞 → 吞句 bug（墙钟误切）+ 流式冻结根除；round21 起流式解码亦独立 tokio::task。详见 debugging.md round 简表。）** 历史背景：原同步调用远程 ~3.5s/次期间流式/VAD 全停，ring 积压解除后追赶音频被压缩 → 墙钟 gap 压扁导致过度并窗（10x 重放 4s→0.4s 复现） |
 | R6 | **Stage1Config::new IO 拆分** | 低 | 构造函数内嵌模型路径解析 IO，拆成独立函数（recognizer.rs TODO） |
 | R7 | **daemon 静态路径去硬编码** | 低 | `BASE` 常量 → FileLoader 机制（main.rs TODO） |
 

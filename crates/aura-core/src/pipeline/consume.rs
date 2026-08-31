@@ -232,7 +232,7 @@ impl OnnxStage1Recognizer {
                 time_ms = ((s.end_s - s.start_s) * 1000.0).round() as u64,
                 fed = stream.fed,
                 streaming = %s.streaming_text,
-                "句定稿(句级 batch 稍后入队,异步执行)"
+                "句结束"
             );
         }
         // Final stream fragment: the sentence's DEFINITIVE streaming text (live partials only

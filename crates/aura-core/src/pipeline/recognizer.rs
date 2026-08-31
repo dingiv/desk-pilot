@@ -10,7 +10,7 @@
 //! - [`Self::run_ingest`] — scout TCP → AudioRing(阻塞,自动重连);
 //! - [`Self::run`] — 消费循环(VAD + 流式 + 边界决策),**永不被 batch 阻塞**(batch 由
 //!   Pipeline 的任务结构经 [`Self::recognize_once`] 自建,round12 起)
-//!   (batch 异步化的根因修复:见 docs/aura/async-batch-design.md)。
+//!   (batch 异步化的根因修复:见 docs/aura/debugging.md)。
 //!
 //! Boundary paradigm (docs/aura/stages.md): a paragraph OPENS at the VAD speech onset
 //! (detected() rising edge → timestamp id, live partials carry the REAL key from the first
@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 
 
 use anyhow::{bail, Result};
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 use crate::audio_store::{AudioStore, DEFAULT_CAP_SAMPLES};
 use crate::buffer::AudioRing;
@@ -380,7 +380,7 @@ impl OnnxStage1Recognizer {
         match self.batch_asr.recognize(pcm, sr) {
             Ok(text) if !text.trim().is_empty() => Some(text),
             Ok(_) => {
-                debug!(
+                info!(
                     what,
                     paragraph_id, "batch 识别成功但文本为空(噪声/静音)→ 回退流式"
                 );

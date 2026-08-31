@@ -3,8 +3,8 @@
 > **一句话**:声音进来,流式先出粗稿(实时),batch 再出精稿(秒级),Stage2 拿**两路结果对照**做终稿。
 > 边界信号("我说完了")及时,精度("说得对不对")后到后改——**渐进精化**是这套架构的核心形态。
 >
-> 代码为准。执行细节/线程模型/事件不变式见 [async-batch-design.md](async-batch-design.md),
-> 数据契约见 [stages.md](stages.md)。本文是架构层的完整描述。
+> 代码为准。数据契约见 [stages.md](stages.md);排障见 [debugging.md](debugging.md)。
+> 本文是架构层的完整描述。
 
 ---
 
@@ -34,10 +34,11 @@
 Stage1 由 VAD 快速控制启动:**检测到声音的瞬间**(detected() 翻转),创建一个新的
 paragraph(分配时间戳真 id)和一个新的 sentence(流式 partial 从第一条起就携带真实键),
 同时补喂起音前 ~0.5s 的 lead-in——软起音不丢,流式和 batch 听到同一句话的完整音频。
+(注:lead-in 是给会话的补喂音频;partial 解码节拍另计,见 §2.2。)
 
 ### 2.2 句内 —— 流式粗稿
 
-说话期间,流式 ASR 每 ~0.5s 解码一次 partial,文本逐条推给前端(首选候选持续生长,
+说话期间,流式 ASR 每 ~0.3s 解码一次 partial,文本逐条推给前端(首选候选持续生长,
 这就是听写的"实时感")。热词偏置在这一路生效。
 
 ### 2.3 句间隔(1s 空白)—— 句级 batch + 纠偏
@@ -60,7 +61,7 @@ batch 识别的结果,一同交给 Stage2——这是该段的**定稿**。段�
 ### 2.5 事件流(一句话的一生)
 
 ```
-起音 ──► stream×N(流式 partial,~0.5s/条)
+起音 ──► stream×N(流式 partial,~0.3s/条)
 1s 空白 ─► stream(final,句定稿流式)
         └► [句级 batch 识别,异步,~百ms/远端秒级]
               └► batch_sentence(batch 文本)          ← 先
@@ -126,11 +127,24 @@ t0+Δ'     sentence_calibration "第一句。" ← 纠偏(双通道)再替换
 
 ## 5. 执行模型(载体)
 
-全异步编排(round14+,round21 流式再拆):消费循环(VAD/分句/段落决策)是原生异步任务;
-流式识别模型是独立 tokio::task(async fn,executor 协作调度;帧经通道转发,partial 回传
-仍从消费循环发射);阻塞桥是 scout 采集(sync IO,blocking pool);每句的 batch 识别与
-纠偏、每段的重跑与定稿,都是 spawn 出的任务——`select!` 主循环是唯一的发射点,所有发往
-前端的事件先统一留痕再发。详见 [async-batch-design.md](async-batch-design.md) §1。
+全异步编排(round14+,round21 流式再拆,round24 通道收敛):**常驻阻塞线程只有采音**
+(scout TCP → ring,blocking pool);其余都是 tokio 任务协作分时——消费循环(VAD/分句/
+段落决策)、流式识别任务(独立 tokio::task,与消费循环仅一对通道)、每句 batch 任务与
+纠偏任务、每段重跑与定稿任务(内部 `spawn_blocking` 干 `reqwest::blocking` 的真活)。
+**`select!` 主循环是唯一的发射点**,所有发往前端的事件先统一留痕再发。
+
+通道清单(谁喂谁、什么频率):
+
+| 通道 | 方向 | 频率 | 载荷 |
+|---|---|---|---|
+| ring + `Notify` | 采音 → 消费循环 | 31Hz 恒定 | 帧 |
+| `StreamCmd`(cmd) | 消费循环 → 流式任务 | 高频(语音期 31Hz)+ 低频控制 | `Feed` 帧 / `Onset` lead-in / `Reset` / `Finalize` |
+| `StreamOut`(out) | 流式任务 → 消费循环 | ~0.3s partial + 每句一条 | `Partial` / `Finalized`(定稿回执,同通道) |
+| `s1` 事件通道 | 消费循环 → 主循环 | 低频 | SF / Batch(EOS)/ ParagraphEdge(settle) |
+| `turn` 事件通道 | 各任务 → 主循环 | 低频 | BS / SC / BP / PCal |
+
+高频(帧)与低频(事件)在通道上分层,互不阻塞;batch 从头到尾不见实时帧——它吃的是
+EOS 定稿交接的整句 PCM(恰为流式任务累积的那份,含 soft onset)。
 
 ---
 

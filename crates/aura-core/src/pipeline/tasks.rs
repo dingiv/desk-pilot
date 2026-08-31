@@ -9,7 +9,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::hub::{FinalTurn, Storage};
 use crate::pipeline::calibrator::Stage2Calibrator;
@@ -68,10 +68,19 @@ pub(crate) fn emit_turn<F>(on_turn: &F, ev: TurnEvent<'_>)
 where
     F: Fn(TurnEvent),
 {
-    info!(event = %describe_turn(&ev), "emit→前端");
+    // 级别(round25):流式高频 → debug;batch/纠偏/边界 → info。
+    match ev {
+        TurnEvent::StreamFragment { .. } => debug!(event = %describe_turn(&ev), "emit→前端"),
+        _ => info!(event = %describe_turn(&ev), "emit→前端"),
+    }
     on_turn(ev);
 }
 /// 任务产出回传通道(pipeline 内部;主循环 drain → 单点 emit)。
+/// 墙钟时刻(HH:MM:SS.mmm,本地时区)—— batch/纠偏调用的起止对表用(round25)。
+fn wall(t: chrono::DateTime<chrono::Local>) -> String {
+    t.format("%H:%M:%S%.3f").to_string()
+}
+
 pub(crate) type TurnTx = tokio::sync::mpsc::UnboundedSender<TurnEvent<'static>>;
 /// 段级重跑的兜底超时:HttpAsr 自带请求级超时,这里保证"重跑无论挂死/panic,
 /// 段定稿链(PCal/归档)必然继续"—— PCal 必发是客户端 REPLACED 语义的契约前提。
@@ -98,13 +107,18 @@ pub(crate) async fn sentence_task(
 ) -> SentenceOutcome {
     let out = tokio::task::spawn_blocking(move || {
         let pcm = s1.audio_store().concat(&[audio_id]);
+        let start = chrono::Local::now();
         let t0 = Instant::now();
         let text = s1.recognize_once(&pcm, sr, "句级", paragraph_id);
-        (text, t0.elapsed().as_millis() as u64)
+        (text, t0.elapsed().as_millis() as u64, start, chrono::Local::now())
     })
     .await
-    .unwrap_or((None, 0));
-    let (text, asr_ms) = out;
+    .unwrap_or_else(|_| (None, 0, chrono::Local::now(), chrono::Local::now()));
+    let (text, asr_ms, start, end) = out;
+    info!(paragraph_id, sentence_id,
+        start = %wall(start), end = %wall(end), asr_ms,
+        batch = text.as_deref().unwrap_or("(none)"),
+        "batch[sentence] 完成");
     if let Some(text) = &text {
         let _ = turn.send(TurnEvent::BatchSentence {
             paragraph_id,
@@ -133,13 +147,17 @@ pub(crate) async fn live_calibration_task(
         let _ = h.await;
     }
     let t = Instant::now();
+    let start = chrono::Local::now();
     let calibrated = tokio::task::spawn_blocking(move || {
         calibrate.lock().unwrap().calibrate_paragraph(paragraph_id, &sentences)
     })
     .await
     .unwrap_or_default();
+    let end = chrono::Local::now();
     let route_ms = t.elapsed().as_secs_f64() * 1000.0;
-    info!(paragraph_id, route_ms = route_ms.round() as u64, calibrated = %calibrated, "纠偏[sentence]");
+    info!(paragraph_id, sentence_id = up_to,
+        start = %wall(start), end = %wall(end), route_ms = route_ms.round() as u64,
+        calibrated = %calibrated, "纠偏[sentence]");
     let _ = turn.send(TurnEvent::SentenceCalibration {
         paragraph_id,
         sentence_id: up_to,
@@ -198,23 +216,33 @@ pub(crate) async fn paragraph_task(
     if paragraph.sentences.len() > 1 {
         let pcm = Arc::clone(&paragraph.pcm);
         let run = Arc::clone(&run_paragraph_batch);
-        let batch_text = match tokio::time::timeout(
+        // 计时进闭包(round25):起止墙钟 + 耗时;事件字段 batch_asr_ms 落真值。
+        let (batch_text, rerun_ms) = match tokio::time::timeout(
             PARAGRAPH_RERUN_TIMEOUT,
-            tokio::task::spawn_blocking(move || run(&pcm, sr, paragraph_id)),
+            tokio::task::spawn_blocking(move || {
+                let start = chrono::Local::now();
+                let t0 = Instant::now();
+                let text = run(&pcm, sr, paragraph_id);
+                let ms = t0.elapsed().as_millis() as u64;
+                info!(paragraph_id, start = %wall(start), end = %wall(chrono::Local::now()),
+                    rerun_ms = ms, batch = text.as_deref().unwrap_or("(none)"),
+                    "batch[paragraph] 整段重跑完成");
+                (text, ms)
+            }),
         )
         .await
         {
-            Ok(Ok(t)) => t,
+            Ok(Ok((t, ms))) => (t, ms),
             Ok(Err(e)) => {
                 warn!(error = %e, paragraph_id, "段级重跑任务 panic → 回退句级 batch");
-                None
+                (None, 0)
             }
             Err(_) => {
                 warn!(paragraph_id, "段级重跑超时 → 回退句级 batch(阻塞线程残留,无碍)");
-                None
+                (None, 0)
             }
         };
-        paragraph.batch_asr_ms = 0; // 计时在闭包外拿不到 —— 保留事件字段语义,见下
+        paragraph.batch_asr_ms = rerun_ms;
         if let Some(text) = batch_text {
             paragraph.batch_text = Some(text.clone());
             let _ = turn.send(TurnEvent::BatchParagraph { paragraph_id, text });
@@ -223,6 +251,7 @@ pub(crate) async fn paragraph_task(
 
     // 定稿整流:一次 LLM(全句 best_text —— 句级 batch 已全部回填,live 整流给不了的)。
     let t = Instant::now();
+    let start = chrono::Local::now();
     let calibrated = {
         let cal = Arc::clone(&calibrate);
         let para = paragraph.clone();
@@ -230,9 +259,11 @@ pub(crate) async fn paragraph_task(
             .await
             .unwrap_or_default()
     };
+    let end = chrono::Local::now();
     let route_ms = t.elapsed().as_secs_f64() * 1000.0;
     info!(
         paragraph_id = paragraph.id,
+        start = %wall(start), end = %wall(end),
         at_s = (paragraph.start_s * 10.0).round() / 10.0,
         sentences = paragraph.sentences.len(),
         batch = %paragraph.batch_text.clone().unwrap_or_default(),

@@ -23,19 +23,21 @@
 
 ## 二、状态清单（盘点 + 分类 + 归属）
 
-### 数据面（`GET /api/asr_stream` → `AsrSegment` 流，每事件直推；5 事件协议 2026-08-18）
+### 数据面（`GET /api/asr_stream` → `AsrEvent` 流，每事件直推；5 识别事件 + correction）
 
 | #   | 状态                             | 来源                                     | 频率                    | 数据量           | 段类型                                    |
 | --- | -------------------------------- | ---------------------------------------- | ----------------------- | ---------------- | ----------------------------------------- |
-| 1   | 段级流式 partial / 段定稿（raw） | Stage1 流式会话                          | **高**（~0.5s，说话中） | 小（~50–200 字） | `stream_fragment {window_id, segment_id}` |
-| 2   | 段级 batch 结果                  | Stage1 段 EOS                            | 中（每段）              | 小               | `batch_segment {window_id, segment_id}`   |
-| 3   | 整窗 batch 重跑（权威 raw）      | Stage1 窗口 settle                       | 低（每窗口）            | 小               | `batch_window {window_id}`                |
-| 4   | 窗口联合整流（provisional）      | Stage2 `calibrate_window`（每 VAD 间隔） | 中（每段 ~1–5s）        | 小               | `segment_calibration {window_id}`         |
-| 5   | 窗口定稿                         | Stage2 `finalize_window`（WindowEdge）   | 低（每窗口）            | 小–中            | `window_calibration {window_id}`          |
-| 6   | 用户纠偏标记（per-window）       | `POST /api/correct {window_id}`          | 极低（用户动作）        | 极小             | `correction {window_id}`                  |
+| 1   | 句级流式 partial / 句定稿（raw） | Stage1 流式任务                          | **高**（~0.3s，说话中） | 小（~50–200 字） | `stream_fragment {window_id, segment_id}` |
+| 2   | 句级 batch 结果                  | 句任务（EOS 触发）                       | 中（每句）              | 小               | `batch_sentence {window_id, segment_id}`  |
+| 3   | 整段 batch 重跑（权威 raw）      | 段任务（段关闭；单句段不发）             | 低（每段）              | 小               | `batch_paragraph {window_id}`             |
+| 4   | 联合纠偏（provisional）          | Stage2 `calibrate_paragraph`（**BS 到达触发**） | 中（每句 batch 后） | 小               | `sentence_calibration {window_id, segment_id}` |
+| 5   | 段定稿                           | Stage2 `finalize_paragraph`（段关闭）    | 低（每段）              | 小–中            | `paragraph_calibration {window_id}`       |
+| 6   | 用户纠偏标记（per-paragraph）    | `POST /api/correct {window_id}`          | 极低（用户动作）        | 极小             | `correction {window_id}`                  |
 
-> **batch 两层都上数据面**（2026-08-18 协议）：`batch_segment`（每段 EOS）+ `batch_window`
-> （整窗重跑，权威 raw）。客户端若只要定稿可忽略前四类。
+> **wire 字段名冻结旧词汇**（Rust 侧 sentence/paragraph 经 serde rename 回
+> `window_id`/`segment_id`）——预构建 Web SPA 与存量日志不受影响。
+> `sentence_calibration` 的 `segment_id` = 覆盖上界（round20b：触发该次纠偏的 BS 句，
+> 前端零派生状态即知覆盖谁）。客户端若只要定稿可忽略前四类。
 
 ### 控制面（`GET /api/state` → `AuraStateView` 快照，节流 ping → 重拉）
 
