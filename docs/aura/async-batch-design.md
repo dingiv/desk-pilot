@@ -1,426 +1,432 @@
-# Stage1 batch 异步化:把 batch 识别移出消费线程(设计)
+# aura 后端流水线执行与事件触发状态流(as-built + 前后端时序错位清单)
 
-> **状态:已实现(2026-08-30,dev 分支)。** 代码为准。
-> **落地形态与本文设计有两处差异**(实现时的用户约束):
-> 1. **单 batch worker(N=1 FIFO)** 而非 §5.1 的 N=2 池 —— 用户指定"添加一个独立的线程"。
->    后果:连续说话时 job 可能积压(吞吐 ≈ 1 句/3.5s),定稿延迟受排队影响(§6 B1 的
->    取舍);要升级成池只需在 `pipeline.rs` 对同一条 job 通道多 spawn 几个线程,消费循环
->    与事件契约不变。
-> 2. **线程创建全部收归 `pipeline.rs`** —— Stage1/Stage2 只暴露阻塞函数
->    (`OnnxStage1Recognizer::run_ingest` / `run_batch_worker` / `Stage1Recognizer::run`),
->    stage 模块内部 **不 spawn 任何线程**;ingest 线程的创建也一并收归(原设计里 ingest
->    仍由 recognizer 自建)。
-> 未落地(属 P4):job 超时 + tick 线程就绪兜底。
+> **状态:现状实录(2026-09-01);round13 修复 + round14 线程模型收拢已落地(见下)。** round12(tokio 化)+
+> round11 S3 之后,实测**前后端时序对接错位、不可用**——本文是修错前的地基文档:后端
+> 流水线**实际怎么执行**、每个事件**由什么状态触发**、在哪个线程上**何时发出**,以及
+> 据此核对出的**错位清单(§7)**。
 >
-> 本文是 [`pipeline-optimization.md`](pipeline-optimization.md) 的 **P0(地基)**;整条管线的
-> 分层优化(P1 整流去冗余 / P2 短段免重跑 / P3 首字延迟 / P4 鲁棒性)见该文档。
-> 关联 bug:说话间隔 1–3.5s 时,前端预览里**第一句概率性被吞**(段落被过早切分)。
-> 代码入口:Stage1 = `crates/aura-core/src/recognizer.rs`(消费循环 + 边界决策),
-> Stage2 = `crates/aura-core/src/calibrator.rs`(联合整流),组装 = `crates/aura-core/src/pipeline.rs`
-> (Stage2 worker + 事件路由 + 归档),前端折叠(消费方)= `crates/ime-core/src/voice_state.rs`。
-> 契约权威:`docs/aura/stages.md`。
+> **round13 修复记录(2026-09-01,同日落地;代码为准)**:
+> - **A → 已修**:段落 id 改为**创建时刻时间戳**(UNIX_EPOCH 微秒,严格递增
+>   `max(now, last+1)`)—— recognizer `next_win_id`(取代 `next_random_win_id`);
+>   id 即顺序对客户端成立,lib.rs 契约文档同步。
+> - **B → 已修**:**起音即开段**—— VAD detected() rising edge 即分配真实段落 id
+>   (`on_speech_onset`,feed_streaming 起音臂调用),live partial 从第一条起携带真键,
+>   幽灵段根除;配套**空段 GC**(开段后从未出句,静默满 merge_gap 静默丢弃,防陈旧
+>   空段被远期语音复用导致 id 错位)。回溯 SOS 降级为防御兜底。
+> - **D → 已修**:主循环只为 **just-closed 句**(Batch 载荷最后一个)投句任务,N²
+>   重投回归消除。
+> - **E.3 → 已修**:**live 整流回归 Batch 臂**——每 Batch 触发一次 live 校准
+>   (`live_calibration_task`,段内链式串行,SC 顺序 = 段落生长序);段任务只做
+>   join 回填 + 段重跑 + 定稿,并在定稿前等 live 链尾(全部 SC 先于 PCal)。
+>   架构需求"1s 空白 → Batch 识别 → stage2 紧跟纠偏,先后明确"恢复成立。
+> - 测试:audio-aura-core 65+1 全绿(新增 tracker 4 + live 链 1,改写段任务 2)。
+> - **round14 线程模型收拢(2026-09-01)**:`Pipeline::run` 改为**纯 async future** ——
+>   run() 内部不再声明任何 std 线程;阻塞桥经 `spawn_blocking` 骑 runtime blocking
+>   pool,主循环即 run() 自身。daemon 把 `pipeline.run(..)` 直接 spawn 到 socket
+>   runtime(**零专用线程**);examples/bench 用 `Pipeline::spawn`(一条专用线程 +
+>   current_thread rt)便捷入口。事件语义/顺序不变,纯执行载体简化。
+> - **round14b 消费循环 async 化(同日)**:阻塞桥 ②(s1 消费循环)从 spawn_blocking
+>   改为**原生异步任务** —— 帧等待从 `Condvar` 换 `tokio::sync::Notify`(permit 语义
+>   防丢唤醒),VAD(32ms/帧,微秒级)与流式解码(0.5s 节流)内联在 executor 上;
+>   深度睡眠/恢复从 `(Mutex, Condvar)` 换 `Arc<Notify>`(daemon resume 同步侧
+>   `notify_one` 即可)。**唯一剩余阻塞桥 = scout TCP ingest(sync IO)**。
+>   trait 方法改 RPITIT + `Send`(async fn in trait 写不出 auto bound)。冒烟实测
+>   idle 深睡 → 客户端接入 resume 闭环正常(见 §1 拓扑表)。
+> - **round16 统一发射留痕 + round16b 定稿回填修复**:主循环(单点发射)每条发往
+>   前端的 TurnEvent 先记一条 `info`(describe_turn 单行摘要,p 值即时间戳可比大小)
+>   —— 前后端时序对表的权威序列。日志随即钉死一个 round12 回归:**paragraph_task
+>   的 join 回填结果(acc)从未写回段落实体** —— 定稿/归档用的是 ParagraphEdge
+>   快照(各句 batch_text 恒 None,tracker 副本从不更新)→ best_text 静默回退流式;
+>   PassThrough(LLM 禁用)下 PCal 直接发流式拼接,经 REPLACED 把 finals 已到手的
+>   batch 占位换回流式(单句段落无 BP 掩盖,完全裸露;多句段落被段重跑掩盖)。
+>   修复:回填写回 `paragraph.sentences`;主循环另维护**已回填**句集(Batch 刷新 +
+>   BS patch),live SC 的输入同样吃到前句 batch。回归测试
+>   `paragraph_task_finalize_uses_backfilled_sentence_batches` 钉死。
+> - **round17 panic 修复 + round17b SC 触发点修正**:① 段重跑/归档的阻塞调用裸跑在
+>   async 任务里 → `reqwest::blocking` 内部 runtime drop **panic** → 段任务崩死、
+>   PCal/归档永久丢失(实测 p724)—— 重跑包 `spawn_blocking` + 15s 兜底超时
+>   (**PCal 必发**成为硬保证),归档同包;② live SC 触发点从 Batch 事件(EOS 时刻)
+>   **移到该句 BS 到达时** —— 架构要求"batch 完成 → 之后纠偏,先后明确"(此前 SC
+>   抢在 BS 前、内容退化为流式);③ Batch 臂句集合并(round16b 的编辑当时静默
+>   未生效,本次落定):保留 BS 已回填的 batch,SC/PCal 输入不再退回全流式。
+> - **round17c 纠偏输入双通道(默认)**:`LlmInput` 默认 `batch` → **`both`** —— 纠偏
+>   纠的就是 batch + 流式两路识别的结果,参数必须都传进 Stage2(prompt 双转写对照:
+>   `<primary>` = best_text(batch 优先),`<secondary>` = 流式拼接,批式丢句首由流式
+>   补回)。单路(batch/stream)降为显式配置的降级模式;aura.yaml 同步 `input: both`。
+> - **round18/19 前端留痕 + 丢事件三连修**:① 接收侧统一留痕(`前端←event`,与 server
+>   `emit→前端` 同词汇,两边 diff 即定位缺口);② **SSE 30s 掐流根因** —— `AuraClient`
+>   的 `.timeout(30s)` 覆盖整个响应生命周期,长流每 ~30s 被掐(重连窗口事件永久丢 +
+>   UI 闪"不可用")—— 拆出**无总超时**的 SSE 专用 client(仅连接超时);③ daemon 的
+>   `{"type":"hello"}` 握手 ack 静默跳过(曾误报"契约不匹配");④ SSE 内部重连成功后
+>   自发 `Resync`:reset + `/api/results` 全量对账,补断连窗口丢的定稿(广播无回放,
+>   这是唯一补历史通道)。
+> - **round20 SC 陈旧遮蔽修复**:`cascade_preview` 的"纠偏 > batch > 流式"级联中,
+>   SC 是**快照**—— 只覆盖到触发它的那句 BS,**不知道自己已过时**:同段第二句
+>   流式期间,best_calc 恒返回陈旧 SC,新句被遮住(实测"第二句不刷新 UI")。
+>   修:`ParaState` 记 SC 覆盖上界(`sc_covers_sid` = 触发它的 BS 句 id),
+>   过界新句以 batch>流式 **续接**在 SC 之后 —— SC 仍优先,但只顶替它覆盖的部分。
+> - **round20b 覆盖上界走协议**:`segment_calibration` 事件**自带 `segment_id`**
+>   (触发该次纠偏的 BS 句)—— 客户端的派生记账(max_bs_sid 追踪)删除,fold
+>   直接取事件字段。SC"该覆盖谁"由 wire 契约声明,不再前端推断。
+>
+> 本文取代原"Stage1 batch 异步化设计"(该设计已落地并被 round12 取代,历史内容见 git)。
+> 代码为准。行号以当前工作区为准:
+> Stage1 = `crates/aura-core/src/recognizer.rs`,编排 = `crates/aura-core/src/pipeline.rs`,
+> 契约 = `crates/aura-core/src/lib.rs`,daemon = `apps/audio-aura/src/main.rs`,
+> wire = `crates/aura-agent/src/view.rs`,客户端折叠 = `crates/aura-agent/src/transcript.rs`。
 
 ---
 
-## 1. 问题
-
-**复现**:说完第一句,停顿 1–3.5s,再说第二句。概率性出现:
+## 0. 全链路总览
 
 ```
-我说完第一句话.  [2s]  我说了第二句话.
-
-bug  预览:我说完第一句话  →  我说了第二句话          ← 第一句被吞
-期望 预览:我说完第一句话  →  我说完第一句话. 我说了第二句
+麦克风 ──► omni-scout(:7878 /audio TCP)
+        ──► [blocking pool]       scout → AudioRing(Notify 唤醒;spawn_blocking,sync IO)
+        ──► [异步任务]            消费循环:VAD 门控流式 + 分句 + 段落决策(原生 async)
+                                      │ Stage1Event(5 种,FIFO)
+                                      ▼ s1_tx (tokio unbounded)
+              [pipeline.run 任务]   select! 主循环 —— on_turn 唯一调用者(单点发射)
+                                     (round14:daemon = rt 任务,零专用线程)
+                  ├─ StreamFragment ──────────► 直发
+                  ├─ ParagraphClosed ─────────► 直发(边界,先于下一段任何事件)
+                  ├─ Batch ──► 句任务 ×N(spawn_blocking recognize_once)
+                  │               └─► BatchSentence ──► turn_tx ──► 主循环 emit
+                  └─ ParagraphEdge ──► 段任务(join 句任务 → live 整流 → 段重跑
+                                          → 定稿整流 → 归档)
+                                      └─► SentenceCalibration / BatchParagraph /
+                                          ParagraphCalibration ──► turn_tx ──► emit
+                                      ▼
+              daemon on_turn:TurnEvent → AsrEvent(wire tag FROZEN)
+                                      ▼ broadcast(1024)
+              GET /api/asr_stream(SSE,data: {json}\n\n)
+                                      ▼
+              [aura-agent client] 字节级分帧 → parse_event
+                                      ▼ fold_event
+              SharedTranscript(折叠状态机)──► IME 候选/预览
 ```
 
-**现象**:第一句掉成一个独立定稿(另一条候选),第二句进了新段落,两段没有拼在一起。
-
 ---
 
-## 2. 根因
+## 1. 执行拓扑(谁在哪跑什么)
 
-**一句话**:句级 batch 是**消费主线程上的同步阻塞调用**(远程 ~3.5s/次),阻塞期间墙钟照走,
-恢复瞬间 `check_settle` 用墙钟判定"已静默 ≥ merge_gap",把段落**过早定稿**——此时第二句的
-音频还压在 AudioRing 里没被处理,自然落进新段落。
+| 线程 / 任务 | runtime | 运行内容 | 产出 |
+|---|---|---|---|
+| blocking pool(ingest) | tokio blocking | `s1.run_ingest()`:scout TCP → AudioRing,自动重连(2s 退避) | ring + Notify(permit) |
+| 消费循环任务(round14b) | **原生异步** | `s1.run(cb).await`:帧等待 = Notify + 截止;VAD/流式内联;深睡 = 等 resume Notify | `Stage1Event` → `s1_tx` |
+| `pipeline.run` future | daemon rt 任务 / 独立宿主专用线程 | `select!` 主循环:两源(s1_rx / turn_rx)单点 `on_turn` | `TurnEvent`(wire 前形态) |
+| 句任务 | spawn_blocking | `recognize_once(句 PCM)`,完成即回传 | `BatchSentence` → `turn_tx` |
+| 段任务 | tokio::spawn | join 句任务(就绪门)→ live 整流 → 段重跑 → 定稿 → 归档 | §3.3 四种事件 → `turn_tx` |
+| `aura-pipeline`(外层) | std | `spawn` 包装 `run`(满足 `-> !`);daemon 用 | — |
+| `aura-socket` | multi_thread tokio | daemon 主线程:axum SSE、控制面、idle 监控 | broadcast `AsrEvent` |
 
-**阻塞链**(全部在 `aura-pipeline` 这一个 std 线程上):
+**通道**:
 
-1. 句 1 EOS → `finalize_sentence`(`recognizer.rs:804`):
-   `self.batch_asr.recognize(&sentence_pcm, sr)` **同步**执行,远程 ~3.5s。
-   这 3.5s 里消费循环**不取帧、不跑 `check_settle`、不喂流式**——第二句音频全堆在 ring 里。
-2. 阻塞期间 `speaking` 恒 false:句 1 EOS 时流式会话已 reset(空),阻塞期间又没喂第二句
-   音频 → `last_partial` 空 → `speaking = false`(`recognizer.rs:933`)。
-   于是 `check_settle` 的 `speaking` 抑制**没有兜住**。
-3. batch 返回,循环恢复,**第一步就是 `check_settle`**(`recognizer.rs:954`):
-   `now - last.end_s`(墙钟)≥ `merge_gap` → 判"静默已满" → `emit_paragraph_edge`
-   把段落 1 定稿(只含句 1)。
-4. 第二句随后才被处理,`tracker` 已 `take_open()` → 句 2 拿**新段落 id**
-   (`prospective`,`recognizer.rs:582`)。前端按 `current_paragraph` 渲染 → 组合预览只剩句 2,
-   句 1 掉成独立定稿(`voice_state.rs:335` 的 `ParagraphCalibration` 臂)。
-
-**为什么概率性**:触发条件 = `batch 延迟 ≥ 到 merge_gap 截止点的剩余时间`。
-batch ≈ 3.5s、`merge_gap` = 3.5s,几乎每次句末都贴线,掷硬币:
-
-- batch 早于截止点返回(本地 batch 快 / 网络快)→ 第二句音频在段落还开着时被处理 → 正常拼接。
-- batch 晚于截止点返回(远程 ~3.5s)→ 恢复瞬间 `check_settle` 命中 → 误切。
-
-**为什么只在 1–3.5s 区间**:`≥3.5s` 本就该切段(行为正确);`<1.0s` 是同句不切。
-卡在这个"同段"区间 + batch 慢,才触发。
-
-> `recognizer.rs:898` 的 TODO 已记录此问题:"batch 调用还在消费线程内同步执行
-> (远程 ~3.5s/次会暂停流式)"。本文即该 TODO 的完整设计。
-
----
-
-## 3. 现状架构(as-is)
-
-**线程**:
-
-| 线程 | 职责 | 是否阻塞音频 |
+| 通道 | 类型 | 语义 |
 |---|---|---|
-| `aura-stage1-ingest` | scout TCP → AudioRing | 否(独立) |
-| `aura-pipeline`(std) | **Stage1 消费循环**:取帧 / VAD / 喂流式 / **同步 batch** / 边界决策 | **是(batch 在这)** |
-| `aura-stage2`(std) | LLM 联合整流(mpsc 只收 `Batch` / `ParagraphEdge`) | 否(独立) |
-| `aura-socket`(tokio) | axum SSE(数据面 `/api/asr_stream` + 控制面 `/api/stream`) | 否 |
+| ring + condvar | `Mutex<AudioRing>` + Condvar | ingest → 消费循环;`wait_frame` 支持截止时间(无轮询) |
+| `s1_tx` | tokio unbounded mpsc | 消费循环 → 主循环;`Stage1Event` **FIFO = VAD 顺序** |
+| `turn_tx` | tokio unbounded mpsc | 句/段任务 → 主循环;完成序,与 s1_rx 任意交错 |
+| `asr_events` | tokio broadcast(1024) | daemon → SSE 订阅者;lagged → comment 帧(客户端 warn 感知) |
 
-**事件流**(消费循环 → Stage2 worker → 前端):
-
-```
-说话 → VAD 门控流式(StreamFragment,inline 直发前端)
-  ↓ 静音 ≥ min_silence (EOS)
-finalize_sentence:
-  streaming_text = 流式 finalize(快,本地)
-  batch_text     = batch_asr.recognize()   ← ★ 同步阻塞 ~3.5s
-  tracker.on_eos → 段落决策
-  [若 gap ≥ merge_gap 先定稿上段] emit_paragraph_edge:
-     整段 batch 重跑 = batch_asr.recognize(concat PCM)  ← ★ 同步阻塞
-     → ParagraphEdge
-  emit StreamFragment(定稿流式) + Batch(带全部句,含 batch_text)
-  ↓ 静默 ≥ merge_gap / flush / 大 gap
-ParagraphEdge → Stage2 finalize(零 LLM,取存档)→ ParagraphCalibration
-```
-
-**关键点**:`aura-stage2` 的 LLM 调用**不**卡音频(独立线程);**唯一**卡消费线程的是
-两处 batch(`recognizer.rs:804` 句级 + `recognizer.rs:620` 段级重跑)。把这两处移出消费线程,
-bug 即根除。
+**深度睡眠**:`running=false` → 消费循环退出(condvar 等 resume);ingest 照常;idle 由
+daemon 无订阅超时触发。暂停期间**无任何事件**。
 
 ---
 
-## 4. 设计目标 / 非目标
+## 2. Stage1 消费循环(`aura-stage1` 线程)—— 事件触发的第一现场
 
-**目标**
+### 2.1 帧循环(每 32ms 一帧,`run()` recognizer.rs:1063)
 
-1. **消费循环永不被 batch 阻塞** —— 流式 / VAD / `check_settle` 持续运行,`speaking` 保持
-   真实值,段落不再被墙钟误切。
-2. **batch 吞吐不降** —— 并行识别,定稿延迟不劣于现状(现状句级 batch 本就是在说话间隙
-   "免费"跑的)。
-3. **前端契约零改动** —— `AsrEvent` wire 协议 **FROZEN**(`aura-agent/view.rs`),
-   改动**完全收敛在 `aura-core` 内**(Stage1 + pipeline + Stage2),daemon / SSE / 前端不动。
-4. **顺序与定稿正确性** —— **定稿 `ParagraphCalibration` 必在该段落全部 `BatchSentence` 之后**
-   (且用最佳文本);`BatchParagraph` 允许与部分 `BatchSentence` 交错(池并行),前端按 id 折叠
-   不受影响(§5.7)。定稿文本用**最佳可得**文本(batch 优先,流式回退)。
+```
+⓪ running=false?            → return(深度睡眠)
+① active=false?             → park 等音频(scout 暂停),continue
+② 时间驱动检查(now_s = 墙钟):
+   speaking = 流式 partial 非空          ← 回溯式 VAD 的关键抑制量
+   ②a flush_paragraph && !speaking       → force_settle → ParagraphEdge(§2.3-c)
+   ②b tracker.check_settle(now, speaking)→ ParagraphEdge(§2.3-a)
+   ②c 流式会话停滞 ≥ 8s 且 partial 未变   → 重置会话(防幻觉残留)
+   ②d 诊断日志(3s)
+③ 取帧:ring 有帧直接取;空则 park 到最早截止
+   (settle deadline / flush 50ms / 看门狗 / 断流静音喂);
+   断流 > 2s 且有 partial → 喂合成静音逼 VAD EOS
+④ VAD:push_frame → v_detected() + events(SOS/EOS)
+⑤ 流式(VAD 门控):
+   detected 翻转(false→true)→ 补喂 lead-in(~0.5s,soft onset)
+   每 15 帧(≈0.5s)解码一次 partial,变化才发:
+       StreamFragment{paragraph_id=prospective(), sentence_id=prospective()}   ★ §7-B
+   空闲 → 帧进 lead-in 环形缓冲(有界)
+⑥ 分句事件:
+   SOS → cur_sentence = tracker.on_sos()      ← 回溯式:与 EOS 同批到达!
+   EOS → finalize_sentence(§2.2)
+```
 
-**非目标(本轮不做,见 §10)**
+### 2.2 `finalize_sentence`(EOS 臂,recognizer.rs:935)—— 句事件发射序
 
-- 段级 batch 重跑的跳过/降级(它是"整段跨句重听"的权威文本,保留现状语义)。
-- batch 失败重试策略(沿用 `Option` 回退流式)。
-- 多段落并发定稿(边界范式下同一时刻只有一个开放段落,天然串行)。
+1. 句 PCM = 流式会话累积的完整音频(含 soft onset;流式与 batch 同源);
+2. `start_s` 由 PCM 时长**回溯**(SOS 墙钟 = EOS 瞬间,不可用);
+3. `VadSentence{batch_text: None}`(batch 异步,in-flight);PCM 入 AudioStore;
+4. `tracker.on_eos(sentence)` → `(settled?, paragraph_id, 全部句)`;
+   - settled = 大 gap 在此处关上段(§2.3-b)→ **先** `emit_paragraph_edge(prev)`;
+5. 发**句定稿流式** `StreamFragment`(该句权威流式文本);
+6. 发 `Batch{paragraph_id, sentences=当前段全部句, sr}`;
+7. `batch_jobs=false` → 不投 job(round12:句任务由主循环在 Batch 臂自建)。
+
+**同一 EOS 内发射序(s1_tx FIFO 保证)**:
+`[ParagraphEdge(prev段)?] → StreamFragment(final) → Batch`。
+
+### 2.3 ParagraphTracker 状态机(段落决策,纯逻辑)
+
+状态:`open: Option<OpenParagraph{paragraph_id, sentences, active}>`。
+
+**关键事实(修复前):SOS 是回溯的**——Silero 只在句完成时弹出 SOS+EOS 对
+(recognizer.rs:604 注释)。**round13 后:段落起音即开**(detected() rising edge →
+`on_speech_onset` 分配时间戳真 id),partial 从第一条起携带真键;回溯 SOS 只补
+sentence id(开段降级为防御兜底):
+- ~~live partial 用 `prospective()` 预测键~~ → 现返回**开段真键**;
+- 段落 id 分配 = `next_win_id()`(recognizer.rs)——**时间戳微秒,严格递增**
+  (`max(now, last+1)` 防时钟回拨),id 即顺序;
+
+**三条关段路径**(都产出 `ParagraphEdge` → `emit_paragraph_edge`,recognizer.rs:733):
+
+| 路径 | 触发 | 时点 | 抑制条件 |
+|---|---|---|---|
+| a. `check_settle`(661) | 每帧循环②b,墙钟 `now - last.end_s ≥ merge_gap` | **及时**(静默满即关,唤醒由 settle_deadline 驱动) | `active`(句进行中)或 `speaking`(partial 非空——下一句已在说但 SOS 未到) |
+| b. `settle_if_gap`(624) | 下一句 EOS 时,回溯 onset 与上句 end 的 gap ≥ merge_gap | **迟到**(等下一句 EOS) | **几乎不可达的防御路径**:回溯 onset 含 lead-in(比起音更早),若 a 在 deadline 被 speaking 抑制,则该句起音早于 deadline − 0.5s ⇒ 回溯 gap 必 < merge_gap ⇒ b 也不触发。真正兜底的是单测(直接喂合成句) |
+| c. `force_settle`(678) | `flush_paragraph=true` 且 `!speaking`(IME 分字符键 `'` = "我说完了") | 主动,50ms 内 | 句进行中 → 挂起重试;无段落 → 消费掉标记 |
+
+`emit_paragraph_edge`:拼接 PCM(Arc,此后**逐句 clip 被逐出**,Arc 是唯一存活副本)→
+`ParagraphEdge{paragraph: VadParagraph{batch_text: None, pcm, ..}, sr}` → 单句段落免重跑
+(多句才段重跑)。
+
+### 2.4 ActiveSession 生命周期
+
+连续喂帧(不分段);**EOS / 段落 settle / 停滞 8s** 时重置——每个会话恰好覆盖
+[上一边界, 本 EOS] ≈ 一句话(含边界静音,解码为空)。partial 节流 15 帧;partial 未变
+超 8s = VAD 没锁住的微弱音频 → 重置防幻觉残留进下一句。
 
 ---
 
-## 5. 设计
+## 3. Pipeline 编排(round12:主循环 + 句任务 + 段任务)
 
-### 5.1 核心思想
-
-把两处同步 batch 调用替换为**投递到独立 batch 工作池的异步 job**。消费循环只在 EOS /
-settle 时**入队** job(非阻塞,微秒级)并继续;batch 池完成后把结果作为**新事件**发回
-pipeline,由 pipeline 累积并按"就绪"条件触发定稿。
+### 3.1 主循环(`pipeline.run` future,select! 两源,单点 on_turn)
 
 ```
-消费循环(不再阻塞)              batch 工作池(N 线程)            Stage2 worker(pipeline)
-  EOS → 入队句级 job ──────────►  recognize() ──SentenceBatchReady──►  累积句 batch
-  settle → 入队段级重跑 job ───►  recognize() ──ParagraphBatchReady──►  就绪 → 定稿
-  继续取帧/VAD/流式/check_settle                              (LLM 联合整流)
+s1_rx.recv() ──┬─ StreamFragment → on_turn 直发(高频低延迟路径)
+               ├─ Batch{pid, sentences, sr}:
+               │    ① 只为 just-closed 句(sentences.last())spawn 句任务       ★ round13
+               │    ② spawn live 整流任务(链式:prev = 本段上一个 live 任务)   ★ round13
+               ├─ ParagraphEdge{paragraph, sr} →
+               │      on_turn(ParagraphClosed{pid})     ← 先于段任务任何产出
+               │      spawn(paragraph_task(paragraph, waits{句任务+live链尾}, ..))
+               └─ SentenceBatchReady / ParagraphBatchReady → no-op(batch_jobs=false 不再产生)
+turn_rx.recv() ── t → on_turn(t)(句/段任务产出,drain 单点 emit)
 ```
 
-### 5.2 新组件:batch 工作池(`BatchPool`)
+**边界时序的结构保证**:`ParagraphClosed(N)` 与段 N+1 的第一个 `StreamFragment` 同源
+(s1_rx FIFO)、按 VAD 顺序产出 → wire 上**严格有序**。段 N+1 的 turn 类事件
+(BatchSentence 等)只能由 Batch(N+1) 触发,而 Batch(N+1) 在 s1_rx 中必在
+ParagraphEdge(N) 之后 → 亦晚于 ParagraphClosed(N) 的 emit。✓
 
-- **位置**:新增 `crates/aura-core/src/batch_pool.rs`(或并入 `recognizer.rs`)。
-- **形态**:N 个 std 线程(默认 **N=2**,可配),共享一个 job 队列(`std::sync::mpsc`)。
-- **job**:`BatchJob { kind, pcm: Arc<Vec<i16>>, sr }`,
-  - `kind = Sentence { paragraph_id, sentence_id }` | `Paragraph { paragraph_id }`。
-- **执行**:worker 取 job → `batch_asr.recognize(&pcm, sr)`(**带超时**,默认 30s,超时任
-  `None`)→ 发结果事件。**每个 job 必然产出一个结果事件**(`Some` / `None`),不丢不堵,
-  保证 §5.6 的就绪计数一定能到齐。
-- **PCM 共享**:job 携带 `Arc<Vec<i16>>`,与 AudioStore / VadParagraph 共享,避免拷贝
-  (需把 `AudioStore` 由 `BTreeMap<u64, Vec<i16>>` 改为 `BTreeMap<u64, Arc<Vec<i16>>>`,
-  或在 job 里按 `audio_id` 从 store 取 —— 二选一,推荐前者)。
-- **生命周期**:由 `Pipeline::run` 启动一次,job 通道关闭时 worker 排空退出;`batch_asr`
-  以 `Arc<dyn AsrProvider>` clone 注入。
+`select!` 无 `biased`:两源同时就绪时**随机**选分支——只影响"修订类事件之间"的交错
+(客户端按 id 归位,无语义破坏)。
 
-> **为什么是池而不是单线程(FIFO)**:见 §6 的 B1/B2 对比。句级 batch ~3.5s 与真实语速
-> (每 3–8s 一句)同量级,单线程会在连续说话时**积压**,定稿延迟被拉大;N=2 提供 2× 吞吐
-> (每 ~1.75s 一句),舒适地覆盖典型语速,同时段级重跑(长 job,整段音频)占一个 worker,
-> 句级短 job 用另一个,互不拖累。
+### 3.2 句任务(`sentence_task`,pipeline.rs:433)
 
-### 5.3 新事件模型(`Stage1Event` 增补 2 个,保留 3 个)
+`spawn_blocking`:store 取句 clip → `recognize_once`(失败/空 = 合法 None,不重试——
+实时优先)→ **先** `turn_tx.send(BatchSentence)`(仅 Some)→ 返回 `SentenceOutcome`。
+remote ASR ~3.5s,完成序任意。
 
-`lib.rs` 的 `Stage1Event` 是 **Stage1 → pipeline 的内部契约**(非 wire,可改)。
-新增:
+### 3.3 段任务(`paragraph_task`,pipeline.rs:463)—— 就绪门 = join!
 
-| 事件 | 载荷 | 语义 |
+```
+join 句任务(逐个 await,完成一个处理一个):
+    回填 acc[sid].batch → calibrate_paragraph(全句 best_text)
+    → SentenceCalibration{pid}(live 联合整流,严格在该句 BatchSentence 之后)
+段级重跑(仅多句段):recognize_once(concat PCM) → BatchParagraph{pid}
+定稿整流:finalize_paragraph(全句 best_text,一次 LLM)
+归档:record_final(PCM→archive,三份文本→day log + ring)
+→ ParagraphCalibration{pid}
+```
+
+Stage2 无状态(校准器 `Arc<Mutex>` 串行,LLM 单飞);`PassThrough`(LLM disable)= 恒等,
+`calibrated` 承载原文。
+
+---
+
+## 4. 事件目录(触发 × 发射点 × wire × 保证)
+
+### Stage1Event(内部,消费循环 → 主循环,s1_tx FIFO)
+
+| 事件 | 触发 | 载荷要点 |
 |---|---|---|
-| `StreamFragment`(不变) | pid, sid, text, at_s | 流式 partial + 句定稿流式,inline 直发前端 |
-| `Batch`(语义微调) | pid, `sentences` | 每句 EOS 发出;**新句 `batch_text` 恒 `None`**(batch 异步)。仍带"当前段落全部句"(streaming 已定、batch 待定) |
-| `SentenceBatchReady`(**新增**) | pid, sid, `batch_text: Option<String>`, `asr_ms: u64` | 某句 batch 完成 |
-| `ParagraphEdge`(语义微调) | `paragraph: VadParagraph` | 段落边界关闭;`paragraph.batch_text` 恒 `None`(整段重跑异步);`pcm`(Arc)仍在,供归档/重跑 |
-| `ParagraphBatchReady`(**新增**) | pid, `batch_text: Option<String>`, `asr_ms: u64` | 整段重跑完成 |
+| `StreamFragment` | partial 变化(≈0.5s 节流)+ **句定稿一条**(EOS) | `paragraph_id` = **起音开的真段键**(round13);句定稿条同键 |
+| `Batch` | 每句 EOS | 该段**全部句**快照;新句 `batch_text: None`(in-flight) |
+| `ParagraphEdge` | 关段(a/b/c 三路径) | `VadParagraph{batch_text: None, pcm: Arc}`;clip 随即逐出 |
+| `SentenceBatchReady` / `ParagraphBatchReady` | 旧编排 batch worker | round12 `batch_jobs=false` 下**不再产生**(主循环 no-op 防御) |
 
-**wire 不受影响**:`AsrEvent`(`aura-agent/view.rs`)的 5 个 tag/字段名 **FROZEN**。
-pipeline 把新内部事件映射回**同名**的 `TurnEvent` / `AsrEvent`(§5.4),只是**时序**变了
-(`BatchSentence` / `BatchParagraph` 晚到)。前端 `voice_state.rs` 按 id 折叠、关闭快照稳定,
-**零改动**(§7 验证)。
+### TurnEvent(主循环单点 on_turn)→ AsrEvent(wire,tag FROZEN)
 
-### 5.4 各组件流程
+| TurnEvent | AsrEvent(tag) | 触发 | 发射点 | 顺序保证 |
+|---|---|---|---|---|
+| StreamFragment | `stream_fragment` | partial 变化 / 句定稿 | 主循环直发 | 段内 FIFO |
+| ParagraphClosed | `paragraph_closed` | ParagraphEdge | 主循环直发 | **先于下一段任何事件**(§3.1) |
+| BatchSentence | `batch_segment` | 句任务完成 | turn_rx drain | 晚于该句 Batch;段内任意序 |
+| BatchParagraph | `batch_window` | 段重跑完成(仅多句段) | turn_rx drain | 晚于 ParagraphClosed |
+| SentenceCalibration | `segment_calibration` | **该句 BatchSentence 之后**(round17b:BS 到达触发 live 整流链) | turn_rx drain | 严格在该句 BS 后;段内链式串行(SC 顺序 = 段落生长序);全部先于 PCal;输入含已到 batch |
+| ParagraphCalibration | `window_calibration` | 定稿整流完成 | turn_rx drain | 该段最后一条事件 |
 
-**消费循环(`recognizer.rs`,不再阻塞)**
+wire 字段:段落 → `window_id`,句 → `segment_id`(旧词汇表 FROZEN)。
 
-- `finalize_sentence`(EOS):
-  1. `streaming_text = 流式 finalize`(不变,快)。
-  2. 建 `VadSentence { batch_text: None, .. }`,PCM 入 store(**不再调 `recognize`**)。
-  3. `tracker.on_eos` → 段落决策(不变)。
-  4. **入队句级 job**(克隆 `Arc<pcm>` 到 `BatchPool`,非阻塞)—— 替代 `recognize`。
-  5. 若大 gap 先定稿上段 → `emit_paragraph_edge`(见下)。
-  6. `emit StreamFragment(定稿流式) + Batch { pid, sentences }`(sentences 里新句 batch=None)。
-- `emit_paragraph_edge`(settle):
-  1. `store.concat(&ids)` 拼出段落 `Arc<pcm>`(不变,廉价)。
-  2. 建 `VadParagraph { batch_text: None, pcm, .. }`(**不再调 `recognize` 重跑**)。
-  3. **入队段级重跑 job**(携 `Arc<pcm>`,非阻塞)—— 替代重跑。
-  4. `emit ParagraphEdge { paragraph }`。
-  5. `store.evict(&ids)`(不变)。
-- **消费循环自始至终不等待任何 batch 结果** —— 这就是 bug 的根除点。`speaking` 由持续
-  喂帧的流式会话维持真实值,`check_settle` 的墙钟判定在"有语音在 ring 里"时被正确抑制。
+### 客户端折叠(Transcript,aura-agent)—— 前端假设的契约
 
-**batch 池(`batch_pool.rs`)**
+- **段落 id 即顺序**:`BTreeMap<paragraph_id>`,`finals()` 按 id **降序**(最新在前),
+  `active_paragraph()` = **id 最大的未关闭段**(transcript.rs:119/295/199);
+- 首选预览只跟活动段(绝不跨段堆叠);段落关闭(`ParagraphClosed`/`BatchParagraph`/
+  `ParagraphCalibration`)即进 finals 占位,后续按 id **REPLACED** 替换;
+- `StreamFragment` 折叠进段句槽(**`!closed` 才写**,ghost 永远可写 → §7-B);
+- 降级链:live 只由流式写;batch 缺席逐级回退流式拼接;校准只增强 calc,不污染 plain。
 
-- worker 线程循环:取 job → `recognize`(带 30s 超时)→ `send(SentenceBatchReady |
-  ParagraphBatchReady { pid, sid?, text: Option, asr_ms })`。
-- 结果发往 pipeline 的 Stage2 输入通道(与消费循环的 `Batch` / `ParagraphEdge` **同一通道**,
-  多 sender 安全,§5.8 通道拓扑)。
+---
 
-**pipeline / Stage2 worker(`pipeline.rs` + `calibrator.rs`)**
+## 5. 端到端时间线(三个场景)
 
-事件在同一条 mpsc 上**有序到达**(但 `Batch` 与 `SentenceBatchReady` 的**交叉**是任意的,
-§5.7 已证明任意交叉都安全)。处理:
+> **注**:以下时间线如实记录**修复前(round12)的行为**——幽灵段/假键的展示是
+> §7-B 的病理解剖。round13 后:每段首句 partial 即携带真键(无 F 幽灵行),
+> Batch 后立即有 SC(live 整流),其余交错关系不变。
 
-| 内部事件 | pipeline 动作 | 产出 `TurnEvent` |
-|---|---|---|
-| `StreamFragment` | inline 直发(不变) | `StreamFragment` |
-| `Batch { pid, sentences }` | ① 累积 `sentences[pid]`(设 streaming/时序,**保留已有 batch**);② `s2.calibrate_paragraph(pid, &sentences[pid])`(best_text,batch 缺 → 流式回退)→ live 预览 | `SentenceCalibration` |
-| `SentenceBatchReady { pid, sid, text }` | `sentences[pid][sid].batch_text = text` | `BatchSentence`(前端该句 batch 文本,晚到) |
-| `ParagraphEdge { paragraph }` | 存段落(含 `Arc<pcm>`),记 `expected = paragraph.sentences.len()`,标 pending | (无,内部) |
-| `ParagraphBatchReady { pid, text }` | 设段落 `batch_text = text`;若**就绪**(§5.6)→ 定稿 | `BatchParagraph` + `ParagraphCalibration` |
+### 5.1 同段两句(gap < merge_gap)—— 段内唯一全对的路径
 
-**定稿动作**(就绪时,pipeline 内):
-1. `final = s2.finalize_paragraph(&段落)` —— **现改为跑一次 LLM**(用全句 best_text,此时
-   batch 已齐),替代旧"零 LLM 取存档"。
-2. `on_turn(TurnEvent::BatchParagraph { pid, text: 段落 batch_text 或拼接回退 })`。
-3. `storage.record_final(FinalTurn { pid, raw_text: 段落 batch_text, streaming_text,
-   calibrated: final, pcm, .. })` —— **归档从旧的 `ParagraphEdge` 臂移到定稿臂**(此时
-   `batch_text` 才齐)。
-4. `on_turn(TurnEvent::ParagraphCalibration { pid, calibrated: final })`。
-5. 清理 `sentences[pid]`(段落结束)。
-
-> 单句段落:现状 `emit_paragraph_edge` 已"免重跑"(复用句级 batch)。异步化后,单句段落的
-> 段级重跑 job **不投递**(直接复用句级 `SentenceBatchReady`),`ParagraphBatchReady` 由
-> pipeline 在句级就绪时合成 —— 保持"大多数段落省一次 batch"的优化。
-
-### 5.5 Stage2 状态机改动(`calibrator.rs`)
-
-- **去状态化**:删除 `current: Option<(ParagraphId, String)>`(旧"存最后一次整流,定稿取
-  存档")。原因:异步下"最后一个 Batch 已整流完全段"的不变式不再成立(末句 batch 可能
-  未就绪),定稿必须**自己跑一次 LLM** 拿最佳文本。
-- `calibrate_paragraph(pid, sentences)`:**不变**(live,每 Batch 一次,best_text)。
-- `finalize_paragraph(paragraph)`:**改为跑 LLM**(全句 best_text)。语义从"移动左边界、
-  零 LLM"变为"用最终最佳文本整流一次"。失败回退原文(沿用 `joint_calibrate` 的
-  `unwrap_or_else`)。
-- `LlmInput`(batch/stream/both)语义不变;`finalize` 按 `input` 选源(与 `calibrate` 一致)。
-- `PassThroughCalibrator`(LLM 禁用):`finalize` 仍返回 `paragraph.best_text()`(零 LLM),
-  行为不变。
-
-### 5.6 定稿触发(readiness-based)
-
-定稿 = **段级重跑完成** **且** **全句 batch 就绪**(或超时兜底)。事件驱动,无需显式等待:
-
-- `ParagraphEdge` → `pending[pid] = { expected, ready: 0, para_done: false }`。
-- `SentenceBatchReady { pid, sid }` → `pending[pid].ready += 1`(每句恰好一次,§5.2 保证)。
-- `ParagraphBatchReady { pid }` → `pending[pid].para_done = true`。
-- 任一步后检查:`para_done && ready == expected` → 定稿。
-- **超时兜底**(防 job 异常丢失):`ParagraphEdge` 记 deadline(默认 15s);pipeline 用一个
-  轻量 tick(后台线程每 ~1s 发 `Tick` 事件)扫描 `pending`,超期则按"当前最佳文本"定稿
-  (重跑/缺句 batch 按 `None` 回退)。`BatchPool` 的"每 job 必出结果 + 30s 超时"已把此兜底
-  变成极端防御。
-
-> **为什么需要 `ready == expected` 而非只等 `para_done`**:末句 batch 可能比段级重跑**晚**
-> (池并行下重跑可能先完成)。定稿要用**全句 best_text**,必须等末句 batch 到齐,否则末句
-> 退化成流式(质量回退)。这是异步化下"定稿用最佳文本"正确性的关键。
-
-### 5.7 顺序保证(invariants)
-
-需保证:**一个段落的 `BatchSentence`×N 与 `ParagraphCalibration` 的最终语义正确**。逐条:
-
-1. **同一句的 `Batch` 先于其 `SentenceBatchReady`**:`Batch` 在 EOS 由消费循环发出,
-   `SentenceBatchReady` 在 batch 完成后由池发出(更晚)。✓
-2. **`SentenceBatchReady` 之间任意顺序都安全**:pipeline 按 `sid` 累积(`sentences[pid][sid]`),
-   前端按 `(pid, sid)` 折叠(`upsert_sentence`),顺序无关。✓
-3. **`BatchParagraph` 可能先于部分 `BatchSentence`**(池并行下重跑先完成):前端在
-   `BatchParagraph` 标 `closed`;晚到的 `BatchSentence` 更新已关闭段落的句 batch 并重算预览 ——
-   关闭段落的 `plain_preview` 优先 `batch_paragraph`(voice_state.rs:88-97),**不受影响**。
-   定稿(§5.6)本就要等 `ready == expected`,所以 `ParagraphCalibration` 必然在所有
-   `BatchSentence` 之后。✓
-4. **跨段落**:`ParagraphEdge` 后才开新段落;旧段落的重跑/定稿事件按 `pid` 隔离,
-   不污染 `current_paragraph` 的预览。✓
-5. **`StreamFragment` 恒 inline**(不经池),live 显示不受 batch 延迟影响。✓
-
-### 5.8 数据结构与通道拓扑
-
-**pipeline 新增状态**(Stage2 worker 内,单线程访问,无锁):
-
-```rust
-// 每段累积的句(流式来自 Batch,batch 来自 SentenceBatchReady)
-sentences: HashMap<ParagraphId, Vec<VadSentence>>,
-// 定稿就绪表
-pending:   HashMap<ParagraphId, PendingFinal>,
-struct PendingFinal { expected: usize, ready: usize, para_done: bool,
-                      paragraph: VadParagraph, deadline: Instant }
-```
-
-**通道拓扑**(多 sender → 单 receiver):
+**注意**:连第一句的 partial 都是预测键(说话期间 open=None,§2.3)。完整序列:
 
 ```
-消费循环 ──┐ (StreamFragment 走 on_turn inline,不入此通道)
-           ├─► mpsc::Sender<Stage1Event> ──► Stage2 worker (mpsc::Receiver)
-batch 池  ──┘   (Batch / ParagraphEdge /
-                 SentenceBatchReady / ParagraphBatchReady / Tick)
+t0   说话1开始(open=None)
+t1~  SF(F1,s1,partial)×N           F1 = last_win_id+1(假)
+t2   EOS1:on_eos → 开段 p1(随机)→ SF(p1,s1,final) → Batch(p1,[s1])
+     主循环:Batch → 句任务(p1,s1)
+t2'  句任务完成 → BS(p1,s1) → SC(p1)(段任务未开,live 整流只在段任务里 → 无)
+     ★ 注意:round12 下 SentenceCalibration 只由段任务发 → 段落关闭前**没有 live 校准**
+t3   说话2开始(open=Some(p1))
+t4~  SF(p1,s2,partial)×N           ← 键正确
+t5   EOS2:gap<merge_gap → 入 p1 → SF(p1,s2,final) → Batch(p1,[s1,s2])
+     主循环:再 spawn (p1,s1)+(p1,s2)                ← §7-D:s1 重投!
+t6   静默 ≥ merge_gap(check_settle,deadline 唤醒)→ ParagraphEdge(p1)
+     主循环:PC(p1) → 段任务(join×3[含 s1 重复] → 重跑(2 句)→ 定稿 → 归档)
+t6'~ SC(p1)×3 → BP(p1) → PCal(p1)
 ```
 
-`mpsc::Sender` 可 Clone + 多 sender,消费循环与 batch 池各持一个 clone,Stage2 worker
-单 receiver 顺序消费。`StreamFragment` 保持 inline(高频,不占 Stage2 通道)。
+客户端:`(F1,s1)` 幽灵段残留(§7-B);`(p1,*)` 正常折叠;finals(p1) 正确。
+**候选 = 幽灵(active 若 F1 > p1)+ finals(p1)** → 看到重复/陈旧首选,50% 概率。
 
-**`AudioStore` 改动(可选但推荐)**:`Vec<i16>` → `Arc<Vec<i16>>`,让 job / 段落 / store
-共享 PCM。若不改,job 按 `audio_id` 从 store 取(多一次 `clone`,可接受)。
+### 5.2 大停顿换段(gap ≥ merge_gap)—— 幽灵段诞生地(常见路径)
+
+```
+t0   说话1(段落 k)partial 键:首句假键 Fk,后句真键 pk
+t1   EOS1 → SF(pk,s1,final) → Batch(pk,[s1]) → 句任务
+t2   静默到 merge_gap → check_settle(未被抑制)→ ParagraphEdge(pk)
+     → PC(pk) → 段任务(pk)
+t3   说话2(段落 k+1)开始,open=None → partial 键 F(k+1)(假)
+t4   段任务产出陆续到:BS(pk,s1) / SC(pk) / BP(pk) / PCal(pk)
+     —— 与段 k+1 的 SF(F(k+1),..) 在 wire 上任意交错(协议允许,按 id 归位)
+t5   EOS(句1) → 开段 p(k+1)(随机)→ SF(final) → Batch → …
+```
+
+客户端最终态:
+- `pk`:关闭、定稿 → finals ✓
+- `Fk / F(k+1)`:**永不开闭的幽灵段**,各含一句过时 partial,永远参与 active 竞争,
+  永不进 finals,永不清理;
+- 若 `F > p`(每段 ~50%):首选 = 幽灵的陈旧文本(用户说话时预览**冻结/倒退**)。
+
+**实测"重复混乱"的形态来源**:finals(pk)(定稿完整文本)与幽灵/新段的 partial 残留
+**并存于候选**(IME 侧把 finals + 预览组合成候选行)→ 同一句话出现两份、其中一份是
+中途 partial(如"喂，喂，喂。现在出现了跟我严重的问题了啊" + "喂喂现在出现了更严重的
+问题了啊!")。哪个幽灵胜出取决于随机 id 的大小比较——**概率性、每段必现**。
+
+### 5.3 flush(IME "我说完了")
+
+`flush_paragraph=true` 且 `!speaking` → `force_settle` → ParagraphEdge → 同 5.2 的段任务
+链。说话中 → 挂起等 EOS(50ms tick 重试);无段落 → 消费标记。
 
 ---
 
-## 6. 备选方案与权衡
+## 6. 时序保证的真实边界(server 实际保证了什么)
 
-| 方案 | 描述 | 评价 |
+| 保证 | 成立 | 依据 |
 |---|---|---|
-| **A 对症**(不推荐) | `speaking` 额外看 ring 是否非空(阻塞期间有积压语音 → 抑制定稿) | 几行止血,但**没解决吞吐/延迟**:batch 仍卡消费循环,流式 partial 在 batch 期间冻结,长段落延迟依旧。治标 |
-| **B1 单线程 FIFO 池** | 一个 batch worker,job 严格 FIFO | 顺序天然保证(重跑必在末句之后),最简。但**吞吐 = 1 句/3.5s**,连续说话时积压,定稿延迟被拉大(3 句段可达 ~14s)。**不选为主方案**,作 N=1 配置 |
-| **B2 池 + readiness 定稿**(本文主方案) | N=2 池并行 + 就绪计数定稿 | 吞吐 2×,重跑(长 job)与句级(短 job)并行;定稿延迟 ≈ max(末句 batch, 重跑),**不劣于现状**(现状句级 batch 本就在说话间隙跑)。代价:pipeline 多 ~40 行状态 + 去状态化 Stage2 |
-| **batch 挂 Stage2 线程**(拒绝) | 把 batch 挪到 `aura-stage2`(已独立于消费循环) | 最省(无新组件),但 **batch 与 LLM 串行**在同一线程:live 校准被 batch 延迟 ~3.5s(UX 回退),且 LLM + batch 互相拖累。**拒绝** |
-| **去掉段级重跑**(拒绝) | 段落文本 = 句级 batch 拼接,省一次重跑 | 损失"整段跨句重听"的权威质量(现状明确要它);属另一优化维度,非本 bug 所需 |
-
-**主方案 = B2**。理由:唯一同时满足"根除阻塞(目标 1)+ 吞吐不降(目标 2)+ 定稿最佳文本
-(目标 4)"的方案;改动收敛在 `aura-core`(目标 3)。
-
----
-
-## 7. 边界与失败模式
-
-| 场景 | 行为 | 说明 |
-|---|---|---|
-| **batch 网络失败** | `recognize` Err → 结果 `None` → 句/段 `batch_text=None` → best_text 回退流式 | 与现状完全一致(`Option` 回退是既有契约) |
-| **batch 超时**(>30s) | worker 判超时 → 发 `None` → 同上回退 | 新增:给 batch 一个独立超时(区别于转发的 300s),防单 job 永久占 worker |
-| **重跑 job 异常丢失** | `ready`/`para_done` 到不齐 → tick 超时(15s)按当前最佳文本定稿 | 极端防御;`BatchPool`"每 job 必出结果"已使其几乎不可达 |
-| **idle 深度睡眠**(`running=false`) | 消费循环退出;batch 池**继续排空**在途 job(发结果到 Stage2) | 池独立于 `s1.run`,不受 idle 影响;结果对应已暂停的段落,前端折叠无害 |
-| **重连 / `reset` / `sync_history`** | 前端清空;在途的旧段落 `*Ready` 事件到达 → 更新已无关的 `pid` 状态 | 按 `pid` 隔离,不污染当前预览;无害(现状重连也有同类残留) |
-| **flush_paragraph**(IME"我说完了") | 跳过 merge_gap,立即入队重跑 job + `ParagraphEdge`;消费循环不阻塞 | 与非 flush 路径同构;定稿由 readiness 驱动 |
-| **batch 禁用**(`asr.backend: disable`) | `DisabledAsr` 恒返空 → 结果 `None` → 全流式 | 与现状一致;`BatchPool` 仍跑(空识别,廉价),或可特判跳过(优化) |
-| **单句段落** | 不投重跑 job,复用句级 `SentenceBatchReady` 合成 `ParagraphBatchReady` | 保持"大多数段落省一次 batch" |
+| 段内 SF 顺序 | ✓ | s1_tx FIFO |
+| `ParagraphClosed(N)` 先于段 N+1 任何事件 | ✓ | 同源 FIFO + 任务触发依赖(§3.1) |
+| `SentenceCalibration` 严格在该句 `BatchSentence` 后(round17b) | ✓ | BS 到达触发链式 live 任务(架构:batch 完成 → 之后纠偏);迟到的 BS(段已关)不再触发,PCal 已回填 |
+| 该段全部 SC 先于 `ParagraphCalibration` | ✓ | 段任务先 await live 链尾再定稿 |
+| `ParagraphCalibration` 是该段最后事件 | ✓ | 段任务末尾 |
+| 跨段修订类事件不破坏已关段 | ✓ | 协议按 id REPLACED;round13 后无幽灵段,PC 后不再有该段 SF |
+| paragraph_id 单调(客户端排序依据) | ✓(round13) | 时间戳 id,严格递增 |
+| live partial 的段键 = 实际归属段 | ✓(round13) | 起音即开段,真键前置 |
 
 ---
 
-## 8. 成本分析
+## 7. 前后端时序错位清单(现状不可用的根因)
 
-- **LLM 调用**:现状 N(每 Batch)+ 0(定稿零 LLM)= **N** 次/段。
-  异步化:N(每 Batch live)+ **1**(定稿跑 LLM)= **N+1** 次/段。
-  **增量 = 每段 1 次**(定稿那次,用来把末句 batch 纳入最终文本)。
-  注:现状 Stage2 本就 O(n²)(每次 `calibrate` 整流全段),+1 可忽略。
-- **内存**:`AudioStore` 改 `Arc` 后,batch job / 段落 / store 共享 PCM,**不新增拷贝**;
-  池在途 job 持 `Arc` 指针(非 PCM 本体)。
-- **定稿延迟**:≈ `max(末句 batch, 段级重跑)`。现状句级 batch 在说话间隙同步跑(阻塞循环),
-  定稿只需等重跑;异步化句级 batch 并行跑,**定稿延迟不劣于现状**,且 live 显示不再冻结。
-  段级重跑(长段落 ~10s)的固有延迟**保留**(属重跑本身的成本,非本设计引入;见 §10 后续)。
-- **线程**:新增 N=2 个 std 线程(常驻,空闲时 park 在 job 通道上,零 CPU)。
+### A. 段落 id 随机 vs 客户端"id 即顺序"——契约断裂(最根本)【round13 已修】
 
----
+- **server**:`next_random_win_id()`(recognizer.rs:589)刻意随机("避免可预测性");
+- **client**:transcript.rs:119 注释明言"`paragraph_id`(daemon 端**单调递增**)",
+  `BTreeMap` + `finals()` 降序 + `active_paragraph()` = max 未关闭 id,全部以 id 为序;
+- **lib.rs:48** 的 `ParagraphId` 文档也声称 "monotonic within a run"——三方各说各话;
+- **症状**:finals 候选顺序随机颠倒(实测"候选 2,3,4 顺序反、最新句子在候选 4");
+  active 段选择错误(旧段 id 大者胜出);`sync_history` 后顺序同样乱;
+- **修复**:id = 创建时刻时间戳微秒(`next_win_id`,严格递增)。
 
-## 9. 迁移与测试计划
+### B. prospective 假段键 → 幽灵段(高频、每段必中)【round13 已修】
 
-**改动面(全部在 `aura-core`)**:
+- **server(修复前)**:live partial 的段键来自 `prospective()`;`open=None` 时 =
+  `last_win_id+1`(纯预测),与 EOS 时 `next_random_win_id()` 分配的真键**永不相等**。
+  触发面 = **每个段落的首句**(段落总是在静默期关闭,首句说话期间 open=None);
+- **client**:幽灵段永远收不到 `ParagraphClosed`(真键才有关闭事件)→ 永远"未关闭" →
+  ① 永远参与 `active_paragraph()` 竞争(id 比大小,~50% 胜出 → 首选冻结在首句陈旧
+  partial);② 永不进 finals(说过的话"消失"感);③ `BTreeMap` 无界泄漏;
+- **变体(2.3-b 路径,几乎不可达)**:下一句 partial 以 `(pk, s_next)` 折叠进真段 pk、
+  PC(pk) 后残留在 finals——几何上被 lead-in 抵消(见 §2.3 表注),仅作防御保留;
+- **根因**:`ParagraphClosed(N) 后不再有段 N 的 SF` 这条 server 语义,被"PC 之后仍到达、
+  但键是假段"的 SF 破坏——客户端无法区分"新段开流"与"幽灵残留";
+- **修复**:**起音即开段**(`on_speech_onset`,rising edge 分配真键)+ 空段 GC
+  (从未出句的开段,静默满 merge_gap 静默丢弃)。
 
-| 文件 | 改动 |
-|---|---|
-| `lib.rs` | `Stage1Event` 增 `SentenceBatchReady` / `ParagraphBatchReady`;`Batch` / `ParagraphEdge` 语义注释 |
-| `batch_pool.rs` | **新增** `BatchPool`(N worker + job 通道 + 30s 超时 + 必出结果) |
-| `recognizer.rs` | `finalize_sentence` / `emit_paragraph_edge` 改为**入队 job** 替代 `recognize`;持有 `BatchPool` sender;删同步调用 |
-| `pipeline.rs` | Stage2 worker 处理新事件 + `sentences` / `pending` 累积 + readiness 定稿 + `record_final` 移到定稿臂;启动 `BatchPool`;tick 线程 |
-| `calibrator.rs` | `finalize_paragraph` 改跑 LLM;删 `current` 状态;`PassThrough` 适配 |
-| `audio_store.rs` | (推荐)`Vec<i16>` → `Arc<Vec<i16>>`(job/段落/store 共享 PCM) |
+### C. ParagraphClosed 时点(已核实:非问题)
 
-**job 通道所有权(接线)**:job 通道在 `assemble` 创建 —— **sender 存进 `OnnxStage1Recognizer`**
-(消费循环 EOS/settle 入队用),**receiver 留在 `Pipeline`**;`Pipeline::run` 启动 batch 池
-worker 时把 receiver + `batch_asr` 的 clone + Stage2 `tx` 的 clone 注入 worker。消费循环
-(`s1.run`)与 batch 池分属两线程却共用一条 job 通道,结果汇入同一条 Stage2 输入通道。
+- 实际关段走 check_settle(静默满 merge_gap 即关,deadline 唤醒,及时)与 flush;
+  `settle_if_gap` 因回溯 onset 含 lead-in 几何上几乎不可达(§2.3 表注);
+- 边界信号本身及时且有序(§6 前两行保证成立)——**错位不在边界时点,而在 A/B 的键与序**。
 
-**前端 / daemon / wire:零改动**(`AsrEvent` FROZEN;`voice_state.rs` 按 id 折叠天然兼容晚到事件)。
+### D. round12 Batch 全量重投 —— 成本二次放大回归(功能正确但不可上线)【round13 已修】
 
-**测试**:
+- pipeline.rs:337(修复前):`for s in sentences` 对 Batch 载荷(**该段全部句**)逐句
+  spawn 句任务 → 每句 EOS 都为**全部历史句**再投一次:N 句段 = N(N+1)/2 次 ASR + 同数
+  次 live LLM 整流 + 段任务 join 膨胀;客户端幂等(按 sid upsert)所以**不破显示**,但
+  remote ~3.5s/次下延迟与费用爆炸;
+- 旧编排(finalize_sentence 只投 just-closed 句)无此问题;Batch 载荷"全量快照"是为
+  **无状态 Stage2** 设计的,不适合当任务触发器用;
+- **修复**:主循环只为 `sentences.last()`(just-closed 句)投句任务。
 
-1. **单元**(`batch_pool`):每 job 必出结果(成功 / 失败 / 超时三态);多 job 并发不串。
-2. **单元**(`recognizer` 边界):EOS 入队 + 不阻塞(用 mock `AsrProvider` 睡眠 5s,断言消费
-   循环在期间仍能处理下一句 / 喂流式)。
-3. **集成**(关键回归):**复现原 bug 场景** —— 句 1 EOS 后 batch 故意慢(> merge_gap),
-   断言第二句**并入同一段**(不吞第一句);并断言定稿文本 = 两句 batch 拼接。
-4. **集成**(顺序):构造"重跑先于末句 batch 完成",断言 `ParagraphCalibration` 仍在所有
-   `BatchSentence` 之后、且用末句 batch(非流式回退)。
-5. **端到端**(手动):真机 1–3.5s 停顿连说,观察 fcitx 预览不再吞句;`/api/asr_stream`
-   事件时序符合 §5.7。
-6. **回归**:`cargo test -p aura-core`(feature `asr`)+ 现有 `calibrator` / `pipeline` /
-   `voice_state` 测试全绿(Stage2 去状态化后 `paragraph_state_machine_overwrites_and_
-   finalizes_without_llm` 需按新语义改写:定稿**有** 1 次 LLM)。
+### E. 次要(记录在案)
 
-**灰度**:`BatchPool` 的 N 可配(0 = 退回现状同步路径,作开关回退);上线先 N=2,
-观察定稿延迟 / LLM 成本后再调。
-
----
-
-## 10. 开放问题 / 后续(本轮不做)
-
-1. **段级重跑延迟**(长段落 ~10s):可考虑"短段落跳过重跑(阈值,如 <3s 音频)"或
-   "重跑结果作为**增强**而非定稿前置(先按句级 batch 定稿,重跑到达后刷新归档)"。
-   后者让定稿更快,但引入"定稿后文本被刷新"的语义,需前端配合 —— 单独设计。
-2. **live 校准增强**:可选在 `SentenceBatchReady` 触发再校准(based-on-batch 的 live 预览),
-   代价是每句 +1 次 LLM(O(n²) 放大)。默认关,作可配开关。
-3. **定稿 LLM 省一次**:若"最后一次 `calibrate` 时全句 batch 已齐"(罕见),可复用其结果、
-   省掉定稿那次 LLM —— 需 Stage2 记忆最后一次校准的输入完整性,复杂度换一次调用,暂不做。
-4. **batch 池自适应 N**:按在途 job 数 / 延迟动态调 N。
-5. **`AudioStore` 的 `Arc` 化**影响面评估(其它持有 PCM 的路径:归档 WAV、`/api/audio`)。
+1. `select!` 无 biased:修订类事件交错随机(协议内,无害);
+2. 幽灵段无清理(与 B 同源)——**随 B 修复消失**;
+3. ~~round12 下 `SentenceCalibration` 只由段任务发 → 段落关闭前没有 live 校准~~
+   **round13 已修**:live 整流回归 Batch 臂(`live_calibration_task`,段内链式串行),
+   SC 顺序 = 段落生长序,且全部 SC 先于 PCal(段任务等 live 链尾后定稿)。注意语义:
+   SC 在 **Batch 事件时**触发(新句用流式文本,batch 未回回退流式),与其
+   `BatchSentence` 无先后约束(§4 表已更新);
+4. 单句段落/段重跑 `batch_asr_ms = 0`(计时丢失,性能埋点失真);
+5. `Batch` 载荷内句 `batch_text` 恒 None(协议如此)——`best_text` 在段关闭前只有流式可回退,
+   live 整流输入质量受限(设计取舍,非遗漏)。
 
 ---
 
-## 附:与现状的关键差异(一页速览)
+## 8. 修复方向(round13 拍板与落地)
 
-| 维度 | 现状 | 异步化(B2) |
-|---|---|---|
-| 句级 batch | 消费循环**同步**(~3.5s 阻塞) | 池**异步**,消费循环不阻塞 |
-| 段级重跑 | 消费循环**同步**(settle 时阻塞) | 池**异步**,settle 仅入队 |
-| 消费循环 | 被 batch 卡 → `check_settle` 误切(**bug**) | 持续运行,`speaking` 真实 → 不误切 |
-| live 流式显示 | batch 期间**冻结** | 持续流动 |
-| Stage2 | 有状态(存最后一次整流),定稿**零 LLM** | 无状态,定稿**跑 1 次 LLM**(纳入末句 batch) |
-| LLM 调用/段 | N | N+1 |
-| 定稿延迟 | 等重跑(句级已同步跑完) | ≈ max(末句 batch, 重跑),不劣于现状 |
-| 前端 / wire | — | **零改动**(`AsrEvent` FROZEN) |
-| 改动收敛 | — | 仅 `aura-core`(Stage1 + pipeline + Stage2) |
+1. **id 契约统一(A)** ~~段落 id 改回单调递增……~~ → **已落地:id = 创建时刻时间戳**
+   (微秒,严格递增;兼具可读性 —— id 即段落创建时刻,日志可直接读出)。
+2. **幽灵段根治(B)** ~~三选一~~ → **已落地:方案 a(server 真键前置)**——detected()
+   rising edge 即开段分配真 id(`on_speech_onset`),SOS 降级为防御兜底;配套空段 GC。
+3. **Batch 重投(D)** → **已落地**:主循环只为 `sentences.last()`(just-closed 句)投任务。
+4. **live 校准回归(E.3)** → **已落地**:Batch 臂触发 `live_calibration_task`(段内
+   链式串行,SC 顺序 = 段落生长序);段任务等 live 链尾后定稿(全部 SC 先于 PCal)。

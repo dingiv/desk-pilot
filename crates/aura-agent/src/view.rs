@@ -114,6 +114,10 @@ pub enum AsrEvent {
     SentenceCalibration {
         #[serde(rename = "window_id")]
         paragraph_id: u64,
+        /// 触发本次纠偏的句 id = SC 的**覆盖上界**(round20b:server 随事件带下,
+        /// 前端零派生状态即可知道覆盖谁 —— 只覆盖 ≤ 该句的部分,过界新句续接)。
+        #[serde(rename = "segment_id")]
+        sentence_id: u64,
         calibrated: String,
     },
     /// The settled paragraph's final calibration (per `ParagraphEdge`) — the paragraph's LAST

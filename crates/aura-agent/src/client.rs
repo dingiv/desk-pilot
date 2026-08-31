@@ -56,7 +56,12 @@ pub enum SseConnState {
 #[derive(Clone)]
 pub struct AuraClient {
     base: String,
+    /// REST 调用(`state`/`results`/…,一次性请求):总超时 30s 合理。
     http: reqwest::Client,
+    /// SSE 长流:**绝不设总超时** —— reqwest 的 `.timeout()` 覆盖整个响应生命周期,
+    /// 会把流在 30s 处掐断(实测:每 ~30s 重连一次,断连窗口的事件永久丢失 +
+    /// UI 闪"语音服务暂不可用")。只设连接超时;读等待无限(SSE 可以长时间无数据)。
+    stream_http: reqwest::Client,
 }
 
 impl AuraClient {
@@ -64,7 +69,10 @@ impl AuraClient {
     pub fn new(base: impl Into<String>) -> Result<Self> {
         let base = base.into().trim_end_matches('/').to_string();
         let http = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
-        Ok(Self { base, http })
+        let stream_http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()?;
+        Ok(Self { base, http, stream_http })
     }
 
     /// The daemon origin (normalized, no trailing slash) — the client's identity.
@@ -198,17 +206,29 @@ impl AuraClient {
         &self,
         url: String,
         on_conn: Option<Box<dyn Fn(SseConnState) + Send + Sync>>,
+        on_reconnect: Option<Box<dyn Fn() + Send + Sync>>,
     ) -> impl Stream<Item = String> + '_ {
         async_stream::stream! {
             let mut attempts: u32 = 0;
+            let mut ever_connected = false;
             loop {
                 if let Some(cb) = &on_conn {
                     cb(SseConnState::Connecting);
                 }
-                match self.http.get(&url).send().await {
+                match self.stream_http.get(&url).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         // 连上过 → 计数清零,之后的断线重连从头退避。
                         attempts = 0;
+                        // **重连成功(非首次)**→ 通知上层对账:广播无回放,断连
+                        // 窗口的事件已永久丢失,上层用 `/api/results` 全量补齐
+                        //(round19;SSE 专用 client 修复 30s 掐流后,仅真实网络
+                        // 断连会走到这里)。
+                        if ever_connected {
+                            if let Some(cb) = &on_reconnect {
+                                cb();
+                            }
+                        }
+                        ever_connected = true;
                         if let Some(cb) = &on_conn {
                             cb(SseConnState::Connected);
                         }
@@ -274,7 +294,7 @@ impl AuraClient {
     pub fn subscribe(&self, freq_ms: u64) -> impl Stream<Item = AuraStateView> + '_ {
         let url = format!("{}/api/stream?state_changed_frequency={}", self.base, freq_ms.max(250));
         async_stream::stream! {
-            let data = self.sse_data(url, None);
+            let data = self.sse_data(url, None, None);
             tokio::pin!(data); // sse_data's stream is !Unpin — pin before .next()
             while let Some(payload) = data.next().await {
                 if payload.contains("\"state_changed\"") {
@@ -294,7 +314,7 @@ impl AuraClient {
     pub fn subscribe_events(&self) -> impl Stream<Item = AsrEvent> + '_ {
         let url = format!("{}/api/asr_stream", self.base);
         async_stream::stream! {
-            let data = self.sse_data(url, None);
+            let data = self.sse_data(url, None, None);
             tokio::pin!(data);
             while let Some(payload) = data.next().await {
                 match parse_event(&payload) {
@@ -309,7 +329,7 @@ impl AuraClient {
     /// client and is `'static` — usable across scopes, e.g. moved into a `FuturesUnordered` in
     /// the IoThread's voice server. Reconnect / resilient behavior is unchanged.
     pub fn subscribe_events_owned(self) -> impl Stream<Item = AsrEvent> + 'static {
-        self.subscribe_events_owned_with_conn(None)
+        self.subscribe_events_owned_with_conn(None, None)
     }
 
     /// Owned data-plane stream + 连接状态回调(`on_conn` 每次 Connecting /
@@ -318,10 +338,11 @@ impl AuraClient {
     pub fn subscribe_events_owned_with_conn(
         self,
         on_conn: Option<Box<dyn Fn(SseConnState) + Send + Sync>>,
+        on_reconnect: Option<Box<dyn Fn() + Send + Sync>>,
     ) -> impl Stream<Item = AsrEvent> + 'static {
         let url = format!("{}/api/asr_stream", self.base);
         async_stream::stream! {
-            let data = self.sse_data(url, on_conn);
+            let data = self.sse_data(url, on_conn, on_reconnect);
             tokio::pin!(data);
             while let Some(payload) = data.next().await {
                 match parse_event(&payload) {
@@ -344,11 +365,28 @@ fn data_payloads(frame: &str) -> impl Iterator<Item = &str> {
 
 /// 解析一个 data payload 为 [`AsrEvent`]。解析失败**不静默**:round11 审计
 /// 发现 `if let Ok` 会把不匹配的事件(unknown tag / wire 字段变化)无声扔掉
-/// —— 前端苦等 sentence/paragraph 结束事件的头号嫌疑。丢弃必须留痕。
+/// —— 前端苦等 sentence/paragraph 结果事件的头号嫌疑。丢弃必须留痕。
+///
+/// **接收留痕(round18)**:每一条成功解析的事件先记一条 info 再返回 —— 与
+/// server 端 `emit→前端`(pipeline.rs `describe_turn`)同词汇同格式,两边日志
+/// 直接 diff 即可定位"server 发了 / 前端没收到"的丢事件缺口(lagged/断连/折叠丢弃)。
 fn parse_event(payload: &str) -> Option<AsrEvent> {
     match serde_json::from_str::<AsrEvent>(payload) {
-        Ok(seg) => Some(seg),
+        Ok(seg) => {
+            tracing::info!(event = %describe_event(&seg), "前端←event");
+            Some(seg)
+        }
         Err(e) => {
+            // daemon 的连接握手 ack(`{"type":"hello"}`)不是 wire 识别事件 —— 静默
+            // 跳过,不当"契约不匹配"报(每次重连一条,曾经的噪音源)。
+            let is_hello = serde_json::from_str::<serde_json::Value>(payload)
+                .ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|t| t == "hello"))
+                .unwrap_or(false);
+            if is_hello {
+                tracing::debug!("aura SSE 握手(hello),跳过");
+                return None;
+            }
             let head: String = payload.chars().take(120).collect();
             tracing::warn!(error = %e, payload = %head, "aura SSE 事件解析失败,已丢弃(wire 契约不匹配?)");
             None
@@ -356,10 +394,39 @@ fn parse_event(payload: &str) -> Option<AsrEvent> {
     }
 }
 
+/// 单行事件摘要(**接收侧**),与 server 端 `describe_turn`(pipeline.rs)同词汇:
+/// `stream/batch_sentence/...` + `p<id> s<id>` + 文本 —— 对表 diff 时按
+/// `p<id>` 与文本即可对齐(校准行不带 route_ms,server 侧多一个毫秒数)。
+fn describe_event(ev: &AsrEvent) -> String {
+    match ev {
+        AsrEvent::StreamFragment { paragraph_id, sentence_id, text, at_s } => {
+            format!("stream p{paragraph_id} s{sentence_id} @{at_s:.2} {text:?}")
+        }
+        AsrEvent::ParagraphClosed { paragraph_id } => {
+            format!("paragraph_closed p{paragraph_id}")
+        }
+        AsrEvent::BatchSentence { paragraph_id, sentence_id, text } => {
+            format!("batch_sentence p{paragraph_id} s{sentence_id} {text:?}")
+        }
+        AsrEvent::BatchParagraph { paragraph_id, text } => {
+            format!("batch_paragraph p{paragraph_id} {text:?}")
+        }
+        AsrEvent::SentenceCalibration { paragraph_id, sentence_id, calibrated } => {
+            format!("sentence_calibration p{paragraph_id} s{sentence_id} {calibrated:?}")
+        }
+        AsrEvent::ParagraphCalibration { paragraph_id, calibrated } => {
+            format!("paragraph_calibration p{paragraph_id} {calibrated:?}")
+        }
+        AsrEvent::Correction { paragraph_id, raw, corrected } => {
+            format!("correction p{paragraph_id} {raw:?}→{corrected:?}")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::data_payloads;
-    use crate::view::AsrEvent;
+    use super::{data_payloads, describe_event, parse_event};
+    use crate::view::AsrEvent as E;
 
     #[test]
     fn extracts_data_payloads() {
@@ -374,6 +441,39 @@ mod tests {
         // keep-alive comments (axum KeepAlive) and event/id lines carry no data.
         assert_eq!(data_payloads(": keep-alive\n").collect::<Vec<_>>(), Vec::<&str>::new());
         assert_eq!(data_payloads("event: ping\ndata:\n").collect::<Vec<_>>(), Vec::<&str>::new());
+    }
+
+    /// describe_event(接收留痕)格式快照 —— 与 server `describe_turn` 同词汇,
+    /// 对表 diff 的契约。
+    #[test]
+    fn describe_event_matches_server_vocabulary() {
+        use crate::view::AsrEvent as E;
+        assert_eq!(
+            describe_event(&E::ParagraphClosed { paragraph_id: 7 }),
+            "paragraph_closed p7"
+        );
+        assert!(describe_event(&E::BatchSentence {
+            paragraph_id: 7, sentence_id: 2, text: "批".into(),
+        }).starts_with("batch_sentence p7 s2"));
+        assert!(describe_event(&E::StreamFragment {
+            paragraph_id: 7, sentence_id: 2, text: "流".into(), at_s: 1.5,
+        }).starts_with("stream p7 s2 @1.50"));
+    }
+
+    /// daemon 的 SSE 握手 ack(`{"type":"hello"}`)不是识别事件 —— 静默跳过
+    /// (round19:曾每次重连触发一条"契约不匹配"warn 噪音)。
+    #[test]
+    fn hello_handshake_event_is_silently_skipped() {
+        assert!(parse_event(r#"{"type":"hello"}"#).is_none());
+        // 正常事件不受影响;文本里恰含 "hello" 字样不得误伤。
+        let ev = parse_event(
+            r#"{"type":"stream_fragment","window_id":1,"segment_id":1,"text":"hello world","at_s":0.5}"#,
+        )
+        .expect("text 含 hello 的正常事件必须解析成功");
+        match ev {
+            E::StreamFragment { text, .. } => assert_eq!(text, "hello world"),
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     /// 回归(round11 Bug 1):中文跨 TCP chunk 撕裂不得产生 U+FFFD。
@@ -403,9 +503,9 @@ mod tests {
             }
         }
         assert_eq!(payloads.len(), 1);
-        let ev: AsrEvent = serde_json::from_str(&payloads[0]).expect("valid AsrEvent json");
+        let ev: E = serde_json::from_str(&payloads[0]).expect("valid AsrEvent json");
         match ev {
-            AsrEvent::StreamFragment { text, .. } => assert_eq!(text, "你好世界,语音识别文本"),
+            E::StreamFragment { text, .. } => assert_eq!(text, "你好世界,语音识别文本"),
             other => panic!("wrong event: {other:?}"),
         }
         assert!(!payloads[0].contains('\u{FFFD}'), "no replacement chars");

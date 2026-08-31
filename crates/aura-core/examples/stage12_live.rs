@@ -14,7 +14,7 @@
 use std::fs;
 use std::io::Write;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use audio_aura_core::recognizer::{OnnxStage1Recognizer, Stage1Config};
@@ -72,9 +72,13 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     println!("\n● Pipeline 就绪 (scout {scout_addr}/audio). Ctrl-C 结束.\n");
-    Pipeline::new(s1, Box::new(s2)).run(
+    // round14:run 是 async future —— 无 runtime 宿主自建 current_thread runtime 驱动。
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(Pipeline::new(s1, Box::new(s2)).run(
         Arc::new(AtomicBool::new(true)),
-        Arc::new((Mutex::new(()), Condvar::new())),
+        Arc::new(tokio::sync::Notify::new()),
         move |ev| match ev {
         TurnEvent::ParagraphClosed { paragraph_id } => {
             println!("  ●段关闭 w{paragraph_id}(文本定格,定稿修订稍后)")
@@ -88,7 +92,7 @@ fn main() -> anyhow::Result<()> {
         TurnEvent::BatchParagraph { paragraph_id, text } => {
             println!("  ≈ 段批 w{paragraph_id}: {text}")
         }
-        TurnEvent::SentenceCalibration { paragraph_id, calibrated, route_ms } => {
+        TurnEvent::SentenceCalibration { paragraph_id, calibrated, route_ms, .. } => {
             println!("  ≈ w{paragraph_id} 整流中 @{route_ms:.0}ms: {calibrated}");
         }
         TurnEvent::ParagraphCalibration { paragraph_id, calibrated, route_ms } => {
@@ -99,5 +103,7 @@ fn main() -> anyhow::Result<()> {
                 paragraph_id, route_ms, cell(&calibrated)
             );
         }
-    });
+    },
+    ));
+    Ok(())
 }

@@ -82,3 +82,8 @@ apps/{visual_scout,visual_rover_cli,visual_rover_web,visual_scout_devtools}  ←
 ## Quick Development
 
 The project now are quickly iterated now. We don't need too much test cases.
+
+Standing rules (用户指令,长期有效):
+- **代码编写一律用 Edit 工具**做单点修改;禁止用脚本/正则批量替换(易静默失配)。
+- **绝不主动 git commit / push**;只有用户明确要求时才提交。
+- **从今以后不新增测试**;因重构而失效的既有测试**直接移除**,不修不迁。

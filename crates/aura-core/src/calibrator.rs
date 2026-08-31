@@ -21,8 +21,9 @@ use crate::prompt::PromptBuilder;
 
 /// Stage2's correction pass (纠偏/整流), driven by the Stage1 events. The calibrator is
 /// STATELESS — each call takes the full paragraph payload and runs its own LLM pass:
-/// - `Stage1Event::Batch` → [`calibrate_paragraph`](Self::calibrate_paragraph) — joint calibration
-///   of EVERY sentence in the current paragraph (multi-sentence) — the live preview;
+/// - 每句 batch 完成(BS 到达,round17b)→ [`calibrate_paragraph`](Self::calibrate_paragraph)
+///   — joint calibration of EVERY sentence in the current paragraph (multi-sentence) — the
+///   live preview(架构需求:batch 完成 → 之后纠偏,先后明确);
 /// - readiness finalization (pipeline, when all sentence batches + the re-run are in) →
 ///   [`finalize_paragraph`](Self::finalize_paragraph) — ONE LLM pass over the paragraph's final
 ///   best texts (the last sentence's batch may have arrived after its `Batch`, so the final pass
@@ -62,15 +63,17 @@ impl Stage2Calibrator for PassThroughCalibrator {
 /// Stage2 纠偏的输入源（配置 `llm.input`）——选择把哪些识别文本喂给 LLM。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum LlmInput {
-    /// 只用 batch 结果（`VadSentence::best_text()`：batch 优先，流式回退）。默认——batch 是权威。
-    #[default]
+    /// 只用 batch 结果（`VadSentence::best_text()`：batch 优先，流式回退）——batch 权威。
     #[serde(rename = "batch")]
     Batch,
     /// 只用流式结果（`streaming_text`）——热词偏置更强、句首更全，但同音字更多。
     #[serde(rename = "stream")]
     Stream,
-    /// batch + 流式双通道对照（`<primary_transcript>` + `<secondary_transcript>`）——批式丢句首
-    /// 时由流式补回（见 [`crate::prompt::DUAL_TRANSCRIPT_INSTRUCTION`]）。
+    /// batch + 流式**双通道对照**（`<primary_transcript>` + `<secondary_transcript>`）——
+    /// 批式丢句首时由流式补回，流式同音字多由批式压住（见
+    /// [`crate::prompt::DUAL_TRANSCRIPT_INSTRUCTION`]）。**默认**(round17c:纠偏纠的
+    /// 就是两路识别的结果 —— 参数必须都传,单路是降级模式)。
+    #[default]
     #[serde(rename = "both")]
     Both,
 }

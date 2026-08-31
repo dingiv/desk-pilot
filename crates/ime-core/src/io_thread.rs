@@ -75,6 +75,9 @@ pub enum VoiceCmd {
     /// 主动归档(分字符键 `'` = "我说完了"):让 aura 立即关闭当前开放窗口并
     /// 整窗 batch,跳过 merge_gap 剩余等待。未连接时 no-op。
     FlushParagraph,
+    /// SSE 流内部重连成功后(自愈)发出的**全量对账**:广播无回放,断连窗口的
+    /// 事件已永久丢失 —— reset + `/api/results` 补齐错过的定稿(round19)。
+    Resync,
 }
 
 /// 向 voice server 发命令的 typed sender(包装 io thread 的 `tx`)。
@@ -139,11 +142,12 @@ impl IoThread {
         let (tx, rx) = mpsc::channel::<IoEvent>(64);
         let voice_tx = VoiceCmdSender(tx.clone());
         let rt2 = Arc::clone(&rt);
+        let io_tx = tx.clone();
         std::thread::Builder::new()
             .name("ime-io".into())
             .spawn(move || {
                 let voice = VoiceSession::new(voice_base, voice_state, idle_timeout_secs);
-                rt2.block_on(io_main(rx, frontend, voice));
+                rt2.block_on(io_main(io_tx, rx, frontend, voice));
             })
             .expect("spawn ime io thread");
         IoThread {
@@ -236,6 +240,7 @@ impl VoiceSession {
         ctx: usize,
         frontend: &Weak<dyn FrontEndHandle>,
         sources: &mut FuturesUnordered<SseSource>,
+        resync_tx: mpsc::Sender<IoEvent>,
     ) -> bool {
         let is_new = self.active_ctx != ctx as i64;
         self.active_ctx = ctx as i64;
@@ -261,19 +266,7 @@ impl VoiceSession {
                     // 灌入最近的定稿 —— 这样 `#asr` 重新打开时首个候选
                     // 是断连期间说的那句话,而不是旧残留。
                     if ok {
-                        self.state.reset();
-                        match client.results().await {
-                            Ok(history) => {
-                                self.state.sync_history(&history);
-                                tracing::info!(
-                                    count = history.len(),
-                                    "voice reconnect → synced aura history"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "voice reconnect: results sync failed");
-                            }
-                        }
+                        self.sync_history_from_daemon(&client).await;
                     }
                     // SSE 流连接状态回调:连不上/连上都要**及时**汇报
                     // UI(用户修的 bug —— 之前流内部退避重连时,状态
@@ -296,8 +289,15 @@ impl VoiceSession {
                         st.set_conn(v);
                         notify_conn(&fe, -1); // 广播:有 #asr 的 ctx 刷新
                     });
+                    // 重连成功 → 给自己发 Resync(全量对账补断连窗口丢的定稿)。
+                    let resync_tx2 = resync_tx.clone();
+                    let on_reconnect =
+                        Box::new(move || match resync_tx2.try_send(IoEvent::Voice(VoiceCmd::Resync)) {
+                            Ok(()) => tracing::info!("voice SSE reconnected → Resync(全量对账)"),
+                            Err(e) => tracing::warn!(error = %e, "voice Resync 发送失败(io 通道满?)"),
+                        });
                     sources.push(Box::pin(poll_event(Box::pin(
-                        client.subscribe_events_owned_with_conn(Some(on_conn)),
+                        client.subscribe_events_owned_with_conn(Some(on_conn), Some(on_reconnect)),
                     ))));
                     self.connected = true;
                 }
@@ -310,6 +310,19 @@ impl VoiceSession {
             }
         }
         is_new
+    }
+
+    /// 全量对账:reset + `/api/results` 灌入断连期间错过的定稿。attach 初连与
+    /// SSE 内部重连(Resync)共用 —— 广播无回放,这是唯一的补历史通道。
+    async fn sync_history_from_daemon(&mut self, client: &AuraClient) {
+        self.state.reset();
+        match client.results().await {
+            Ok(history) => {
+                self.state.sync_history(&history);
+                tracing::info!(count = history.len(), "voice → synced aura history");
+            }
+            Err(e) => tracing::warn!(error = %e, "voice: results sync failed"),
+        }
     }
 
     /// `#asr` 会话退出(deactivate):清掉 ctx。懒惰的循环也会在下次
@@ -399,6 +412,7 @@ impl VoiceSession {
 /// 通用 I/O 事件循环(原 `voice_server_main` —— round10 分层:循环只认
 /// [`IoEvent`] 与会话回调,voice 语义全在 [`VoiceSession`])。
 async fn io_main(
+    tx: mpsc::Sender<IoEvent>,
     mut rx: mpsc::Receiver<IoEvent>,
     frontend: Weak<dyn FrontEndHandle>,
     mut voice: VoiceSession,
@@ -411,7 +425,7 @@ async fn io_main(
             ev = rx.recv() => {
                 match ev {
                     Some(IoEvent::Voice(VoiceCmd::Attach { ctx })) => {
-                        let is_new = voice.attach(ctx, &frontend, &mut sources).await;
+                        let is_new = voice.attach(ctx, &frontend, &mut sources, tx.clone()).await;
                         if is_new {
                             // 立即刷一次(即使未连上,predict 也会显示"未连接")。
                             try_refresh(&mut voice.active_ctx, &frontend);
@@ -422,6 +436,19 @@ async fn io_main(
                     }
                     Some(IoEvent::Voice(VoiceCmd::FlushParagraph)) => {
                         voice.flush_paragraph().await;
+                    }
+                    Some(IoEvent::Voice(VoiceCmd::Resync)) => {
+                        // SSE 自愈重连后的全量对账(未连接/mock 下 no-op)。
+                        if voice.connected && !voice.state.is_mock() {
+                            voice.last_activity = tokio::time::Instant::now();
+                            match AuraClient::new(&voice.base) {
+                                Ok(client) => voice.sync_history_from_daemon(&client).await,
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "voice Resync: AuraClient::new failed")
+                                }
+                            }
+                            try_refresh(&mut voice.active_ctx, &frontend);
+                        }
                     }
                     Some(IoEvent::Blocking { ctx, task }) => {
                         // 阻塞任务(HTTP 拉取等)放 tokio 阻塞池执行:既不让 current_thread

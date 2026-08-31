@@ -8,8 +8,8 @@
 #   ./scripts/dev-up.sh stop             # 全部停止
 #
 # 环境变量(可选):
-#   SCOUT_MOCK=路径        scout 用 mock 模式(容器/无 PipeWire 环境必用;
-#                          默认 apps/omni-scout/assets/mock-audio)
+#   SCOUT_MOCK=目录        可选:启用纯音频 mock(--mock-audio,容器/无 PipeWire
+#                          环境用);默认不设 = 真实麦克风
 #   SCOUT_PORT=7878        omni-scout 端口
 #   ROUTER_PORT=8080       dp-router 对外端口(LLM + ASR 统一;被 aura Stage1 batch + Stage2 调用)
 #   ROUTER_CONFIG=路径     dp-router 配置覆盖(默认 apps/dp-router/dp-router.yaml)
@@ -32,8 +32,8 @@ SCOUT_PORT="${SCOUT_PORT:-7878}"
 ROUTER_PORT="${ROUTER_PORT:-8080}"
 ROUTER_CONFIG="${ROUTER_CONFIG:-}"
 AURA_PORT="${AURA_PORT:-9091}"
-# --mock-audio 期望音频**目录**(循环播放);scout 自带 apps/omni-scout/assets/mock-audio。
-SCOUT_MOCK="${SCOUT_MOCK:-$ROOT/apps/omni-scout/assets/mock-audio}"
+# --mock-audio 期望音频**目录**(循环播放);默认不设 = 真实麦克风。
+SCOUT_MOCK="${SCOUT_MOCK:-}"
 
 
 pid_file() { echo "$PID_DIR/$1.pid"; }
@@ -52,10 +52,12 @@ start_one() {
     fi
     case "$name" in
         scout)
-            # 纯音频 mock(--mock-audio,容器/无 PipeWire 环境);真实环境
-            # 去掉 SCOUT_MOCK 或改用 --mock <video>。
+            # 默认真实麦克风。容器/无 PipeWire 环境才显式 SCOUT_MOCK=<目录> 启用
+            # 纯音频 mock(--mock-audio 循环播放)。
             echo "  scout  (omni-scout :$SCOUT_PORT, 真实麦克风)"
-            (cd "$ROOT" && cargo run -p omni-scout -- --port "$SCOUT_PORT"\
+            local scout_cmd=(cargo run -p omni-scout -- --port "$SCOUT_PORT")
+            [ -n "${SCOUT_MOCK:-}" ] && scout_cmd+=(--mock-audio "$SCOUT_MOCK")
+            (cd "$ROOT" && "${scout_cmd[@]}"\
                 >"$(log_file scout)" 2>&1 & echo $! >"$(pid_file scout)")
             ;;
         router)
@@ -69,7 +71,6 @@ start_one() {
                 >"$(log_file router)" 2>&1 & echo $! >"$(pid_file router)")
             ;;
         aura)
-            # required-features = [asr];cuda 仅编译开关(运行走 CPU 除非有 GPU)。
             # scout_addr 是位置参数(不是 flag)。
             # Stage1 batch ASR + Stage2 LLM 一律走 dp-router(:$ROUTER_PORT)。
             # 流式 ASR 仍在 aura 进程内(sherpa-onnx,不需要外部依赖)。
@@ -77,7 +78,7 @@ start_one() {
             # 调用若 model 未在线,SDK 走 dp-router 的 POST /admin/models/load
             # 动态拉起(load 是异步的,SDK 轮询 /admin/models 直到 online 再发请求)。
             echo "  aura   (aura-daemon :$AURA_PORT → scout :$SCOUT_PORT / router :$ROUTER_PORT [LLM + ASR])"
-            (cd "$ROOT" && cargo run -p aura-daemon --features asr -- \
+            (cd "$ROOT" && cargo run -p aura-daemon -- \
                 --port "$AURA_PORT" "127.0.0.1:$SCOUT_PORT" \
                 >"$(log_file aura)" 2>&1 & echo $! >"$(pid_file aura)")
             ;;
@@ -151,8 +152,14 @@ fi
 if [ "$action" = "start" ]; then
     echo ""
     echo "  探活:"
-    [ "$target" = "all" ] || [ "$target" = "scout" ]   && echo "    scout  → http://127.0.0.1:$SCOUT_PORT"
-    [ "$target" = "all" ] || [ "$target" = "router" ]  && echo "    router → http://127.0.0.1:$ROUTER_PORT/health / /admin/models / /v1/chat/completions / /v1/audio/transcriptions"
-    [ "$target" = "all" ] || [ "$target" = "aura" ]    && echo "    aura   → http://127.0.0.1:$AURA_PORT"
+    if [ "$target" = "all" ] || [ "$target" = "scout" ]; then
+        echo "    scout  → http://127.0.0.1:$SCOUT_PORT"
+    fi
+    if [ "$target" = "all" ] || [ "$target" = "router" ]; then
+        echo "    router → http://127.0.0.1:$ROUTER_PORT/health / /admin/models / /v1/chat/completions / /v1/audio/transcriptions"
+    fi
+    if [ "$target" = "all" ] || [ "$target" = "aura" ]; then
+        echo "    aura   → http://127.0.0.1:$AURA_PORT"
+    fi
     echo "  日志: $LOG_DIR/*.log (tail -f 查看)"
 fi

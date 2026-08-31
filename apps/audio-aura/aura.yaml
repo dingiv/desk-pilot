@@ -62,10 +62,10 @@ llm:
   model: "qwen2.5-3b-instruct-q4_k_m.gguf"  # local: GGUF 文件名; remote: 服务端模型名
   # model_dir: "/path/to/models"            # local 时模型根目录覆盖 (默认 MODELS 命名空间)
   # endpoint: "http://127.0.0.1:3000"       # backend=remote 时服务地址
-  input: batch                  # Stage2 纠偏输入源: batch (默认) | stream | both
-                                #   batch  = 只用批式结果(best_text: batch 优先)
+  input: both                   # Stage2 纠偏输入源: both (默认) | batch | stream
+                                #   both   = 双通道对照(两路都传: batch 权威 + 流式补句首/热词)
+                                #   batch  = 只用批式结果(best_text: batch 优先) —— 降级
                                 #   stream = 只用流式结果(热词偏置强/句首全, 但同音字多)
-                                #   both   = 双通道对照(batch 权威 + 流式补句首)
   # backend=disable: 完全关闭第二阶段 —— 不加载 LLM, 校准=恒等 (calibrated 直接承载
   # 原文, 零 LLM 延迟/开销; 纯 ASR 部署或对照 Stage2 贡献用)。
 

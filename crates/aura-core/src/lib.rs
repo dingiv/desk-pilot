@@ -45,8 +45,10 @@ pub use hub::{FinalTurn, Storage, TurnRecord};
 pub type AudioId = u64;
 /// Sentence id — monotonic within a pipeline run.
 pub type SentenceId = u64;
-/// Paragraph id — monotonic within a run, assigned when the paragraph OPENS (its first SOS), so
-/// live `StreamFragment` partials can carry the real id (no prospective guessing).
+/// Paragraph id — **创建时刻时间戳**(UNIX_EPOCH 起微秒,u64,严格递增:`max(now, last+1)`
+/// 防时钟回拨;跨运行也单调)。分配时机 = 段落**开启**的瞬间(VAD detected() rising
+/// edge,round13 起音即开段)→ live `StreamFragment` partial 从第一条起携带真实 id。
+/// **id 即顺序**:客户端按 id 排序(BTreeMap 降序 = 说话顺序),时间戳天然满足。
 pub type ParagraphId = u64;
 
 /// One VAD-gap-delimited clip — the atomic Stage1 unit. A sentence is complete the moment its
@@ -136,9 +138,10 @@ impl VadParagraph {
 pub enum Stage1Event {
     /// Live streaming output for the CURRENT sentence (per-sentence session ⇒ the fragment
     /// belongs to exactly one sentence). Carries the real `paragraph_id` (assigned at the
-    /// paragraph's first SOS) + `sentence_id`. Passes straight through to the UI — NOT a Stage2
-    /// input (D2: no live-partial calibration). Emitted on every streaming decode change, plus
-    /// one FINAL fragment at EOS carrying the sentence's definitive `streaming_text`.
+    /// paragraph's speech onset — VAD rising edge) + `sentence_id`. Passes straight through to
+    /// the UI — NOT a Stage2 input (D2: no live-partial calibration). Emitted on every streaming
+    /// decode change, plus one FINAL fragment at EOS carrying the sentence's definitive
+    /// `streaming_text`.
     StreamFragment { paragraph_id: ParagraphId, sentence_id: SentenceId, text: String, at_s: f64 },
     /// A VAD gap closed a sentence. `sentences` is ALL sentences of the current paragraph so far
     /// (Stage2 jointly calibrates them — the payload IS the paragraph, keeping Stage2 stateless).

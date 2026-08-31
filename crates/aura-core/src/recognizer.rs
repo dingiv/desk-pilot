@@ -10,12 +10,12 @@
 //! - [`Self::run`] — 消费循环(VAD + 流式 + 边界决策),**永不被 batch 阻塞**
 //!   (batch 异步化的根因修复:见 docs/aura/async-batch-design.md)。
 //!
-//! Boundary paradigm (docs/aura/stages.md): the VAD gap (`min_silence`) closes a
-//! [`VadSentence`] (its own streaming session per D1 + one batch JOB enqueued, packed as a
-//! `Batch` event with `batch_text: None`; the result arrives via `SentenceBatchReady`); the
-//! merge paragraph (`merge_gap`) closes a [`VadParagraph`] (concatenated PCM re-run JOB
-//! enqueued, packed as a `ParagraphEdge` with `batch_text: None`; the result arrives via
-//! `ParagraphBatchReady`). PCM lives in the [`AudioStore`] by id as a shared `Arc<Vec<i16>>` —
+//! Boundary paradigm (docs/aura/stages.md): a paragraph OPENS at the VAD speech onset
+//! (detected() rising edge → timestamp id, live partials carry the REAL key from the first
+//! fragment); the VAD gap (`min_silence`) closes a [`VadSentence`] (its own streaming session
+//! per D1 + one batch pass, packed as a `Batch` event with `batch_text: None`); the merge
+//! paragraph (`merge_gap`) closes a [`VadParagraph`] (packed as a `ParagraphEdge` with
+//! `batch_text: None`). PCM lives in the [`AudioStore`] by id as a shared `Arc<Vec<i16>>` —
 //! jobs and the paragraph share the allocation; events carry ids + texts only.
 //!
 //! ```ignore
@@ -27,8 +27,10 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use tokio::sync::Notify;
 
 /// A batch job the consume loop enqueues (non-blocking, microseconds); a dedicated worker
 /// thread — spawned by [`crate::pipeline::Pipeline`] — drains this channel and runs the
@@ -101,6 +103,18 @@ const PARTIAL_EVERY_FRAMES: u32 = 15;
 /// 下一句). Real speech never trips this: a ≥min_silence pause closes the sentence via EOS,
 /// which resets the session long before the partial could go stale.
 const STALE_SESSION_RESET: Duration = Duration::from_secs(8);
+/// 起音→首条 partial 的盲区边际:partial 每 15 帧(~0.5s)才解码一次,起音后这段
+/// 盲区里 `partial 非空` 还没翻转,但 VAD `detected()` 已经是 true —— settle 判定若
+/// 只看 partial,起音落在 merge_gap 截止点前盲区里的下一句会被**误切**(段落本该
+/// 合并;且关段后仍产生该段的 SF,客户端首选回落陈旧流式 = "batch 后退回流式"
+/// 的 round15 回归)。0.6s = 0.5s 节流 + 解码余量。
+const VOICE_SETTLE_MARGIN: f64 = 0.6;
+
+/// settle 抑制的"说话中"判定:partial 非空,**或**最近一帧 VAD detected() 距今
+/// < [`VOICE_SETTLE_MARGIN`](self::VOICE_SETTLE_MARGIN)。
+fn speech_pending(partial_nonempty: bool, last_voice_s: f64, now_s: f64) -> bool {
+    partial_nonempty || (now_s - last_voice_s) < VOICE_SETTLE_MARGIN
+}
 
 /// VAD 门控流式的 lead-in 帧数(每帧 32ms):detected() 翻转起音时补喂最近 ~0.5s 的帧,
 /// 让 soft onset 进入流式/batch(Silero 要几帧过阈值,detected 翻转晚于真实起音)。
@@ -270,12 +284,14 @@ impl Stage1Config {
     }
 }
 
-/// A Stage1 recognizer: audio in → [`Stage1Event`]s out. `run` blocks forever (drives the
-/// ingest+consume loop) and invokes `on_event` for each interim partial / settled sentence /
-/// closed paragraph.
+/// A Stage1 recognizer: audio in → [`Stage1Event`]s out. `run` 是**原生异步**的
+/// (round14b:帧等待走 `tokio::sync::Notify`,计算沿 VAD/流式推理在 executor 上内联)
+/// —— 调用方 `s1.run(cb).await`(永不完成直到 `running` 置 false)。
 pub trait Stage1Recognizer {
     /// 跑消费循环直到 `running` 被置 false(idle 深度睡眠)→ 返回。daemon 恢复时重新调用。
-    fn run(&self, on_event: &mut dyn FnMut(Stage1Event)) -> ();
+    /// RPITIT + 显式 `Send`(async fn in trait 无法声明 auto bound;调用方 tokio::spawn 需要)。
+    fn run(&self, on_event: &mut (dyn FnMut(Stage1Event) + Send))
+    -> impl std::future::Future<Output = ()> + Send;
 }
 
 /// Batch ASR turned off (`asr.backend: disable`): every pass yields empty text, which the
@@ -300,8 +316,11 @@ pub struct OnnxStage1Recognizer {
     /// stay in `mgr` (always local sherpa).
     batch_asr: Arc<dyn AsrProvider>,
     ring: Arc<Mutex<AudioRing>>,
-    /// Wakes the consume loop when the ingest thread pushes frames (no polling).
-    ring_cv: Arc<Condvar>,
+    /// Wakes the async consume loop when the ingest pushes frames (no polling).
+    /// Notify 的 permit 语义天然防丢唤醒:push 后的 notify_one 会存一张 permit,
+    /// 稍后的 `notified().await` 立即返回;且 notify_one 可从同步代码调用
+    /// (ingest 仍是阻塞桥)。
+    ring_notify: Arc<Notify>,
     /// Merge-paragraph gap (s) — see [`Stage1Config::merge_gap_s`].
     merge_gap_s: f64,
     active: Arc<AtomicBool>,
@@ -359,13 +378,13 @@ impl OnnxStage1Recognizer {
         };
         mgr.warm();
         let ring = Arc::new(Mutex::new(AudioRing::new(cfg.ring_cap_samples)));
-        let ring_cv = Arc::new(Condvar::new());
+        let ring_notify = Arc::new(Notify::new());
         let (batch_tx, batch_rx) = mpsc::channel();
         Ok((
             Self {
                 mgr,
                 ring,
-                ring_cv,
+                ring_notify,
                 merge_gap_s: cfg.merge_gap_s,
                 active: cfg.active,
                 running: cfg.running,
@@ -394,13 +413,13 @@ impl OnnxStage1Recognizer {
             }
         };
         let ring = Arc::new(Mutex::new(AudioRing::new(cfg.ring_cap_samples)));
-        let ring_cv = Arc::new(Condvar::new());
+        let ring_notify = Arc::new(Notify::new());
         let (batch_tx, batch_rx) = mpsc::channel();
         Ok((
             Self {
                 mgr,
                 ring,
-                ring_cv,
+                ring_notify,
                 merge_gap_s: cfg.merge_gap_s,
                 active: cfg.active,
                 running: cfg.running,
@@ -439,9 +458,9 @@ impl OnnxStage1Recognizer {
                 let mut g = self.ring.lock().unwrap();
                 g.push(win);
                 drop(g);
-                // Wake the consume loop — it sleeps on the condvar between frames
-                // (deadline-driven, no polling).
-                self.ring_cv.notify_all();
+                // Wake the async consume loop — it awaits the Notify between frames
+                // (deadline-driven, no polling). notify_one 可从同步代码调用。
+                self.ring_notify.notify_one();
             },
             Duration::from_secs(2),
         )
@@ -521,28 +540,43 @@ impl OnnxStage1Recognizer {
     }
 }
 
-/// Block until a full Silero paragraph is available in the ring (wakes on the ingest thread's
-/// condvar notify). `timeout: Some` additionally caps the wait — `None` return means the
-/// deadline fired (the caller re-runs its time-based checks); `timeout: None` parks until
-/// audio arrives (no timer at all — nothing time-based is pending).
-fn wait_frame(
+/// Wait until a full Silero frame is available in the ring (wakes on the ingest's
+/// `Notify`). `timeout: Some` additionally caps the wait — `None` return means the deadline
+/// fired (the caller re-runs its time-based checks); `timeout: None` parks until audio
+/// arrives (no timer at all — nothing time-based is pending).
+///
+/// **async(round14b)**:消费循环原生异步 —— 唤醒源从 Condvar 换成 `tokio::sync::Notify`
+/// (permit 语义:检查 ring 之后、`await` 之前的 push 不会丢唤醒 —— notify_one 存的
+/// permit 会让 `notified()` 立即就绪)。std Mutex 保留:临界区是纳秒级的 ring 操作,
+/// async 里短暂持锁是标准做法。
+async fn wait_frame(
     ring: &Mutex<AudioRing>,
-    ring_cv: &Condvar,
+    notify: &Notify,
     frame_samples: usize,
     timeout: Option<Duration>,
 ) -> Option<Vec<i16>> {
-    let mut g = ring.lock().unwrap();
-    if g.has_frame(frame_samples) {
-        return Some(g.drain(frame_samples));
-    }
-    let mut g = match timeout {
-        Some(t) => {
-            let (g, _timed_out) =
-                ring_cv.wait_timeout_while(g, t, |r| !r.has_frame(frame_samples)).unwrap();
-            g
+    {
+        let mut g = ring.lock().unwrap();
+        if g.has_frame(frame_samples) {
+            return Some(g.drain(frame_samples));
         }
-        None => ring_cv.wait_while(g, |r| !r.has_frame(frame_samples)).unwrap(),
-    };
+    }
+    // 先注册 waiter 再复查一次 ring(双保险;permit 语义本身已防丢唤醒)。
+    let notified = notify.notified();
+    {
+        let mut g = ring.lock().unwrap();
+        if g.has_frame(frame_samples) {
+            return Some(g.drain(frame_samples));
+        }
+    }
+    match timeout {
+        Some(t) => {
+            let _ = tokio::time::timeout(t, notified).await;
+        }
+        None => notified.await,
+    }
+    // 醒来(通知或截止)→ 终检一次 ring(截止竞态窗口内可能刚 push)。
+    let mut g = ring.lock().unwrap();
     if g.has_frame(frame_samples) {
         Some(g.drain(frame_samples))
     } else {
@@ -556,11 +590,13 @@ fn wait_frame(
 
 /// The open paragraph: its settled sentences + whether a sentence is in progress (SOS seen,
 /// EOS pending). The in-progress sentence's id/timing live recognizer-side ([`ActiveSession`]);
-/// the tracker only needs "is one active" for settle suppression.
+/// the tracker only needs "is one active" for settle suppression. `opened_at` = 起音开段时刻
+/// (VAD rising edge),供空段落 GC(起音后从未出句的微弱音频,静默满 merge_gap 即弃)。
 struct OpenParagraph {
     paragraph_id: ParagraphId,
     sentences: Vec<VadSentence>,
     active: bool,
+    opened_at: f64,
 }
 
 /// A paragraph closed by a big gap or the settle-timeout — the recognizer turns this into a
@@ -583,17 +619,18 @@ impl ParagraphTracker {
         Self { merge_gap_s, next_sentence_id: 1, last_win_id: 0, open: None }
     }
 
-    /// 生成一个**随机** paragraph id(基于系统时间亚微秒纳秒,无依赖、不可预测,
-    /// `u64` 足够宽不会快速碰撞)。用随机而非递增 —— 避免可预测性,也让重连后
-    /// 历史段落 id 与新段落不产生"连续/相邻"的假关联。
-    fn next_random_win_id(&mut self) -> ParagraphId {
-        let nanos = std::time::SystemTime::now()
+    /// 生成段落 id = **创建时刻时间戳**(UNIX_EPOCH 起微秒,u64)。严格递增:
+    /// `max(now, last+1)` 防时钟回拨/同微秒碰撞;恒 ≠ 0。
+    ///
+    /// **id 即顺序(契约)**:客户端 Transcript 以 id 排序(BTreeMap 降序 = 说话顺序),
+    /// 时间戳天然单调,取代旧随机器(`next_random_win_id` —— 随机 id 打碎了客户端
+    /// 排序假设,§7-A);时间戳还让 id 在日志里可直接读出段落创建时刻。
+    fn next_win_id(&mut self) -> ParagraphId {
+        let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos() as u64)
+            .map(|d| d.as_micros() as u64)
             .unwrap_or(0);
-        // 混入自增计数:同一纳秒内连续两次也会不同(仅作防碰撞,不是"递增 id")。
-        self.last_win_id += 1;
-        let mut id = nanos ^ (self.last_win_id.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut id = now.max(self.last_win_id.saturating_add(1));
         if id == 0 {
             id = 1;
         }
@@ -601,16 +638,30 @@ impl ParagraphTracker {
         id
     }
 
+    /// VAD 起音(detected() false→true 翻转)即开段 —— **真键前置**(§7-B 幽灵段根治):
+    /// 段落 id 在说话第一刻就分配,live partial 从第一条起携带真实段键;不再依赖
+    /// 回溯 SOS(EOS 时刻)补开。已有开段(段内第 2+ 句)则不动。
+    fn on_speech_onset(&mut self, now: f64) {
+        if self.open.is_none() {
+            let id = self.next_win_id();
+            self.open =
+                Some(OpenParagraph { paragraph_id: id, sentences: Vec::new(), active: false, opened_at: now });
+        }
+    }
+
     /// VAD StartOfSpeech. NOTE: the SOS is RETROACTIVE — it fires at the sentence's EOS instant
     /// (its wall-clock IS the EOS time, NOT the speech onset), so the merge/split decision
     /// CANNOT happen here (using the EOS instant as the onset would inflate every gap by the
     /// sentence's own duration and settle on EVERY sentence — the "paragraph never has >1 sentence"
-    /// bug). This only allocates the sentence id + marks the paragraph active; the settle decision
-    /// moves to [`Self::on_eos`], which back-derives the true speech onset from the PCM.
-    fn on_sos(&mut self) -> SentenceId {
+    /// bug). Normally the paragraph was already opened at the speech onset
+    /// ([`Self::on_speech_onset`]); the open here is only a degenerate fallback (no rising edge
+    /// was ever seen). This allocates the sentence id + marks the sentence active; the settle
+    /// decision moves to [`Self::on_eos`], which back-derives the true speech onset from the PCM.
+    fn on_sos(&mut self, now: f64) -> SentenceId {
         if self.open.is_none() {
-            let id = self.next_random_win_id();
-            self.open = Some(OpenParagraph { paragraph_id: id, sentences: Vec::new(), active: false });
+            let id = self.next_win_id();
+            self.open =
+                Some(OpenParagraph { paragraph_id: id, sentences: Vec::new(), active: false, opened_at: now });
         }
         let sentence_id = self.next_sentence_id;
         self.next_sentence_id += 1;
@@ -641,9 +692,15 @@ impl ParagraphTracker {
     fn on_eos(&mut self, sentence: VadSentence) -> (Option<SettledParagraph>, ParagraphId, Vec<VadSentence>) {
         let settled = self.settle_if_gap(sentence.start_s);
         if self.open.is_none() {
-            // First sentence, or the previous paragraph just settled.
-            let id = self.next_random_win_id();
-            self.open = Some(OpenParagraph { paragraph_id: id, sentences: Vec::new(), active: false });
+            // First sentence, or the previous paragraph just settled. opened_at 用回溯
+            // onset(正常路径在起音已开段,这里是防御兜底)。
+            let id = self.next_win_id();
+            self.open = Some(OpenParagraph {
+                paragraph_id: id,
+                sentences: Vec::new(),
+                active: false,
+                opened_at: sentence.start_s,
+            });
         }
         let w = self.open.as_mut().expect("paragraph just ensured");
         w.active = false;
@@ -658,9 +715,21 @@ impl ParagraphTracker {
     /// right now but this VAD's SOS for that speech hasn't arrived yet (it's RETROACTIVE, comes
     /// with EOS). Without this suppression the wall-clock timeout would fire mid-sentence and
     /// split the next sentence into a fresh paragraph — the "paragraph never has >1 sentence" bug.
+    ///
+    /// 空段落 GC(起音开段的配套):开段后从未出句(微弱音频,partial 一直空)→ 静默满
+    /// `merge_gap_s` 即**静默丢弃**(不发事件——emit 侧对空段落本就 no-op)。真语音不会
+    /// 误伤:partial 自起音 ~0.5s 起非空 → `speaking` 抑制;句一旦落地(sentences 非空)
+    /// 走正常 settle 路径。不 GC 的后果:陈旧空段被很久之后的语音复用,id(时间戳)
+    /// 落后于中间段落 → 客户端 id 排序错位。
     fn check_settle(&mut self, now: f64, speaking: bool) -> Option<SettledParagraph> {
         let w = self.open.as_ref()?;
         if w.active || speaking {
+            return None;
+        }
+        if w.sentences.is_empty() {
+            if now - w.opened_at >= self.merge_gap_s {
+                self.open = None; // 空段 GC:静默丢弃,无事件
+            }
             return None;
         }
         let last = w.sentences.last()?;
@@ -690,13 +759,17 @@ impl ParagraphTracker {
     }
 
     /// Seconds until [`Self::check_settle`] would close the open paragraph (None = no pending
-    /// settle: nothing open, no sentences yet, a sentence in progress, or `speaking` — the next
+    /// settle: nothing open, a sentence in progress, or `speaking` — the next
     /// sentence's speech is ongoing but its SOS hasn't arrived yet). Drives the consume loop's
-    /// condvar deadline — wake exactly when the trailing paragraph is due, not on a poll cadence.
+    /// condvar deadline — wake exactly when the trailing paragraph (or an empty onset-opened
+    /// paragraph awaiting GC) is due, not on a poll cadence.
     fn settle_deadline(&self, now: f64, speaking: bool) -> Option<f64> {
         let w = self.open.as_ref()?;
         if w.active || speaking {
             return None;
+        }
+        if w.sentences.is_empty() {
+            return Some((self.merge_gap_s - (now - w.opened_at)).max(0.0));
         }
         let last = w.sentences.last()?;
         Some((self.merge_gap_s - (now - last.end_s)).max(0.0))
@@ -706,14 +779,12 @@ impl ParagraphTracker {
         self.open.take().map(|w| SettledParagraph { paragraph_id: w.paragraph_id, sentences: w.sentences })
     }
 
-    /// The ids the sentence currently being spoken WILL get: the open paragraph's id (or the next
-    /// one when nothing is open) + the next sentence id. Used to key live `StreamFragment`
-    /// partials —
-    /// this VAD emits SOS RETROACTIVELY (with EOS), so the real assignment only exists at EOS.
+    /// The ids the sentence currently being spoken WILL get: the open paragraph's id (or the
+    /// next one when nothing is open) + the next sentence id. Used to key live `StreamFragment`
+    /// partials. 正常路径下段落已在起音开启(`on_speech_onset`),partial 从第一条起就是
+    /// **真实段键**;`open=None` 的兜底预测仅剩退化场景(flush 在微弱音频中切段等),
+    /// 实际不可达 —— partial 只在 detected 分支发射,而 rising edge 先于任何 accept 发生。
     /// Authoritative grouping arrives with the `Batch`/`ParagraphEdge` events.
-    ///
-    /// paragraph id 是随机的;未开段落时给一个"预测"随机值(仅用于给 partial 预分组,
-    /// 实际分配在 EOS 用 [`next_random_win_id`](Self::next_random_win_id))。
     fn prospective(&self) -> (ParagraphId, SentenceId) {
         let w = self
             .open
@@ -833,19 +904,23 @@ enum FrameResult {
 impl OnnxStage1Recognizer {
     /// 取一帧(32ms)处理,或 park 后重跑循环。ring 有帧直接取;空则等音频/截止,
     /// 断流>2s 且有 partial 时喂合成静音逼 VAD EOS(100ms 节流,避免 CPU 空转)。
-    fn drain_frame(
+    async fn drain_frame(
         &self,
         ring_empty_since: &mut Option<Instant>,
         sess: &Option<ActiveSession>,
         last_silence_feed: &mut Instant,
         wake_at: Option<Duration>,
     ) -> FrameResult {
-        let mut g = self.ring.lock().unwrap();
-        if g.has_frame(WINDOW) {
+        // 作用域块取帧:guard 绝不跨 await(generator Send 分析对显式 drop 保守,
+        // 作用域块是可靠写法)。
+        let ready = {
+            let mut g = self.ring.lock().unwrap();
+            g.has_frame(WINDOW).then(|| g.drain(WINDOW))
+        };
+        if let Some(f) = ready {
             *ring_empty_since = None;
-            return FrameResult::Frame(g.drain(WINDOW));
+            return FrameResult::Frame(f);
         }
-        drop(g);
         ring_empty_since.get_or_insert_with(Instant::now);
         let since = *ring_empty_since.as_ref().unwrap();
         let has_partial = sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
@@ -856,14 +931,14 @@ impl OnnxStage1Recognizer {
                 debug!("ring empty > 2s during speech — feeding silence to force VAD EOS");
                 FrameResult::Frame(vec![0i16; WINDOW])
             } else {
-                match wait_frame(&self.ring, &self.ring_cv, WINDOW, Some(Duration::from_millis(100))) {
+                match wait_frame(&self.ring, &self.ring_notify, WINDOW, Some(Duration::from_millis(100))).await {
                     Some(f) => { *ring_empty_since = None; FrameResult::Frame(f) }
                     None => FrameResult::Parked,
                 }
             }
         } else {
             // Park until the ingest pushes or the next deadline — 无轮询,空闲零唤醒.
-            match wait_frame(&self.ring, &self.ring_cv, WINDOW, wake_at) {
+            match wait_frame(&self.ring, &self.ring_notify, WINDOW, wake_at).await {
                 Some(f) => { *ring_empty_since = None; FrameResult::Frame(f) }
                 None => FrameResult::Parked,
             }
@@ -888,6 +963,9 @@ impl OnnxStage1Recognizer {
         let (Some(asr), Some(a)) = (self.mgr.streaming_asr(), sess.as_mut()) else { return };
         if v_detected {
             if !*speech_active {
+                // ★ 起音即开段(§7-B 根治):rising edge 立刻分配真实段落 id —— 此后
+                // 本段所有 partial/事件都携带真键,幽灵段(预测键)不复存在。
+                tracker.on_speech_onset(at_s);
                 // 起音:补喂 lead-in,让流式/batch 都听到 soft onset
                 for chunk in lead_in.drain(..) {
                     a.stream.accept_waveform(sr as i32, &chunk);
@@ -1055,119 +1133,143 @@ fn next_wake_at(
 }
 
 impl Stage1Recognizer for OnnxStage1Recognizer {
-    // R5 已整改(2026-08-30 batch 异步化): 轮询已除(ring 挂 Condvar,仅真实截止时间唤醒,
-    // 空闲零唤醒);batch 调用移出消费线程 —— EOS/settle 只入队 BatchJob(微秒级),阻塞的
-    // recognize 由 Pipeline 的 batch worker 线程执行,结果经 SentenceBatchReady /
-    // ParagraphBatchReady 回传。消费循环不再被 batch 阻塞:流式/VAD/check_settle 持续运行,
-    // 修复了"间隔 1–3.5s 首句被吞"(batch 阻塞期间墙钟越过 merge_gap 导致段落误切)。
-    fn run(&self, on_event: &mut dyn FnMut(Stage1Event)) {
-        let sr = 16000u32;
-        let start = Instant::now();
-        let mut last_diag = Instant::now();
-        let mut frames_in = 0u64;
+    // R5 已整改(2026-08-30 batch 异步化): 轮询已除(ring 挂 Notify,仅真实截止时间唤醒,
+    // 空闲零唤醒);batch 调用移出消费线程 —— EOS/settle 只发事件(微秒级),阻塞的
+    // recognize 由 Pipeline 的句任务执行。消费循环不再被 batch 阻塞:流式/VAD/check_settle
+    // 持续运行,修复了"间隔 1–3.5s 首句被吞"(batch 阻塞期间墙钟越过 merge_gap 导致段落误切)。
+    // round14b:消费循环本体 async —— 帧等待 = Notify(park 空闲零唤醒),VAD(每 32ms,
+    // 微秒级)与流式解码(0.5s 节流)内联在 executor 上,量级是协作式调度的标准负载。
+    // RPITIT 返回 Future(而非 `async fn`):调用方 tokio::spawn 需要显式 `+ Send`,
+    // async fn in trait 写不出这个 bound —— clippy 的 manual_async_fn 建议在此不适用。
+    #[allow(clippy::manual_async_fn)]
+    fn run(&self, on_event: &mut (dyn FnMut(Stage1Event) + Send))
+    -> impl std::future::Future<Output = ()> + Send {
+        async {
+            let sr = 16000u32;
+            let start = Instant::now();
+            let mut last_diag = Instant::now();
+            let mut frames_in = 0u64;
 
-        let sasr = self.mgr.streaming_asr();
-        // 流式会话:段/段落边界重置,由 VAD detected() 门控喂帧。`cur_sentence` 由回溯式 SOS 分配
-        // (与 EOS 同批到达),EOS 臂用它建句。
-        let mut sess: Option<ActiveSession> = sasr.map(|asr| ActiveSession::new(asr.create_session()));
-        let mut ring_empty_since: Option<Instant> = None;
-        let mut tracker = ParagraphTracker::new(self.merge_gap_s);
-        let mut cur_sentence: SentenceId = 0;
-        let mut last_silence_feed = Instant::now(); // 断流喂静音的节流(100ms)
-        let mut lead_in: VecDeque<Vec<i16>> = VecDeque::new(); // 起音补喂缓冲(~0.5s)
-        let mut speech_active = false; // 上一帧 detected()——翻转时补喂 lead_in
+            let sasr = self.mgr.streaming_asr();
+            // 流式会话:段/段落边界重置,由 VAD detected() 门控喂帧。`cur_sentence` 由回溯式 SOS 分配
+            // (与 EOS 同批到达),EOS 臂用它建句。
+            let mut sess: Option<ActiveSession> = sasr.map(|asr| ActiveSession::new(asr.create_session()));
+            let mut ring_empty_since: Option<Instant> = None;
+            let mut tracker = ParagraphTracker::new(self.merge_gap_s);
+            let mut cur_sentence: SentenceId = 0;
+            let mut last_silence_feed = Instant::now(); // 断流喂静音的节流(100ms)
+            let mut lead_in: VecDeque<Vec<i16>> = VecDeque::new(); // 起音补喂缓冲(~0.5s)
+            let mut speech_active = false; // 上一帧 detected()——翻转时补喂 lead_in
+            // 最近一帧 detected()=true 的墙钟(初始 -1 = 从未有语音)—— settle 抑制的
+            // 起音盲区边际用。
+            let mut last_voice_s: f64 = -1.0;
 
-        loop {
-            // ⓪ idle 深度睡眠:running=false → 退出消费循环。daemon 断开 scout,下一个客户端
-            //   连接时置回 true 并重新调用 run() 恢复识别。
-            if !self.running.load(Ordering::Relaxed) {
-                return;
-            }
-            // ① 连接开关:scout 暂停时挂起等音频,不做 VAD/ASR
-            if !self.active.load(Ordering::Relaxed) {
-                let _ = wait_frame(&self.ring, &self.ring_cv, WINDOW, None);
-                continue;
-            }
-
-            // ② 时间驱动检查:主动归档 / 段落定稿 / 停滞看门狗 / 诊断
-            let now_s = start.elapsed().as_secs_f64();
-            // `speaking`(流式 partial 非空)抑制段落按墙钟定稿——回溯式 VAD 的下一句 SOS
-            // 尚未到达,若定稿会把下一句错划进新段落。
-            let speaking = sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
-            // 用户侧主动归档(IME 分字符 = "我说完了"):跳过 merge_gap 剩余等待立即整段
-            // batch。说话中(EOS 未到)保持挂起下一 tick 重试 —— 立即切段会截断尾音;
-            // 无段落则消费掉标记(空按,不让陈旧 flush 影响之后的语音)。
-            if self.flush_paragraph.load(Ordering::Acquire) && !speaking {
-                match tracker.force_settle() {
-                    Some(settled) => {
-                        self.flush_paragraph.store(false, Ordering::Release);
-                        info!(paragraph_id = settled.paragraph_id, sentences = settled.sentences.len(),
-                            "flush: 主动归档(跳过 merge_gap 等待)");
-                        emit_paragraph_edge(settled, &self.audio_store, &self.batch_tx, sr, self.batch_jobs, on_event);
-                        sess = sasr.map(|asr| ActiveSession::new(asr.create_session())); // 段落边界重置会话
-                    }
-                    None if !tracker.has_open_paragraph() => {
-                        self.flush_paragraph.store(false, Ordering::Release);
-                    }
-                    None => {} // 句进行中 → 挂起,等 EOS 后下一 tick 强制定稿
+            loop {
+                // ⓪ idle 深度睡眠:running=false → 退出消费循环。daemon 断开 scout,下一个客户端
+                //   连接时置回 true 并重新调用 run() 恢复识别。
+                if !self.running.load(Ordering::Relaxed) {
+                    return;
                 }
-            }
-            if let Some(settled) = tracker.check_settle(now_s, speaking) {
-                emit_paragraph_edge(settled, &self.audio_store, &self.batch_tx, sr, self.batch_jobs, on_event);
-                sess = sasr.map(|asr| ActiveSession::new(asr.create_session())); // 段落边界重置会话
-            }
-            if let Some(a) = sess.as_ref() {
-                if !a.last_partial.is_empty() && a.last_change.elapsed() >= STALE_SESSION_RESET {
-                    warn!(stale_s = a.last_change.elapsed().as_secs(), partial = %a.last_partial,
-                        "流式会话停滞重置——VAD 未定句的微弱音频不残留到下一句");
-                    sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
+                // ① 连接开关:scout 暂停时挂起等音频,不做 VAD/ASR
+                if !self.active.load(Ordering::Relaxed) {
+                    let _ = wait_frame(&self.ring, &self.ring_notify, WINDOW, None).await;
+                    continue;
                 }
-            }
-            if last_diag.elapsed() >= Duration::from_secs(3) {
-                let has_partial = sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
-                debug!(frames = frames_in, ring = self.ring.lock().unwrap().len(), has_partial, "stage1 diag");
-                last_diag = Instant::now();
-            }
 
-            // ③ 取帧:ring 有帧直接取;空则 park 等音频/截止(断流>2s 且有 partial → 喂静音逼 EOS)
-            let wake_at = next_wake_at(
-                &tracker,
-                &sess,
-                ring_empty_since,
-                now_s,
-                speaking,
-                self.flush_paragraph.load(Ordering::Acquire),
-            );
-            let frame = match self.drain_frame(&mut ring_empty_since, &sess, &mut last_silence_feed, wake_at) {
-                FrameResult::Frame(f) => f,
-                FrameResult::Parked => continue,
-            };
-            frames_in += 1;
-
-            // ④ VAD:每帧跑(便宜),得到 detected()(实时语音信号,门控流式) + 分句事件
-            let vad = self.mgr.vad().unwrap();
-            let events = vad.push_frame(&frame);
-            let v_detected = vad.detected();
-
-            // ⑤ 流式:VAD 门控喂帧/解码(空闲 park);起音补喂 lead_in(soft onset);
-            //    accept 与 pcm 喂同一帧 → 流式/batch 共享音频
-            self.feed_streaming(
-                &mut sess, &mut tracker, &mut lead_in, &mut speech_active,
-                &frame, sr, start.elapsed().as_secs_f64(), v_detected, on_event,
-            );
-
-            // ⑥ 分句:SOS 分配段号;EOS 定稿成段(batch + ParagraphEdge)
-            for ev in events {
-                match ev.kind {
-                    VadEventKind::StartOfSpeech => cur_sentence = tracker.on_sos(),
-                    VadEventKind::EndOfSpeech => {
-                        let end_s = start.elapsed().as_secs_f64();
-                        let a = sess.take();
-                        let fed = a.as_ref().map(|a| a.fed).unwrap_or(0);
+                // ② 时间驱动检查:主动归档 / 段落定稿 / 停滞看门狗 / 诊断
+                let now_s = start.elapsed().as_secs_f64();
+                // `speaking` 抑制段落按墙钟定稿——回溯式 VAD 的下一句 SOS 尚未到达,若
+                // 定稿会把下一句错划进新段落。组合判定:partial 非空 **或** 起音盲区边际
+                // 内(detected() 近期见过;见 VOICE_SETTLE_MARGIN)。
+                let speaking = speech_pending(
+                    sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false),
+                    last_voice_s,
+                    now_s,
+                );
+                // 用户侧主动归档(IME 分字符 = "我说完了"):跳过 merge_gap 剩余等待立即整段
+                // batch。说话中(EOS 未到)保持挂起下一 tick 重试 —— 立即切段会截断尾音;
+                // 无段落则消费掉标记(空按,不让陈旧 flush 影响之后的语音)。
+                if self.flush_paragraph.load(Ordering::Acquire) && !speaking {
+                    match tracker.force_settle() {
+                        Some(settled) => {
+                            self.flush_paragraph.store(false, Ordering::Release);
+                            info!(paragraph_id = settled.paragraph_id, sentences = settled.sentences.len(),
+                                "flush: 主动归档(跳过 merge_gap 等待)");
+                            emit_paragraph_edge(settled, &self.audio_store, &self.batch_tx, sr, self.batch_jobs, on_event);
+                            sess = sasr.map(|asr| ActiveSession::new(asr.create_session())); // 段落边界重置会话
+                        }
+                        None if !tracker.has_open_paragraph() => {
+                            self.flush_paragraph.store(false, Ordering::Release);
+                        }
+                        None => {} // 句进行中 → 挂起,等 EOS 后下一 tick 强制定稿
+                    }
+                }
+                if let Some(settled) = tracker.check_settle(now_s, speaking) {
+                    emit_paragraph_edge(settled, &self.audio_store, &self.batch_tx, sr, self.batch_jobs, on_event);
+                    sess = sasr.map(|asr| ActiveSession::new(asr.create_session())); // 段落边界重置会话
+                }
+                if let Some(a) = sess.as_ref() {
+                    if !a.last_partial.is_empty() && a.last_change.elapsed() >= STALE_SESSION_RESET {
+                        warn!(stale_s = a.last_change.elapsed().as_secs(), partial = %a.last_partial,
+                            "流式会话停滞重置——VAD 未定句的微弱音频不残留到下一句");
                         sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
-                        self.finalize_sentence(
-                            a, &mut tracker, &mut cur_sentence, sr, end_s, ev.pcm.clone(), fed, on_event,
-                        );
+                    }
+                }
+                if last_diag.elapsed() >= Duration::from_secs(3) {
+                    let has_partial = sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
+                    debug!(frames = frames_in, ring = self.ring.lock().unwrap().len(), has_partial, "stage1 diag");
+                    last_diag = Instant::now();
+                }
+
+                // ③ 取帧:ring 有帧直接取;空则 park 等音频/截止(断流>2s 且有 partial → 喂静音逼 EOS)
+                let wake_at = next_wake_at(
+                    &tracker,
+                    &sess,
+                    ring_empty_since,
+                    now_s,
+                    speaking,
+                    self.flush_paragraph.load(Ordering::Acquire),
+                );
+                let frame = match self
+                    .drain_frame(&mut ring_empty_since, &sess, &mut last_silence_feed, wake_at)
+                    .await
+                {
+                    FrameResult::Frame(f) => f,
+                    FrameResult::Parked => continue,
+                };
+                frames_in += 1;
+
+                // ④ VAD:每帧跑(便宜),得到 detected()(实时语音信号,门控流式) + 分句事件
+                let vad = self.mgr.vad().unwrap();
+                let events = vad.push_frame(&frame);
+                let v_detected = vad.detected();
+                if v_detected {
+                    last_voice_s = start.elapsed().as_secs_f64();
+                }
+
+                // ⑤ 流式:VAD 门控喂帧/解码(空闲 park);起音补喂 lead_in(soft onset);
+                //    accept 与 pcm 喂同一帧 → 流式/batch 共享音频
+                self.feed_streaming(
+                    &mut sess, &mut tracker, &mut lead_in, &mut speech_active,
+                    &frame, sr, start.elapsed().as_secs_f64(), v_detected, on_event,
+                );
+
+                // ⑥ 分句:SOS 分配句号(段落已在起音开启,SOS 只补 sentence id);
+                //    EOS 定稿成句(batch + ParagraphEdge)
+                for ev in events {
+                    match ev.kind {
+                        VadEventKind::StartOfSpeech => {
+                            cur_sentence = tracker.on_sos(start.elapsed().as_secs_f64())
+                        }
+                        VadEventKind::EndOfSpeech => {
+                            let end_s = start.elapsed().as_secs_f64();
+                            let a = sess.take();
+                            let fed = a.as_ref().map(|a| a.fed).unwrap_or(0);
+                            sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
+                            self.finalize_sentence(
+                                a, &mut tracker, &mut cur_sentence, sr, end_s, ev.pcm.clone(), fed, on_event,
+                            );
+                        }
                     }
                 }
             }
@@ -1190,17 +1292,33 @@ mod tests {
         }
     }
 
+    // ── round15:起音盲区边际(speech_pending)──────────────────────────
+
+    /// 起音→首条 partial 的 ~0.5s 盲区内,"partial 非空"还没翻转 —— settle 抑制必须
+    /// 由 detected() 近期见过来兜住,否则起音落在 merge_gap 截止前的盲区里会被误切
+    /// (客户端症状:首选 batch 后退回流式)。
+    #[test]
+    fn speech_pending_covers_partial_lag_after_onset() {
+        // 起音 t=10.0(detected=true),首 partial ~10.5 才出。
+        assert!(speech_pending(false, 10.0, 10.2), "盲区内:partial 未出也抑制");
+        assert!(speech_pending(false, 10.0, 10.55), "边缘仍覆盖");
+        assert!(!speech_pending(false, 10.0, 10.7), "超出边际 → 不再抑制(可定稿/GC)");
+        // partial 到位后接管抑制;从未有语音则不抑制。
+        assert!(speech_pending(true, 0.0, 100.0), "partial 非空恒抑制");
+        assert!(!speech_pending(false, -1.0, 0.0), "从未检测到语音");
+    }
+
     #[test]
     fn short_gap_absorbs_into_same_paragraph() {
         let mut t = ParagraphTracker::new(2.5);
-        let s1 = t.on_sos();
+        let s1 = t.on_sos(0.0);
         let (settled, w1, sentences) = t.on_eos(sentence(s1, 0.0, 0.5));
         assert!(settled.is_none());
         assert_eq!(sentences.len(), 1);
 
         // gap 1.0−0.5 = 0.5 < 2.5 → same paragraph, second sentence (merge happens at EOS,
         // where the true onset is back-derived).
-        let s2 = t.on_sos();
+        let s2 = t.on_sos(0.0);
         let (settled, w, sentences) = t.on_eos(sentence(s2, 1.0, 1.5));
         assert!(settled.is_none(), "short gap must NOT settle");
         assert_eq!(w, w1, "same paragraph continues");
@@ -1210,10 +1328,10 @@ mod tests {
     #[test]
     fn big_gap_settles_previous_paragraph_and_opens_new_one() {
         let mut t = ParagraphTracker::new(2.5);
-        let s1 = t.on_sos();
+        let s1 = t.on_sos(0.0);
         let (_, w1, _) = t.on_eos(sentence(s1, 0.0, 0.5));
         // gap 5.0−0.5 = 4.5 ≥ 2.5 → settle w1 at the next sentence's EOS, open w2.
-        let s2 = t.on_sos();
+        let s2 = t.on_sos(0.0);
         let (settled, w2, sentences) = t.on_eos(sentence(s2, 5.0, 5.5));
         let s = settled.expect("big gap settles the previous paragraph");
         assert_eq!(s.paragraph_id, w1);
@@ -1225,7 +1343,7 @@ mod tests {
     #[test]
     fn settle_timeout_closes_trailing_paragraph() {
         let mut t = ParagraphTracker::new(2.5);
-        let s1 = t.on_sos();
+        let s1 = t.on_sos(0.0);
         let (_, w1, _) = t.on_eos(sentence(s1, 0.0, 0.5));
         assert!(t.check_settle(2.0, false).is_none(), "2.0 − 0.5 = 1.5 < 2.5, not yet");
         let s = t.check_settle(3.0, false).expect("3.0 − 0.5 = 2.5 ≥ merge_gap → settle");
@@ -1239,7 +1357,7 @@ mod tests {
         let mut t = ParagraphTracker::new(2.5);
         assert!(t.force_settle().is_none(), "无段落 → None(调用方消费掉 flush 标记)");
         assert!(!t.has_open_paragraph());
-        let s1 = t.on_sos();
+        let s1 = t.on_sos(0.0);
         let (_, w1, _) = t.on_eos(sentence(s1, 0.0, 0.5));
         // 0.2s 后强制归档(gap 0.2 < merge_gap 2.5 —— 常规定稿还早)。
         let s = t.force_settle().expect("有已定稿句 → 立即归档");
@@ -1255,9 +1373,9 @@ mod tests {
     fn force_settle_holds_while_sentence_active() {
         // 句进行中(SOS 已见 EOS 未到)→ 不动,调用方保持 flush 挂起。
         let mut t = ParagraphTracker::new(2.5);
-        let s1 = t.on_sos();
+        let s1 = t.on_sos(0.0);
         let (_, _, _) = t.on_eos(sentence(s1, 0.0, 0.5));
-        let s2 = t.on_sos(); // 第二句开口
+        let s2 = t.on_sos(0.0); // 第二句开口
         assert!(t.force_settle().is_none(), "active 句压制强制归档");
         assert!(t.has_open_paragraph(), "段落仍在 → flush 保持挂起");
         let (_, w, sentences) = t.on_eos(sentence(s2, 1.0, 1.5));
@@ -1273,11 +1391,11 @@ mod tests {
         // the trailing paragraph).
         let mut t = ParagraphTracker::new(2.5);
         assert!(t.settle_deadline(0.0, false).is_none(), "nothing open yet");
-        let s1 = t.on_sos();
+        let s1 = t.on_sos(0.0);
         t.on_eos(sentence(s1, 0.0, 0.5));
         assert!((t.settle_deadline(1.0, false).unwrap() - 2.0).abs() < 1e-9, "2.5 − (1.0 − 0.5)");
         assert!((t.settle_deadline(3.0, false).unwrap() - 0.0).abs() < 1e-9, "due now, clamped at 0");
-        let _s2 = t.on_sos(); // sentence in progress (active=true)
+        let _s2 = t.on_sos(0.0); // sentence in progress (active=true)
         assert!(t.settle_deadline(1.2, false).is_none(), "active sentence ⇒ suppressed, no deadline");
     }
 
@@ -1286,9 +1404,9 @@ mod tests {
         // Regression guard: a long following sentence must not be mistaken for "no
         // continuation" and force-split the paragraph mid-speech.
         let mut t = ParagraphTracker::new(2.5);
-        let s1 = t.on_sos();
+        let s1 = t.on_sos(0.0);
         t.on_eos(sentence(s1, 0.0, 0.5));
-        let _s2 = t.on_sos(); // sentence in progress (active=true)
+        let _s2 = t.on_sos(0.0); // sentence in progress (active=true)
         assert!(t.check_settle(100.0, false).is_none(), "active sentence ⇒ settle suppressed");
     }
 
@@ -1298,7 +1416,7 @@ mod tests {
         // session 的 partial 非空(=speaking=true)必须抑制 settle 超时。否则墙钟超时
         // 会在下一句说话时定稿,把它错划进新段落(症状:段落永远只有 1 个 sentence)。
         let mut t = ParagraphTracker::new(2.5);
-        let s1 = t.on_sos();
+        let s1 = t.on_sos(0.0);
         t.on_eos(sentence(s1, 0.0, 0.5));
         // 下一句正在说话(SOS 尚未到),墙钟已远超 merge_gap —— speaking=true 抑制。
         assert!(t.check_settle(100.0, true).is_none(), "speaking ⇒ settle suppressed");
@@ -1310,18 +1428,93 @@ mod tests {
     #[test]
     fn merge_gap_zero_makes_every_sentence_its_own_paragraph() {
         let mut t = ParagraphTracker::new(0.0);
-        let s1 = t.on_sos();
+        let s1 = t.on_sos(0.0);
         let (_, w1, _) = t.on_eos(sentence(s1, 0.0, 0.5));
         // Any gap ≥ 0 settles at the next sentence's EOS (gap 0.6 − 0.5 = 0.1 ≥ 0).
-        let s2 = t.on_sos();
+        let s2 = t.on_sos(0.6);
         let (settled, w2, _) = t.on_eos(sentence(s2, 0.6, 0.7));
         assert_eq!(settled.expect("gap 0.1 ≥ 0 settles").paragraph_id, w1);
         assert_ne!(w2, w1);
         // …and the settle timeout fires immediately after an EOS too.
-        let s3 = t.on_sos();
+        let s3 = t.on_sos(10.0);
         t.on_eos(sentence(s3, 10.0, 10.5));
         assert!(t.check_settle(10.5, false).is_some(), "now − end = 0 ≥ 0 → settle");
     }
+
+    // ── round13:起音即开段 + 时间戳 id(§7-A/B 修复)──────────────────────
+
+    /// 起音开段 → prospective 返回**真实**段 id;该段后续所有事件(EOS 的
+    /// Batch/ParagraphEdge)携带同一 id —— 幽灵段(预测键 ≠ 实际键)不复存在。
+    #[test]
+    fn onset_opens_paragraph_prospective_returns_real_id() {
+        let mut t = ParagraphTracker::new(2.5);
+        t.on_speech_onset(10.0);
+        let (pid, _sid) = t.prospective();
+        let s1 = t.on_sos(10.4);
+        assert_eq!(t.prospective().0, pid, "段内 prospective 稳定");
+        let (settled, w, _) = t.on_eos(sentence(s1, 10.0, 10.5));
+        assert!(settled.is_none());
+        assert_eq!(w, pid, "EOS 归属段 = 起音开的段(prospective 即真键)");
+        // 静默满 merge_gap 关段,下一次起音 → 新段(时间戳更大)。
+        let _ = t.check_settle(20.0, false).expect("静默 9.5s ≥ 2.5s → settle");
+        t.on_speech_onset(20.5);
+        let (pid2, _) = t.prospective();
+        assert!(pid2 > pid, "时间戳 id 严格递增 —— id 即顺序");
+    }
+
+    /// 时间戳 id 严格递增:同微秒连续开段(防御 max(last+1))也绝不重复/回退。
+    #[test]
+    fn timestamp_win_ids_strictly_increasing() {
+        let mut t = ParagraphTracker::new(2.5);
+        let mut prev = 0u64;
+        for i in 0..8 {
+            t.on_speech_onset(i as f64);
+            let (pid, _) = t.prospective();
+            assert!(pid > prev, "id 必须严格递增(时间戳,防时钟回拨/同微秒)");
+            prev = pid;
+            // 立刻出句并关段,下一轮开新段。
+            let s = t.on_sos(i as f64);
+            t.on_eos(sentence(s, i as f64, i as f64 + 0.5));
+            let _ = t.check_settle(i as f64 + 10.0, false);
+        }
+    }
+
+    /// 空段 GC:起音开的段从未出句(微弱音频)→ 静默满 merge_gap 静默丢弃;
+    /// 不 GC 会让陈旧空段被很久之后的语音复用,id 落后 → 客户端排序错位。
+    #[test]
+    fn empty_onset_paragraph_gced_after_merge_gap() {
+        let mut t = ParagraphTracker::new(2.5);
+        t.on_speech_onset(0.0);
+        let (pid, _) = t.prospective();
+        assert!(t.check_settle(2.0, false).is_none(), "2.0 < 2.5,未到期");
+        assert!(t.has_open_paragraph(), "GC 前段还在");
+        assert!(t.check_settle(2.6, false).is_none(), "GC 静默:返回 None(无事件)");
+        assert!(!t.has_open_paragraph(), "空段静默满 merge_gap 即弃");
+        // 下一次起音开**新**段(id 更大),不复用陈旧空段。
+        t.on_speech_onset(100.0);
+        let (pid2, _) = t.prospective();
+        assert!(pid2 > pid, "新段时间戳更大");
+        // settle_deadline 也覆盖空段(消费循环要能在 GC 时点醒来)。
+        assert!(t.check_settle(103.0, false).is_none(), "GC 掉 100.0 的空段");
+        assert!(!t.has_open_paragraph());
+        t.on_speech_onset(200.0);
+        let d = t.settle_deadline(201.0, false).expect("空段也有 GC 截止");
+        assert!((d - 1.5).abs() < 1e-9, "2.5 − (201.0 − 200.0)");
+    }
+
+    /// 真语音不误伤:partial 非空(speaking)抑制空段 GC —— 长句(> merge_gap)
+    /// 说话中不会被墙钟 GC 掉段落。
+    #[test]
+    fn speaking_suppresses_empty_onset_gc() {
+        let mut t = ParagraphTracker::new(2.5);
+        t.on_speech_onset(0.0);
+        assert!(t.check_settle(100.0, true).is_none());
+        assert!(t.has_open_paragraph(), "speaking ⇒ 空段不 GC");
+        assert!(t.settle_deadline(100.0, true).is_none(), "speaking ⇒ 无 GC 截止");
+        assert!(t.check_settle(100.0, false).is_none(), "静默后 GC");
+        assert!(!t.has_open_paragraph());
+    }
+
 
     fn sentence_into(store: &AudioStore, id: SentenceId) -> VadSentence {
         VadSentence {

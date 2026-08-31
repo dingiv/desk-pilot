@@ -41,18 +41,22 @@ use std::sync::Mutex;
 /// Max retained settled utterances (candidate slots)。
 pub const MAX_FINALS: usize = 8;
 
-/// 一个句子的识别状态(供 `ParaState` 折叠)。
-#[derive(Debug, Clone, Default)]
+/// 一个句子的识别状态(供 `ParaState` 折叠)。**自带句 id**(`segment_id`)——
+/// 事件匹配(`s.id == event.sentence_id`)与调试自述都靠它,不再挂在容器外壁。
+#[derive(Debug, Clone)]
 struct SentenceState {
+    id: u64,
     /// 最近一次 `StreamFragment` 文本。
     stream: String,
     /// `BatchSentence` 结果(EOS 出 batch 后才有)。
     batch: Option<String>,
 }
 
-/// 一个段落的识别状态。
-#[derive(Debug, Clone, Default)]
+/// 一个段落的识别状态。**自带段 id**(`window_id`)—— 与 BTreeMap 的 key 互为
+/// 镜像(结构体自述身份,`finals`/调试直接用 `p.id`)。
+#[derive(Debug, Clone)]
 struct ParaState {
+    id: u64,
     /// 整段已关闭(`BatchParagraph` / `ParagraphCalibration` 到达)。
     closed: bool,
     /// 整段 batch 重跑文本(`BatchParagraph`,权威 raw)。
@@ -61,15 +65,31 @@ struct ParaState {
     calibrated: Option<String>,
     /// Stage2 对当前段落所有已到 Sentence 的临时联合校准(`SentenceCalibration`)。
     sentence_calibration: Option<String>,
-    /// 各 Sentence,按首见顺序。
-    sentences: Vec<(u64, SentenceState)>,
+    /// SC 的覆盖上界 —— **事件自带的句 id**(`segment_calibration.segment_id`,
+    /// round20b:触发该次纠偏的 BS 句;server 直接带下,客户端零派生状态)。
+    /// 过界的新句(正在说的)以最优文本续接在 SC 之后,不被陈旧 SC 遮住。
+    sc_covers_sid: Option<u64>,
+    /// 各 Sentence,按首见顺序(自带 id,`s.id` 匹配事件)。
+    sentences: Vec<SentenceState>,
 }
 
 impl ParaState {
+    fn new(id: u64) -> Self {
+        ParaState {
+            id,
+            closed: false,
+            batch_paragraph: None,
+            calibrated: None,
+            sentence_calibration: None,
+            sc_covers_sid: None,
+            sentences: Vec::new(),
+        }
+    }
+
     /// 逐句拼接:每句有 `BatchSentence` 用 `BatchSentence`,否则 `StreamFragment`。
     fn concat_sentences(&self) -> String {
         let mut out = String::new();
-        for (_, ev) in &self.sentences {
+        for ev in &self.sentences {
             let text = ev.batch.clone().unwrap_or_else(|| ev.stream.clone());
             out.push_str(&text);
         }
@@ -85,7 +105,9 @@ impl ParaState {
     }
 
     /// calc 的段内 best:窗口已关闭 → `ParagraphCalibration` 优先于
-    /// `BatchParagraph`;未关闭 → `SentenceCalibration` 优先于逐句拼接。
+    /// `BatchParagraph`;未关闭 → `SentenceCalibration`(**只顶替它覆盖的部分**,
+    /// 覆盖上界 `sc_covers_sid`;之后的新句 —— 正在说的 —— 以 batch>流式 续接,
+    /// 陈旧 SC 不得遮住新句,round20)优先于逐句拼接。
     fn best_calc(&self) -> String {
         if self.closed {
             return self
@@ -95,7 +117,16 @@ impl ParaState {
                 .unwrap_or_default();
         }
         match &self.sentence_calibration {
-            Some(sc) if !sc.is_empty() => sc.clone(),
+            Some(sc) if !sc.is_empty() => {
+                let cover = self.sc_covers_sid.unwrap_or(0);
+                let mut out = sc.clone();
+                for st in &self.sentences {
+                    if st.id > cover {
+                        out.push_str(&st.batch.clone().unwrap_or_else(|| st.stream.clone()));
+                    }
+                }
+                out
+            }
             _ => self.concat_sentences(),
         }
     }
@@ -116,13 +147,24 @@ impl ParaState {
 /// 纯折叠状态机(零 tokio 零锁;经 [`SharedTranscript`] 共享)。
 #[derive(Default)]
 pub struct Transcript {
-    /// 段落状态,**id 即顺序**(daemon 端单调递增;跨段乱序鲁棒的根基)。
+    /// 段落状态,**id 即顺序**(时间戳,单调递增;跨段乱序鲁棒的根基)。
     paragraphs: BTreeMap<u64, ParaState>,
-    /// 当前流式文本(`StreamFragment` raw)。`ParagraphCalibration` 后清空。
+    /// 当前流式文本(`StreamFragment` raw)。
     live: String,
+    /// `live` 的来源段 —— live 只能被**它自己段**的关闭/定稿清掉:跨段交错
+    /// (段 N 的 PCal 迟到时用户已在说段 N+1)不得误清新段正在说的 partial;
+    /// 同理,段关闭时若 live 属于该段,立即清空(首选让位 finals,不残留旧句)。
+    live_pid: Option<u64>,
 }
 
 impl Transcript {
+    /// 取/建段落状态(id 落进结构体,与 map key 互为镜像 —— debug 断言钉死)。
+    fn para(&mut self, id: u64) -> &mut ParaState {
+        let p = self.paragraphs.entry(id).or_insert_with(|| ParaState::new(id));
+        debug_assert_eq!(p.id, id, "ParaState.id 与 map key 必须互为镜像");
+        p
+    }
+
     /// 折叠一个 `AsrEvent`(SSE 数据面到达时由写入端调用)。
     pub fn fold(&mut self, ev: &crate::view::AsrEvent) {
         match ev {
@@ -132,20 +174,31 @@ impl Transcript {
                 text,
                 ..
             } => {
-                self.live = text.clone();
-                let entry = self.paragraphs.entry(*paragraph_id).or_default();
-                if !entry.closed {
-                    upsert_sentence(&mut entry.sentences, *sentence_id, |s| {
-                        s.stream = text.clone();
-                    });
+                // 字段直访(不相交借用):本臂随后还要写 self.live/self.live_pid,
+                // 不能走借用整个 self 的 para()。
+                let entry = self
+                    .paragraphs
+                    .entry(*paragraph_id)
+                    .or_insert_with(|| ParaState::new(*paragraph_id));
+                // **已关闭段的迟到 SF 完全忽略**(round15 回归:首选"batch 后退回
+                // 流式")。句槽不写只是防御;关键是 **live 不能写** —— 首选兜底链是
+                // `plain_preview().or(live)`,段关闭后 plain 为空,live 被这条陈旧
+                // 流式 partial 污染即回退。迟到句的完整文本由它实际归属段的事件携带。
+                if entry.closed {
+                    return;
                 }
+                self.live = text.clone();
+                self.live_pid = Some(*paragraph_id);
+                upsert_sentence(&mut entry.sentences, *sentence_id, |s| {
+                    s.stream = text.clone();
+                });
             }
             crate::view::AsrEvent::BatchSentence {
                 paragraph_id,
                 sentence_id,
                 text,
             } => {
-                let entry = self.paragraphs.entry(*paragraph_id).or_default();
+                let entry = self.para(*paragraph_id);
                 upsert_sentence(&mut entry.sentences, *sentence_id, |s| {
                     s.batch = Some(text.clone());
                 });
@@ -155,29 +208,44 @@ impl Transcript {
                 // 任何事件到达。标记该段关闭 —— finals 立即以流式/拼接文本
                 // 占位;后续 `BatchParagraph` / `ParagraphCalibration` 按 id
                 // 修订替换(REPLACED)。
-                let entry = self.paragraphs.entry(*paragraph_id).or_default();
+                let entry = self.para(*paragraph_id);
                 entry.closed = true;
+                // live 属于本段(正常:PC 先于下一段任何事件)→ 立即清空,
+                // 首选让位 finals,不残留该段最后一句在首选上。
+                if self.live_pid == Some(*paragraph_id) {
+                    self.live.clear();
+                    self.live_pid = None;
+                }
             }
             crate::view::AsrEvent::BatchParagraph { paragraph_id, text } => {
-                let entry = self.paragraphs.entry(*paragraph_id).or_default();
+                let entry = self.para(*paragraph_id);
                 entry.closed = true;
                 entry.batch_paragraph = Some(text.clone());
             }
             crate::view::AsrEvent::SentenceCalibration {
                 paragraph_id,
+                sentence_id,
                 calibrated,
             } => {
                 // 校准不写 `live` —— live 是流式底线(本地、可靠),迟到的校准
                 // 文本把 live 倒退回旧句会造成显示抖动。校准只进窗口状态。
-                let entry = self.paragraphs.entry(*paragraph_id).or_default();
+                // 覆盖上界直接取事件自带的句 id(round20b):SC 只覆盖 ≤ 它的
+                // 已关闭句,正在说的新句不在内 —— best_calc 把过界新句续接而非遮住。
+                let entry = self.para(*paragraph_id);
                 entry.sentence_calibration = Some(calibrated.clone());
+                entry.sc_covers_sid = Some(*sentence_id);
             }
             crate::view::AsrEvent::ParagraphCalibration {
                 paragraph_id,
                 calibrated,
             } => {
-                self.live.clear();
-                let entry = self.paragraphs.entry(*paragraph_id).or_default();
+                // live 只在属于本段时清:跨段交错(本段定稿迟到、新段已在说)
+                // 不得误清新段的 partial。
+                if self.live_pid == Some(*paragraph_id) {
+                    self.live.clear();
+                    self.live_pid = None;
+                }
+                let entry = self.para(*paragraph_id);
                 entry.closed = true;
                 entry.calibrated = Some(calibrated.clone());
                 // finals 不再单独缓存 —— `finals()` 按段 id 动态收集,迟到
@@ -237,6 +305,17 @@ impl Transcript {
             .unwrap_or_default()
     }
 
+    /// **live 级联预览**(架构规则:纠偏 > batch > 流式)。活动段 = 该段的
+    /// `best_calc`(SC 非空 → SC;否则逐句 batch 优先、流式兜底的拼接 —— 只有最新
+    /// 那句还停留在流式,老句早已被 batch/纠偏顶替);无活动段(段刚关、下一句
+    /// 未起)回退原始 live 流式。
+    pub fn cascade_preview(&self) -> String {
+        match self.active_paragraph() {
+            Some(p) => p.best_calc(),
+            None => self.live.clone(),
+        }
+    }
+
     /// 旧的展开兜底:最新 final > 组合预览 > live > ""。
     pub fn snapshot(&self) -> String {
         self.finals()
@@ -256,6 +335,7 @@ impl Transcript {
     pub fn clear(&mut self) {
         self.paragraphs.clear();
         self.live.clear();
+        self.live_pid = None;
     }
 
     /// 重连后**全量同步 aura 历史定稿**(`GET /api/results`,最旧 → 最新):
@@ -267,7 +347,7 @@ impl Transcript {
             if calibrated.is_empty() {
                 continue;
             }
-            let entry = self.paragraphs.entry(*id).or_default();
+            let entry = self.para(*id);
             entry.closed = true;
             entry.calibrated = Some(calibrated.clone());
         }
@@ -284,8 +364,8 @@ impl Transcript {
         if text.is_empty() {
             return;
         }
-        let id = self.paragraphs.last_key_value().map_or(0, |(id, _)| id + 1);
-        let entry = self.paragraphs.entry(id).or_default();
+        let id = self.paragraphs.last_key_value().map_or(0, |(k, _)| k + 1);
+        let entry = self.para(id);
         entry.closed = true;
         entry.calibrated = Some(text.to_string());
         self.live.clear();
@@ -395,6 +475,11 @@ impl SharedTranscript {
         self.inner.lock().unwrap().calc_preview()
     }
 
+    /// **live 级联预览**(纠偏 > batch > 流式;详见 [`Transcript::cascade_preview`])。
+    pub fn cascade_preview(&self) -> String {
+        self.inner.lock().unwrap().cascade_preview()
+    }
+
     /// 旧的展开兜底:最新 final > 组合预览 > live > ""。
     pub fn snapshot(&self) -> String {
         self.inner.lock().unwrap().snapshot()
@@ -428,17 +513,16 @@ impl Default for SharedTranscript {
 }
 
 fn upsert_sentence(
-    sentences: &mut Vec<(u64, SentenceState)>,
+    sentences: &mut Vec<SentenceState>,
     sentence_id: u64,
     f: impl FnOnce(&mut SentenceState),
 ) {
-    if let Some((_, s)) = sentences.iter_mut().find(|(id, _)| *id == sentence_id) {
+    if let Some(s) = sentences.iter_mut().find(|s| s.id == sentence_id) {
         f(s);
     } else {
-        sentences.push((sentence_id, SentenceState::default()));
-        if let Some((_, s)) = sentences.last_mut() {
-            f(s);
-        }
+        let mut s = SentenceState { id: sentence_id, stream: String::new(), batch: None };
+        f(&mut s);
+        sentences.push(s);
     }
 }
 
@@ -471,9 +555,10 @@ mod tests {
         }
     }
 
-    fn sentence_cal(wid: u64, text: &str) -> AsrEvent {
+    fn sentence_cal(wid: u64, sid: u64, text: &str) -> AsrEvent {
         AsrEvent::SentenceCalibration {
             paragraph_id: wid,
+            sentence_id: sid,
             calibrated: text.into(),
         }
     }
@@ -542,9 +627,10 @@ mod tests {
         s.fold_event(&stream(1, 1, "第一段"));
         s.fold_event(&batch_sentence(1, 1, "第一段"));
         s.fold_event(&stream(1, 2, "第二段"));
-        // 阶段2 联合校准到达 → calc 走它。
-        s.fold_event(&sentence_cal(1, "联合整流"));
-        assert_eq!(s.calc_preview(), "联合整流");
+        // 阶段2 联合校准到达 → calc 走它。round20:SC 只覆盖 ≤ 触发它的 BS 句
+        //(s1),正在说的 s2 不在覆盖内 → **续接**在 SC 之后,不被遮住。
+        s.fold_event(&sentence_cal(1, 1, "联合整流"));
+        assert_eq!(s.calc_preview(), "联合整流第二段");
         // 未关闭,plain 走 concat(第一段 batch, 第二段 stream)。
         assert_eq!(s.plain_preview(), "第一段第二段");
     }
@@ -683,6 +769,71 @@ mod tests {
         assert_eq!(s.snapshot(), "第二句");
     }
 
+    /// **live 级联(架构:纠偏 > batch > 流式)**:活动段内逐句状态机刷新,
+    /// 最新句停在流式、老句被 batch 顶替、整段被纠偏(SC)顶替;无活动段回退 live。
+    #[test]
+    fn cascade_preview_prefers_calibration_over_batch_over_stream() {
+        let s = SharedTranscript::new();
+        // 句1:流式+batch;句2(最新):仅流式。
+        s.fold_event(&stream(1, 1, "流式一"));
+        s.fold_event(&batch_sentence(1, 1, "批式一"));
+        s.fold_event(&stream(1, 2, "流式二"));
+        // 无 SC → batch>流式 的逐句拼接(最新句停在流式)。
+        assert_eq!(s.cascade_preview(), "批式一流式二");
+        // SC 到达(覆盖 s1,触发它的 BS 是 s1)→ 顶替覆盖内部分;
+        // **正在说的 s2(过界新句)续接,不被陈旧 SC 遮住**(round20 回归:
+        // 实测第二句流式不刷新 UI 的根因)。
+        s.fold_event(&sentence_cal(1, 1, "纠偏一二"));
+        assert_eq!(s.cascade_preview(), "纠偏一二流式二");
+        // 新句继续生长 → 尾巴持续刷新。
+        s.fold_event(&stream(1, 2, "流式二还在长"));
+        assert_eq!(s.cascade_preview(), "纠偏一二流式二还在长");
+        // 段关闭(无活动段)→ 回退 live;PC 已清 live → 空。
+        s.fold_event(&AsrEvent::ParagraphClosed { paragraph_id: 1 });
+        assert_eq!(s.cascade_preview(), "");
+        // 下一句起音,live 恢复流式。
+        s.fold_event(&stream(2, 1, "新段流式"));
+        assert_eq!(s.cascade_preview(), "新段流式");
+    }
+
+    /// **回归(round15 实测:首选 流式→batch→又退回流式)**。路径:迟到的 SF(段已
+    /// 关闭,服务端 onset-vs-deadline 盲区 race 的产物)不得污染 live —— 首选兜底链
+    /// `plain.or(live)` 在段关闭后 plain 为空,live 被陈旧流式写入即回退。
+    #[test]
+    fn late_stream_fragment_for_closed_paragraph_never_pollutes_live() {
+        let s = SharedTranscript::new();
+        s.fold_event(&stream(1, 1, "流式一"));
+        s.fold_event(&batch_sentence(1, 1, "批式一"));
+        assert_eq!(s.plain_preview(), "批式一", "级联:batch 优先于流式");
+        s.fold_event(&AsrEvent::ParagraphClosed { paragraph_id: 1 });
+        assert_eq!(s.finals(), vec!["批式一"]);
+        assert_eq!(s.plain_preview(), "");
+        // 迟到的 SF(段已关):完全忽略 —— 不写句槽,更不写 live。
+        s.fold_event(&stream(1, 2, "迟到partial"));
+        assert_eq!(s.live(), "", "closed 段的 SF 不写 live");
+        assert_eq!(s.plain_preview(), "", "首选不回退到陈旧流式");
+        assert_eq!(s.finals(), vec!["批式一"], "finals 不受污染");
+    }
+
+    /// **级联优先级不变式(用户要求确认)**:同句 SF 在 BS 之后到达(任何乱序),
+    /// 拼接级联仍用 batch —— 流式结果不会把 preview 的优先级计算顶回去。
+    #[test]
+    fn cascade_never_reverts_sentence_to_stream_after_batch() {
+        let s = SharedTranscript::new();
+        s.fold_event(&stream(1, 1, "流式A"));
+        s.fold_event(&batch_sentence(1, 1, "批式A"));
+        // 同句迟到的流式更新:batch 槽位不被覆写。
+        s.fold_event(&stream(1, 1, "流式A迟到的同句更新"));
+        assert_eq!(s.plain_preview(), "批式A");
+        // 多句共存:前句 batch + 后句流式,各按各的优先级。
+        s.fold_event(&stream(1, 2, "流式B"));
+        assert_eq!(s.plain_preview(), "批式A流式B");
+        // 整段 batch(BP)仍优先于逐句拼接。
+        s.fold_event(&batch_paragraph(1, "整段批"));
+        assert_eq!(s.plain_preview(), "", "段关闭,首选让位");
+        assert_eq!(s.finals(), vec!["整段批"]);
+    }
+
     /// sync_history 按 id 归位:重连补历史后,后续迟到定稿不破坏顺序。
     #[test]
     fn sync_history_ids_align_with_late_finals() {
@@ -694,5 +845,40 @@ mod tests {
         s.fold_event(&stream(3, 1, "新段"));
         s.fold_event(&win_cal(3, "新段定稿"));
         assert_eq!(s.finals(), vec!["新段定稿", "历史二", "历史一"]);
+    }
+
+    // ── live 归属段(live_pid):跨段交错不误清 + 关段即让位 ──────────────
+
+    /// **回归(round13 前端审计 F1)**:段 N 的定稿迟到(PCal 物理晚于新段
+    /// 起音)→ 不得误清新段正在说的 live/首选。
+    #[test]
+    fn late_paragraph_calibration_keeps_new_paragraph_live() {
+        let s = SharedTranscript::new();
+        // 段 1 定稿链尾还在路上,用户已开始说段 2。
+        s.fold_event(&stream(2, 1, "新段的partial"));
+        s.fold_event(&win_cal(1, "旧段定稿"));
+        // 新段的 live 与首选不受旧段定稿影响。
+        assert_eq!(s.live(), "新段的partial");
+        assert_eq!(s.plain_preview(), "新段的partial");
+        // 旧段定稿正常进 finals(顺序正确)。
+        assert_eq!(s.finals(), vec!["旧段定稿"]);
+    }
+
+    /// **回归(round13 前端审计 F2)**:段关闭(PC)即清自己的 live → 首选
+    /// 立即让位 finals,不把该段最后一句残留显示在首选上(与候选 2 重复)。
+    #[test]
+    fn paragraph_closed_clears_own_live_and_yields_preview() {
+        let s = SharedTranscript::new();
+        s.fold_event(&stream(1, 1, "最后一句流式"));
+        s.fold_event(&AsrEvent::ParagraphClosed { paragraph_id: 1 });
+        assert_eq!(s.live(), "", "PC 清自己段的 live");
+        assert_eq!(s.plain_preview(), "", "首选让位 —— finals 承接");
+        assert_eq!(s.finals(), vec!["最后一句流式"], "关闭即占位");
+        // 之后新段开流,旧段的定稿到达也不影响新段 live(与上例互补的方向)。
+        s.fold_event(&stream(2, 1, "新段"));
+        s.fold_event(&win_cal(1, "定稿"));
+        assert_eq!(s.live(), "新段");
+        assert_eq!(s.plain_preview(), "新段");
+        assert_eq!(s.finals(), vec!["定稿"]);
     }
 }

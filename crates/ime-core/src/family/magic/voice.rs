@@ -4,8 +4,9 @@
 //! [`SharedTranscript`](super::SharedTranscript)。本成员只读这个
 //! shared state 来产生候选 —— 不再有任何轮询 / 异步状态。
 //!
-//! 预测模型下,`#asr` 精确匹配时提供语音结果预测(最多 4 条:流式 live +
-//! 已定稿 finals),放候选列表最前,`#asr` 本身是末尾 rollback。
+//! 预测模型下,`#asr` 精确匹配时提供语音结果预测(**live 级联预览 + 最多 4 条
+//! 已定稿 finals**,共 ≤5 条,见 docs/aura/pipeline.md §8),放候选列表最前,
+//! `#asr` 本身是末尾 rollback。
 //!
 //! ## 与 voice server 的协作(懒惰,按需)
 //!
@@ -28,7 +29,8 @@ use crate::io_thread::{VoiceCmd, VoiceCmdSender};
 use super::FamilyEnv;
 use super::SharedTranscript;
 
-const MAX_SUBMIT: usize = 4;
+/// 候选窗口上限:**live + 最多 4 个历史段**(级联折叠的展示面;见 pipeline.md §8)。
+const MAX_SUBMIT: usize = 5;
 
 /// Live voice-input command (`#asr`)。
 pub struct VoiceMember {
@@ -77,17 +79,10 @@ impl VoiceMember {
         }
         let finals = state.finals();
         let mut out = Vec::new();
-        // 首选 = 未定稿段落的组装预览:小停顿产生新 batch 后继续说话,预览是
-        // 前段 Batch + 当前段流式("第一句第二句")—— 跨段乱序(前段定稿迟到)
-        // 旧句也不会消失(round11:id 即顺序)。空则回退原始 live。
-        let composed = {
-            let p = state.plain_preview();
-            if p.is_empty() {
-                state.live()
-            } else {
-                p
-            }
-        };
+        // 首选 = **live 段落的级联预览**(架构规则:纠偏 > batch > 流式)—— 段内逐句
+        // 状态机刷新,只有最新句停在流式,老句被 batch 顶替、整段被纠偏顶替。
+        // 无活动段(段刚关、下句未起)回退原始 live,再空则让位历史(finals 承接)。
+        let composed = state.cascade_preview();
         if !composed.is_empty() {
             // 三文本独立:候选行展示 🎙+文本,preedit 显示纯文本(不带图标),
             // 提交纯文本。

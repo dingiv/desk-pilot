@@ -22,7 +22,7 @@
 
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -35,7 +35,7 @@ use clap::Parser;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{error, info, warn};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
@@ -385,7 +385,8 @@ struct DaemonState {
     /// 活跃的 SSE 长连接订阅数(数据面 + 控制面)。idle 监控据此判断"无客户端"。
     subscribers: Arc<std::sync::atomic::AtomicUsize>,
     /// 恢复唤醒:pipeline 线程在 idle 后 park 在这里; 下一个客户端连接时 notify。
-    resume_cv: Arc<(Mutex<()>, Condvar)>,
+    /// 唤醒 pipeline 消费循环从深度睡眠恢复(round14b:异步 Notify,permit 语义)。
+    resume_notify: Arc<Notify>,
     /// idle 深度睡眠超时; None = 关闭。
     idle_timeout: Option<Duration>,
     /// Bumped on ANY SETTINGS change (connected / hotword / correction). Recognition events do
@@ -435,7 +436,7 @@ impl DaemonState {
         if self.running.swap(true, Ordering::Release) == false {
             info!("client connected — resuming recognition");
         }
-        self.resume_cv.1.notify_one();
+        self.resume_notify.notify_one();
     }
 
     /// 进入 idle 深度睡眠:running=false(Stage1 消费循环退出) + active=false(断开 scout)。
@@ -516,7 +517,7 @@ fn main() -> Result<()> {
     // 结果经数据面 /api/asr_stream 推送。
     let flush_paragraph = Arc::new(AtomicBool::new(false));
     // idle 恢复唤醒: daemon 在下一个客户端连接时置 running=true + notify pipeline 线程。
-    let resume_cv: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
+    let resume_cv: Arc<Notify> = Arc::new(Notify::new());
     let version = Arc::new(AtomicU64::new(0));
     // Data-plane channel: recognition sentences pushed to /api/asr_stream subscribers.
     let (asr_events, _) = broadcast::channel::<AsrEvent>(1024);
@@ -593,13 +594,18 @@ fn main() -> Result<()> {
         Some(Arc::clone(&storage)), // ParagraphCalibration 时自动 record_final(archive+day log+ring)
     )?;
 
-    // ── Pipeline on its core-owned thread ── recognition sentences → DATA plane; Stage3 on
-    //    paragraph finals. No event bus: the SSE handler pings off `version`.
+    // ── Pipeline on the socket runtime(round14:零专用线程)── 识别事件 → 数据面;
+    //    Stage3 挂段落定稿。无事件总线:SSE handler 靠 `version` ping。
+    //    runtime 提前建好,pipeline.run 作为常驻任务 spawn 上去(阻塞桥走 blocking pool)。
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("aura-socket")
+        .build()?;
     {
         let tool = tool.clone();
         let version = Arc::clone(&version);
         let asr_events = asr_events.clone();
-        pipeline.spawn(Arc::clone(&running), Arc::clone(&resume_cv), move |ev| {
+        rt.spawn(pipeline.run(Arc::clone(&running), Arc::clone(&resume_cv), move |ev| {
             // Recognition events → DATA plane only (broadcast the sentence). The control
             // plane (version/snapshot) is NOT bumped here — only settings changes bump it.
             // (识别日志与段落归档在 core 的 run() 内部——这里只做线协议映射。)
@@ -613,7 +619,7 @@ fn main() -> Result<()> {
                     })
                 }
                 // 段落边界:server 保证的时序信号 —— 必先于下一段的任何事件
-                // (pipeline 线程同线直发,round11 S3)。
+                // (pipeline 主循环按序直发,round11 S3)。
                 TurnEvent::ParagraphClosed { paragraph_id } => {
                     Some(AsrEvent::ParagraphClosed { paragraph_id })
                 }
@@ -623,8 +629,8 @@ fn main() -> Result<()> {
                 TurnEvent::BatchParagraph { paragraph_id, text } => {
                     Some(AsrEvent::BatchParagraph { paragraph_id, text })
                 }
-                TurnEvent::SentenceCalibration { paragraph_id, calibrated, .. } => {
-                    Some(AsrEvent::SentenceCalibration { paragraph_id, calibrated })
+                TurnEvent::SentenceCalibration { paragraph_id, sentence_id, calibrated, .. } => {
+                    Some(AsrEvent::SentenceCalibration { paragraph_id, sentence_id, calibrated })
                 }
                 TurnEvent::ParagraphCalibration { paragraph_id, calibrated, route_ms } => {
                     // Stage3 may add hotwords — that's a SETTINGS change → control plane.
@@ -640,10 +646,10 @@ fn main() -> Result<()> {
             if let Some(seg) = sentence {
                 let _ = asr_events.send(seg);
             }
-        })?;
+        }));
     }
 
-    // ── Socket on the main thread's tokio runtime ──
+    // ── Socket on the same runtime (main thread block_on) ──
     let state = DaemonState {
         hotwords: Arc::clone(&hotwords),
         corrections: Arc::clone(&corrections),
@@ -652,7 +658,7 @@ fn main() -> Result<()> {
         flush_paragraph: Arc::clone(&flush_paragraph),
         idle: Arc::new(AtomicBool::new(false)),
         subscribers: Arc::new(AtomicUsize::new(0)),
-        resume_cv: Arc::clone(&resume_cv),
+        resume_notify: Arc::clone(&resume_cv),
         idle_timeout: idle_timeout.map(Duration::from_secs),
         version: Arc::clone(&version),
         asr_events: asr_events.clone(),
@@ -660,10 +666,6 @@ fn main() -> Result<()> {
         stage3_on,
         storage,
     };
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_name("aura-socket")
-        .build()?;
     // idle 深度睡眠监控:无 SSE 订阅持续 idle_timeout → 进入 idle(Stage1 退出 + 断开 scout)。
     if let Some(timeout) = state.idle_timeout {
         if timeout > Duration::ZERO {
@@ -689,7 +691,7 @@ fn main() -> Result<()> {
         }
     }
     info!(port, "socket: http://{bind_addr}:{port}  (/api/state /api/stream /api/control/scout /api/correct /api/audio)");
-    info!(scout = %spec.scout_addr, stage3 = stage3_on, log_level = %log_level, idle_timeout = ?idle_timeout, "pipeline running on bg thread — Ctrl-C 结束");
+    info!(scout = %spec.scout_addr, stage3 = stage3_on, log_level = %log_level, idle_timeout = ?idle_timeout, "pipeline running as rt task(round14 零专用线程)— Ctrl-C 结束");
     rt.block_on(serve_socket(state, bind_addr, port, web_dist));
     Ok(())
 }
@@ -969,7 +971,8 @@ mod tests {
             ..Default::default()
         };
         let s = resolve(Cli::default(), conf);
-        assert!(matches!(&s.spec.asr, AsrSpec::Remote { endpoint, model } if endpoint == "http://127.0.0.1:8000"));
+        assert!(matches!(&s.spec.asr, AsrSpec::Remote { endpoint, .. } if endpoint == "http://127.0.0.1:8080"),
+            "endpoint = 测试数据里给的 8080(原断言写 8000 是笔误)");
         assert!(matches!(&s.spec.llm, LlmSpec::Remote { endpoint, model }
             if endpoint == "http://127.0.0.1:3000" && model == "m.gguf"));
     }
@@ -1009,7 +1012,7 @@ mod tests {
     fn resolve_selects_llm_input() {
         // llm.input 默认 batch;显式配置 stream/both 时正确映射。
         let d = resolve(Cli::default(), AuraConf::default());
-        assert_eq!(d.spec.llm_input, LlmInput::Batch, "默认 batch");
+        assert_eq!(d.spec.llm_input, LlmInput::Both, "默认 both(双通道:batch+流式都传)");
 
         let conf = AuraConf {
             llm: LlmConf {

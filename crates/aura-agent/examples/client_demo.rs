@@ -62,9 +62,10 @@ async fn main() -> anyhow::Result<()> {
             }
             AsrEvent::SentenceCalibration {
                 paragraph_id,
+                sentence_id,
                 calibrated,
             } => {
-                println!("[{t}] sen-calib w{paragraph_id} | {calibrated}")
+                println!("[{t}] sen-calib w{paragraph_id} s{sentence_id} | {calibrated}")
             }
             AsrEvent::ParagraphCalibration {
                 paragraph_id,
