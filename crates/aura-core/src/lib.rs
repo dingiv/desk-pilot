@@ -15,9 +15,7 @@ pub mod archive;
 pub mod audio_store;
 pub mod buffer;
 pub mod calibrator;
-#[cfg(feature = "asr")]
 pub mod pipeline;
-#[cfg(feature = "asr")]
 pub mod recognizer;
 pub mod hub;
 pub mod prompt;
@@ -27,7 +25,6 @@ pub mod vad;
 pub mod wav;
 
 pub use calibrator::{LlmInput, PassThroughCalibrator, Stage2Calibrator, Stage2CalibratorImpl};
-#[cfg(feature = "asr")]
 pub use pipeline::{AsrSpec, LlmSpec, Pipeline, PipelineSpec, StreamSpec, TurnEvent, VadSpec};
 pub use prompt::PromptBuilder;
 pub use hub::{FinalTurn, Storage, TurnRecord};

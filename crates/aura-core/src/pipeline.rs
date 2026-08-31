@@ -40,6 +40,8 @@ use crate::recognizer::{OnnxStage1Recognizer, Stage1Config, Stage1Recognizer};
 use crate::{ParagraphId, SentenceId, Stage1Event, VadParagraph, VadSentence};
 use dp_models::http::HttpLlm;
 
+use tokio;
+
 // ── PipelineSpec — 选型描述（daemon resolve() 产出，assemble() 消费）────────────────
 // 分层:daemon 负责"从哪儿读配置"(yaml/json/CLI/默认值),这里只认 fully-resolved 的
 // 具体值 —— 线协议/文件格式不进 core。VadSpec::default 与 Stage1Config::new 的内置
@@ -880,7 +882,7 @@ mod tests {
         // disable → 纯流式:batch_enabled=false(不加载批式模型,DisabledAsr 顶位)。
         let cfg = stage1_config(&spec(AsrSpec::Disabled), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false))).unwrap();
         assert!(!cfg.batch_enabled);
-        assert!(matches!(cfg.asr_kind, ProviderKind::Local { .. }), "不影响 streaming/VAD 的本地路径");
+        assert!(matches!(cfg.asr_kind, ProviderKind::Local), "不影响 streaming/VAD 的本地路径");
 
         // 未知流式引擎 → 显式报错(不静默回退默认)。
         let mut s = spec(local("sensevoice"));

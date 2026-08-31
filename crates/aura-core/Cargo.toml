@@ -9,48 +9,34 @@ publish.workspace = true
 # ── Stage1 ASR examples (former aura-asr) + Stage1→Stage2 bench ──
 [[example]]
 name = "transcribe"
-required-features = ["asr"]
 
 [[example]]
 name = "batch_transcribe"
-required-features = ["asr"]
 
 [[example]]
 name = "qwen3_asr"
-required-features = ["asr"]
 
 [[example]]
 name = "scout_debug"
 
 [[example]]
 name = "streaming_asr"
-required-features = ["asr"]
 
 [[example]]
 name = "streaming_asr_hot"
-required-features = ["asr"]
 
 # Thin Stage1→Stage2 bench built on the Pipeline composer.
 # Stage2 LLM 走 dp-router(OpenAI 兼容 `/v1/chat/completions`);examples 默认指向
 # http://127.0.0.1:8080,可通过 DP_ROUTER_ENDPOINT / DP_ROUTER_MODEL 环境变量覆盖。
 [[example]]
 name = "stage12_live"
-required-features = ["asr"]
 
 [[example]]
 name = "calibrate_bench"
-required-features = ["asr"]
-
-[features]
-default = []
-# Stage1 local ASR (Silero VAD + streaming/batch via dp-models' sherpa-onnx wrapper) + the
-# executor/composer modules. Default build stays light (contract + storage).
-# Stage2 LLM 走 dp-router(http),不再需要 cuda / mistral 重依赖。
-asr = ["dp-models/speech", "dep:tokio"]
 
 [dependencies]
-dp-models = { workspace = true }
-tokio = { version = "1", optional = true, features = ["rt", "macros", "sync", "time"] }
+dp-models = { workspace = true, features = ["speech"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shared = { path = "../shared", features = ["log"] }
