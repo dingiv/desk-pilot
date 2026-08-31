@@ -10,6 +10,7 @@
 //! - [`post`] — **stage3 后处理**:合成 → 全局调整 → 造词单字区 → 视图组装
 pub mod chain;
 pub mod family;
+pub mod key;
 pub mod post;
 pub mod pre;
 pub mod state;

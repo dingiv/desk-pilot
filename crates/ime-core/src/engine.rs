@@ -29,7 +29,6 @@ use std::sync::{Arc, Mutex};
 use crate::family::magic::{MagicFamily, ReqFetcher};
 use crate::family::InputContext;
 use crate::fsm::family::FamilyPipeline;
-use crate::fsm::family::StepEnv;
 // 统一键事件由输入路由层定义(旧名 InputEvent;构造器同名,测试平移)。
 pub use crate::fsm::state::{KeyEvent, StateFlags};
 use crate::fsm::state::StateMachine;

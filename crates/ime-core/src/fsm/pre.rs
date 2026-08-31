@@ -55,8 +55,10 @@ impl ControlStage {
         //    (`?num=2` 的 `=`、`#req` URL 的 `-`/`[`/`]`…)—— 由状态机决定
         //    (数字在可选中态选中候选,否则追加)。方向/翻页键仍导航。
         if pipeline.state == ComposeState::Snippet {
-            if let Some(c) = command_char(key.kind) {
-                return pipeline.step(c, env);
+            // 命令文本字符(`?num=2` 的数字、`#req` URL 的 `-`/`[`/`]`…)
+            // 从键导出(as_command_char),走文本通道;方向/翻页键仍导航。
+            if let Some(c) = key.kind.as_command_char() {
+                return pipeline.step_char(c, env);
             }
         }
 
@@ -66,21 +68,21 @@ impl ControlStage {
             // 3. Space / Enter / Backspace:组合中是提交/强选/删除,idle 属于应用。
             KeyKind::Space => {
                 if flags.contains(StateFlags::COMPOSING) {
-                    pipeline.step(' ', env)
+                    pipeline.step_key(KeyKind::Space, env)
                 } else {
                     FamilyPipeline::passthrough_view()
                 }
             }
             KeyKind::Enter => {
                 if flags.contains(StateFlags::COMPOSING) {
-                    pipeline.step('\n', env)
+                    pipeline.step_key(KeyKind::Enter, env)
                 } else {
                     FamilyPipeline::passthrough_view()
                 }
             }
             KeyKind::Backspace => {
                 if flags.contains(StateFlags::COMPOSING) {
-                    pipeline.step('\x08', env)
+                    pipeline.step_key(KeyKind::Backspace, env)
                 } else {
                     FamilyPipeline::passthrough_view()
                 }
@@ -185,9 +187,9 @@ impl ControlStage {
                 }
             },
 
-            // 8. 可打印字符:交给组合状态机(idle 内部自分流:触发前缀进
-            //    Snippet,小写进 Pinyin,其余返回透传视图)。
-            KeyKind::Char(c) => pipeline.step(c, env),
+            // 8. 可打印字符:交给组合状态机的文本通道(idle 内部自分流:
+            //    触发前缀进 Snippet,小写进 Pinyin,其余返回透传视图)。
+            KeyKind::Char(c) => pipeline.step_char(c, env),
         }
     }
 }
@@ -199,15 +201,3 @@ fn handled_empty_view() -> ImeView {
     v
 }
 
-/// Magic 模式下作为命令文本回填给 member 的字符(数字 + 翻页/移光标符号)。
-fn command_char(kind: KeyKind) -> Option<char> {
-    match kind {
-        KeyKind::Digit(n) => Some(char::from(b'0' + n)),
-        KeyKind::Plus => Some('+'),
-        KeyKind::Equal => Some('='),
-        KeyKind::Minus => Some('-'),
-        KeyKind::BracketLeft => Some('['),
-        KeyKind::BracketRight => Some(']'),
-        _ => None,
-    }
-}

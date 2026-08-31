@@ -29,13 +29,13 @@
 //! When the last syllable is committed, the resulting phrase is saved to
 //! the PhraseBook for future sessions.
 
-use crate::expander::Expander;
 use crate::family::magic::{
     ChainContext, LiveCommand, MagicMatch, MagicMember, Prediction,
 };
 
 use crate::frontend::ImeView;
-use super::post::{CandMeta, PanelItem};
+use super::key::KeyKind;
+use super::post::CandMeta;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ComposeState {
@@ -52,13 +52,13 @@ pub struct FamilyPipeline {
     pub ctx: usize,
     pub state: ComposeState,
     /// 组合会话(S4 下沉):原始键入/预测串/预编辑/光标/造词半成品。
-    pub comp: Composition,
+    pub(crate) comp: Composition,
 
     /// 调试模式:候选词显示提供者与权重(`[score family/source]`)。
     pub candidate_meta_enabled: bool,
 
     /// 候选面板(S4 下沉):items/meta/partial 同源同序 + 高亮/分页。
-    pub panel: CandidatePanel,
+    pub(crate) panel: CandidatePanel,
 
     /// postprocess → query_pinyin 的带出槽(stage3 内部中间值,非持久状态)。
     pub(crate) pending_full_comp_count: usize,
@@ -192,11 +192,24 @@ impl FamilyPipeline {
         }
     }
 
-    pub fn step(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
+    /// stage2 键入口:控制键以 [`KeyKind`] 枚举分流(键语义不再伪装成
+    /// 字符 —— 旧实现 stage1 编码 `' '`/`'\n'`/`'\x08'`、stage2 再解码,
+    /// 两处字面量一致才正确;现在键是键,字符是字符)。
+    pub fn step_key(&mut self, key: KeyKind, env: &dyn StepEnv) -> ImeView {
+        match self.state {
+            // idle 的控制键属于应用(stage1 已放行;防御兜底)。
+            ComposeState::Idle => Self::passthrough_view(),
+            ComposeState::Snippet => self.snippet_key(key, env),
+            ComposeState::Pinyin => self.pinyin_key(key, env),
+        }
+    }
+
+    /// 文本字符通道(字母/数字/符号/触发符):idle 内自分流。
+    pub fn step_char(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
         match self.state {
             ComposeState::Idle => self.handle_idle(ch, env),
-            ComposeState::Snippet => self.handle_snippet(ch, env),
-            ComposeState::Pinyin => self.handle_pinyin(ch, env),
+            ComposeState::Snippet => self.snippet_char(ch, env),
+            ComposeState::Pinyin => self.pinyin_char(ch, env),
         }
     }
 
@@ -813,32 +826,38 @@ impl FamilyPipeline {
     /// - Space 选中高亮候选(预测提交 / 补全改写 / rollback 提交);
     /// - 数字键在可选中态(精确无参 / 前缀)选中候选,否则作为命令文本;
     /// - 其它字符追加后重查。
-    fn handle_snippet(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
-        // Backspace: pop last char, re-query. Empty → reset.
-        if ch == '\x08' {
-            self.comp.buffer.pop();
-            if self.comp.buffer.is_empty() {
-                self.reset();
-                return ImeView::empty();
+    fn snippet_key(&mut self, key: KeyKind, env: &dyn StepEnv) -> ImeView {
+        match key {
+            // Backspace: pop last char, re-query. Empty → reset.
+            KeyKind::Backspace => {
+                self.comp.buffer.pop();
+                if self.comp.buffer.is_empty() {
+                    self.reset();
+                    return ImeView::empty();
+                }
+                self.query_magic(env)
             }
-            return self.query_magic(env);
+            // Enter: force raw text.
+            KeyKind::Enter => {
+                let raw = std::mem::take(&mut self.comp.buffer);
+                self.reset();
+                Self::commit_view(&raw)
+            }
+            // Space: commit the highlighted candidate.
+            KeyKind::Space => {
+                let hl = self
+                    .panel.highlight
+                    .min(self.panel.items.len().saturating_sub(1));
+                self.select_magic(hl, env)
+            }
+            _ => Self::passthrough_view(),
         }
+    }
 
-        // Enter: force raw text.
-        if ch == '\n' || ch == '\r' {
-            let raw = std::mem::take(&mut self.comp.buffer);
-            self.reset();
-            return Self::commit_view(&raw);
-        }
-
-        // Space: commit the highlighted candidate.
-        if ch == ' ' {
-            let hl = self
-                .panel.highlight
-                .min(self.panel.items.len().saturating_sub(1));
-            return self.select_magic(hl, env);
-        }
-
+    /// Snippet 态的文本字符:数字在可选中态选候选、否则与其它字符一并追加
+    /// 进命令缓冲(`?num=2` 的数字与 `-`/`[`/`]` 由 stage1 经
+    /// `as_command_char` hoist 到本通道)。
+    fn snippet_char(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
         // 数字键:可选中时选中候选,否则作为命令文本追加(如 `?num=2`)。
         if let d @ '1'..='9' = ch {
             if self.magic.selectable {
@@ -863,49 +882,56 @@ impl FamilyPipeline {
 
     // ── Pinyin ─────────────────────────────────────────────────────────
 
-    fn handle_pinyin(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
-        match ch {
-            '\x08' => self.pinyin_backspace(env),
-            '\n' | '\r' => self.pinyin_enter(),
-            ' ' => self.pinyin_space(env),
-            // 链分隔符:`'` 是组合内结构字符(ti'an 的两条链),不是终结符。
-            // 追加进 buffer;预测层(拼音家族)按 `'` 切链组合。回格删 `'`
-            // 天然回到无链状态 —— 链结构纯由 buffer 内容决定,无隐藏状态。
-            // 附带"我说完了"信号:语音会话在听时让 aura 立即归档开放窗口
-            // (整窗 batch,跳过 merge_gap 等待);无语音会话 → tx 为 None,跳过。
-            '\'' => {
-                if let Some(tx) = env.voice_cmd_tx() {
-                    tx.send(crate::io_thread::VoiceCmd::FlushParagraph);
-                }
-                self.comp.buffer.push('\'');
-                self.comp.raw_buffer.push('\'');
-                self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
-                self.comp.cursor = self.comp.preedit.len();
-                self.panel.fresh = false;
-                self.query_pinyin(env)
-            }
-            // 链式命令:`'#` 序列开启命令链(X'#translate)。`#` 不终结组合、
-            // 不提交 —— 上游链保留在 buffer 里,转入 Snippet 态做命令输入;
-            // 单独的 `#`(无 `'` 前导)维持旧的终结符行为(提交候选 + `#`)。
-            '#' if self.comp.buffer.ends_with('\'') => {
-                self.comp.buffer.push('#');
-                self.comp.raw_buffer.push('#');
-                self.state = ComposeState::Snippet;
-                self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
-                self.comp.cursor = self.comp.preedit.len();
-                self.panel.fresh = false;
-                self.query_magic(env)
-            }
-            c if c.is_ascii_alphabetic() => {
-                self.comp.buffer.push(c.to_ascii_lowercase());
-                self.comp.raw_buffer.push(c);
-                self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
-                self.comp.cursor = self.comp.preedit.len();
-                self.panel.fresh = false;
-                self.query_pinyin(env)
-            }
-            c => self.pinyin_terminator(c),
+    /// Pinyin 态的控制键(枚举分流):退格删拼音、回车/空格强选。
+    fn pinyin_key(&mut self, key: KeyKind, env: &dyn StepEnv) -> ImeView {
+        match key {
+            KeyKind::Backspace => self.pinyin_backspace(env),
+            KeyKind::Enter => self.pinyin_enter(),
+            KeyKind::Space => self.pinyin_space(env),
+            _ => Self::passthrough_view(),
         }
+    }
+
+    /// Pinyin 态的文本字符:字母入 buffer、`'` 切链、`'#` 开命令链、
+    /// 其余符号是终结符。
+    fn pinyin_char(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
+        // 链分隔符:`'` 是组合内结构字符(ti'an 的两条链),不是终结符。
+        // 追加进 buffer;预测层(拼音家族)按 `'` 切链组合。回格删 `'`
+        // 天然回到无链状态 —— 链结构纯由 buffer 内容决定,无隐藏状态。
+        // 附带"我说完了"信号:语音会话在听时让 aura 立即归档开放窗口
+        // (整窗 batch,跳过 merge_gap 等待);无语音会话 → tx 为 None,跳过。
+        if ch == '\'' {
+            if let Some(tx) = env.voice_cmd_tx() {
+                tx.send(crate::io_thread::VoiceCmd::FlushParagraph);
+            }
+            self.comp.buffer.push('\'');
+            self.comp.raw_buffer.push('\'');
+            self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
+            self.comp.cursor = self.comp.preedit.len();
+            self.panel.fresh = false;
+            return self.query_pinyin(env);
+        }
+        // 链式命令:`'#` 序列开启命令链(X'#translate)。`#` 不终结组合、
+        // 不提交 —— 上游链保留在 buffer 里,转入 Snippet 态做命令输入;
+        // 单独的 `#`(无 `'` 前导)维持旧的终结符行为(提交候选 + `#`)。
+        if ch == '#' && self.comp.buffer.ends_with('\'') {
+            self.comp.buffer.push('#');
+            self.comp.raw_buffer.push('#');
+            self.state = ComposeState::Snippet;
+            self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
+            self.comp.cursor = self.comp.preedit.len();
+            self.panel.fresh = false;
+            return self.query_magic(env);
+        }
+        if ch.is_ascii_alphabetic() {
+            self.comp.buffer.push(ch.to_ascii_lowercase());
+            self.comp.raw_buffer.push(ch);
+            self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
+            self.comp.cursor = self.comp.preedit.len();
+            self.panel.fresh = false;
+            return self.query_pinyin(env);
+        }
+        self.pinyin_terminator(ch)
     }
 
     fn query_pinyin(&mut self, env: &dyn StepEnv) -> ImeView {
@@ -1186,8 +1212,22 @@ mod step_env_tests {
                 magic,
             }
         }
+        /// 模拟 stage1(pre)的分流:控制键走 step_key,字符走 step_char,
+        /// snippet 态命令字符经 as_command_char hoist —— 与生产路径一致。
         fn process_key(&self, ch: char, sm: &mut FamilyPipeline) -> ImeView {
-            sm.step(ch, self)
+            let kind = KeyKind::from_char(ch);
+            if sm.state == ComposeState::Snippet {
+                if let Some(c) = kind.as_command_char() {
+                    return sm.step_char(c, self);
+                }
+            }
+            match kind {
+                KeyKind::Space | KeyKind::Enter | KeyKind::Backspace => {
+                    sm.step_key(kind, self)
+                }
+                KeyKind::Char(c) => sm.step_char(c, self),
+                _ => FamilyPipeline::passthrough_view(),
+            }
         }
         fn select_candidate(&self, index: usize, sm: &mut FamilyPipeline) -> ImeView {
             sm.select(index, self)

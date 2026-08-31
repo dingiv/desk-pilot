@@ -4,8 +4,8 @@
 //!
 //! [`FamilyPipeline`] 的类型声明仍在 [`super::family`];本文件是它的
 //! stage3 行为分片(同 crate 跨文件 impl)。
-use super::family::{ComposeState, FamilyPipeline, MagicSession};
-use crate::family::{InputContext, RankedCandidate, ScoredCandidate};
+use super::family::{ComposeState, FamilyPipeline};
+use crate::family::RankedCandidate;
 use crate::frontend::{ImeView, CANDIDATE_SLOTS};
 use crate::fsm::family::StepEnv;
 
@@ -46,7 +46,7 @@ impl FamilyPipeline {
         // 1. 全局调整:单字母输入的 self/case 置顶。
         let ranked = promote_single_letter(&self.comp.buffer, ranked);
         // 2. PanelItem 化:meta 与文本同源。
-        let mut items: Vec<PanelItem> = ranked
+        let items: Vec<PanelItem> = ranked
             .into_iter()
             .map(|c| PanelItem {
                 meta: CandMeta {
@@ -213,8 +213,8 @@ impl FamilyPipeline {
 /// 共用此规则,保持两处候选顺序一致。多字符 buffer 原样返回。
 pub(crate) fn promote_single_letter(
     buffer: &str,
-    mut ranked: Vec<crate::family::RankedCandidate>,
-) -> Vec<crate::family::RankedCandidate> {
+    mut ranked: Vec<RankedCandidate>,
+) -> Vec<RankedCandidate> {
     if buffer.len() != 1 {
         return ranked;
     }
@@ -227,7 +227,7 @@ pub(crate) fn promote_single_letter(
         return ranked;
     };
     let (lower, upper) = (ch.to_string(), ch.to_ascii_uppercase().to_string());
-    let is_letter = |r: &crate::family::RankedCandidate| {
+    let is_letter = |r: &RankedCandidate| {
         r.family == "english" && (r.text == lower || r.text == upper)
     };
     let mut head: Vec<_> = ranked.iter().filter(|r| is_letter(r)).cloned().collect();
