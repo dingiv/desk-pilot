@@ -130,7 +130,27 @@ engine.key_ctx(key)
     FamilyPipeline 关联函数(passthrough_view 等)前缀对齐
   - 测试:ime-core 157+21+2、swift-ime 7+12+15 全绿
 
-- **R4 ✅ 依赖单向化**(用户点名先做,提前于 R1-R3):
+- **R3 ✅ pre.rs 抽取**(先于 R1/R2 记录顺序无碍):
+  - **`ControlStage` 显式结构体**(零大小,Copy):stage1 是管线的一员,
+    不是散落的 match —— StateMachine 持 `control: ControlStage` 字段
+  - `ControlStage::route_key(table, pipeline, key, env)`:系统键就地处理
+    (提交/选词/翻页/高亮/透传/命令文本 hoist),字符键交 stage2;
+    action NONE→HANDLED 不变式、flags 同步随迁
+  - handled_empty_view/command_char 随迁;KeyEvent/KeyKind 仍定义于
+    state.rs(stage1 的输入类型)
+- **R2 ✅ post.rs 抽取**:PanelItem/CandMeta(产出结构)+ postprocess
+  (merge→promote→造词重排)+ make_view/fill_view(滑动窗口)/
+  rebuild_magic_view 自 family.rs 迁出;FamilyPipeline 的 stage3 行为
+  分片(同 crate 跨文件 impl);escape_preedit/pending_full_comp_count
+  可见性放宽
+- **R1 ✅ 纯改名**:
+  - 文件:router.rs → state.rs、state.rs → family.rs(git mv 保历史)
+  - 类型:StateMachineTable → StateMachine;原 StateMachine → FamilyPipeline
+  - 方法:route/route_inner → step/step_inner;PerContext 字段 sm → pipeline
+  - 引用面:engine / lib.rs 导出 / apps(tui/fcitx5)/ examples / tests
+    全量同步;顶层 router/state 别名删除(顶层 family 名被家族模块占用)
+  - 过程修正:全局替换顺序坑(Table→StateMachine 又被吞)与
+    PerContext.table 类型/参数类型/关联函数前缀逐一回改(用户点名先做,提前于 R1-R3):
   - **`FamilyEnv` trait 定义在 family/mod.rs**(family 需要什么,family
     自己说了算):expander / voice_cmd_tx(默认 None)/ record_pick /
     learn_phrase / learn_composed_phrase / compose_single_chars
