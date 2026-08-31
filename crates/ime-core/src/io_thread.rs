@@ -29,21 +29,25 @@ use crate::frontend::{FrontEndHandle, StateView};
 use crate::family::magic::SharedVoiceState;
 
 /// 魔法命令发给 I/O 线程的异步工作请求。
+///
+/// 普适的异步能力面(round10):任何魔法命令(不限于 ASR/REQ)都经
+/// [`IoThread::spawn_blocking`] / [`IoThread::spawn_task`] 两扇正门使用
+/// I/O 线程 —— 阻塞任务进 tokio 阻塞池,异步任务进事件循环;两者完成
+/// 后都会 `refresh_ui(ctx)` 把新候选刷上前端。
 pub enum IoEvent {
-    /// 在 I/O 线程上跑一个同步任务(可能阻塞,如 HTTP 拉取)。任务完成后
-    /// `refresh_ui(ctx)` 让前端重渲染。成员把"写异步状态"的闭包发过来,
-    /// 事件循环不阻塞预测主路径。
-    Run {
+    /// 阻塞任务(HTTP 拉取等)→ tokio 阻塞池执行,不占事件循环。
+    Blocking {
         ctx: usize,
         task: Box<dyn FnOnce() + Send + 'static>,
     },
+    /// 异步任务 → 事件循环 runtime 上执行(魔法命令异步 IO 的正门:
+    /// async HTTP / SSE / WebSocket …)。
+    Task {
+        ctx: usize,
+        fut: futures::future::BoxFuture<'static, ()>,
+    },
     /// 请求前端提供 count 条剪贴板历史(`#clip` 需要时)。
     RequestClipboard { ctx: usize, count: u32 },
-    /// 在 I/O 线程的 main future 内部 spawn 一个 caller 给的 future。绕过
-    /// `current_thread` runtime 跨线程 `Handle::spawn` 不 poll remote task 的坑:
-    /// 把 spawn intent 推到 channel,main future 收到后调 `tokio::spawn` 直接
-    /// 加入本地 ready queue。
-    SpawnAux(Box<dyn FnOnce() + Send + 'static>),
     /// voice server 命令(`#asr` 家族发)。复用同一个 rx。
     Voice(VoiceCmd),
     /// 停止事件循环。
@@ -155,6 +159,25 @@ impl IoThread {
     /// 发一个事件给 I/O 线程(非阻塞)。线程已死/通道满时静默丢弃。
     pub fn send(&self, ev: IoEvent) {
         let _ = self.tx.try_send(ev);
+    }
+
+    /// **普适异步能力面 1/2**:阻塞任务 → tokio 阻塞池执行(不占事件
+    /// 循环),完成后 `refresh_ui(ctx)`。同步 HTTP 拉取等。
+    pub fn spawn_blocking(&self, ctx: usize, task: impl FnOnce() + Send + 'static) {
+        self.send(IoEvent::Blocking {
+            ctx,
+            task: Box::new(task),
+        });
+    }
+
+    /// **普适异步能力面 2/2**:异步任务 → 事件循环 runtime 执行,完成后
+    /// `refresh_ui(ctx)`。async HTTP / SSE / WebSocket —— 魔法命令的
+    /// 异步 IO 正门(不占阻塞线程,不阻塞事件循环)。
+    pub fn spawn_task(&self, ctx: usize, fut: impl Future<Output = ()> + Send + 'static) {
+        self.send(IoEvent::Task {
+            ctx,
+            fut: Box::pin(fut),
+        });
     }
 
     /// voice 命令 sender(与 `tx` 同一通道)—— `#asr` 家族经它发 Attach/Detach。
@@ -297,13 +320,13 @@ async fn voice_server_main(
                             }
                         }
                     }
-                    Some(IoEvent::Run { ctx, task }) => {
+                    Some(IoEvent::Blocking { ctx, task }) => {
                         // 阻塞任务(HTTP 拉取等)放 tokio 阻塞池执行:既不让 current_thread
                         // 事件循环被卡住(否则语音段会停摆),也避免在 async 上下文里做阻塞
                         // 调用(后者在 runtime drop 时会 panic "Cannot drop a runtime in a
                         // context where blocking is not allowed")。
                         if tokio::task::spawn_blocking(task).await.is_err() {
-                            tracing::warn!("io Run blocking task panicked");
+                            tracing::warn!("io blocking task panicked");
                         }
                         if let Some(f) = frontend.upgrade() {
                             f.refresh_ui(StateView { ctx });
@@ -315,10 +338,17 @@ async fn voice_server_main(
                             f.refresh_ui(StateView { ctx });
                         }
                     }
-                    Some(IoEvent::SpawnAux(spawn)) => {
-                        spawn();
-                        // 触发 runtime 调度刚 spawn 的 task。
-                        tokio::task::yield_now().await;
+                    Some(IoEvent::Task { ctx, fut }) => {
+                        // 异步任务 spawn 到事件循环(脱离 select —— 长任务
+                        // 不阻塞其他事件);完成后 refresh,把命令的新候选
+                        // 刷上前端(与 Blocking 臂对称)。
+                        let frontend = frontend.clone();
+                        tokio::spawn(async move {
+                            fut.await;
+                            if let Some(f) = frontend.upgrade() {
+                                f.refresh_ui(StateView { ctx });
+                            }
+                        });
                     }
                     Some(IoEvent::Shutdown) | None => break,
                 }

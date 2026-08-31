@@ -497,22 +497,19 @@ impl ReqMember {
         shared.version.fetch_add(1, Ordering::Release);
         tracing::debug!(url, ?body, "req fire");
         match self.resources.io() {
-            Some(io) => io.send(crate::io_thread::IoEvent::Run {
-                ctx,
-                task: Box::new(move || {
-                    let result = fetcher.post(&url, &body);
-                    let st = match result {
-                        Ok(body) => {
-                            let preds = parse_response(&body);
-                            tracing::debug!(url, count = preds.len(), "req response parsed");
-                            ReqStatus::Done(preds)
-                        }
-                        Err(e) => ReqStatus::Failed(e),
-                    };
-                    tracing::debug!(url, ok = matches!(st, ReqStatus::Done(_)), "req done");
-                    *shared.status.lock().unwrap() = st;
-                    shared.version.fetch_add(1, Ordering::Release);
-                }),
+            Some(io) => io.spawn_blocking(ctx, move || {
+                let result = fetcher.post(&url, &body);
+                let st = match result {
+                    Ok(body) => {
+                        let preds = parse_response(&body);
+                        tracing::debug!(url, count = preds.len(), "req response parsed");
+                        ReqStatus::Done(preds)
+                    }
+                    Err(e) => ReqStatus::Failed(e),
+                };
+                tracing::debug!(url, ok = matches!(st, ReqStatus::Done(_)), "req done");
+                *shared.status.lock().unwrap() = st;
+                shared.version.fetch_add(1, Ordering::Release);
             }),
             // 无 I/O 线程(未接线的测试场景)→ 就地执行。
             None => {
