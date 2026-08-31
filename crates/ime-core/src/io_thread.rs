@@ -476,9 +476,12 @@ mod tests {
             state,
             DEFAULT_IDLE_TIMEOUT_SECS,
         );
-        io.send(IoEvent::SpawnAux(Box::new(|| {
-            // do nothing — event loop spawned an empty closure and yielded.
-        })));
+        io.spawn_task(
+            0,
+            async {
+                // do nothing — event loop spawned an empty future and refreshed.
+            },
+        );
         drop(io);
     }
 

@@ -97,14 +97,17 @@ impl AddonCmdSpec {
     }
 }
 
-/// Synchronous HTTP POST provider, injected into the family. The production impl
-/// (reqwest, behind the `http` cargo feature) runs on the blocking pool; tests
-/// inject a fake. POST 的 JSON body 携带结构化参数(`cmd`/`path`/`query`/`pick`),
-/// 便于扩展更多参数。
+/// HTTP POST provider, injected into the family. The production impl
+/// (reqwest async, behind the `http` cargo feature) runs on the IoThread
+/// event loop — 魔法命令的异步 IO 正门(round10:REQ 与 ASR 共用同一
+/// 异步框架,零阻塞线程);tests inject a fake. POST 的 JSON body 携带
+/// 结构化参数(`cmd`/`path`/`query`/`pick`),便于扩展更多参数。
+///
+/// 返回 `BoxFuture`(dyn 兼容 —— fetcher 以 `Arc<dyn ReqFetcher>` 注入)。
 pub trait ReqFetcher: Send + Sync {
     /// POST `url` with a JSON `body`; return the response body (plain text) or an
     /// error message.
-    fn post(&self, url: &str, body: &str) -> Result<String, String>;
+    fn post(&self, url: &str, body: &str) -> futures::future::BoxFuture<'_, Result<String, String>>;
 }
 
 /// Always-failing fetcher — active when ime-core is built without the `http`
@@ -114,43 +117,46 @@ pub struct NoopFetcher;
 
 #[cfg(not(feature = "http"))]
 impl ReqFetcher for NoopFetcher {
-    fn post(&self, _url: &str, _body: &str) -> Result<String, String> {
-        Err("HTTP 未启用（ime-core 需开启 http feature）".into())
+    fn post(&self, _url: &str, _body: &str) -> futures::future::BoxFuture<'_, Result<String, String>> {
+        Box::pin(async { Err("HTTP 未启用（ime-core 需开启 http feature）".into()) })
     }
 }
 
-/// reqwest-backed fetcher (feature `http`). One blocking client, shared.
+/// reqwest-backed fetcher (feature `http`). One async client, shared —
+/// 请求跑在 IoThread 事件循环上,不占阻塞线程。
 #[cfg(feature = "http")]
 pub struct ReqwestFetcher {
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
 }
 
 #[cfg(feature = "http")]
 impl ReqwestFetcher {
     pub fn new(timeout: std::time::Duration) -> Self {
-        let client = reqwest::blocking::Client::builder()
+        let client = reqwest::Client::builder()
             .timeout(timeout)
             .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+            .unwrap_or_else(|_| reqwest::Client::new());
         ReqwestFetcher { client }
     }
 }
 
 #[cfg(feature = "http")]
 impl ReqFetcher for ReqwestFetcher {
-    fn post(&self, url: &str, body: &str) -> Result<String, String> {
-        let resp = self
+    fn post(&self, url: &str, body: &str) -> futures::future::BoxFuture<'_, Result<String, String>> {
+        let fut = self
             .client
             .post(url)
             .header("Content-Type", "application/json")
             .body(body.to_string())
-            .send()
-            .map_err(|e| e.to_string())?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(format!("HTTP {}", status.as_u16()));
-        }
-        resp.text().map_err(|e| e.to_string())
+            .send();
+        Box::pin(async move {
+            let resp = fut.await.map_err(|e| e.to_string())?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(format!("HTTP {}", status.as_u16()));
+            }
+            resp.text().await.map_err(|e| e.to_string())
+        })
     }
 }
 
@@ -497,8 +503,10 @@ impl ReqMember {
         shared.version.fetch_add(1, Ordering::Release);
         tracing::debug!(url, ?body, "req fire");
         match self.resources.io() {
-            Some(io) => io.spawn_blocking(ctx, move || {
-                let result = fetcher.post(&url, &body);
+            // 异步正门:请求跑在 IoThread 事件循环上(真异步,零阻塞线程),
+            // 完成后由 IoThread 统一 refresh_ui(ctx)。
+            Some(io) => io.spawn_task(ctx, async move {
+                let result = fetcher.post(&url, &body).await;
                 let st = match result {
                     Ok(body) => {
                         let preds = parse_response(&body);
@@ -511,9 +519,10 @@ impl ReqMember {
                 *shared.status.lock().unwrap() = st;
                 shared.version.fetch_add(1, Ordering::Release);
             }),
-            // 无 I/O 线程(未接线的测试场景)→ 就地执行。
+            // 无 I/O 线程(未接线的测试场景)→ 轻量 executor 就地执行
+            // (假 fetcher 返回 ready future;生产永远有 IoThread)。
             None => {
-                let result = fetcher.post(&url, &body);
+                let result = futures::executor::block_on(fetcher.post(&url, &body));
                 let st = match result {
                     Ok(body) => ReqStatus::Done(parse_response(&body)),
                     Err(e) => ReqStatus::Failed(e),

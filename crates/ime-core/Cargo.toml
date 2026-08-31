@@ -6,8 +6,9 @@ description = "swift-ime pure logic crate: trie matcher, snippet expander, middl
 
 [features]
 default = []
-# Real HTTP for the `#req` magic command (reqwest blocking client on a worker
-# thread). Off by default — ime-core stays dependency-light; frontends that want
+# Real HTTP for the `#req` magic command (reqwest async client on the IoThread
+# event loop — 魔法命令异步 IO 正门;workspace 的 blocking feature 留给 dp-models).
+# Off by default — ime-core stays dependency-light; frontends that want
 # `#req` out of the box enable it (swift-ime does).
 http = ["dep:reqwest"]
 
