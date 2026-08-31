@@ -226,3 +226,5 @@ state.rs 内部自访问。过渡策略:聚合体暴露与旧字段同形的访�
   造词单字区);独立重算(rank_detailed + promote)退役
   - golden rank() 从此 = 用户真实候选;snippet 态分支保留
   - 测试:ime-core 162+21+2、swift-ime 7+12+15 全绿
+
+> **第八轮收尾。** FSM 文件结构重排(三阶段三文件、显式命名、依赖单向化)见 [第九轮 →](issues-round9.md)
