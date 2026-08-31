@@ -1483,6 +1483,22 @@ mod step_env_tests {
     }
 
     #[test]
+    fn idle_slash_is_passthrough() {
+        // 回归:is_trigger_start 曾把 '/' 也当触发器引导符,单独输入 '/'
+        // 被误捕获进 snippet 态。原 matcher trie 根孩子只有 '#' —— 只有
+        // '#' 进入命令组合;片段 '#/name' 的 '/' 是命令文本的一部分。
+        let d = d();
+        let mut s = sm();
+        let v = d.process_key('/', &mut s);
+        assert_eq!(s.state, crate::fsm::state::ComposeState::Idle, "'/' stays idle");
+        assert!(v.candidate_count == 0, "no candidates for '/'");
+        // '#' 仍进入命令组合。
+        let v2 = d.process_key('#', &mut s);
+        assert_eq!(s.state, crate::fsm::state::ComposeState::Snippet, "'#' enters snippet");
+        let _ = v2;
+    }
+
+    #[test]
     fn idle_letter_enters_pinyin() {
         let d = d();
         let mut s = sm();
