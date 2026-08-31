@@ -275,7 +275,7 @@ impl CandidateFamily for EmojiFamily {
                     1.0
                 } else {
                     let diff = kw.chars().count().saturating_sub(input_len);
-                    0.6 * crate::scoring::prefix_decay(diff)
+                    0.6 * crate::family::scoring::prefix_decay(diff)
                 };
                 out.push(ScoredCandidate {
                     text: emoji.clone(),

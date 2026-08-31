@@ -209,14 +209,14 @@ impl WeightsConfig {
     /// Convert to ime-core's unified [`ScoringConfig`] — family priorities,
     /// family priorities and the freq→score scale all come from
     /// `swift-ime.yaml`; missing sections fall back to the legacy defaults.
-    pub fn to_scoring(&self) -> ime_core::scoring::ScoringConfig {
-        ime_core::scoring::ScoringConfig {
-            priorities: ime_core::scoring::FamilyPriorities {
+    pub fn to_scoring(&self) -> ime_core::family::scoring::ScoringConfig {
+        ime_core::family::scoring::ScoringConfig {
+            priorities: ime_core::family::scoring::FamilyPriorities {
                 pinyin: self.family_priority.pinyin,
                 english: self.family_priority.english,
                 emoji: self.family_priority.emoji,
             },
-            freq_scale: ime_core::scoring::FreqScale {
+            freq_scale: ime_core::family::scoring::FreqScale {
                 max_weight: self.freq_scale.max_weight,
                 min_score: self.freq_scale.min_score,
                 max_score: self.freq_scale.max_score,

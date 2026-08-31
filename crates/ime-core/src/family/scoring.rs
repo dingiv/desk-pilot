@@ -1,9 +1,13 @@
-//! scoring — 可配置的打分参数。
+//! scoring — 可配置的打分参数(归属 family:打分是家族排序的词汇)。
 //!
 //! 之前这些值散落写死在各个 family / 模块里(家族优先级、recency 五档 boost、
 //! bigram boost 上限、freq→score 映射),无法在不改代码的情况下调整。现在聚合为
-//! [`ScoringConfig`],由构造者(fcitx5 前端读 `swift-ime.yaml`)注入引擎。
-//! `Default` 与旧的写死值完全一致——不配置时行为不变。
+//! [`ScoringConfig`],由构造者(fcitx5 前端读 `swift-ime.yaml`)注入引擎
+//! (`ImeEngine::with_config` → 各家族)。`Default` 与旧的写死值完全一致——
+//! 不配置时行为不变。
+//!
+//! 依赖方向:family 拥有本文件(round9 R4 同则 —— family 需要什么由 family
+//! 定义);engine/apps 只消费注入。
 
 /// 家族优先级(最终分 = raw_score × priority/100)。
 ///

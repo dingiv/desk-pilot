@@ -426,7 +426,7 @@ impl LatticeDecoder {
     ///   那样贴顶同分、退化成稳定序;
     /// - 顶流封顶 max_score(0.90),给 recent/context 合成公式留加成空间
     ///   ((1-a)(a+b)/8+a 在 a→1 时失效)。
-    pub fn freq_to_score(&self, scale: &crate::scoring::FreqScale, freq: u64) -> f64 {
+    pub fn freq_to_score(&self, scale: &crate::family::scoring::FreqScale, freq: u64) -> f64 {
         let w = freq.max(1) as f64;
         let max = if scale.max_weight > 0.0 {
             scale.max_weight
@@ -679,7 +679,7 @@ mod tests {
         b.insert(b"jixu", "急须".as_bytes(), 164_505);
         let dict = inputx_fsa::Dict::new(b.finish()).expect("dict");
         let dec = LatticeDecoder::new(dict, &path);
-        let scale = crate::scoring::FreqScale {
+        let scale = crate::family::scoring::FreqScale {
             max_weight: 0.0,
             min_score: 0.25,
             max_score: 1.0,
@@ -700,7 +700,7 @@ mod tests {
             "lower freq scores lower"
         );
         // 显式分母 + 更紧的 [min,max]:重标保持单调,顶 = max_score、底 = min_score。
-        let tight = crate::scoring::FreqScale {
+        let tight = crate::family::scoring::FreqScale {
             max_weight: 100_000.0,
             min_score: 0.25,
             max_score: 0.90,

@@ -9,7 +9,6 @@ pub mod fsm;
 pub mod frontend;
 pub mod io_thread;
 
-pub mod scoring;
 pub mod store;
 pub mod voice_state;
 

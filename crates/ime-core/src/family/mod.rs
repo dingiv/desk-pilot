@@ -216,13 +216,13 @@ pub struct UnifiedScorer {
     families: Vec<Box<dyn CandidateFamily>>,
     /// Configurable per-family priority overrides (from `swift-ime.yaml`);
     /// families without an entry keep their own `priority()`.
-    priorities: crate::scoring::FamilyPriorities,
+    priorities: FamilyPriorities,
 }
 
 impl UnifiedScorer {
     pub fn new(
         families: Vec<Box<dyn CandidateFamily>>,
-        priorities: crate::scoring::FamilyPriorities,
+        priorities: FamilyPriorities,
     ) -> Self {
         UnifiedScorer {
             families,
@@ -380,7 +380,7 @@ mod tests {
         };
         let scorer = UnifiedScorer::new(
             vec![Box::new(fam_a), Box::new(fam_b)],
-            crate::scoring::FamilyPriorities::default(),
+            FamilyPriorities::default(),
         );
         let result = scorer.rank("test");
         assert_eq!(result.len(), 1); // deduped to one
@@ -396,7 +396,7 @@ mod tests {
         };
         let scorer = UnifiedScorer::new(
             vec![Box::new(fam)],
-            crate::scoring::FamilyPriorities::default(),
+            FamilyPriorities::default(),
         );
         let result = scorer.rank("test");
         assert_eq!(&result[..3], &["high", "mid", "low"]);
@@ -418,7 +418,7 @@ mod tests {
         };
         let scorer = UnifiedScorer::new(
             vec![Box::new(pinyin), Box::new(english)],
-            crate::scoring::FamilyPriorities::default(),
+            FamilyPriorities::default(),
         );
         let result = scorer.rank("bla");
         // 候选A: 0.7 × 1.0 = 0.70, black: 1.0 × 0.6 = 0.60
@@ -454,7 +454,7 @@ mod tests {
         };
         let scorer = UnifiedScorer::new(
             vec![Box::new(DisabledFamily), Box::new(fam)],
-            crate::scoring::FamilyPriorities::default(),
+            FamilyPriorities::default(),
         );
         let result = scorer.rank("x");
         assert_eq!(result, vec!["yes"]);
@@ -469,7 +469,7 @@ mod tests {
         };
         let scorer = UnifiedScorer::new(
             vec![Box::new(fam)],
-            crate::scoring::FamilyPriorities::default(),
+            FamilyPriorities::default(),
         );
         assert!(scorer.rank("").is_empty());
     }
@@ -477,6 +477,8 @@ mod tests {
 
 // ── Submodule declarations ──────────────────────────────────────────────
 
+pub mod scoring;
+pub use scoring::{FamilyPriorities, FreqScale, ScoringConfig, PREFIX_DECAY_FREE, prefix_decay};
 pub mod emoji;
 pub mod english;
 pub mod magic;

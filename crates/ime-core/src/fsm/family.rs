@@ -1201,7 +1201,7 @@ mod step_env_tests {
             let pinyin = Arc::new(PinyinFamily::new());
             let scorer = UnifiedScorer::new(
                 vec![Box::new(Arc::clone(&pinyin))],
-                crate::scoring::FamilyPriorities::default(),
+                crate::family::scoring::FamilyPriorities::default(),
             );
             TestEnv {
                 expander: Expander::new(Arc::new(StaticProvider {

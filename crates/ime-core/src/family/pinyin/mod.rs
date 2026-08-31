@@ -43,7 +43,7 @@ pub struct PinyinFamily {
     weights: PinyinWeights,
     store: Mutex<Option<Arc<WeightStore>>>,
     /// freq→score 映射参数(swift-ime.yaml → weights.freq_scale)。
-    freq_scale: crate::scoring::FreqScale,
+    freq_scale: crate::family::scoring::FreqScale,
     /// 上下文感知开关(swift-ime.yaml → input.context_aware,默认开)。
     /// 关闭时 `predict_with_context` 退化为纯 `predict` —— 不做 recency /
     /// bigram 联想 / 整词联想加成,候选排序完全由词典频率决定。
@@ -121,17 +121,17 @@ impl PinyinFamily {
     pub fn new() -> Self {
         Self::with_scoring(
             PinyinWeights::default(),
-            crate::scoring::ScoringConfig::default(),
+            crate::family::scoring::ScoringConfig::default(),
         )
     }
 
     pub fn with_weights(weights: PinyinWeights) -> Self {
-        Self::with_scoring(weights, crate::scoring::ScoringConfig::default())
+        Self::with_scoring(weights, crate::family::scoring::ScoringConfig::default())
     }
 
     /// Full construction: pinyin weights + the unified scoring config (recency
     /// boosts, bigram ceiling, freq→score scale) from `swift-ime.yaml`.
-    pub fn with_scoring(weights: PinyinWeights, scoring: crate::scoring::ScoringConfig) -> Self {
+    pub fn with_scoring(weights: PinyinWeights, scoring: crate::family::scoring::ScoringConfig) -> Self {
         PinyinFamily {
             engine: inputx_pinyin::PinyinEngine::with_fuzzy(
                 inputx_pinyin::FuzzyConfig::permissive(),
@@ -156,14 +156,14 @@ impl PinyinFamily {
     pub fn with_phrase_book(phrase_book: PhraseBook) -> Self {
         Self::with_scoring_and_phrase_book(
             PinyinWeights::default(),
-            crate::scoring::ScoringConfig::default(),
+            crate::family::scoring::ScoringConfig::default(),
             phrase_book,
         )
     }
 
     fn with_scoring_and_phrase_book(
         weights: PinyinWeights,
-        scoring: crate::scoring::ScoringConfig,
+        scoring: crate::family::scoring::ScoringConfig,
         phrase_book: PhraseBook,
     ) -> Self {
         PinyinFamily {
@@ -597,7 +597,7 @@ impl PinyinFamily {
                             .chars()
                             .count()
                             .saturating_sub(input.chars().count());
-                        let decay = crate::scoring::prefix_decay(diff);
+                        let decay = crate::family::scoring::prefix_decay(diff);
                         base_score * self.weights.prefix_lookup * decay
                     };
                     match out.iter_mut().find(|c| c.text == r.text) {
@@ -1033,7 +1033,7 @@ mod tests {
                 Box::new(PinyinFamily::new()),
                 Box::new(EnglishFamily::with_default_dict()),
             ],
-            crate::scoring::FamilyPriorities::default(),
+            crate::family::scoring::FamilyPriorities::default(),
         );
         let name = "nihao";
         assert!(
