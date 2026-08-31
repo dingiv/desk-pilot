@@ -27,7 +27,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::family::magic::{MagicFamily, ReqFetcher};
-use crate::family::InputContext;
 use crate::fsm::family::FamilyPipeline;
 // 统一键事件由输入路由层定义(旧名 InputEvent;构造器同名,测试平移)。
 pub use crate::fsm::state::{KeyEvent, StateFlags};
@@ -42,7 +41,6 @@ struct PerContext {
     pipeline: FamilyPipeline,
     /// 输入路由层的状态机表(标志位寄存器)—— 每键路由后同步。
     table: StateMachine,
-    text_context: InputContext,
 }
 
 impl PerContext {
@@ -52,7 +50,6 @@ impl PerContext {
         PerContext {
             pipeline,
             table: StateMachine::new(),
-            text_context: InputContext::new(),
         }
     }
 }
@@ -284,8 +281,12 @@ impl ImeEngine {
     // ── ctx helpers ─────────────────────────────────────────────────────
 
     fn with_ctx<T>(&self, ctx: usize, f: impl FnOnce(&ImeEngine, &mut PerContext) -> T) -> T {
-        // FIXME: 一处不必要的 unwrap
-        let mut map = self.contexts.lock().unwrap();
+        // 锁中毒(某次 with_ctx 闭包 panic 过)不传染 —— 恢复内部数据继续,
+        // 状态机/pipeline 数据本身未损坏,panic 会把整个引擎打死。
+        let mut map = self
+            .contexts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let pc = map
             .entry(ctx)
             .or_insert_with(|| PerContext::with_page_size(self.page_size, self.candidate_meta));
@@ -352,24 +353,9 @@ impl ImeEngine {
     /// 不再自行拦截任何键。
     pub fn key_ctx(&self, ctx: usize, key: KeyEvent) -> ImeView {
         self.with_ctx(ctx, |disp, pc| {
-            pc.pipeline.context = pc.text_context.clone();
-            let view = pc.table.step(&mut pc.pipeline, key, disp);
-            let committed = ImeView::str_field(&view.commit_text);
-            // FIXME: 这个业务逻辑应该放在 route 内部, 放的位置太靠外了
-            if !committed.is_empty() {
-                pc.text_context.update(committed);
-                // Record bigram / recency(E2:按提交家族分派到对应家族表)。
-                let commit_family = pc.pipeline.last_commit_family;
-                self.record_commit(committed, commit_family);
-                // `#del` 的 del_len 选项用:记录本次提交的字符数。
-                self.record_last_commit_len(committed);
-                // 提交来源是英文候选 → 已是在词典中的词,不学成自生词
-                // (空格/数字提交英文候选的陈旧 bug)。
-                if pc.pipeline.take_last_commit_family() != Some("english") {
-                    self.learn_english_if_ascii(committed);
-                }
-            }
-            view
+            // 提交落地(context 滚动 / recency / 自生词学习)由管线内部
+            // commit_text 统一处理 —— engine 壳零回写。
+            pc.table.step(&mut pc.pipeline, key, disp)
         })
     }
 
@@ -392,21 +378,7 @@ impl ImeEngine {
     /// Select a candidate by index for a given context.
     pub fn select_ctx(&self, ctx: usize, index: usize) -> ImeView {
         self.with_ctx(ctx, |disp, pc| {
-            pc.pipeline.context = pc.text_context.clone();
             let view = pc.pipeline.select(index, disp);
-            let committed = ImeView::str_field(&view.commit_text);
-            if !committed.is_empty() {
-                pc.text_context.update(committed);
-                // E2:按提交家族分派 recency 记录。
-                let commit_family = pc.pipeline.last_commit_family;
-                self.record_commit(committed, commit_family);
-                // `#del` 的 del_len 选项用:记录本次提交的字符数。
-                self.record_last_commit_len(committed);
-                // 英文候选提交 → 不学成自生词(空格/数字提交的陈旧 bug)。
-                if pc.pipeline.take_last_commit_family() != Some("english") {
-                    self.learn_english_if_ascii(committed);
-                }
-            }
             // 路由之外的 pipeline 变更 —— 状态机表重新同步。
             pc.table.sync_from(&pc.pipeline);
             view
@@ -548,16 +520,6 @@ impl ImeEngine {
         self.pinyin_family.import_l0_json(json)
     }
 
-    /// Record a committed word for recency boosting —— 按提交家族分派(E2):
-    /// 英文候选进 english 家族的 recency 表,其余(拼音)保持原路径。
-    fn record_commit(&self, word: &str, family: Option<&str>) {
-        if family == Some("english") {
-            self.english_family.record_commit(word);
-        } else {
-            self.pinyin_family.record_commit(word);
-        }
-    }
-
     /// 候选元数据(与 [`candidates`](Self::candidates) 同序)—— 测试断言
     /// meta 对齐用;调试视图经 view.candidates[].meta 走 fill_view。
     #[cfg(test)]
@@ -621,7 +583,8 @@ impl ImeEngine {
             .unwrap()
             .entry(DEFAULT_CTX)
             .or_insert_with(|| PerContext::with_page_size(self.page_size, self.candidate_meta))
-            .text_context
+            .pipeline
+            .context
             .update(text);
     }
 
@@ -654,19 +617,6 @@ impl ImeEngine {
                 *self.persistence.lock().unwrap() = Some(pm);
             }
             Err(e) => eprintln!("[swift-ime] weight store open failed: {e}"),
-        }
-    }
-
-    /// 记录最近一次提交文本的 UTF-8 字符数(`#del` 的 `del_len` 选项读它)。
-    fn record_last_commit_len(&self, committed: &str) {
-        *self.magic.resources().last_commit_len.lock().unwrap() = committed.chars().count() as u32;
-    }
-
-    /// 提交文本是纯 ASCII 字母数字(如 cd)时,学入英文家族 user 层
-    /// (英文自生词)。汉字/emoji/符号不触发。Enter 强选 raw 的主路径。
-    fn learn_english_if_ascii(&self, committed: &str) {
-        if !committed.is_empty() && committed.chars().all(|c| c.is_ascii_alphanumeric()) {
-            self.english_family.record_learned_word(committed);
         }
     }
 
@@ -867,6 +817,23 @@ impl crate::family::FamilyEnv for ImeEngine {
     }
     fn learn_composed_phrase(&self, pinyin: &str, hanzi: &str) {
         self.pinyin_family.learn_composed_phrase(pinyin, hanzi);
+    }
+    fn record_commit_text(&self, word: &str, family: Option<&str>) {
+        if family == Some("english") {
+            self.english_family.record_commit(word);
+        } else {
+            self.pinyin_family.record_commit(word);
+        }
+    }
+    fn record_commit_len(&self, word: &str) {
+        *self.magic.resources().last_commit_len.lock().unwrap() = word.chars().count() as u32;
+    }
+    fn learn_ascii_word(&self, word: &str) {
+        // 提交文本是纯 ASCII 字母数字(如 cd)时,学入英文家族 user 层
+        // (英文自生词)。汉字/emoji/符号不触发。Enter 强选 raw 的主路径。
+        if !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric()) {
+            self.english_family.record_learned_word(word);
+        }
     }
     fn voice_cmd_tx(&self) -> Option<crate::io_thread::VoiceCmdSender> {
         self.magic.voice_cmd_tx()

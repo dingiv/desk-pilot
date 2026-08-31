@@ -134,6 +134,13 @@ pub trait FamilyEnv: Send + Sync {
     fn learn_phrase(&self, _pinyin: &str, _hanzi: &str) {}
     /// 造词学习(逐字选择完成后整词入单词本)。
     fn learn_composed_phrase(&self, _pinyin: &str, _hanzi: &str) {}
+    /// 提交落地学习:recency/bigram 按提交家族分派(`Some("english")` →
+    /// 英文家族,其余 → 拼音家族)。
+    fn record_commit_text(&self, _word: &str, _family: Option<&str>) {}
+    /// `#del` 的 del_len 选项用:记录本次提交的字符数。
+    fn record_commit_len(&self, _word: &str) {}
+    /// 纯 ASCII 字母数字提交学入英文家族 user 层(自生词;英文候选提交不学)。
+    fn learn_ascii_word(&self, _word: &str) {}
     /// 造词单字候选(首音节词典序;链式/单音节返回空)。
     fn compose_single_chars(
         &self,

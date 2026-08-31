@@ -68,9 +68,6 @@ pub struct FamilyPipeline {
     /// 命令实例 / 数字键语义。
     pub(crate) magic: MagicSession,
 
-    /// 最近一次提交的候选家族(select 后 reset 的一次性通信,信息源 =
-    /// panel.meta.find(text);引擎提交点读后即清,避免残留到后续 raw 提交)。
-    pub(crate) last_commit_family: Option<&'static str>,
 }
 
 /// 魔法命令会话(S4 状态下沉):snippet 态(`#…`)的会话状态。
@@ -135,12 +132,6 @@ pub(crate) struct CandidatePanel {
 }
 
 impl FamilyPipeline {
-    /// 取走并清空最近一次提交的候选家族(one-shot,引擎提交点读后置空,
-    /// 避免残留在后续 raw 提交上)。
-    pub(crate) fn take_last_commit_family(&mut self) -> Option<&'static str> {
-        self.last_commit_family.take()
-    }
-
     /// 面板镜像(S3 统一):last_meta → RankedCandidate,与 candidates
     /// 同序同源 —— 用户看见什么,这里就是什么。
     pub(crate) fn detailed(&self) -> Vec<crate::family::RankedCandidate> {
@@ -499,6 +490,7 @@ impl FamilyPipeline {
             }
             // 提交用 commit_text(展示转义时原文提交),光标针对展示文本。
             let commit = pred.commit_value().to_string();
+            self.commit_text(&commit, env, None);
             return match pred.cursor {
                 Some(c) => Self::commit_view_at(&commit, c),
                 None => Self::commit_view(&commit),
@@ -514,6 +506,7 @@ impl FamilyPipeline {
         // 3. rollback:提交原始缓冲。
         let raw = std::mem::take(&mut self.comp.buffer);
         self.reset();
+        self.commit_text(&raw, env, None);
         Self::commit_view(&raw)
     }
 
@@ -580,6 +573,7 @@ impl FamilyPipeline {
                 return Self::delete_view(head.delete_count);
             }
             let commit = head.commit_value().to_string();
+            self.commit_text(&commit, env, None);
             return match head.cursor {
                 Some(c) => Self::commit_view_at(&commit, c),
                 None => Self::commit_view(&commit),
@@ -588,6 +582,7 @@ impl FamilyPipeline {
         // 无预测 → 提交原始输入。
         let raw = std::mem::take(&mut self.comp.buffer);
         self.reset();
+        self.commit_text(&raw, env, None);
         Self::commit_view(&raw)
     }
 
@@ -640,10 +635,8 @@ impl FamilyPipeline {
             if !self.comp.committed_text.is_empty() {
                 env.learn_composed_phrase(&full_pinyin, &final_text);
             }
-            self.context.update(&final_text);
-            // 记录提交候选的来源家族(供引擎判断是否学成自生词 —— 英文候选不学)。
             self.reset();
-            self.last_commit_family = commit_family;
+            self.commit_text(&final_text, env, commit_family);
             Self::commit_view(&final_text)
         } else {
             // Partial commit: append this single character, shrink buffer.
@@ -667,6 +660,22 @@ impl FamilyPipeline {
         }
     }
 
+    /// 提交落地的**统一出口**:context 滚动 + 学习记录(recency/bigram/
+    /// 自生词,经 [`FamilyEnv`])。提交语义属于管线内部 —— engine 壳对
+    /// 提交零回写(原 `key_ctx`/`select_ctx` 的"太靠外"回写已内聚于此)。
+    ///
+    /// `family` = 提交内容的来源家族:`Some("english")` 只进英文 recency、
+    /// 不学自生词;`None`(raw 强选 / snippet 文本)按拼音族 recency、
+    /// ASCII 时学英文自生词 —— 与旧引擎回写行为一致。
+    pub(crate) fn commit_text(&mut self, text: &str, env: &dyn StepEnv, family: Option<&'static str>) {
+        self.context.update(text);
+        env.record_commit_text(text, family);
+        env.record_commit_len(text);
+        if family != Some("english") {
+            env.learn_ascii_word(text);
+        }
+    }
+
     pub fn reset(&mut self) {
         self.clear_active_command();
         self.state = ComposeState::Idle;
@@ -685,9 +694,6 @@ impl FamilyPipeline {
         self.magic.hints.clear();
         self.magic.predictions.clear();
         self.magic.selectable = false;
-        // last_commit_family 在 select 之后(重置之后)设置,由引擎取走;此处
-        // 清掉以防残留。select 内部会先 reset 再设,不受影响。
-        self.last_commit_family = None;
     }
 
     /// Is the candidate panel OPEN (non-empty candidate list)? Navigation/paging special keys
@@ -841,6 +847,7 @@ impl FamilyPipeline {
             KeyKind::Enter => {
                 let raw = std::mem::take(&mut self.comp.buffer);
                 self.reset();
+                self.commit_text(&raw, env, None);
                 Self::commit_view(&raw)
             }
             // Space: commit the highlighted candidate.
@@ -886,7 +893,7 @@ impl FamilyPipeline {
     fn pinyin_key(&mut self, key: KeyKind, env: &dyn StepEnv) -> ImeView {
         match key {
             KeyKind::Backspace => self.pinyin_backspace(env),
-            KeyKind::Enter => self.pinyin_enter(),
+            KeyKind::Enter => self.pinyin_enter(env),
             KeyKind::Space => self.pinyin_space(env),
             _ => Self::passthrough_view(),
         }
@@ -931,7 +938,7 @@ impl FamilyPipeline {
             self.panel.fresh = false;
             return self.query_pinyin(env);
         }
-        self.pinyin_terminator(ch)
+        self.pinyin_terminator(ch, env)
     }
 
     fn query_pinyin(&mut self, env: &dyn StepEnv) -> ImeView {
@@ -992,7 +999,7 @@ impl FamilyPipeline {
         }
     }
 
-    fn pinyin_enter(&mut self) -> ImeView {
+    fn pinyin_enter(&mut self, env: &dyn StepEnv) -> ImeView {
         // Enter 强选 raw 文本:提交原始大小写(raw_buffer),非小写 buffer。
         let raw = std::mem::take(&mut self.comp.raw_buffer);
         let committed = std::mem::take(&mut self.comp.committed_text);
@@ -1002,6 +1009,7 @@ impl FamilyPipeline {
             format!("{committed}{raw}")
         };
         self.reset();
+        self.commit_text(&text, env, None);
         Self::commit_view(&text)
     }
 
@@ -1019,6 +1027,7 @@ impl FamilyPipeline {
                 format!("{committed}{raw}")
             };
             self.panel.fresh = false;
+            self.commit_text(&text, env, None);
             return Self::commit_view(&text);
         }
 
@@ -1031,7 +1040,7 @@ impl FamilyPipeline {
         self.select(idx, env)
     }
 
-    fn pinyin_terminator(&mut self, ch: char) -> ImeView {
+    fn pinyin_terminator(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
         let fresh = self.panel.fresh;
         let top = self.panel.items.first().cloned();
         let committed = std::mem::take(&mut self.comp.committed_text);
@@ -1047,12 +1056,15 @@ impl FamilyPipeline {
             committed
         };
         if !fresh {
-            return Self::commit_view(&format!("{prefix}{raw}{ch}"));
+            let text = format!("{prefix}{raw}{ch}");
+            self.commit_text(&text, env, None);
+            return Self::commit_view(&text);
         }
         let text = match top {
             Some(t) => format!("{prefix}{}{ch}", apply_input_casing(&t, &raw)),
             None => format!("{prefix}{raw}{ch}"),
         };
+        self.commit_text(&text, env, None);
         Self::commit_view(&text)
     }
 }
