@@ -7,7 +7,8 @@
 //! - [`chain`] — `'` 链式输入的段解析(纯函数):`ti'an` / `X'#cmd` /
 //!   `X''#cmd` 的语法在此,状态机与拼音家族按它路由
 //!
-//! (stage3 后处理在 stage2 管线内联 —— post.rs 独立成文件见 R2。)
+//! - [`post`] — **stage3 后处理**:合成 → 全局调整 → 造词单字区 → 视图组装
 pub mod chain;
 pub mod family;
+pub mod post;
 pub mod state;
