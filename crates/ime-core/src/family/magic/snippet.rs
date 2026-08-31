@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use super::member::{CommandArgs, MagicMember, Prediction};
 use super::MagicResources;
-use crate::fsm::state::StepEnv;
+use super::FamilyEnv;
 
 /// 空名片段命令(`#/hello?name=Mike`)。
 pub struct SnippetMember {
@@ -49,7 +49,7 @@ impl MagicMember for SnippetMember {
         Box::new(SnippetMember::new(Arc::clone(&self.resources)))
     }
 
-    fn predict(&mut self, _ctx: usize, input: &str, env: &dyn StepEnv) -> Vec<Prediction> {
+    fn predict(&mut self, _ctx: usize, input: &str, env: &dyn FamilyEnv) -> Vec<Prediction> {
         // 输入形如 "#/hello?name=Mike" → 剥掉 `#` 后解析 `/path` 与 `?query`。
         let raw = input.strip_prefix('#').unwrap_or(input);
         let args = CommandArgs::parse(raw);

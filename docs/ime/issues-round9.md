@@ -114,4 +114,16 @@ engine.key_ctx(key)
 
 ## 执行记录
 
-(待填:R1-R4 每步落地后登记)
+- **R4 ✅ 依赖单向化**(用户点名先做,提前于 R1-R3):
+  - **`FamilyEnv` trait 定义在 family/mod.rs**(family 需要什么,family
+    自己说了算):expander / voice_cmd_tx(默认 None)/ record_pick /
+    learn_phrase / learn_composed_phrase / compose_single_chars
+  - `MagicMember::predict*/query` 的 `&dyn StepEnv` → `&dyn FamilyEnv`;
+    `pick/tick` 的 `&mut StateMachine` 参数化(成员只用 sm.ctx 与
+    sm.comp.buffer → 参数 `ctx: usize, buffer: &str`)
+  - fsm 侧:`StepEnv: FamilyEnv` 超集,只剩 fsm 特有能力(scorer /
+    first_syllable / magic);ImeEngine 与 TestEnv 各自实现 FamilyEnv
+    (家族能力)+ StepEnv(fsm 能力)
+  - **验证**:`grep crate::fsm family/` 零命中(注释链接一并清理)——
+    family → fsm 反向依赖清零,fsm → family 单向成立
+  - 测试:ime-core 157+21+2、swift-ime 7+12+15 全绿

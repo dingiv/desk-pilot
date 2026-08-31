@@ -727,7 +727,8 @@ impl ImeEngine {
             // The member is taken out so its tick can freely mutate the state
             // machine, then put back (the member may have exited itself).
             let mut member = pc.sm.magic.active.take()?;
-            let new_preds = member.tick(&mut pc.sm, disp);
+            let new_preds =
+                member.tick(pc.sm.ctx, &pc.sm.comp.buffer.clone(), disp);
             // Live 成员的 tick 当前返回 None(由 listener 主动 refresh_ui 触发);
             // 但 frontend 拉 magic_tick 时仍要拿到最新候选 —— 重新调 predict 一次。
             let preds = new_preds.unwrap_or_else(|| {
@@ -842,12 +843,9 @@ impl Default for ImeEngine {
 
 // ── StepEnv:状态机访问家族能力的接面(原 Dispatcher 职责,转发层裁撤)──
 
-impl crate::fsm::state::StepEnv for ImeEngine {
+impl crate::family::FamilyEnv for ImeEngine {
     fn expander(&self) -> &crate::Expander {
         &self.expander
-    }
-    fn scorer(&self) -> &crate::family::UnifiedScorer {
-        &self.scorer
     }
     fn record_pick(&self, pinyin: &str, word: &str) {
         // 家族私有方法(D5):经具体句柄直调 —— 学习语义只有 pinyin 有。
@@ -869,11 +867,17 @@ impl crate::fsm::state::StepEnv for ImeEngine {
     fn learn_composed_phrase(&self, pinyin: &str, hanzi: &str) {
         self.pinyin_family.learn_composed_phrase(pinyin, hanzi);
     }
-    fn magic(&self) -> &MagicFamily {
-        &self.magic
-    }
     fn voice_cmd_tx(&self) -> Option<crate::io_thread::VoiceCmdSender> {
         self.magic.voice_cmd_tx()
+    }
+}
+
+impl crate::fsm::state::StepEnv for ImeEngine {
+    fn scorer(&self) -> &crate::family::UnifiedScorer {
+        &self.scorer
+    }
+    fn magic(&self) -> &MagicFamily {
+        &self.magic
     }
 }
 

@@ -14,7 +14,7 @@
 //! entries, prediction hints and activation dispatch are all generated from the
 //! registry. No engine / FSM special-casing needed.
 
-use crate::fsm::state::{StateMachine, StepEnv};
+use super::FamilyEnv;
 
 /// 命令的一条预测选项。
 ///
@@ -118,7 +118,7 @@ impl Prediction {
     }
 
     /// 参数输入态候选:展示文本 = 完整输入(`#del/15`);选中后框架不提交文本,
-    /// 而是用完整输入调用成员 `predict` 强制触发(见 [`select_magic`](crate::fsm::state::StateMachine::select_magic))。
+    /// 而是用完整输入调用成员 `predict` 强制触发(见状态机的 select_magic)。
     pub fn submit(text: impl Into<String>) -> Self {
         Prediction {
             text: text.into(),
@@ -284,7 +284,7 @@ pub trait MagicMember: Send + Sync {
     /// 精确匹配(含参数)时的预测选项(不含 rollback)。`ctx` 是所属输入上下文
     /// (成员可发异步事件 + 订阅);`input` 是完整输入(如 `#asr?num=2`)。
     /// 返回空 = 无预测(只剩 rollback)。
-    fn predict(&mut self, ctx: usize, input: &str, env: &dyn StepEnv) -> Vec<Prediction>;
+    fn predict(&mut self, ctx: usize, input: &str, env: &dyn FamilyEnv) -> Vec<Prediction>;
 
     /// 链式预测:声明本命令感知上游(`X'#cmd` 的 X 求值结果)。
     /// `Some` → 框架把上游传给 [`predict_with_context`](MagicMember::predict_with_context),
@@ -302,7 +302,7 @@ pub trait MagicMember: Send + Sync {
         ctx: usize,
         input: &str,
         upstream: &ChainContext,
-        env: &dyn StepEnv,
+        env: &dyn FamilyEnv,
     ) -> Vec<Prediction> {
         let _ = upstream;
         self.predict(ctx, input, env)
@@ -310,8 +310,8 @@ pub trait MagicMember: Send + Sync {
 
     /// 用户选中了第 `index` 个**交互式**预测。成员更新内部状态后,调用方
     /// 重新查询 `predict` 替换选项(不上屏)。非交互预测不经过这里。
-    fn pick(&mut self, index: usize, text: &str, sm: &mut StateMachine, env: &dyn StepEnv) {
-        let _ = (index, text, sm, env); // 默认:无交互副作用
+    fn pick(&mut self, index: usize, text: &str, ctx: usize, env: &dyn FamilyEnv) {
+        let _ = (index, text, ctx, env); // 默认:无交互副作用
     }
 
     /// 该命令注册的**全部完整触发路径**(不含 `#`)。默认 = 命令名 + 别名;
@@ -325,8 +325,8 @@ pub trait MagicMember: Send + Sync {
 
     /// 异步刷新预测(live 成员:voice 版本 / req 结果落地)。返回 `Some(新预测)`
     /// 表示候选变了,调用方据此更新;`None` = 没变。
-    fn tick(&mut self, sm: &mut StateMachine, env: &dyn StepEnv) -> Option<Vec<Prediction>> {
-        let _ = (sm, env);
+    fn tick(&mut self, ctx: usize, buffer: &str, env: &dyn FamilyEnv) -> Option<Vec<Prediction>> {
+        let _ = (ctx, buffer, env);
         None
     }
 

@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use super::member::{MagicMember, Prediction};
 use super::MagicResources;
-use crate::fsm::state::{StateMachine, StepEnv};
+use super::FamilyEnv;
 
 /// Default local magic backend — override via [`MagicFamily::set_req_base`] (or the
 /// frontend's config: `magic.req_base`).
@@ -563,7 +563,7 @@ impl MagicMember for ReqMember {
         })
     }
 
-    fn predict(&mut self, ctx: usize, input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
+    fn predict(&mut self, ctx: usize, input: &str, _env: &dyn FamilyEnv) -> Vec<Prediction> {
         // 后缀从输入派生;匹配路径/后缀任一变化(含首次)→ 自动发请求。
         let prev_path = self.cur_path.clone();
         let arg = self.args_of(input);
@@ -595,7 +595,7 @@ impl MagicMember for ReqMember {
         ctx: usize,
         input: &str,
         upstream: &super::member::ChainContext,
-        env: &dyn StepEnv,
+        env: &dyn FamilyEnv,
     ) -> Vec<Prediction> {
         let up = upstream.first_text().to_string();
         if self.upstream.as_deref() != Some(up.as_str()) {
@@ -606,23 +606,22 @@ impl MagicMember for ReqMember {
         self.predict(ctx, input, env)
     }
 
-    fn pick(&mut self, _index: usize, text: &str, sm: &mut StateMachine, _env: &dyn StepEnv) {
+    fn pick(&mut self, _index: usize, text: &str, ctx: usize, _env: &dyn FamilyEnv) {
         // 只有服务器返回的交互候选才把文本传回重发;请求中/失败等状态占位不重发。
         let is_done = matches!(&*self.async_state.status.lock().unwrap(), ReqStatus::Done(_));
         if is_done {
             let url = self.url();
             let body = self.request_body(Some(text));
-            self.fire_url(sm.ctx, url, body);
+            self.fire_url(ctx, url, body);
         }
     }
 
-    fn tick(&mut self, sm: &mut StateMachine, env: &dyn StepEnv) -> Option<Vec<Prediction>> {
+    fn tick(&mut self, ctx: usize, buffer: &str, env: &dyn FamilyEnv) -> Option<Vec<Prediction>> {
         let cur = self.async_state.version.load(Ordering::Acquire);
         if cur == self.last_version {
             return None; // no request finished since the last rebuild
         }
         self.last_version = cur;
-        let input = sm.comp.buffer.clone();
-        Some(self.predict(sm.ctx, &input, env))
+        Some(self.predict(ctx, buffer, env))
     }
 }

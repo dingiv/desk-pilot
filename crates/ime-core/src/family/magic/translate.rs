@@ -9,7 +9,7 @@
 //! 语音高亮传给翻译)的联调桩。接入真实翻译模型时只改 [`translate`]。
 
 use super::member::{ChainContext, CommandArgs, ContextKind, MagicMember, Prediction};
-use crate::fsm::state::{StateMachine, StepEnv};
+use super::FamilyEnv;
 
 pub struct TranslateMember;
 
@@ -66,7 +66,7 @@ impl MagicMember for TranslateMember {
         _ctx: usize,
         input: &str,
         upstream: &ChainContext,
-        _env: &dyn StepEnv,
+        _env: &dyn FamilyEnv,
     ) -> Vec<Prediction> {
         let text = upstream.first_text();
         if text.is_empty() {
@@ -77,11 +77,11 @@ impl MagicMember for TranslateMember {
     }
 
     /// 无上游的单独调用:提示链式用法(选中不上屏)。
-    fn predict(&mut self, _ctx: usize, _input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
+    fn predict(&mut self, _ctx: usize, _input: &str, _env: &dyn FamilyEnv) -> Vec<Prediction> {
         vec![Prediction::interactive("用法:上游'#translate[/目标语言]")]
     }
 
-    fn tick(&mut self, _sm: &mut StateMachine, _env: &dyn StepEnv) -> Option<Vec<Prediction>> {
+    fn tick(&mut self, ctx: usize, buffer: &str, env: &dyn FamilyEnv) -> Option<Vec<Prediction>> {
         None
     }
 }

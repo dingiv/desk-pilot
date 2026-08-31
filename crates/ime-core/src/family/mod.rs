@@ -109,6 +109,43 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
+// ── FamilyEnv:家族侧的环境能力接面 ─────────────────────────────────────
+//
+// 依赖单向化(R4):本 trait 由 **family 定义**,fsm 侧的 `StepEnv`
+// 继承它(fsm → family 单向)。家族代码(member predict / query)只看
+// 得到 FamilyEnv —— 家族需要什么,家族自己说了算。
+
+/// 家族预测/成员会话所需的环境能力(由引擎提供实现)。
+pub trait FamilyEnv: Send + Sync {
+    /// 片段变量展开器(`$DATE` / `$CLIPBOARD` / `$CURSOR`)。
+    fn expander(&self) -> &crate::family::magic::expander::Expander;
+
+    /// voice server 命令 sender(`#asr` Attach/Detach、分字符归档)。
+    /// 未接线(测试/无 aura)时 `None`。
+    fn voice_cmd_tx(&self) -> Option<crate::io_thread::VoiceCmdSender> {
+        None
+    }
+
+    /// 拼音家族:L0 选择记录(频率加成)。
+    fn record_pick(&self, pinyin: &str, word: &str) {
+        let _ = (pinyin, word);
+    }
+    /// 学短语(已在词典的词不入本)。
+    fn learn_phrase(&self, _pinyin: &str, _hanzi: &str) {}
+    /// 造词学习(逐字选择完成后整词入单词本)。
+    fn learn_composed_phrase(&self, _pinyin: &str, _hanzi: &str) {}
+    /// 造词单字候选(首音节词典序;链式/单音节返回空)。
+    fn compose_single_chars(
+        &self,
+        _input: &str,
+        _ctx: &InputContext,
+        _existing: &[String],
+        _limit: usize,
+    ) -> Vec<ScoredCandidate> {
+        Vec::new()
+    }
+}
+
 // ── CandidateFamily trait ───────────────────────────────────────────────
 
 /// A pluggable prediction source. Each family is an independent engine

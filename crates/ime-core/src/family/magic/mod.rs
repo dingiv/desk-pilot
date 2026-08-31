@@ -32,13 +32,13 @@ pub use member::{
 };
 pub use req::{AddonCmdSpec, AddonConfig, ReqFetcher, DEFAULT_REQ_BASE};
 pub use snippet::SnippetMember;
+pub use crate::family::FamilyEnv;
 pub use translate::TranslateMember;
 pub use voice::VoiceMember;
 
 use req::ReqMember;
 
 use crate::store::snippet_md::SnippetEntry;
-use crate::fsm::state::StepEnv;
 
 /// SharedVoiceState 槽 —— voice listener task 在 IoThread 上折叠 SSE 段写入,
 /// 魔法成员 (`#asr` / `#submit`) 同步读。引擎构造时一次性注入。
@@ -277,7 +277,7 @@ impl MagicFamily {
         active: &mut Option<Box<dyn MagicMember>>,
         ctx: usize,
         input: &str,
-        env: &dyn StepEnv,
+        env: &dyn FamilyEnv,
     ) -> MagicAnswer {
         let match_input = input.trim_end_matches('\'').to_string();
         let mut ans = MagicAnswer::default();

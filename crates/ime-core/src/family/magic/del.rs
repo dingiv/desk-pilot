@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use super::member::{CommandArgs, MagicMember, Prediction};
 use super::MagicResources;
-use crate::fsm::state::{StateMachine, StepEnv};
+use super::FamilyEnv;
 
 /// 固定删除长度选项。
 const FIXED_OPTIONS: &[u32] = &[10, 20, 999];
@@ -47,7 +47,7 @@ impl MagicMember for DelMember {
         Box::new(DelMember::new(Arc::clone(&self.resources)))
     }
 
-    fn predict(&mut self, _ctx: usize, input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
+    fn predict(&mut self, _ctx: usize, input: &str, _env: &dyn FamilyEnv) -> Vec<Prediction> {
         let args = Self::args_of(input);
 
         // `#del/15` → 删除 15 个。
@@ -71,7 +71,7 @@ impl MagicMember for DelMember {
         out
     }
 
-    fn tick(&mut self, _sm: &mut StateMachine, _env: &dyn StepEnv) -> Option<Vec<Prediction>> {
+    fn tick(&mut self, ctx: usize, buffer: &str, env: &dyn FamilyEnv) -> Option<Vec<Prediction>> {
         None
     }
 }

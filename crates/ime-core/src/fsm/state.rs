@@ -526,7 +526,7 @@ impl StateMachine {
             if pred.interactive {
                 // 交互式:传给命令 → 重新预测,替换选项(不上屏)。
                 if let Some(mut m) = self.magic.active.take() {
-                    m.pick(index, &pred.text, self, env);
+                    m.pick(index, &pred.text, self.ctx, env);
                     self.magic.active = Some(m);
                 }
                 return self.query_magic(env);
@@ -1284,10 +1284,10 @@ pub(crate) fn apply_input_casing(word: &str, raw_input: &str) -> String {
 }
 
 /// Borrowed engine components needed by the FSM to evaluate transitions.
-pub trait StepEnv {
-    //(InputContext 经全路径引用;trait 方法签名保持与家族 API 一致)
-    fn expander(&self) -> &Expander;
-
+/// 状态机侧的环境接面(R4 依赖单向化):家族能力已上移
+/// [`crate::family::FamilyEnv`](由 family 定义,本 trait 继承),此处只保留
+/// fsm 特有的能力 —— 统一打分器与拼音首音节纯函数。
+pub trait StepEnv: crate::family::FamilyEnv {
     /// Unified candidate scorer — combines all families.
     fn scorer(&self) -> &crate::family::UnifiedScorer;
 
@@ -1297,38 +1297,9 @@ pub trait StepEnv {
         crate::family::pinyin::first_syllable_of(pinyin)
     }
 
-    /// 造词单字候选(逐字输入组词)—— 拼音家族私有能力(D5):链式豁免/
-    /// 多音节判定/首音节提取/单字过滤在家族内聚,壳只管调用与面板重排。
-    /// 默认空(无拼音家族的环境)。
-    fn compose_single_chars(
-        &self,
-        input: &str,
-        ctx: &crate::family::InputContext,
-        existing: &[String],
-        limit: usize,
-    ) -> Vec<crate::family::ScoredCandidate> {
-        Vec::new()
-    }
-
-    /// Record a user pick in inputx-pinyin's L0 layer for frequency boosting.
-    fn record_pick(&self, pinyin: &str, word: &str);
-
-    /// Called after a multi-step composition completes.
-    fn learn_phrase(&self, pinyin: &str, hanzi: &str);
-
-    /// Called after a composed (自生词) multi-step selection completes — the
-    /// result joins the phrase book unconditionally.
-    fn learn_composed_phrase(&self, pinyin: &str, hanzi: &str);
-
     /// The magic command registry — spawns live member instances on trigger
     /// completion, holds the shared resources (voice slot, req config).
     fn magic(&self) -> &crate::family::magic::MagicFamily;
-
-    /// 向 IoThread 上的 voice server 发命令(`#asr` 用它发 `Attach`/`Detach`)。
-    /// 默认委托 `magic()` 的共享槽 —— `Dispatcher` 无需额外字段。
-    fn voice_cmd_tx(&self) -> Option<crate::io_thread::VoiceCmdSender> {
-        self.magic().voice_cmd_tx()
-    }
 }
 
 /// 单字母输入:字母本尊 + 大小写互换置顶(english family 的 self/case 成员)。
@@ -1459,19 +1430,22 @@ mod step_env_tests {
         }
     }
 
-    impl StepEnv for TestEnv {
+    impl crate::family::FamilyEnv for TestEnv {
         fn expander(&self) -> &Expander {
             &self.expander
         }
+        fn record_pick(&self, _p: &str, _w: &str) {}
+        fn learn_phrase(&self, _p: &str, _h: &str) {}
+        fn learn_composed_phrase(&self, _p: &str, _h: &str) {}
+    }
+
+    impl StepEnv for TestEnv {
         fn scorer(&self) -> &UnifiedScorer {
             &self.scorer
         }
         fn magic(&self) -> &MagicFamily {
             &self.magic
         }
-        fn record_pick(&self, _p: &str, _w: &str) {}
-        fn learn_phrase(&self, _p: &str, _h: &str) {}
-        fn learn_composed_phrase(&self, _p: &str, _h: &str) {}
     }
 
     fn d() -> TestEnv {

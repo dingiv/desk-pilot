@@ -8,7 +8,7 @@
 //! 单独使用(`#concat` 无上游)给出提示(空链语法是它存在的意义)。
 
 use super::member::{ChainContext, ContextKind, MagicMember, Prediction};
-use crate::fsm::state::{StateMachine, StepEnv};
+use super::FamilyEnv;
 
 pub struct ConcatMember;
 
@@ -47,7 +47,7 @@ impl MagicMember for ConcatMember {
         _ctx: usize,
         _input: &str,
         upstream: &ChainContext,
-        _env: &dyn StepEnv,
+        _env: &dyn FamilyEnv,
     ) -> Vec<Prediction> {
         if upstream.items.is_empty() {
             return vec![Prediction::interactive("(上游无候选)")];
@@ -60,11 +60,11 @@ impl MagicMember for ConcatMember {
     }
 
     /// 无上游的单独调用:提示空链语法(选中不上屏)。
-    fn predict(&mut self, _ctx: usize, _input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
+    fn predict(&mut self, _ctx: usize, _input: &str, _env: &dyn FamilyEnv) -> Vec<Prediction> {
         vec![Prediction::interactive("用法:上游''#concat(两个 ' 传整页)")]
     }
 
-    fn tick(&mut self, _sm: &mut StateMachine, _env: &dyn StepEnv) -> Option<Vec<Prediction>> {
+    fn tick(&mut self, ctx: usize, buffer: &str, env: &dyn FamilyEnv) -> Option<Vec<Prediction>> {
         None
     }
 }

@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use super::member::{CommandArgs, MagicMember, Prediction};
 use super::MagicResources;
-use crate::fsm::state::StepEnv;
+use super::FamilyEnv;
 
 /// 剪贴板历史容量。
 pub const CLIP_HISTORY_CAP: usize = 20;
@@ -60,7 +60,7 @@ impl MagicMember for ClipMember {
         Box::new(ClipMember::new(Arc::clone(&self.resources)))
     }
 
-    fn predict(&mut self, ctx: usize, input: &str, _env: &dyn StepEnv) -> Vec<Prediction> {
+    fn predict(&mut self, ctx: usize, input: &str, _env: &dyn FamilyEnv) -> Vec<Prediction> {
         let raw = input.strip_prefix("#clip").unwrap_or("");
         let args = CommandArgs::parse(raw);
         let count = if args.path.is_empty() { 4 } else { 1 };

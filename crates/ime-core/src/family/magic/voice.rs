@@ -25,7 +25,7 @@ use std::sync::Arc;
 use super::member::{CommandArgs, MagicMember, Prediction};
 use super::MagicResources;
 use crate::io_thread::{VoiceCmd, VoiceCmdSender};
-use crate::fsm::state::{StateMachine, StepEnv};
+use super::FamilyEnv;
 use crate::voice_state::SharedVoiceState;
 
 const MAX_SUBMIT: usize = 4;
@@ -118,7 +118,7 @@ impl MagicMember for VoiceMember {
         Box::new(VoiceMember::new(Arc::clone(&self.resources)))
     }
 
-    fn predict(&mut self, ctx: usize, input: &str, env: &dyn StepEnv) -> Vec<Prediction> {
+    fn predict(&mut self, ctx: usize, input: &str, env: &dyn FamilyEnv) -> Vec<Prediction> {
         // 每次预测都通知 voice server 这个 ctx —— 幂等,懒 server 借此重瞄
         // 目标 / 重连 / 立即刷一次 UI。发不到(未接线)就静默,预测照常。
         match env.voice_cmd_tx().or_else(|| self.tx()) {
@@ -175,7 +175,7 @@ impl MagicMember for VoiceMember {
         }
     }
 
-    fn tick(&mut self, _sm: &mut StateMachine, _env: &dyn StepEnv) -> Option<Vec<Prediction>> {
+    fn tick(&mut self, ctx: usize, buffer: &str, env: &dyn FamilyEnv) -> Option<Vec<Prediction>> {
         // 数据变化由 voice server 主动调 `frontend.refresh_ui` 触发 —— 我们的
         // predict 已经把最新 state 算成 candidates,无需 tick 路径重建。
         None
