@@ -1,4 +1,4 @@
-//! pipeline (原 composer) — the `Pipeline` (组装车间): wires [`Stage1Recognizer`] →
+//! pipeline (原 composer) — the `Pipeline` (组装车间): wires [`recognizer::OnnxStage1Recognizer`] →
 //! [`Stage2Calibrator`] and emits [`TurnEvent`]s to a caller-supplied callback. Pure
 //! orchestration — it does no printing, no file I/O, no Stage3 logic.
 //!
@@ -43,7 +43,7 @@ use tracing::{info, warn};
 
 use crate::calibrator::{LlmInput, PassThroughCalibrator, Stage2Calibrator, Stage2CalibratorImpl};
 use crate::hub::{FinalTurn, Storage};
-use crate::recognizer::{OnnxStage1Recognizer, Stage1Config, Stage1Recognizer};
+use crate::recognizer::{OnnxStage1Recognizer, Stage1Config};
 use crate::{ParagraphId, SentenceId, Stage1Event, VadParagraph, VadSentence};
 use dp_models::http::HttpLlm;
 
@@ -261,10 +261,10 @@ impl Pipeline {
     ) where
         F: Fn(TurnEvent) + Send + Sync + 'static,
     {
-        let Pipeline { s1, s2, storage } = self;
+        let Pipeline { s1: stage1, s2, storage } = self;
         let on_turn = Arc::new(on_turn);
         // s1 被消费线程、任务(recognize_once)共享 —— Arc。
-        let s1 = Arc::new(s1);
+        let stage1 = Arc::new(stage1);
 
         // 事件桥:s1 消费循环(阻塞)→ 主循环。unbounded:send 永不阻塞消费循环。
         let (s1_tx, mut s1_rx) = tokio::sync::mpsc::unbounded_channel::<Stage1Event>();
@@ -275,7 +275,7 @@ impl Pipeline {
 
         // ── 阻塞桥 ①:scout TCP → ring(blocking pool;自动重连,永不返回)──────
         {
-            let s1 = Arc::clone(&s1);
+            let s1: Arc<OnnxStage1Recognizer> = Arc::clone(&stage1);
             let span = tracing::info_span!("aura-stage1-ingest");
             tokio::task::spawn_blocking(move || {
                 let _g = span.enter();
@@ -284,10 +284,10 @@ impl Pipeline {
         }
 
         // ── 桥 ②:s1 消费循环 —— **原生异步任务**(round14b:run 本体 async,帧等待走
-        //     Notify;VAD 每 32ms 微秒级 + 流式解码 0.5s 节流,内联在 executor 上是
+        //     Notify;VAD 每 32ms 微秒级 + 流式解码 0.3s 节流,内联在 executor 上是
         //     协作式调度的标准负载)。流式/VAD/边界决策;batch_jobs=false 不投 job。
         {
-            let s1 = Arc::clone(&s1);
+            let s1 = Arc::clone(&stage1);
             let span = tracing::info_span!("aura-stage1");
             tokio::spawn(async move {
                 let _g = span.enter();
@@ -336,7 +336,7 @@ impl Pipeline {
                         // (§7-D 回归,已修)。
                         let entry = pending.entry(paragraph_id).or_default();
                         if let Some(s) = sentences.last() {
-                            let s1c = Arc::clone(&s1);
+                            let s1c = Arc::clone(&stage1);
                             let turn = turn_tx.clone();
                             entry.push(tokio::spawn(sentence_task(
                                 s1c, paragraph_id, s.id, s.audio_id, sr, turn,
@@ -371,7 +371,7 @@ impl Pipeline {
                             sentences: pending.remove(&paragraph.id).unwrap_or_default(),
                             live: live_chain.remove(&paragraph.id),
                         };
-                        let s1c = Arc::clone(&s1);
+                        let s1c = Arc::clone(&stage1);
                         let s2c = Arc::clone(&s2);
                         let turn = turn_tx.clone();
                         let run_batch: RunParagraphBatch =

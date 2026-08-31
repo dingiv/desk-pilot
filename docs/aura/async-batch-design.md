@@ -27,7 +27,7 @@
 >   current_thread rt)便捷入口。事件语义/顺序不变,纯执行载体简化。
 > - **round14b 消费循环 async 化(同日)**:阻塞桥 ②(s1 消费循环)从 spawn_blocking
 >   改为**原生异步任务** —— 帧等待从 `Condvar` 换 `tokio::sync::Notify`(permit 语义
->   防丢唤醒),VAD(32ms/帧,微秒级)与流式解码(0.5s 节流)内联在 executor 上;
+>   防丢唤醒),VAD(32ms/帧,微秒级)在 executor 上,流式解码 round21 起独立任务;
 >   深度睡眠/恢复从 `(Mutex, Condvar)` 换 `Arc<Notify>`(daemon resume 同步侧
 >   `notify_one` 即可)。**唯一剩余阻塞桥 = scout TCP ingest(sync IO)**。
 >   trait 方法改 RPITIT + `Send`(async fn in trait 写不出 auto bound)。冒烟实测
@@ -68,6 +68,15 @@
 > - **round20b 覆盖上界走协议**:`segment_calibration` 事件**自带 `segment_id`**
 >   (触发该次纠偏的 BS 句)—— 客户端的派生记账(max_bs_sid 追踪)删除,fold
 >   直接取事件字段。SC"该覆盖谁"由 wire 契约声明,不再前端推断。
+> - **round21 流式模型独立任务**:accept/decode(ONNX 前向)从消费循环拎出 ——
+>   独立 tokio::task(**async fn**,`tokio::spawn` 交 executor 协作调度,不占阻塞
+>   线程)owns 流式 session + 节流解码,消费循环只转发帧指令(`Onset`/`Feed`/
+>   `Reset`/`Finalize`)。**VAD/分句/段落定稿从此与流式推理零共享执行流**;partial
+>   回传后仍由消费循环发射(两任务汇于同一事件出口,SF→BS→PC/PCal 全序不破)。
+>   EOS 定稿 = 每句一次 oneshot 往返(唯一同步点,B 侧本地 finalize,几十 ms)。
+>   B 侧 last_partial 状态以 `PartialMirror`(nonempty + last_change)镜像进消费
+>   循环,供 speaking 抑制 / 断流喂静音 / 停滞看门狗;重置/定稿点由消费循环直接
+>   清零(确定性,无竞态)。
 >
 > 本文取代原"Stage1 batch 异步化设计"(该设计已落地并被 round12 取代,历史内容见 git)。
 > 代码为准。行号以当前工作区为准:
@@ -259,7 +268,7 @@ Stage2 无状态(校准器 `Arc<Mutex>` 串行,LLM 单飞);`PassThrough`(LLM dis
 
 | 事件 | 触发 | 载荷要点 |
 |---|---|---|
-| `StreamFragment` | partial 变化(≈0.5s 节流)+ **句定稿一条**(EOS) | `paragraph_id` = **起音开的真段键**(round13);句定稿条同键 |
+| `StreamFragment` | partial 变化(≈0.3s 节流)+ **句定稿一条**(EOS) | `paragraph_id` = **起音开的真段键**(round13);句定稿条同键 |
 | `Batch` | 每句 EOS | 该段**全部句**快照;新句 `batch_text: None`(in-flight) |
 | `ParagraphEdge` | 关段(a/b/c 三路径) | `VadParagraph{batch_text: None, pcm: Arc}`;clip 随即逐出 |
 | `SentenceBatchReady` / `ParagraphBatchReady` | 旧编排 batch worker | round12 `batch_jobs=false` 下**不再产生**(主循环 no-op 防御) |

@@ -126,10 +126,11 @@ t0+Δ'     sentence_calibration "第一句。" ← 纠偏(双通道)再替换
 
 ## 5. 执行模型(载体)
 
-全异步编排(round14+):消费循环(VAD/流式/边界决策)是原生异步任务;唯一的阻塞桥是
-scout 采集(sync IO,blocking pool);每句的 batch 识别与纠偏、每段的重跑与定稿,都是
-spawn 出的任务——`select!` 主循环是唯一的发射点,所有发往前端的事件先统一留痕再发。
-详见 [async-batch-design.md](async-batch-design.md) §1。
+全异步编排(round14+,round21 流式再拆):消费循环(VAD/分句/段落决策)是原生异步任务;
+流式识别模型是独立 tokio::task(async fn,executor 协作调度;帧经通道转发,partial 回传
+仍从消费循环发射);阻塞桥是 scout 采集(sync IO,blocking pool);每句的 batch 识别与
+纠偏、每段的重跑与定稿,都是 spawn 出的任务——`select!` 主循环是唯一的发射点,所有发往
+前端的事件先统一留痕再发。详见 [async-batch-design.md](async-batch-design.md) §1。
 
 ---
 
@@ -154,7 +155,7 @@ spawn 出的任务——`select!` 主循环是唯一的发射点,所有发往前
   这是两级识别范式的固有代价,不是故障;
 - 切句/切段完全由静音间隔决定:句内停顿 >1s 会切句,>3.5s 关段;
 - 近讲单说话人假设:无远场/多说话人/回声消除;
-- 显示延迟下界:partial 0.5s 节流;句级精稿 = EOS + batch 耗时;段定稿 = +3.5s;
+- 显示延迟下界:partial 0.3s 节流;句级精稿 = EOS + batch 耗时;段定稿 = +3.5s;
 - 同一时刻只有一个开放段落(单段流)。
 
 ---

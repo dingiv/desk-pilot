@@ -30,7 +30,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::Notify;
+use tokio::sync::{mpsc as t_mpsc, oneshot, Notify};
 
 /// A batch job the consume loop enqueues (non-blocking, microseconds); a dedicated worker
 /// thread — spawned by [`crate::pipeline::Pipeline`] — drains this channel and runs the
@@ -84,7 +84,9 @@ use tracing::{debug, info, warn};
 use crate::audio_store::{AudioStore, DEFAULT_CAP_SAMPLES};
 use crate::buffer::AudioRing;
 use crate::scout::ScoutAudioSource;
-use crate::{AudioId, SentenceId, Stage1Event, VadEventKind, VadSentence, VadParagraph, ParagraphId};
+use crate::{
+    AudioId, ParagraphId, SentenceId, Stage1Event, VadEventKind, VadParagraph, VadSentence,
+};
 // ONNX 语音栈在 dp-models(feature `speech`)——audio-aura 不再直接依赖 sherpa-onnx。
 use dp_models::onnx::{
     AsrBackend, AsrConfig, OnnxRuntimeManager, StreamingAsrConfig, StreamingSession, VadConfig,
@@ -94,8 +96,8 @@ use dp_models::{http::HttpAsr, AsrProvider, ProviderKind};
 
 /// Default ring capacity: 10 min @ 16 kHz mono (~19 MB).
 const DEFAULT_RING_CAP: usize = 16_000 * 600;
-/// Streaming-partial decode cadence: every N paragraphs (~0.5s @ 32ms Silero paragraphs).
-const PARTIAL_EVERY_FRAMES: u32 = 15;
+/// Streaming-partial decode cadence: every N paragraphs (~0.3s @ 32ms Silero paragraphs).
+const PARTIAL_EVERY_FRAMES: u32 = 9;
 /// Stale-session watchdog: reset the streaming session when its partial has been UNCHANGED
 /// this long AND no EOS came — that means VAD never latched (audio below `threshold` =
 /// discard-by-design), and its residue (hallucinated repetitions included) must NOT leak
@@ -107,7 +109,7 @@ const STALE_SESSION_RESET: Duration = Duration::from_secs(8);
 /// 盲区里 `partial 非空` 还没翻转,但 VAD `detected()` 已经是 true —— settle 判定若
 /// 只看 partial,起音落在 merge_gap 截止点前盲区里的下一句会被**误切**(段落本该
 /// 合并;且关段后仍产生该段的 SF,客户端首选回落陈旧流式 = "batch 后退回流式"
-/// 的 round15 回归)。0.6s = 0.5s 节流 + 解码余量。
+/// 的 round15 回归)。0.6s = 0.3s 节流 + 起音补喂/解码余量。
 const VOICE_SETTLE_MARGIN: f64 = 0.6;
 
 /// settle 抑制的"说话中"判定:partial 非空,**或**最近一帧 VAD detected() 距今
@@ -275,7 +277,11 @@ impl Stage1Config {
     /// sherpa. `model` = 服务端模型名(必传;OpenAI 规范要求 multipart 带 `model` 字段,
     /// 与目标服务如 dp-router.yaml `models[].name` 对齐)。
     /// 流式 ASR + VAD 仍本地 sherpa(实时 partial 需要低延迟)。
-    pub fn with_remote_asr(mut self, endpoint: impl Into<String>, model: impl Into<String>) -> Self {
+    pub fn with_remote_asr(
+        mut self,
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
         self.asr_kind = ProviderKind::Remote {
             endpoint: endpoint.into(),
             model: model.into(),
@@ -284,15 +290,11 @@ impl Stage1Config {
     }
 }
 
-/// A Stage1 recognizer: audio in → [`Stage1Event`]s out. `run` 是**原生异步**的
-/// (round14b:帧等待走 `tokio::sync::Notify`,计算沿 VAD/流式推理在 executor 上内联)
-/// —— 调用方 `s1.run(cb).await`(永不完成直到 `running` 置 false)。
-pub trait Stage1Recognizer {
-    /// 跑消费循环直到 `running` 被置 false(idle 深度睡眠)→ 返回。daemon 恢复时重新调用。
-    /// RPITIT + 显式 `Send`(async fn in trait 无法声明 auto bound;调用方 tokio::spawn 需要)。
-    fn run(&self, on_event: &mut (dyn FnMut(Stage1Event) + Send))
-    -> impl std::future::Future<Output = ()> + Send;
-}
+// A Stage1 recognizer: audio in → [`Stage1Event`]s out. `run`(见下方 impl)是**原生
+// 异步**的(round14b:帧等待走 `tokio::sync::Notify`;round21:流式解码独立 tokio::task)
+// —— 调用方 `s1.run(cb).await`(永不完成直到 `running` 置 false)。round21b:固有
+// `async fn`(原 `Stage1Recognizer` trait 单实现、无人 dyn/泛型用,已删;Send 由内部
+// 状态自然满足,`tokio::spawn` 无碍)。
 
 /// Batch ASR turned off (`asr.backend: disable`): every pass yields empty text, which the
 /// executor maps to `batch_text: None` — the legal "batch unavailable" state consumers
@@ -306,7 +308,9 @@ impl AsrProvider for DisabledAsr {
 }
 
 /// ONNX-backed Stage1 recognizer (Silero VAD + streaming Zipformer + batch ASR via the single
-/// [`OnnxRuntimeManager`]). **Spawns no threads** — the three blocking jobs (ingest / consume
+/// [`OnnxRuntimeManager`]). round21 后内部只起**一个**任务:流式识别 worker
+/// ([`run_stream_worker`],async fn,`tokio::spawn` 交 executor 协作调度)。另两个阻塞
+/// 作业(ingest / consume
 /// loop / batch worker) are exposed as methods the `Pipeline` runs on threads it owns. The ring
 /// is shared with the ingest thread; the consume loop runs on its caller's thread; batch jobs
 /// are handed to the worker via an mpsc channel (see [`Self::new`]).
@@ -344,8 +348,9 @@ pub struct OnnxStage1Recognizer {
 }
 
 impl OnnxStage1Recognizer {
-    /// Build models from `cfg` and warm them. **Spawns no threads** (this crate never does —
-    /// the `Pipeline` owns all of them). Returns the recognizer + the RECV end of the batch-job
+    /// Build models from `cfg` and warm them. 只加载模型不spawn任务 —— 唯一的内部任务
+    /// (流式 worker)由 [`Self::run`] 每次进入时起、退出时随通道关闭而终(支持 idle 深睡
+    /// 后重复 run)。Returns the recognizer + the RECV end of the batch-job
     /// channel: the consume loop sends [`BatchJob`]s (at EOS / settle) and the `Pipeline` hands
     /// `batch_rx` to the worker thread it spawns for [`Self::run_batch_worker`].
     pub fn new(cfg: Stage1Config) -> Result<(Self, mpsc::Receiver<BatchJob>)> {
@@ -402,11 +407,15 @@ impl OnnxStage1Recognizer {
 
     /// Use an already-loaded [`OnnxRuntimeManager`] (e.g. shared with another stage). Same
     /// no-thread contract as [`Self::new`]: returns `(Self, batch_rx)`.
-    pub fn new_with_mgr(mgr: Arc<OnnxRuntimeManager>, cfg: Stage1Config) -> Result<(Self, mpsc::Receiver<BatchJob>)> {
+    pub fn new_with_mgr(
+        mgr: Arc<OnnxRuntimeManager>,
+        cfg: Stage1Config,
+    ) -> Result<(Self, mpsc::Receiver<BatchJob>)> {
         let batch_asr: Arc<dyn AsrProvider> = match (&cfg.asr_kind, cfg.batch_enabled) {
             (_, false) => Arc::new(DisabledAsr),
             (ProviderKind::Local, _) => {
-                Arc::clone(mgr.asr().expect("local mgr must carry the batch ASR")) as Arc<dyn AsrProvider>
+                Arc::clone(mgr.asr().expect("local mgr must carry the batch ASR"))
+                    as Arc<dyn AsrProvider>
             }
             (ProviderKind::Remote { endpoint, model }, _) => {
                 Arc::new(HttpAsr::new(endpoint.clone(), model.clone()))
@@ -451,8 +460,12 @@ impl OnnxStage1Recognizer {
     /// connection). **Blocking — the `Pipeline` runs it on its own thread** (this crate spawns
     /// none).
     pub fn run_ingest(&self) -> ! {
-        let src = ScoutAudioSource::with_active(self.scout_addr.clone(), WINDOW, Arc::clone(&self.active))
-            .with_chunk_ms(self.scout_chunk_ms);
+        let src = ScoutAudioSource::with_active(
+            self.scout_addr.clone(),
+            WINDOW,
+            Arc::clone(&self.active),
+        )
+        .with_chunk_ms(self.scout_chunk_ms);
         src.stream(
             move |win| {
                 let mut g = self.ring.lock().unwrap();
@@ -471,11 +484,20 @@ impl OnnxStage1Recognizer {
     /// `Err` (timeout / 断链 / 熔断) → `None` (caller falls back to streaming). The timeout +
     /// 断链熔断 live in [`dp_models::http::HttpAsr`] (ASR_TIMEOUT=3s, 断链即窗口内不发送);
     /// this just surfaces the outcome + logs the failure reason so "丢 batch" is diagnosable.
-    pub fn recognize_once(&self, pcm: &[i16], sr: u32, what: &str, paragraph_id: ParagraphId) -> Option<String> {
+    pub fn recognize_once(
+        &self,
+        pcm: &[i16],
+        sr: u32,
+        what: &str,
+        paragraph_id: ParagraphId,
+    ) -> Option<String> {
         match self.batch_asr.recognize(pcm, sr) {
             Ok(text) if !text.trim().is_empty() => Some(text),
             Ok(_) => {
-                debug!(what, paragraph_id, "batch 识别成功但文本为空(噪声/静音)→ 回退流式");
+                debug!(
+                    what,
+                    paragraph_id, "batch 识别成功但文本为空(噪声/静音)→ 回退流式"
+                );
                 None
             }
             Err(e) => {
@@ -497,7 +519,11 @@ impl OnnxStage1Recognizer {
     /// `on_result` **exactly once per job** — failure/empty map to `text: None`, jobs are never
     /// dropped (the pipeline's readiness gate relies on every job producing one result).
     /// **Blocking — the `Pipeline` runs it on its own thread.**
-    pub fn run_batch_worker(&self, rx: mpsc::Receiver<BatchJob>, on_result: &mut dyn FnMut(BatchJobResult)) {
+    pub fn run_batch_worker(
+        &self,
+        rx: mpsc::Receiver<BatchJob>,
+        on_result: &mut dyn FnMut(BatchJobResult),
+    ) {
         for job in rx {
             match job {
                 BatchJob::Sentence {
@@ -523,7 +549,11 @@ impl OnnxStage1Recognizer {
                         asr_ms,
                     });
                 }
-                BatchJob::Paragraph { paragraph_id, pcm, sr } => {
+                BatchJob::Paragraph {
+                    paragraph_id,
+                    pcm,
+                    sr,
+                } => {
                     let t0 = Instant::now();
                     let text = self.recognize_once(&pcm, sr, "段落级重跑", paragraph_id);
                     let asr_ms = t0.elapsed().as_millis() as u64;
@@ -533,7 +563,11 @@ impl OnnxStage1Recognizer {
                         batch = text.as_deref().unwrap_or("(none)"),
                         "段落级 batch 重跑完成(异步 worker)"
                     );
-                    on_result(BatchJobResult::Paragraph { paragraph_id, text, asr_ms });
+                    on_result(BatchJobResult::Paragraph {
+                        paragraph_id,
+                        text,
+                        asr_ms,
+                    });
                 }
             }
         }
@@ -589,7 +623,8 @@ async fn wait_frame(
 // ONLY the boundary math — which sentence belongs to which paragraph, and when a paragraph closes.
 
 /// The open paragraph: its settled sentences + whether a sentence is in progress (SOS seen,
-/// EOS pending). The in-progress sentence's id/timing live recognizer-side ([`ActiveSession`]);
+/// EOS pending). The in-progress sentence's id/timing live recognizer-side(消费循环 + 流式
+/// 任务);
 /// the tracker only needs "is one active" for settle suppression. `opened_at` = 起音开段时刻
 /// (VAD rising edge),供空段落 GC(起音后从未出句的微弱音频,静默满 merge_gap 即弃)。
 struct OpenParagraph {
@@ -616,7 +651,12 @@ struct ParagraphTracker {
 
 impl ParagraphTracker {
     fn new(merge_gap_s: f64) -> Self {
-        Self { merge_gap_s, next_sentence_id: 1, last_win_id: 0, open: None }
+        Self {
+            merge_gap_s,
+            next_sentence_id: 1,
+            last_win_id: 0,
+            open: None,
+        }
     }
 
     /// 生成段落 id = **创建时刻时间戳**(UNIX_EPOCH 起微秒,u64)。严格递增:
@@ -644,8 +684,12 @@ impl ParagraphTracker {
     fn on_speech_onset(&mut self, now: f64) {
         if self.open.is_none() {
             let id = self.next_win_id();
-            self.open =
-                Some(OpenParagraph { paragraph_id: id, sentences: Vec::new(), active: false, opened_at: now });
+            self.open = Some(OpenParagraph {
+                paragraph_id: id,
+                sentences: Vec::new(),
+                active: false,
+                opened_at: now,
+            });
         }
     }
 
@@ -660,8 +704,12 @@ impl ParagraphTracker {
     fn on_sos(&mut self, now: f64) -> SentenceId {
         if self.open.is_none() {
             let id = self.next_win_id();
-            self.open =
-                Some(OpenParagraph { paragraph_id: id, sentences: Vec::new(), active: false, opened_at: now });
+            self.open = Some(OpenParagraph {
+                paragraph_id: id,
+                sentences: Vec::new(),
+                active: false,
+                opened_at: now,
+            });
         }
         let sentence_id = self.next_sentence_id;
         self.next_sentence_id += 1;
@@ -689,7 +737,10 @@ impl ParagraphTracker {
     /// sentence ≥ merge_gap (using `sentence.start_s`, the BACK-DERIVED true onset), then pushes this
     /// sentence into the (possibly fresh) paragraph. Returns (settled spans, paragraph id, ALL sentences
     /// so far) — the payload IS the paragraph, so Stage2 stays stateless.
-    fn on_eos(&mut self, sentence: VadSentence) -> (Option<SettledParagraph>, ParagraphId, Vec<VadSentence>) {
+    fn on_eos(
+        &mut self,
+        sentence: VadSentence,
+    ) -> (Option<SettledParagraph>, ParagraphId, Vec<VadSentence>) {
         let settled = self.settle_if_gap(sentence.start_s);
         if self.open.is_none() {
             // First sentence, or the previous paragraph just settled. opened_at 用回溯
@@ -776,7 +827,10 @@ impl ParagraphTracker {
     }
 
     fn take_open(&mut self) -> Option<SettledParagraph> {
-        self.open.take().map(|w| SettledParagraph { paragraph_id: w.paragraph_id, sentences: w.sentences })
+        self.open.take().map(|w| SettledParagraph {
+            paragraph_id: w.paragraph_id,
+            sentences: w.sentences,
+        })
     }
 
     /// The ids the sentence currently being spoken WILL get: the open paragraph's id (or the
@@ -815,8 +869,11 @@ fn emit_paragraph_edge(
     let ids: Vec<AudioId> = settled.sentences.iter().map(|s| s.audio_id).collect();
     let pcm = Arc::new(store.concat(&ids));
     let sentence_count = settled.sentences.len();
-    let streaming_text =
-        settled.sentences.iter().map(|s| s.streaming_text.as_str()).collect::<String>();
+    let streaming_text = settled
+        .sentences
+        .iter()
+        .map(|s| s.streaming_text.as_str())
+        .collect::<String>();
     let start_s = settled.sentences.first().map(|s| s.start_s).unwrap_or(0.0);
     let end_s = settled.sentences.last().map(|s| s.end_s).unwrap_or(0.0);
     // ★ 顺序不变式(竞态防护,同 finalize_sentence):先发 `ParagraphEdge` 事件(占位建
@@ -845,9 +902,15 @@ fn emit_paragraph_edge(
     // round12:`batch_jobs = false`(Pipeline 异步任务自管 batch)→ 不投递,段落重跑由
     // pipeline 段任务经 recognize_once(paragraph.pcm) 自建。
     if sentence_count == 1 {
-        debug!(paragraph_id = settled.paragraph_id, "单句段落——复用句级 batch,跳过整段重跑(不投递 job)");
+        debug!(
+            paragraph_id = settled.paragraph_id,
+            "单句段落——复用句级 batch,跳过整段重跑(不投递 job)"
+        );
     } else if !batch_jobs {
-        debug!(paragraph_id = settled.paragraph_id, "batch_jobs=false — 段落重跑由 pipeline 段任务自建(不投递 job)");
+        debug!(
+            paragraph_id = settled.paragraph_id,
+            "batch_jobs=false — 段落重跑由 pipeline 段任务自建(不投递 job)"
+        );
     } else if let Err(e) = batch_tx.send(BatchJob::Paragraph {
         paragraph_id: settled.paragraph_id,
         pcm,
@@ -860,18 +923,17 @@ fn emit_paragraph_edge(
     store.evict(&ids);
 }
 
-/// The live streaming session + its partial-throttle state. D1 adaptation: sherpa's VAD
-/// emits SOS RETROACTIVELY (together with EOS — the sentence only pops complete), so the
-/// session CANNOT be created at speech onset. Instead it is fed CONTINUOUSLY and RESET at
-/// every sentence boundary (EOS) and paragraph settle — each session therefore covers exactly
+/// The live streaming session + its partial-throttle state — **owned by the dedicated
+/// streaming task** ([`run_stream_worker`]). D1 adaptation: sherpa's VAD emits SOS
+/// RETROACTIVELY (together with EOS — the sentence only pops complete), so the session
+/// CANNOT be created at speech onset. Instead it is fed CONTINUOUSLY and RESET at every
+/// sentence boundary (EOS) and paragraph settle — each session therefore covers exactly
 /// [previous boundary, this EOS] ≈ this one sentence (+ surrounding silence, which decodes
 /// to nothing). Per-sentence attribution is preserved; live partials keep flowing.
 struct ActiveSession {
     stream: StreamingSession,
     frames_since_partial: u32,
     last_partial: String,
-    /// When `last_partial` last CHANGED (decayed text ⇒ stale ⇒ watchdog reset).
-    last_change: Instant,
     /// Diagnostic: frames fed since the last reset.
     fed: u32,
     /// Every fed frame, accumulated — the EXACT audio this streaming session heard. At EOS this
@@ -888,10 +950,152 @@ impl ActiveSession {
             stream,
             frames_since_partial: 0,
             last_partial: String::new(),
-            last_change: Instant::now(),
             fed: 0,
             pcm: Vec::new(),
         }
+    }
+}
+
+// ── round21:流式模型独立任务 ──────────────────────────────────────────────
+// VAD 循环与流式解码彻底分任务:accept_waveform / decode_and_result(ONNX 前向,CPU
+// 密集)不再与 VAD/分句/段落定稿共享执行流。帧经无界通道转发(音频速率 31 msg/s,
+// B 处理快于实时,不积压);partial 回传后仍由消费循环发射 —— 两任务汇于同一事件
+// 出口,顺序不变式(SF…→BS→PC/PCal)不破。唯一同步点:EOS 定稿(每句一次
+// oneshot 往返,B 侧本地 finalize,几十 ms)。
+
+/// VAD 循环 → 流式任务指令。
+enum StreamCmd {
+    /// 起音(rising edge):补喂 lead-in(soft onset 进会话),重置解码节拍。
+    Onset { lead_in: Vec<Vec<i16>> },
+    /// 语音帧(`detected()` 门控;断流时的合成静音帧同路)。
+    Feed(Vec<i16>),
+    /// 会话重置(段落边界 / 停滞看门狗)。
+    Reset,
+    /// EOS 定稿:B 侧 finalize_and_result,回执后自重置会话。
+    Finalize { reply: oneshot::Sender<StreamFinal> },
+}
+
+/// finalize 回执。`pcm: None` = 流式未配置(调用方 fallback VAD 句)。
+struct StreamFinal {
+    text: String,
+    pcm: Option<Vec<i16>>,
+    fed: u32,
+}
+
+/// 流式任务回传:`text = Some(新 partial)` 仅在非空且变化时(→ 消费循环发射 SF);
+/// `nonempty` = B 侧 last_partial 非空(speaking 抑制镜像)。
+struct StreamOut {
+    text: Option<String>,
+    nonempty: bool,
+}
+
+/// B 侧 last_partial 状态的消费循环镜像(speaking 抑制 / 断流喂静音判据 / 停滞看门狗):
+/// 每次 B 回传刷新;重置/定稿点由本侧直接清零(确定性,无竞态)。
+#[derive(Clone, Copy)]
+struct PartialMirror {
+    nonempty: bool,
+    last_change: Instant,
+}
+
+impl PartialMirror {
+    fn empty() -> Self {
+        Self {
+            nonempty: false,
+            last_change: Instant::now(),
+        }
+    }
+}
+
+/// 流式识别任务**本体**(round21:async fn)。由消费循环侧 `tokio::spawn` 交出去 ——
+/// executor 协作调度(ONNX 前向几十 ms 量级,标准协作负载),**不占阻塞线程**。
+/// cmd sender drop(消费循环退出)即任务结束。
+async fn run_stream_worker(
+    mgr: Arc<OnnxRuntimeManager>,
+    sr: u32,
+    mut cmd_rx: t_mpsc::UnboundedReceiver<StreamCmd>,
+    out_tx: t_mpsc::UnboundedSender<StreamOut>,
+) {
+    let Some(asr) = mgr.streaming_asr() else {
+        // 流式未配置:与旧内联行为一致——全部 no-op;finalize 回空定稿
+        // (pcm: None → 调用方 fallback VAD 句)。
+        while let Some(cmd) = cmd_rx.recv().await {
+            if let StreamCmd::Finalize { reply } = cmd {
+                let _ = reply.send(StreamFinal {
+                    text: String::new(),
+                    pcm: None,
+                    fed: 0,
+                });
+            }
+        }
+        return;
+    };
+    let mut a = ActiveSession::new(asr.create_session());
+    while let Some(cmd) = cmd_rx.recv().await {
+        match cmd {
+            StreamCmd::Onset { lead_in } => {
+                for chunk in &lead_in {
+                    a.stream.accept_waveform(sr as i32, chunk);
+                    a.pcm.extend_from_slice(chunk);
+                    a.fed += 1;
+                }
+                a.frames_since_partial = 0; // 补喂后重新起解码节拍
+            }
+            StreamCmd::Feed(f) => {
+                a.stream.accept_waveform(sr as i32, &f);
+                a.pcm.extend_from_slice(&f); // 流式与 batch 共用同一句音频
+                a.fed += 1;
+                a.frames_since_partial += 1;
+                if a.frames_since_partial >= PARTIAL_EVERY_FRAMES {
+                    let partial = asr.decode_and_result(&a.stream);
+                    let changed = !partial.is_empty() && partial != a.last_partial;
+                    if changed {
+                        a.last_partial = partial.clone();
+                    }
+                    let _ = out_tx.send(StreamOut {
+                        text: changed.then_some(partial),
+                        nonempty: !a.last_partial.is_empty(),
+                    });
+                    a.frames_since_partial = 0;
+                }
+            }
+            StreamCmd::Reset => a = ActiveSession::new(asr.create_session()),
+            StreamCmd::Finalize { reply } => {
+                let text = asr.finalize_and_result(&a.stream);
+                let fin = StreamFinal {
+                    text,
+                    pcm: Some(std::mem::take(&mut a.pcm)),
+                    fed: a.fed,
+                };
+                let _ = reply.send(fin); // 回执失败 = 循环已退出,会话随之丢弃
+                a = ActiveSession::new(asr.create_session());
+            }
+        }
+    }
+}
+
+/// 冲刷流式任务回传:`text` 变化 → 发射 `StreamFragment`;镜像刷新(speaking 抑制 /
+/// 停滞看门狗 / 断流喂静音判据)。partial 变化时刻 = 镜像刷新时刻(与旧内联语义一致)。
+fn drain_stream_out(
+    stream_rx: &mut t_mpsc::UnboundedReceiver<StreamOut>,
+    tracker: &ParagraphTracker,
+    at_s: f64,
+    mirror: &mut PartialMirror,
+    on_event: &mut dyn FnMut(Stage1Event),
+) {
+    while let Ok(out) = stream_rx.try_recv() {
+        if out.text.is_some() {
+            mirror.last_change = Instant::now(); // partial 变化时刻 = 镜像刷新时刻
+        }
+        if let Some(text) = out.text {
+            let (paragraph_id, sentence_id) = tracker.prospective();
+            on_event(Stage1Event::StreamFragment {
+                paragraph_id,
+                sentence_id,
+                text,
+                at_s,
+            });
+        }
+        mirror.nonempty = out.nonempty;
     }
 }
 
@@ -907,7 +1111,7 @@ impl OnnxStage1Recognizer {
     async fn drain_frame(
         &self,
         ring_empty_since: &mut Option<Instant>,
-        sess: &Option<ActiveSession>,
+        partial_nonempty: bool,
         last_silence_feed: &mut Instant,
         wake_at: Option<Duration>,
     ) -> FrameResult {
@@ -923,7 +1127,7 @@ impl OnnxStage1Recognizer {
         }
         ring_empty_since.get_or_insert_with(Instant::now);
         let since = *ring_empty_since.as_ref().unwrap();
-        let has_partial = sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
+        let has_partial = partial_nonempty;
         if since.elapsed() > Duration::from_secs(2) && has_partial {
             // 断流:喂合成静音让 VAD 发 EOS(每 100ms 至多一帧,~1s 静音约 3s 墙钟)
             if last_silence_feed.elapsed() >= Duration::from_millis(100) {
@@ -931,79 +1135,35 @@ impl OnnxStage1Recognizer {
                 debug!("ring empty > 2s during speech — feeding silence to force VAD EOS");
                 FrameResult::Frame(vec![0i16; WINDOW])
             } else {
-                match wait_frame(&self.ring, &self.ring_notify, WINDOW, Some(Duration::from_millis(100))).await {
-                    Some(f) => { *ring_empty_since = None; FrameResult::Frame(f) }
+                match wait_frame(
+                    &self.ring,
+                    &self.ring_notify,
+                    WINDOW,
+                    Some(Duration::from_millis(100)),
+                )
+                .await
+                {
+                    Some(f) => {
+                        *ring_empty_since = None;
+                        FrameResult::Frame(f)
+                    }
                     None => FrameResult::Parked,
                 }
             }
         } else {
             // Park until the ingest pushes or the next deadline — 无轮询,空闲零唤醒.
             match wait_frame(&self.ring, &self.ring_notify, WINDOW, wake_at).await {
-                Some(f) => { *ring_empty_since = None; FrameResult::Frame(f) }
+                Some(f) => {
+                    *ring_empty_since = None;
+                    FrameResult::Frame(f)
+                }
                 None => FrameResult::Parked,
             }
         }
     }
 
-    /// 喂流式会话(VAD 门控):`detected()` 为 true 时 accept+解码,起音翻转(false→true)补喂
-    /// 最近 ~0.5s 的 lead-in(soft onset 进会话)。空闲 park,只累积有界 lead-in。
-    /// `accept_waveform` 与 `pcm` 喂**完全相同**的帧 → 流式与 batch 共享同一句音频。
-    fn feed_streaming(
-        &self,
-        sess: &mut Option<ActiveSession>,
-        tracker: &mut ParagraphTracker,
-        lead_in: &mut VecDeque<Vec<i16>>,
-        speech_active: &mut bool,
-        frame: &[i16],
-        sr: u32,
-        at_s: f64,
-        v_detected: bool,
-        on_event: &mut dyn FnMut(Stage1Event),
-    ) {
-        let (Some(asr), Some(a)) = (self.mgr.streaming_asr(), sess.as_mut()) else { return };
-        if v_detected {
-            if !*speech_active {
-                // ★ 起音即开段(§7-B 根治):rising edge 立刻分配真实段落 id —— 此后
-                // 本段所有 partial/事件都携带真键,幽灵段(预测键)不复存在。
-                tracker.on_speech_onset(at_s);
-                // 起音:补喂 lead-in,让流式/batch 都听到 soft onset
-                for chunk in lead_in.drain(..) {
-                    a.stream.accept_waveform(sr as i32, &chunk);
-                    a.pcm.extend_from_slice(&chunk);
-                    a.fed += 1;
-                }
-                a.frames_since_partial = 0; // 补喂后重新起解码节拍
-            }
-            a.stream.accept_waveform(sr as i32, frame);
-            a.pcm.extend_from_slice(frame); // 流式与 batch 共用同一句音频
-            a.fed += 1;
-            a.frames_since_partial += 1;
-            if a.frames_since_partial >= PARTIAL_EVERY_FRAMES {
-                let partial = asr.decode_and_result(&a.stream);
-                if !partial.is_empty() && partial != a.last_partial {
-                    let (paragraph_id, sentence_id) = tracker.prospective();
-                    on_event(Stage1Event::StreamFragment {
-                        paragraph_id,
-                        sentence_id,
-                        text: partial.clone(),
-                        at_s,
-                    });
-                    a.last_partial = partial;
-                    a.last_change = Instant::now();
-                }
-                a.frames_since_partial = 0;
-            }
-        } else {
-            // 空闲:流式会话 park;只累积有界 lead-in(供下次起音补喂)
-            lead_in.push_back(frame.to_vec());
-            if lead_in.len() > LEAD_IN_FRAMES {
-                lead_in.pop_front();
-            }
-        }
-        *speech_active = v_detected;
-    }
-
-    /// 定稿一个 VAD 句(EOS 臂):finalize 流式会话 → streaming_text,句 PCM 入 store(共享
+    /// 定稿一个 VAD 句(EOS 臂):流式任务回执(`StreamFinal`,在调用前已 oneshot 取回)
+    /// → streaming_text,句 PCM 入 store(共享 `Arc`),**入队句级 batch job(异步——消费
     /// `Arc`),**入队句级 batch job(异步——消费循环不阻塞)**,emit `Batch`(`batch_text: None`)
     /// 及可能的 `ParagraphEdge`。`fallback_pcm` = 流式未配置时的 VAD edge-extended 句。
     ///
@@ -1012,24 +1172,19 @@ impl OnnxStage1Recognizer {
     /// 自然吸收;停滞幻觉由 8s 看门狗在下一句前清掉。
     fn finalize_sentence(
         &self,
-        sess: Option<ActiveSession>,
+        stream: StreamFinal,
         tracker: &mut ParagraphTracker,
         cur_sentence: &mut SentenceId,
         sr: u32,
         end_s: f64,
         fallback_pcm: Vec<i16>,
-        fed: u32,
         on_event: &mut dyn FnMut(Stage1Event),
     ) {
-        // 句 PCM = 流式 session 累积的完整音频(含句首 soft onset)——与流式听到的完全一致,
-        // 区别只在 batch 一次整句听(大块)vs 流式逐帧听(小块)。流式未配置时 fallback VAD 句。
-        // `Arc`:store / batch job 共享同一份分配,零拷贝。
-        let sentence_pcm: Arc<Vec<i16>> =
-            Arc::new(sess.as_ref().map(|a| a.pcm.clone()).unwrap_or(fallback_pcm));
-        let streaming_text = match (self.mgr.streaming_asr(), sess.as_ref()) {
-            (Some(asr), Some(a)) => asr.finalize_and_result(&a.stream),
-            _ => String::new(),
-        };
+        // 句 PCM = 流式任务累积的完整音频(含句首 soft onset)——与流式听到的完全一致,
+        // 区别只在 batch 一次整句听(大块)vs 流式逐帧听(小块)。`pcm: None` = 流式未
+        // 配置 → fallback VAD edge-extended 句。`Arc`:store / batch job 共享同一份分配,零拷贝。
+        let sentence_pcm: Arc<Vec<i16>> = Arc::new(stream.pcm.unwrap_or(fallback_pcm));
+        let streaming_text = stream.text;
         // Speech onset back-derived from the PCM duration (SOS was retroactive, so its
         // wall-clock IS the EOS instant).
         let start_s = (end_s - sentence_pcm.len() as f64 / sr as f64).max(0.0);
@@ -1048,7 +1203,14 @@ impl OnnxStage1Recognizer {
         let (settled, paragraph_id, sentences) = tracker.on_eos(sentence);
         // A big gap settled the previous paragraph FIRST — emit it before this sentence's Batch.
         if let Some(s) = settled {
-            emit_paragraph_edge(s, &self.audio_store, &self.batch_tx, sr, self.batch_jobs, on_event);
+            emit_paragraph_edge(
+                s,
+                &self.audio_store,
+                &self.batch_tx,
+                sr,
+                self.batch_jobs,
+                on_event,
+            );
         }
         // 句级日志(debug):段落/段 id、音频时长、两路文本(异步 batch 尚未返回)、会话喂帧数。
         if let Some(s) = sentences.last() {
@@ -1056,7 +1218,7 @@ impl OnnxStage1Recognizer {
                 paragraph_id = paragraph_id,
                 sentence_id = s.id,
                 time_ms = ((s.end_s - s.start_s) * 1000.0).round() as u64,
-                fed,
+                fed = stream.fed,
                 streaming = %s.streaming_text,
                 "句定稿(句级 batch 稍后入队,异步执行)"
             );
@@ -1076,7 +1238,11 @@ impl OnnxStage1Recognizer {
         // `SentenceBatchReady`,Finalizer 找不到该段条目而丢弃它,`ready` 永不达 `expected` →
         // 该段悬挂(永不就绪)。先发 `Batch`(占位建 pending)后入队 job,则结果必在 `Batch`
         // 之后落到同一条 stage2 FIFO 通道 → 就绪计数必到齐。
-        on_event(Stage1Event::Batch { paragraph_id, sentences, sr });
+        on_event(Stage1Event::Batch {
+            paragraph_id,
+            sentences,
+            sr,
+        });
         // 入队句级 batch job(非阻塞;worker 线程跑阻塞 recognize,结果回传
         // SentenceBatchReady)。发送失败 = batch worker 已死(极端故障)——记日志继续,
         // 该句 batch 缺失按 None 处理(best_text 回退流式)。
@@ -1101,7 +1267,7 @@ impl OnnxStage1Recognizer {
 /// 否则 condvar park 到 settle deadline 才醒,flush 延迟退化回 merge_gap)。
 fn next_wake_at(
     tracker: &ParagraphTracker,
-    sess: &Option<ActiveSession>,
+    mirror: PartialMirror,
     ring_empty_since: Option<Instant>,
     now_s: f64,
     speaking: bool,
@@ -1115,15 +1281,12 @@ fn next_wake_at(
         let d = Duration::from_secs_f64(d.max(0.05));
         wake_at = Some(wake_at.map_or(d, |w| w.min(d)));
     }
-    if let Some(a) = sess.as_ref() {
-        if !a.last_partial.is_empty() {
-            let d = STALE_SESSION_RESET.saturating_sub(a.last_change.elapsed());
-            wake_at = Some(wake_at.map_or(d, |w| w.min(d)));
-        }
+    if mirror.nonempty {
+        let d = STALE_SESSION_RESET.saturating_sub(mirror.last_change.elapsed());
+        wake_at = Some(wake_at.map_or(d, |w| w.min(d)));
     }
     if let Some(since) = ring_empty_since {
-        let has_partial = sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
-        if has_partial {
+        if mirror.nonempty {
             // Silence-feed deadline: force VAD EOS if the source dropped mid-utterance.
             let d = Duration::from_secs(2).saturating_sub(since.elapsed());
             wake_at = Some(wake_at.map_or(d, |w| w.min(d)));
@@ -1132,36 +1295,42 @@ fn next_wake_at(
     wake_at
 }
 
-impl Stage1Recognizer for OnnxStage1Recognizer {
+impl OnnxStage1Recognizer {
     // R5 已整改(2026-08-30 batch 异步化): 轮询已除(ring 挂 Notify,仅真实截止时间唤醒,
     // 空闲零唤醒);batch 调用移出消费线程 —— EOS/settle 只发事件(微秒级),阻塞的
     // recognize 由 Pipeline 的句任务执行。消费循环不再被 batch 阻塞:流式/VAD/check_settle
     // 持续运行,修复了"间隔 1–3.5s 首句被吞"(batch 阻塞期间墙钟越过 merge_gap 导致段落误切)。
     // round14b:消费循环本体 async —— 帧等待 = Notify(park 空闲零唤醒),VAD(每 32ms,
-    // 微秒级)与流式解码(0.5s 节流)内联在 executor 上,量级是协作式调度的标准负载。
-    // RPITIT 返回 Future(而非 `async fn`):调用方 tokio::spawn 需要显式 `+ Send`,
-    // async fn in trait 写不出这个 bound —— clippy 的 manual_async_fn 建议在此不适用。
-    #[allow(clippy::manual_async_fn)]
-    fn run(&self, on_event: &mut (dyn FnMut(Stage1Event) + Send))
-    -> impl std::future::Future<Output = ()> + Send {
-        async {
+    // 微秒级)与流式解码(0.3s 节流)内联在 executor 上,量级是协作式调度的标准负载。
+    // round21:流式解码再拎出 —— accept/decode 全部移入独立 tokio::task(async fn,
+    // executor 协作调度),消费循环只转发帧/指令、发射事件;VAD/分句/段落定稿从此与
+    // 流式推理零共享。
+    // round21b:RPITIT 结案 —— 固有 `async fn run`(原 trait 已删)。
+    /// 跑消费循环直到 `running` 被置 false(idle 深度睡眠)→ 返回。daemon 恢复时重新调用。
+    pub async fn run(&self, on_event: &mut (dyn FnMut(Stage1Event) + Send)) {
             let sr = 16000u32;
             let start = Instant::now();
             let mut last_diag = Instant::now();
             let mut frames_in = 0u64;
 
-            let sasr = self.mgr.streaming_asr();
-            // 流式会话:段/段落边界重置,由 VAD detected() 门控喂帧。`cur_sentence` 由回溯式 SOS 分配
-            // (与 EOS 同批到达),EOS 臂用它建句。
-            let mut sess: Option<ActiveSession> = sasr.map(|asr| ActiveSession::new(asr.create_session()));
+            // round21:流式模型拎出消费循环 —— 独立 tokio::task(async fn,executor 协作
+            // 调度,不占阻塞线程)。本循环只转发帧/起音/重置/定稿指令;partial 回传后仍
+            // 从这里发射,事件全序(partial 先于 Batch/ParagraphEdge)不变。VAD(每帧,
+            // 先跑)从此不与流式解码抢同一个任务。`cur_sentence` 由回溯式 SOS 分配
+            // (与 EOS 同批到达)。
+            let (stream_tx, cmd_rx) = t_mpsc::unbounded_channel();
+            let (out_tx, mut stream_rx) = t_mpsc::unbounded_channel();
+            tokio::spawn(run_stream_worker(Arc::clone(&self.mgr), sr, cmd_rx, out_tx));
+            let has_stream = self.mgr.streaming_asr().is_some();
+            let mut mirror = PartialMirror::empty();
             let mut ring_empty_since: Option<Instant> = None;
             let mut tracker = ParagraphTracker::new(self.merge_gap_s);
             let mut cur_sentence: SentenceId = 0;
             let mut last_silence_feed = Instant::now(); // 断流喂静音的节流(100ms)
             let mut lead_in: VecDeque<Vec<i16>> = VecDeque::new(); // 起音补喂缓冲(~0.5s)
             let mut speech_active = false; // 上一帧 detected()——翻转时补喂 lead_in
-            // 最近一帧 detected()=true 的墙钟(初始 -1 = 从未有语音)—— settle 抑制的
-            // 起音盲区边际用。
+                                           // 最近一帧 detected()=true 的墙钟(初始 -1 = 从未有语音)—— settle 抑制的
+                                           // 起音盲区边际用。
             let mut last_voice_s: f64 = -1.0;
 
             loop {
@@ -1178,14 +1347,12 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
 
                 // ② 时间驱动检查:主动归档 / 段落定稿 / 停滞看门狗 / 诊断
                 let now_s = start.elapsed().as_secs_f64();
+                // ②′ 冲刷流式任务回传:partial → 事件;镜像刷新(speaking/看门狗/断流判据)
+                drain_stream_out(&mut stream_rx, &tracker, now_s, &mut mirror, on_event);
                 // `speaking` 抑制段落按墙钟定稿——回溯式 VAD 的下一句 SOS 尚未到达,若
                 // 定稿会把下一句错划进新段落。组合判定:partial 非空 **或** 起音盲区边际
                 // 内(detected() 近期见过;见 VOICE_SETTLE_MARGIN)。
-                let speaking = speech_pending(
-                    sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false),
-                    last_voice_s,
-                    now_s,
-                );
+                let speaking = speech_pending(mirror.nonempty, last_voice_s, now_s);
                 // 用户侧主动归档(IME 分字符 = "我说完了"):跳过 merge_gap 剩余等待立即整段
                 // batch。说话中(EOS 未到)保持挂起下一 tick 重试 —— 立即切段会截断尾音;
                 // 无段落则消费掉标记(空按,不让陈旧 flush 影响之后的语音)。
@@ -1193,10 +1360,21 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                     match tracker.force_settle() {
                         Some(settled) => {
                             self.flush_paragraph.store(false, Ordering::Release);
-                            info!(paragraph_id = settled.paragraph_id, sentences = settled.sentences.len(),
-                                "flush: 主动归档(跳过 merge_gap 等待)");
-                            emit_paragraph_edge(settled, &self.audio_store, &self.batch_tx, sr, self.batch_jobs, on_event);
-                            sess = sasr.map(|asr| ActiveSession::new(asr.create_session())); // 段落边界重置会话
+                            info!(
+                                paragraph_id = settled.paragraph_id,
+                                sentences = settled.sentences.len(),
+                                "flush: 主动归档(跳过 merge_gap 等待)"
+                            );
+                            emit_paragraph_edge(
+                                settled,
+                                &self.audio_store,
+                                &self.batch_tx,
+                                sr,
+                                self.batch_jobs,
+                                on_event,
+                            );
+                            let _ = stream_tx.send(StreamCmd::Reset); // 段落边界重置会话
+                            mirror.nonempty = false;
                         }
                         None if !tracker.has_open_paragraph() => {
                             self.flush_paragraph.store(false, Ordering::Release);
@@ -1205,33 +1383,52 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                     }
                 }
                 if let Some(settled) = tracker.check_settle(now_s, speaking) {
-                    emit_paragraph_edge(settled, &self.audio_store, &self.batch_tx, sr, self.batch_jobs, on_event);
-                    sess = sasr.map(|asr| ActiveSession::new(asr.create_session())); // 段落边界重置会话
+                    emit_paragraph_edge(
+                        settled,
+                        &self.audio_store,
+                        &self.batch_tx,
+                        sr,
+                        self.batch_jobs,
+                        on_event,
+                    );
+                    let _ = stream_tx.send(StreamCmd::Reset); // 段落边界重置会话
+                    mirror.nonempty = false;
                 }
-                if let Some(a) = sess.as_ref() {
-                    if !a.last_partial.is_empty() && a.last_change.elapsed() >= STALE_SESSION_RESET {
-                        warn!(stale_s = a.last_change.elapsed().as_secs(), partial = %a.last_partial,
-                            "流式会话停滞重置——VAD 未定句的微弱音频不残留到下一句");
-                        sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
-                    }
+                if mirror.nonempty && mirror.last_change.elapsed() >= STALE_SESSION_RESET {
+                    warn!(
+                        stale_s = mirror.last_change.elapsed().as_secs(),
+                        "流式会话停滞重置——VAD 未定句的微弱音频不残留到下一句"
+                    );
+                    let _ = stream_tx.send(StreamCmd::Reset);
+                    mirror.nonempty = false;
                 }
                 if last_diag.elapsed() >= Duration::from_secs(3) {
-                    let has_partial = sess.as_ref().map(|a| !a.last_partial.is_empty()).unwrap_or(false);
-                    debug!(frames = frames_in, ring = self.ring.lock().unwrap().len(), has_partial, "stage1 diag");
+                    let has_partial = mirror.nonempty;
+                    debug!(
+                        frames = frames_in,
+                        ring = self.ring.lock().unwrap().len(),
+                        has_partial,
+                        "stage1 diag"
+                    );
                     last_diag = Instant::now();
                 }
 
                 // ③ 取帧:ring 有帧直接取;空则 park 等音频/截止(断流>2s 且有 partial → 喂静音逼 EOS)
                 let wake_at = next_wake_at(
                     &tracker,
-                    &sess,
+                    mirror,
                     ring_empty_since,
                     now_s,
                     speaking,
                     self.flush_paragraph.load(Ordering::Acquire),
                 );
                 let frame = match self
-                    .drain_frame(&mut ring_empty_since, &sess, &mut last_silence_feed, wake_at)
+                    .drain_frame(
+                        &mut ring_empty_since,
+                        mirror.nonempty,
+                        &mut last_silence_feed,
+                        wake_at,
+                    )
                     .await
                 {
                     FrameResult::Frame(f) => f,
@@ -1247,12 +1444,30 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                     last_voice_s = start.elapsed().as_secs_f64();
                 }
 
-                // ⑤ 流式:VAD 门控喂帧/解码(空闲 park);起音补喂 lead_in(soft onset);
-                //    accept 与 pcm 喂同一帧 → 流式/batch 共享音频
-                self.feed_streaming(
-                    &mut sess, &mut tracker, &mut lead_in, &mut speech_active,
-                    &frame, sr, start.elapsed().as_secs_f64(), v_detected, on_event,
-                );
+                // ⑤ 流式转发(VAD 门控;模型在独立任务):起音开段(A 侧 tracker)+
+                //    补喂 lead_in(soft onset);语音帧经通道送 B accept+节流解码,partial
+                //    回传由 ②′ 发射。accept 与 pcm 喂同一帧 → 流式/batch 共享音频。
+                if has_stream {
+                    if v_detected {
+                        if !speech_active {
+                            // ★ 起音即开段(§7-B 根治):rising edge 立刻分配真实段落 id ——
+                            // 此后本段所有 partial/事件都携带真键,幽灵段(预测键)不复存在。
+                            tracker.on_speech_onset(start.elapsed().as_secs_f64());
+                            // 起音:补喂 lead-in,让流式/batch 都听到 soft onset
+                            let _ = stream_tx.send(StreamCmd::Onset {
+                                lead_in: lead_in.drain(..).collect(),
+                            });
+                        }
+                        let _ = stream_tx.send(StreamCmd::Feed(frame));
+                    } else {
+                        // 空闲:流式会话 park;只累积有界 lead-in(供下次起音补喂)
+                        lead_in.push_back(frame);
+                        if lead_in.len() > LEAD_IN_FRAMES {
+                            lead_in.pop_front();
+                        }
+                    }
+                    speech_active = v_detected;
+                }
 
                 // ⑥ 分句:SOS 分配句号(段落已在起音开启,SOS 只补 sentence id);
                 //    EOS 定稿成句(batch + ParagraphEdge)
@@ -1263,17 +1478,36 @@ impl Stage1Recognizer for OnnxStage1Recognizer {
                         }
                         VadEventKind::EndOfSpeech => {
                             let end_s = start.elapsed().as_secs_f64();
-                            let a = sess.take();
-                            let fed = a.as_ref().map(|a| a.fed).unwrap_or(0);
-                            sess = sasr.map(|asr| ActiveSession::new(asr.create_session()));
-                            self.finalize_sentence(
-                                a, &mut tracker, &mut cur_sentence, sr, end_s, ev.pcm.clone(), fed, on_event,
+                            // 先冲刷在途 partial(B 的最后一次节流解码可能尚未回传),
+                            // 再向流式任务要定稿(唯一同步点:每句一次,本地 finalize)。
+                            drain_stream_out(
+                                &mut stream_rx,
+                                &tracker,
+                                end_s,
+                                &mut mirror,
+                                on_event,
                             );
-                        }
-                    }
-                }
-            }
-        }
+                            let (ftx, frx) = oneshot::channel();
+                            let _ = stream_tx.send(StreamCmd::Finalize { reply: ftx });
+                            mirror.nonempty = false; // 会话已被 B 取走重置
+                            let stream = frx.await.unwrap_or(StreamFinal {
+                                text: String::new(),
+                                pcm: None,
+                                fed: 0,
+                            });
+                            self.finalize_sentence(
+                                stream,
+                                &mut tracker,
+                                &mut cur_sentence,
+                                sr,
+                                end_s,
+                                ev.pcm.clone(),
+                                on_event,
+                            );
+                         }
+                     }
+                 }
+             }
     }
 }
 
@@ -1300,9 +1534,15 @@ mod tests {
     #[test]
     fn speech_pending_covers_partial_lag_after_onset() {
         // 起音 t=10.0(detected=true),首 partial ~10.5 才出。
-        assert!(speech_pending(false, 10.0, 10.2), "盲区内:partial 未出也抑制");
+        assert!(
+            speech_pending(false, 10.0, 10.2),
+            "盲区内:partial 未出也抑制"
+        );
         assert!(speech_pending(false, 10.0, 10.55), "边缘仍覆盖");
-        assert!(!speech_pending(false, 10.0, 10.7), "超出边际 → 不再抑制(可定稿/GC)");
+        assert!(
+            !speech_pending(false, 10.0, 10.7),
+            "超出边际 → 不再抑制(可定稿/GC)"
+        );
         // partial 到位后接管抑制;从未有语音则不抑制。
         assert!(speech_pending(true, 0.0, 100.0), "partial 非空恒抑制");
         assert!(!speech_pending(false, -1.0, 0.0), "从未检测到语音");
@@ -1345,17 +1585,28 @@ mod tests {
         let mut t = ParagraphTracker::new(2.5);
         let s1 = t.on_sos(0.0);
         let (_, w1, _) = t.on_eos(sentence(s1, 0.0, 0.5));
-        assert!(t.check_settle(2.0, false).is_none(), "2.0 − 0.5 = 1.5 < 2.5, not yet");
-        let s = t.check_settle(3.0, false).expect("3.0 − 0.5 = 2.5 ≥ merge_gap → settle");
+        assert!(
+            t.check_settle(2.0, false).is_none(),
+            "2.0 − 0.5 = 1.5 < 2.5, not yet"
+        );
+        let s = t
+            .check_settle(3.0, false)
+            .expect("3.0 − 0.5 = 2.5 ≥ merge_gap → settle");
         assert_eq!(s.paragraph_id, w1);
-        assert!(t.check_settle(10.0, false).is_none(), "nothing open anymore");
+        assert!(
+            t.check_settle(10.0, false).is_none(),
+            "nothing open anymore"
+        );
     }
 
     #[test]
     fn force_settle_skips_merge_gap_wait() {
         // 主动归档:远未到 merge_gap 也能立即关段(IME"我说完了"信号)。
         let mut t = ParagraphTracker::new(2.5);
-        assert!(t.force_settle().is_none(), "无段落 → None(调用方消费掉 flush 标记)");
+        assert!(
+            t.force_settle().is_none(),
+            "无段落 → None(调用方消费掉 flush 标记)"
+        );
         assert!(!t.has_open_paragraph());
         let s1 = t.on_sos(0.0);
         let (_, w1, _) = t.on_eos(sentence(s1, 0.0, 0.5));
@@ -1364,7 +1615,10 @@ mod tests {
         assert_eq!(s.paragraph_id, w1);
         assert_eq!(s.sentences.len(), 1);
         assert!(!t.has_open_paragraph(), "段已关");
-        assert!(t.check_settle(100.0, false).is_none(), "settle 路径不再重复触发");
+        assert!(
+            t.check_settle(100.0, false).is_none(),
+            "settle 路径不再重复触发"
+        );
         // 归档后再次 force → 无段落 → None。
         assert!(t.force_settle().is_none());
     }
@@ -1393,10 +1647,19 @@ mod tests {
         assert!(t.settle_deadline(0.0, false).is_none(), "nothing open yet");
         let s1 = t.on_sos(0.0);
         t.on_eos(sentence(s1, 0.0, 0.5));
-        assert!((t.settle_deadline(1.0, false).unwrap() - 2.0).abs() < 1e-9, "2.5 − (1.0 − 0.5)");
-        assert!((t.settle_deadline(3.0, false).unwrap() - 0.0).abs() < 1e-9, "due now, clamped at 0");
+        assert!(
+            (t.settle_deadline(1.0, false).unwrap() - 2.0).abs() < 1e-9,
+            "2.5 − (1.0 − 0.5)"
+        );
+        assert!(
+            (t.settle_deadline(3.0, false).unwrap() - 0.0).abs() < 1e-9,
+            "due now, clamped at 0"
+        );
         let _s2 = t.on_sos(0.0); // sentence in progress (active=true)
-        assert!(t.settle_deadline(1.2, false).is_none(), "active sentence ⇒ suppressed, no deadline");
+        assert!(
+            t.settle_deadline(1.2, false).is_none(),
+            "active sentence ⇒ suppressed, no deadline"
+        );
     }
 
     #[test]
@@ -1407,7 +1670,10 @@ mod tests {
         let s1 = t.on_sos(0.0);
         t.on_eos(sentence(s1, 0.0, 0.5));
         let _s2 = t.on_sos(0.0); // sentence in progress (active=true)
-        assert!(t.check_settle(100.0, false).is_none(), "active sentence ⇒ settle suppressed");
+        assert!(
+            t.check_settle(100.0, false).is_none(),
+            "active sentence ⇒ settle suppressed"
+        );
     }
 
     #[test]
@@ -1419,10 +1685,19 @@ mod tests {
         let s1 = t.on_sos(0.0);
         t.on_eos(sentence(s1, 0.0, 0.5));
         // 下一句正在说话(SOS 尚未到),墙钟已远超 merge_gap —— speaking=true 抑制。
-        assert!(t.check_settle(100.0, true).is_none(), "speaking ⇒ settle suppressed");
-        assert!(t.settle_deadline(100.0, true).is_none(), "speaking ⇒ no settle deadline");
+        assert!(
+            t.check_settle(100.0, true).is_none(),
+            "speaking ⇒ settle suppressed"
+        );
+        assert!(
+            t.settle_deadline(100.0, true).is_none(),
+            "speaking ⇒ no settle deadline"
+        );
         // 说话停止(speaking=false)后,同一时刻立刻能定稿。
-        assert!(t.check_settle(100.0, false).is_some(), "not speaking ⇒ settle fires");
+        assert!(
+            t.check_settle(100.0, false).is_some(),
+            "not speaking ⇒ settle fires"
+        );
     }
 
     #[test]
@@ -1438,7 +1713,10 @@ mod tests {
         // …and the settle timeout fires immediately after an EOS too.
         let s3 = t.on_sos(10.0);
         t.on_eos(sentence(s3, 10.0, 10.5));
-        assert!(t.check_settle(10.5, false).is_some(), "now − end = 0 ≥ 0 → settle");
+        assert!(
+            t.check_settle(10.5, false).is_some(),
+            "now − end = 0 ≥ 0 → settle"
+        );
     }
 
     // ── round13:起音即开段 + 时间戳 id(§7-A/B 修复)──────────────────────
@@ -1456,7 +1734,9 @@ mod tests {
         assert!(settled.is_none());
         assert_eq!(w, pid, "EOS 归属段 = 起音开的段(prospective 即真键)");
         // 静默满 merge_gap 关段,下一次起音 → 新段(时间戳更大)。
-        let _ = t.check_settle(20.0, false).expect("静默 9.5s ≥ 2.5s → settle");
+        let _ = t
+            .check_settle(20.0, false)
+            .expect("静默 9.5s ≥ 2.5s → settle");
         t.on_speech_onset(20.5);
         let (pid2, _) = t.prospective();
         assert!(pid2 > pid, "时间戳 id 严格递增 —— id 即顺序");
@@ -1488,7 +1768,10 @@ mod tests {
         let (pid, _) = t.prospective();
         assert!(t.check_settle(2.0, false).is_none(), "2.0 < 2.5,未到期");
         assert!(t.has_open_paragraph(), "GC 前段还在");
-        assert!(t.check_settle(2.6, false).is_none(), "GC 静默:返回 None(无事件)");
+        assert!(
+            t.check_settle(2.6, false).is_none(),
+            "GC 静默:返回 None(无事件)"
+        );
         assert!(!t.has_open_paragraph(), "空段静默满 merge_gap 即弃");
         // 下一次起音开**新**段(id 更大),不复用陈旧空段。
         t.on_speech_onset(100.0);
@@ -1510,11 +1793,13 @@ mod tests {
         t.on_speech_onset(0.0);
         assert!(t.check_settle(100.0, true).is_none());
         assert!(t.has_open_paragraph(), "speaking ⇒ 空段不 GC");
-        assert!(t.settle_deadline(100.0, true).is_none(), "speaking ⇒ 无 GC 截止");
+        assert!(
+            t.settle_deadline(100.0, true).is_none(),
+            "speaking ⇒ 无 GC 截止"
+        );
         assert!(t.check_settle(100.0, false).is_none(), "静默后 GC");
         assert!(!t.has_open_paragraph());
     }
-
 
     fn sentence_into(store: &AudioStore, id: SentenceId) -> VadSentence {
         VadSentence {
@@ -1538,7 +1823,10 @@ mod tests {
         };
         let mut events = Vec::new();
         emit_paragraph_edge(settled, &store, &tx, 16000, true, &mut |ev| events.push(ev));
-        assert!(rx.try_recv().is_err(), "单句段落绝不投递重跑 job(复用句级 batch)");
+        assert!(
+            rx.try_recv().is_err(),
+            "单句段落绝不投递重跑 job(复用句级 batch)"
+        );
         match &events[0] {
             Stage1Event::ParagraphEdge { paragraph, .. } => assert_eq!(
                 paragraph.batch_text.as_deref(),
@@ -1561,7 +1849,11 @@ mod tests {
         emit_paragraph_edge(settled, &store, &tx, 16000, true, &mut |ev| events.push(ev));
         // 多句段落恰好投递一次重跑 job,携拼接后的整段 PCM(1600*2)。
         match rx.try_recv() {
-            Ok(BatchJob::Paragraph { paragraph_id, pcm, sr }) => {
+            Ok(BatchJob::Paragraph {
+                paragraph_id,
+                pcm,
+                sr,
+            }) => {
                 assert_eq!(paragraph_id, 1);
                 assert_eq!(pcm.len(), 3200, "job 携整段拼接 PCM");
                 assert_eq!(sr, 16000);
@@ -1583,11 +1875,13 @@ mod tests {
     fn empty_paragraph_emits_nothing_and_sends_no_job() {
         let store = AudioStore::new(1_000_000);
         let (tx, rx) = mpsc::channel();
-        let settled = SettledParagraph { paragraph_id: 1, sentences: vec![] };
+        let settled = SettledParagraph {
+            paragraph_id: 1,
+            sentences: vec![],
+        };
         let mut events = Vec::new();
         emit_paragraph_edge(settled, &store, &tx, 16000, true, &mut |ev| events.push(ev));
         assert!(events.is_empty(), "空段落不 emit 事件");
         assert!(rx.try_recv().is_err(), "空段落不投递 job");
     }
-
 }

@@ -131,7 +131,7 @@ impl VadParagraph {
     }
 }
 
-/// Events emitted by [`recognizer::Stage1Recognizer`]. Defined here (ungated) so downstream
+/// Events emitted by [`recognizer::OnnxStage1Recognizer::run`]. Defined here (ungated) so downstream
 /// crates can match on them without the `asr` feature. Append-only — consumers never mutate
 /// an earlier entity in place (the old paradigm's same-seq update is gone).
 #[derive(Debug, Clone)]

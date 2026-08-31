@@ -18,7 +18,7 @@ AudioRing（10min @16kHz mono）
    ▼
 ┌──────────────────── Stage1（音频 → 文本，边界范式）────────────────────┐
 │ 流式会话持续喂帧、段/窗口边界重置（D1 适配，见流程细节）                │
-│   → ~0.5s 节流出 StreamFragment（前瞻 id 键；只进 UI，不是 Stage2 输入）│
+│   → ~0.3s 节流出 StreamFragment（前瞻 id 键；只进 UI，不是 Stage2 输入）│
 │ 能量门：空闲(静音且冷却已过)时跳过 VAD/流式 NN（省 CPU，见流程细节 §6）│
 │ VAD 间隔 (min_silence 1s) → EOS：                                     │
 │   finalize 会话 → streaming_text                                      │
