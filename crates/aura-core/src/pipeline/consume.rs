@@ -192,6 +192,7 @@ impl OnnxStage1Recognizer {
     fn finalize_sentence(
         &self,
         stream: StreamFinal,
+        onset_s: f64,
         tracker: &mut ParagraphTracker,
         cur_sentence: &mut SentenceId,
         sr: u32,
@@ -204,9 +205,13 @@ impl OnnxStage1Recognizer {
         // 配置 → fallback VAD edge-extended 句。`Arc`:store / batch job 共享同一份分配,零拷贝。
         let sentence_pcm: Arc<Vec<i16>> = Arc::new(stream.pcm.unwrap_or(fallback_pcm));
         let streaming_text = stream.text;
-        // Speech onset back-derived from the PCM duration (SOS was retroactive, so its
-        // wall-clock IS the EOS instant).
-        let start_s = (end_s - sentence_pcm.len() as f64 / sr as f64).max(0.0);
+        // start_s = 起音墙钟(rising edge,与 on_speech_onset/check_settle 同一把
+        // 量尺);退化兜底(理论上不可达:每句 EOS 前必有翻转)才用 end−PCM 反推。
+        let start_s = if onset_s > 0.0 {
+            onset_s
+        } else {
+            (end_s - sentence_pcm.len() as f64 / sr as f64).max(0.0)
+        };
         let sentence_id = *cur_sentence;
         let sentence = VadSentence {
             id: sentence_id,
@@ -327,6 +332,11 @@ impl OnnxStage1Recognizer {
              let mut last_silence_feed = Instant::now(); // 断流喂静音的节流(100ms)
              let mut lead_in: VecDeque<Vec<i16>> = VecDeque::new(); // 起音补喂缓冲(~0.5s)
              let mut speech_active = false; // 上一帧 detected()——翻转时补喂 lead_in
+             // 本句起音墙钟(rising edge 时刻)—— round26 量尺统一:settle 判定与
+             // sentence.start_s 都用它,不再用 end−PCM 反推(PCM 含 0.5s lead-in、不含
+             // 尾随 1s 静音,反推值偏晚 ~0.5s → 间隔虚增 → 与起音判定矛盾的
+             // "同句中途换段" bug)。
+             let mut onset_at: f64 = 0.0;
              // VAD 检测前端(front.rs,与 scout 采音同模块):喂帧 + detected 快照 +
              // 起音盲区门状态都在前端侧,本循环只消费它的输出。
              let mut vad_front = VadFront::new(Arc::clone(&self.mgr));
@@ -433,7 +443,9 @@ impl OnnxStage1Recognizer {
                         if !speech_active {
                             // ★ 起音即开段(§7-B 根治):rising edge 立刻分配真实段落 id ——
                             // 此后本段所有 partial/事件都携带真键,幽灵段(预测键)不复存在。
-                            tracker.on_speech_onset(start.elapsed().as_secs_f64());
+                            let at = start.elapsed().as_secs_f64();
+                            tracker.on_speech_onset(at);
+                            onset_at = at; // 本句起音墙钟(EOS 定稿的 settle 量尺)
                             // 起音:补喂 lead-in,让流式/batch 都听到 soft onset
                             let _ = stream_tx.send(StreamCmd::Onset {
                                 lead_in: lead_in.drain(..).collect(),
@@ -466,8 +478,10 @@ impl OnnxStage1Recognizer {
                             mirror.nonempty = false; // 会话已被 B 取走重置
                             let stream =
                                 await_finalize(&mut stream_rx, &tracker, end_s, &mut mirror, on_event).await;
+                            let onset = std::mem::take(&mut onset_at);
                             self.finalize_sentence(
                                 stream,
+                                onset,
                                 &mut tracker,
                                 &mut cur_sentence,
                                 sr,

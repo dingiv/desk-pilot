@@ -8,6 +8,7 @@
 - **[pipeline.md](pipeline.md)** — 双阶段流水线架构全文:两 Stage/两间隔、时间轴工作原理、事件协议与四不变式、执行模型与通道清单、降级链、前端级联折叠。
 - **[stages.md](stages.md)** — Stage1(边界范式 VadSentence/VadParagraph)与 Stage2(联合整流)的能力、流程、wire 契约、设计沿革(D1-D4)。
 - **[client-state-sync.md](client-state-sync.md)** — 客户端状态同步:控制面/数据面/按需,5 事件协议。
+- **[new-pipeline.md](new-pipeline.md)** — 施工中:Stage0/Stage1 分界重构(Stage0VAD trait、VAD 下沉拉流线程、FrontEvent 队列、大脑事件驱动化,R1-R4 分轮)。
 - **[roadmap.md](roadmap.md)** — 已完成/近期/中期/长期。
 
 ## 🧭 设计参考

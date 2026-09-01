@@ -31,6 +31,7 @@
 | SSE 每 ~30s 掐流、UI 闪断           | `AuraClient` 的 `.timeout(30s)` 覆盖整个响应生命周期                 | round19:SSE 专用 client(仅连接超时,无总超时)                                    |
 | 同段第二句流式期间 UI 不刷新        | SC 是快照,遮住过界新句                                               | round20/20b:`sentence_calibration` 自带 `segment_id`(覆盖上界),前端 SC+尾巴续接 |
 | 前端出现幽灵段/段落错位             | 随机段 id + 预测键                                                   | round13:时间戳 id(严格递增)+ 起音即开段                                         |
+| 同一句 partial 在旧段、定稿却进新段(日志:旧段 PC/PCal 插在新句事件中间) | settle 用 end−PCM 反推 start_s(偏晚 ~0.5s → 间隔虚增),与起音判定矛盾 | round26:start_s/settle 统一用起音翻转墙钟 |
 | 流式会话幻觉复读卷入下一句          | 微弱音频悬置会话 35s                                                 | 8s 停滞看门狗重置                                                               |
 | 中文缺字出现 U+FFFD                 | SSE 逐 chunk lossy UTF-8 解码                                        | round11:跨 chunk 缓冲解码                                                       |
 | 长流丢事件                          | (见上 SSE 掐流)                                                      | round19                                                                         |
@@ -48,7 +49,8 @@
 | 17/17b/17c | 重跑 spawn_blocking+兜底;SC 触发点=BS;纠偏输入双通道(both)                                                                                                                                     |
 | 18/19      | 前端级联折叠(§8)+ 接收留痕;SSE 专用 client + hello + Resync                                                                                                                                    |
 | 20/20b     | SC 覆盖上界走协议(segment_id)                                                                                                                                                                  |
-| 21/21b     | 流式模型独立 tokio::task;run 改固有 async fn                                                                                                                                                   |
+| 21/21b | 流式模型独立 tokio::task;run 改固有 async fn |
+| 25/26 | 日志分级(流式 debug / batch·纠偏 info + 起止墙钟与耗时);settle 量尺统一(起音墙钟),修"同句中途换段" |
 | 22–24      | 模块重构:front→vad、pipeline/ 文件夹化(consume/recognizer/tracker/stream/tasks)、死路径清除(batch worker/SentenceBatchReady)、select! 臂处理器化(Ctx/Turns)、通道简化(流式一对通道,回执同通道) |
 
 ## 四、常见误报(不是 bug)

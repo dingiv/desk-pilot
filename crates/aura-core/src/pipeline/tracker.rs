@@ -86,7 +86,8 @@ impl ParagraphTracker {
     /// bug). Normally the paragraph was already opened at the speech onset
     /// ([`Self::on_speech_onset`]); the open here is only a degenerate fallback (no rising edge
     /// was ever seen). This allocates the sentence id + marks the sentence active; the settle
-    /// decision moves to [`Self::on_eos`], which back-derives the true speech onset from the PCM.
+    /// decision moves to [`Self::on_eos`], which uses the onset WALL-CLOCK recorded at the
+    /// rising edge (round26:同一把量尺;end−PCM 反推偏晚 ~0.5s,曾致"同句中途换段")。
     pub(crate) fn on_sos(&mut self, now: f64) -> SentenceId {
         if self.open.is_none() {
             let id = self.next_win_id();
@@ -120,7 +121,7 @@ impl ParagraphTracker {
     }
 
     /// Record a completed sentence. Settles the open paragraph FIRST when the gap since its last
-    /// sentence ≥ merge_gap (using `sentence.start_s`, the BACK-DERIVED true onset), then pushes this
+    /// sentence ≥ merge_gap (using `sentence.start_s` = rising-edge onset wall-clock), then pushes this
     /// sentence into the (possibly fresh) paragraph. Returns (settled spans, paragraph id, ALL sentences
     /// so far) — the payload IS the paragraph, so Stage2 stays stateless.
     pub(crate) fn on_eos(
