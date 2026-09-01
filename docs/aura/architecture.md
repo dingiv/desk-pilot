@@ -1,7 +1,7 @@
 # aura 架构（as-built 2026-08-31）
 
 > 现状权威文档。代码为准。北极星：系统级 AI 秘书（desk-pilot）。
-> 三阶段流程细节见 **`stages.md`**；路线图见 **`roadmap.md`**。
+> 流水线流程细节见 **`pipeline.md`**；路线图见 **`roadmap.md`**。
 
 ## 定位：语音助手前端 + 中间守护进程
 
@@ -27,30 +27,36 @@ dp-models       (通用模型提供库) — ModelProvider 伞形 + 能力 trait 
   ├─ mistral  本地 LLM (feature mistral): MistralLlm (mistral.rs GGUF)
   └─ http     远程: HttpAsr/HttpLlm/HttpVlm (OpenAI 兼容, reqwest::blocking)
 aura-core       (全栈流程;round23 起 pipeline/ 文件夹化)
-  ├─ pipeline/  流水线环节全家:
-  │    mod.rs        编排汇点(select! 主循环 + Ctx/Turns + on_* 处理器 + assemble)
-  │    consume.rs    消费循环(run/wait_frame/finalize_sentence/emit_paragraph_edge)
-  │    recognizer.rs 资源+配置+生命周期(mgr/ring/store、run_ingest、recognize_once)
-  │    vad.rs        音频前端(ingest_loop 采音 + VadFront 检测)
+  ├─ pipeline/  流水线环节全家(round27 重划分,文件 = 线程模型,依赖单向:
+  │    types ← spec/tracker/calibrator/vad ← stream/front ← resources ← loops/batch ← mod):
+  │    mod.rs        组装车间:Pipeline + assemble + stage1_config/stage2_calibrator(薄)
+  │    spec.rs       选型纯数据(PipelineSpec/VadSpec/StreamSpec/AsrSpec/LlmSpec)
+  │    types.rs      跨模块纯类型叶子(FrontEvent/StreamCmd/…/SettledParagraph/TurnEvent)
+  │    loops.rs      两个循环:main_loop(select! 主循环,唯一发射点)+ consume_loop(大脑)
+  │    resources.rs  资源+配置+生命周期(原 recognizer;mgr/vad/front_q/store、
+  │                 run_ingest、recognize_once)
+  │    front.rs      Stage0 拉流线程(ingest_loop 采音+检测+门控直发+断流静音)
+  │    vad.rs        Stage0 检测引擎缝(Stage0VAD trait + SileroVAD,可换引擎)
   │    stream.rs     流式识别任务(独立 tokio::task,一对通道)
-  │    tracker.rs    ParagraphTracker 纯边界数学(可单测)
-  │    tasks.rs      batch/纠偏任务壳(sentence/live_calibration/paragraph)
+  │    tracker.rs    ParagraphTracker 纯边界数学(可单测,测试在本文件)
+  │    batch.rs      batch/纠偏任务壳(原 tasks;sentence/live_calibration/paragraph)
   │    calibrator.rs Stage2CalibratorImpl + Stage2Calibrator trait
   ├─ prompt     PromptBuilder (单句指令 + 多段联合 + 双通道信封)
   ├─ lib.rs     契约(Stage1Event/TurnEvent/VadSentence/VadParagraph)+ Calibrator 封装层
   ├─ hub        Storage: AudioArchive + TurnLog + recent ring
-  ├─ archive / wav / tts / buffer / scout  辅件
+  ├─ archive / wav / tts / scout  辅件
 aura-agent      (Stage3+SDK) 能力 trait + HotwordManager + rules + view (线协议) + AuraClient SDK
 apps/audio-aura (daemon)     config 解析 (CLI/yaml→PipelineSpec) + socket (8 routes) + SSE双面
 crates/native                 napi shim (TS via VOICE_LOCAL_ROUTER)
 ```
 
-**执行模型**（round12+ 任务结构，round21 流式独立，round24 通道收敛；常驻线程只有采音）：
-`spawn_blocking` 采音线程（scout→ring，自动重连）+ 异步任务（消费循环：VAD/分句/段落
-决策，Notify 唤醒零轮询；流式识别任务：一对通道，与消费循环零共享执行流）+ 按需任务
-（每句 batch / live 纠偏 / 段重跑+定稿+归档，内部 `spawn_blocking` 干 `reqwest::blocking`
-真活）+ `select!` 主循环（**唯一发射点**，统一留痕）→ 主线程 tokio（axum SSE）。
-详见 `stages.md` / `pipeline.md` §5。
+**执行模型**（round12+ 任务结构,round21 流式独立,round24 通道收敛,R1-R4 Stage0 分界:
+常驻阻塞线程 = 拉流+VAD 检测）：
+`spawn_blocking` 拉流线程（scout→重切→`Stage0VAD::feed`→门控帧直发流式 + FrontEvent
+入队;断流喂静音也在此）+ 异步任务（消费循环=大脑:分句/段落决策,Notify 唤醒零轮询;
+流式识别任务:一对通道,与消费循环零共享执行流）+ 按需任务（每句 batch / live 纠偏 /
+段重跑+定稿+归档,内部 `spawn_blocking` 干 `reqwest::blocking` 真活）+ `select!` 主循环
+（**唯一发射点**,统一留痕）→ 主线程 tokio（axum SSE）。详见 `pipeline.md` §2(线程模型与文件地图)。
 
 ## 三阶段提交
 

@@ -56,7 +56,19 @@ impl ScoutAudioSource {
     /// Connect to `/audio` and call `on_paragraph` for each fixed-size i16 paragraph. Blocks the calling
     /// thread. Reconnects after `reconnect_delay` on any stream error. While `active == false`, it
     /// does NOT connect (and logs the pause/resume transitions).
-    pub fn stream<F: FnMut(&[i16])>(&self, mut on_paragraph: F, reconnect_delay: Duration) -> ! {
+    pub fn stream<F: FnMut(&[i16])>(&self, on_paragraph: F, reconnect_delay: Duration) -> ! {
+        self.stream_with_starve(on_paragraph, || {}, reconnect_delay)
+    }
+
+    /// [`stream`](Self::stream) + 断流钩子(R4):socket 读超时(100ms)即 `on_starved`
+    /// —— 连接**保活不重连**(超时≠断链;真断链走 read 错误→重连)。前端借此做
+    /// 时间驱动的断流喂静音:VAD 要喂到静音帧才吐 EOS,scout 停推时必须有人喂。
+    pub fn stream_with_starve<F: FnMut(&[i16]), S: FnMut()>(
+        &self,
+        mut on_paragraph: F,
+        mut on_starved: S,
+        reconnect_delay: Duration,
+    ) -> ! {
         info!(addr = %self.addr, "scout ingest started, connecting to /audio");
         let mut was_active = self.active.load(Ordering::Relaxed);
         loop {
@@ -73,16 +85,24 @@ impl ScoutAudioSource {
                 info!(addr = %self.addr, "scout ingest resumed — reconnecting");
                 was_active = true;
             }
-            if let Err(e) = self.stream_once(&mut on_paragraph) {
+            if let Err(e) = self.stream_once(&mut on_paragraph, &mut on_starved) {
                 warn!(error = %e, retry_in = ?reconnect_delay, "scout stream ended; reconnecting");
             }
             std::thread::sleep(reconnect_delay);
         }
     }
 
-    fn stream_once<F: FnMut(&[i16])>(&self, on_paragraph: &mut F) -> anyhow::Result<()> {
+    fn stream_once<F: FnMut(&[i16]), S: FnMut()>(
+        &self,
+        on_paragraph: &mut F,
+        on_starved: &mut S,
+    ) -> anyhow::Result<()> {
         let mut sock = TcpStream::connect(&self.addr)?;
         sock.set_nodelay(true)?; // minimise latency on small chunks
+        // 100ms 读超时:断流感知(超时→on_starved,保活);正常推流(quantum 级)
+        // 永不触发。chunk_ms 聚合(如 500ms)也安全:数据仍按节奏到达,饥饿计时
+        // 走"距上次数据">2s,不会误触。
+        sock.set_read_timeout(Some(Duration::from_millis(100)))?;
         // Optional client-requested push cadence: scout aggregates source buffers into ~N-ms
         // HTTP chunks (clamped to ≥ the capture quantum — it can't push faster than the source).
         let path = match self.chunk_ms {
@@ -102,7 +122,10 @@ impl ScoutAudioSource {
             if let Some(pos) = find_subseq(&buf, b"\r\n\r\n") {
                 break pos + 4; // body starts after the blank line
             }
-            let n = sock.read(&mut tmp)?;
+            let n = match read_or_starve(&mut sock, &mut tmp, on_starved)? {
+                Some(n) => n,
+                None => continue,
+            };
             if n == 0 {
                 anyhow::bail!("eof in headers");
             }
@@ -133,7 +156,10 @@ impl ScoutAudioSource {
                 State::SizeLine => {
                     // Need a complete size line ending in \r\n.
                     if find_subseq(&body, b"\r\n").is_none() {
-                        let n = sock.read(&mut tmp)?;
+                        let n = match read_or_starve(&mut sock, &mut tmp, on_starved)? {
+                            Some(n) => n,
+                            None => continue,
+                        };
                         if n == 0 { break; }
                         body.extend_from_slice(&tmp[..n]);
                         continue;
@@ -148,7 +174,10 @@ impl ScoutAudioSource {
                 State::Payload(remaining) => {
                     if body.len() < remaining + 2 {
                         // Not enough yet (payload + trailing \r\n): refill.
-                        let n = sock.read(&mut tmp)?;
+                        let n = match read_or_starve(&mut sock, &mut tmp, on_starved)? {
+                            Some(n) => n,
+                            None => continue,
+                        };
                         if n == 0 { break; }
                         body.extend_from_slice(&tmp[..n]);
                         continue;
@@ -185,6 +214,24 @@ impl ScoutAudioSource {
             }
         }
         Ok(())
+    }
+}
+
+/// Read with starvation semantics: `Ok(None)` = read timed out (100ms, no data) —
+/// caller keeps the connection and loops; NOT an eof. `Ok(Some(0))` = clean eof.
+fn read_or_starve(
+    sock: &mut TcpStream,
+    tmp: &mut [u8],
+    on_starved: &mut impl FnMut(),
+) -> anyhow::Result<Option<usize>> {
+    use std::io::ErrorKind;
+    match sock.read(tmp) {
+        Ok(n) => Ok(Some(n)),
+        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+            on_starved();
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
     }
 }
 

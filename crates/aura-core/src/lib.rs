@@ -13,7 +13,6 @@
 
 pub mod archive;
 pub mod audio_store;
-pub mod buffer;
 pub mod hub;
 pub mod pipeline;
 pub mod prompt;
@@ -22,7 +21,10 @@ pub mod tts;
 pub mod wav;
 
 pub use pipeline::calibrator::{LlmInput, PassThroughCalibrator, Stage2Calibrator, Stage2CalibratorImpl};
-pub use pipeline::{AsrSpec, LlmSpec, Pipeline, PipelineSpec, StreamSpec, TurnEvent, VadSpec};
+pub use pipeline::vad::{SileroVAD, Stage0VAD};
+pub use pipeline::spec::{AsrSpec, LlmSpec, PipelineSpec, StreamSpec, VadSpec};
+pub use pipeline::types::TurnEvent;
+pub use pipeline::Pipeline;
 pub use prompt::PromptBuilder;
 pub use hub::{FinalTurn, Storage, TurnRecord};
 

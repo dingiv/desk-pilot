@@ -10,10 +10,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::mpsc as t_mpsc;
+use tracing::debug;
 
 use dp_models::onnx::{OnnxRuntimeManager, StreamingSession};
 
 use crate::pipeline::tracker::ParagraphTracker;
+use crate::pipeline::types::{PartialMirror, StreamCmd, StreamFinal, StreamOut};
 use crate::Stage1Event;
 
 /// Streaming-partial decode cadence: every N paragraphs (~0.3s @ 32ms Silero paragraphs).
@@ -66,53 +68,6 @@ impl ActiveSession {
 // 回执走同一条 out 通道的 `Finalized` 变体 —— round24 起不再有 per-句 oneshot,
 // 整个任务只有一对通道)。
 
-/// VAD 循环 → 流式任务指令。
-pub(crate) enum StreamCmd {
-    /// 起音(rising edge):补喂 lead-in(soft onset 进会话),重置解码节拍。
-    Onset { lead_in: Vec<Vec<i16>> },
-    /// 语音帧(`detected()` 门控;断流时的合成静音帧同路)。
-    Feed(Vec<i16>),
-    /// 会话重置(段落边界 / 停滞看门狗)。
-    Reset,
-    /// EOS 定稿:B 侧 finalize_and_result,回执(`StreamOut::Finalized`)经 out
-    /// 通道返回,随后自重置会话。
-    Finalize,
-}
-
-/// finalize 回执。`pcm: None` = 流式未配置(调用方 fallback VAD 句)。
-pub(crate) struct StreamFinal {
-    pub(crate) text: String,
-    pub(crate) pcm: Option<Vec<i16>>,
-    pub(crate) fed: u32,
-}
-
-/// 流式任务回传(out 通道):partial 或 EOS 定稿回执 —— 单通道双向语义,不再有
-/// per-句 oneshot(round24)。
-pub(crate) enum StreamOut {
-    /// partial:`text = Some(新 partial)` 仅在非空且变化时(→ 消费循环发射 SF);
-    /// `nonempty` = B 侧 last_partial 非空(speaking 抑制镜像)。
-    Partial { text: Option<String>, nonempty: bool },
-    /// EOS 定稿回执(必为该句最后一个回传消息 —— B 收到 Finalize 后不再有 Feed 在途)。
-    Finalized(Box<StreamFinal>),
-}
-
-/// B 侧 last_partial 状态的消费循环镜像(speaking 抑制 / 断流喂静音判据 / 停滞看门狗):
-/// 每次 B 回传刷新;重置/定稿点由本侧直接清零(确定性,无竞态)。
-#[derive(Clone, Copy)]
-pub(crate) struct PartialMirror {
-    pub(crate) nonempty: bool,
-    pub(crate) last_change: Instant,
-}
-
-impl PartialMirror {
-    pub(crate) fn empty() -> Self {
-        Self {
-            nonempty: false,
-            last_change: Instant::now(),
-        }
-    }
-}
-
 /// 流式识别任务**本体**(round21:async fn)。由消费循环侧 `tokio::spawn` 交出去 ——
 /// executor 协作调度(ONNX 前向几十 ms 量级,标准协作负载),**不占阻塞线程**。
 /// cmd sender drop(消费循环退出)即任务结束。
@@ -139,7 +94,8 @@ pub(crate) async fn run_stream_worker(
     let mut a = ActiveSession::new(asr.create_session());
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
-            StreamCmd::Onset { lead_in } => {
+            StreamCmd::Onset { at, lead_in } => {
+                debug!(at, chunks = lead_in.len(), "stream 会话起音(重置+补喂 lead_in)");
                 for chunk in &lead_in {
                     a.stream.accept_waveform(sr as i32, chunk);
                     a.pcm.extend_from_slice(chunk);

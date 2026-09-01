@@ -51,6 +51,8 @@
 | 20/20b     | SC 覆盖上界走协议(segment_id)                                                                                                                                                                  |
 | 21/21b | 流式模型独立 tokio::task;run 改固有 async fn |
 | 25/26 | 日志分级(流式 debug / batch·纠偏 info + 起止墙钟与耗时);settle 量尺统一(起音墙钟),修"同句中途换段" |
+| R1–R4(见 pipeline.md 附录 B) | Stage0/Stage1 分界:Stage0VAD trait+SileroVAD;VAD 检测下沉拉流线程;FrontEvent 队列取代 AudioRing;门控帧前端直发流式(Onset 携 onset 墙钟);断流喂静音迁前端(scout 100ms 读超时钩子) |
+| R5(见 pipeline.md 附录 B) | 模块重划分:types/spec/front/loops/batch/resources(原 consume+mod.run+tasks+recognizer+vad 重组);纯移动零逻辑,381 测试不变 |
 | 22–24      | 模块重构:front→vad、pipeline/ 文件夹化(consume/recognizer/tracker/stream/tasks)、死路径清除(batch worker/SentenceBatchReady)、select! 臂处理器化(Ctx/Turns)、通道简化(流式一对通道,回执同通道) |
 
 ## 四、常见误报(不是 bug)

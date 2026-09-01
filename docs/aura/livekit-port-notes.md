@@ -1,7 +1,7 @@
 # LiveKit Agents → Rust 移植笔记（历史）
 
 > **状态**：📋 施工蓝本，**大部分已被边界范式取代**（2026-08-17）。仅保留"采纳 vs 跳过"
-> 结论与参考来源；详细设计见 `stages.md`。B 部分（流式接力/barge-in）等 TTS 真后端
+> 结论与参考来源；详细设计见 `pipeline.md`。B 部分（流式接力/barge-in）等 TTS 真后端
 > （M2 Kokoro）再动工。
 
 来源：精读 `/workspaces/gui_agent/livekit-agents`（Python）。LiveKit ≈ 我们的 Stage1+Stage2
@@ -15,7 +15,7 @@ WebRTC/房间/多参与者，音频源为 omni-scout HTTP。
   `VadSegment`/`VadWindow` + 段级/窗口级 batch。
 - VAD 滞回参数（min_speech / min_silence）——在 `vad.min_silence` 等配置。
 - 断句状态机（min/max delay + 语义 turn-detector）——**未照搬**：用 `min_silence`（切段）
-  与 `merge_gap`（合并窗口）解耦替代（见 `stages.md`）。
+  与 `merge_gap`（合并窗口）解耦替代（见 `pipeline.md`）。
 - 并发原语映射（Future→oneshot / Event→Notify / Task→JoinHandle）——B 部分用。
 
 **跳过**：WebRTC/SFU/房间/多参与者/AEC（本地单用户）；语义 turn-detector（中文 EOU

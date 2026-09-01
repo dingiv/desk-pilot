@@ -1,10 +1,11 @@
-//! recognizer — Stage1 **编排层**:音频环 + 消费循环(`run`:VAD 喂帧 → 段落决策 →
+//! resources —(原 recognizer.rs,round27 正名)Stage1 **资源/配置/生命周期层**:音频环 + 消费循环(`run`:VAD 喂帧 → 段落决策 →
 //! 驱动流式/batch)与 batch worker。Owns ALL the consume-loop state, emitting
 //! [`Stage1Event`]s — it does NOT touch files or run Stage2 (that's `pipeline`'s job,
 //! `audio_aura_core::Pipeline`).
 //!
-//! round22 模块拆分:采音循环 + **VAD 检测** = `front.rs`(音频前端,VadFront);
-//! 分句/段落边界数学 = `tracker.rs`;流式识别任务 = `stream.rs`;本文件只剩编排。
+//! round22 模块拆分:采音+检测+门控 = `vad.rs`(Stage0 前端,Stage0VAD/SileroVAD);
+//! 消费循环(大脑)= `consume.rs`(顶层函数);分句/段落边界数学 = `tracker.rs`;
+//! 流式识别任务 = `stream.rs`;本文件只剩资源/配置/生命周期。
 //!
 //! **本 crate 不创建任何线程** —— 阻塞工作全部以函数暴露,线程/任务由 `Pipeline` 创建并运行:
 //! - [`Self::run_ingest`] — scout TCP → AudioRing(阻塞,自动重连);
@@ -26,7 +27,9 @@
 //! pipeline.run(running, resume, |ev| { /* TurnEvents */ });
 //! ```
 
+use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 use tokio::sync::Notify;
 use std::sync::{Arc, Mutex};
 
@@ -35,16 +38,16 @@ use anyhow::{bail, Result};
 use tracing::{info, warn};
 
 use crate::audio_store::{AudioStore, DEFAULT_CAP_SAMPLES};
-use crate::buffer::AudioRing;
+use crate::pipeline::types::StreamCmd;
+use crate::pipeline::types::{FrontBridge, FrontEvent};
+use crate::pipeline::vad::{SileroVAD, Stage0VAD};
+use tokio::sync::mpsc as t_mpsc;
 use crate::ParagraphId;
 // ONNX 语音栈在 dp-models(feature `speech`)——audio-aura 不再直接依赖 sherpa-onnx。
 use dp_models::onnx::{
     AsrBackend, AsrConfig, OnnxRuntimeManager, StreamingAsrConfig, VadConfig,
 };
 use dp_models::{http::HttpAsr, AsrProvider, ProviderKind};
-
-/// Default ring capacity: 10 min @ 16 kHz mono (~19 MB).
-const DEFAULT_RING_CAP: usize = 16_000 * 600;
 
 // batch 实时性约束(实时管线,不能死等):
 // - 每请求**硬超时** + **断链熔断**都在 `dp_models::http::HttpAsr` 内
@@ -78,7 +81,6 @@ pub struct Stage1Config {
     pub vad: VadConfig,
     pub asr: AsrConfig,
     pub streaming: StreamingAsrConfig,
-    pub ring_cap_samples: usize,
     /// 客户端请求 scout 的推流 cadence(ms):`?chunk_ms=N` 让 scout 把源 buffer 聚合成
     /// N-ms 的 HTTP chunk 再推(不能快过 scout 的 node.quantum)。None = 不传参,scout
     /// 按自身 quantum 速率推。纯网络层优化——消费循环照样重切成 32ms 窗喂 VAD。
@@ -149,7 +151,6 @@ impl Stage1Config {
                 bpe_vocab: p("MODELS::zipformer-streaming-zh-en/bpe.vocab"),
                 ..Default::default()
             },
-            ring_cap_samples: DEFAULT_RING_CAP,
             scout_chunk_ms: None,
             asr_kind: ProviderKind::Local,
             merge_gap_s: 5.0,
@@ -209,11 +210,9 @@ impl Stage1Config {
     }
 }
 
-// A Stage1 recognizer: audio in → [`Stage1Event`]s out. `run`(见下方 impl)是**原生
-// 异步**的(round14b:帧等待走 `tokio::sync::Notify`;round21:流式解码独立 tokio::task)
-// —— 调用方 `s1.run(cb).await`(永不完成直到 `running` 置 false)。round21b:固有
-// `async fn`(原 `Stage1Recognizer` trait 单实现、无人 dyn/泛型用,已删;Send 由内部
-// 状态自然满足,`tokio::spawn` 无碍)。
+// A Stage1 recognizer: audio in → [`Stage1Event`]s out. 消费循环本体 = 顶层 async fn
+// `consume::run(&s1, cb)`(consume.rs;round27 起不再以 impl 方法暴露——recognizer 只
+// 留资源/配置/生命周期)。调用方永不返回直到 `running` 置 false(idle 深睡)。
 
 /// Batch ASR turned off (`asr.backend: disable`): every pass yields empty text, which the
 /// executor maps to `batch_text: None` — the legal "batch unavailable" state consumers
@@ -230,20 +229,33 @@ impl AsrProvider for DisabledAsr {
 /// [`OnnxRuntimeManager`]). round21 后内部只起**一个**任务:流式识别 worker
 /// ([`run_stream_worker`],async fn,`tokio::spawn` 交 executor 协作调度)。另两个阻塞
 /// 作业(ingest / consume
-/// loop / batch worker) are exposed as methods the `Pipeline` runs on threads it owns. The ring
-/// is shared with the ingest thread; the consume loop runs on its caller's thread; batch jobs
-/// are handed to the worker via an mpsc channel (see [`Self::new`]).
+/// loop / batch worker) are exposed as methods the `Pipeline` runs on threads it owns:
+/// the front_q feeds the consume loop; the ingest thread owns VAD detection (R2) while the
+/// mgr feeds ONLY the streaming worker (ASR).
 pub struct OnnxStage1Recognizer {
     pub(crate) mgr: Arc<OnnxRuntimeManager>,
+    /// Stage0 检测器(R1:trait 缝,SileroVAD 默认)—— mgr 从此只喂流式(ASR),
+    /// VAD/ASR 在结构体层面分家。R2 起由拉流线程持有调用。
+    pub(crate) vad: Arc<dyn Stage0VAD>,
     /// Batch ASR as a trait object: local OnnxAsr (from `mgr`) or remote HttpAsr. Streaming/VAD
     /// stay in `mgr` (always local sherpa).
     batch_asr: Arc<dyn AsrProvider>,
-    pub(crate) ring: Arc<Mutex<AudioRing>>,
-    /// Wakes the async consume loop when the ingest pushes frames (no polling).
+    /// Stage0 → 大脑的单 FIFO(R2 取代 AudioRing):ingest 逐帧 push FrontEvent
+    /// (有界,满丢最旧 = 环回),消费循环 pop。frame/detected/events 同批同序。
+    pub(crate) front_q: Arc<Mutex<VecDeque<FrontEvent>>>,
+    /// Wakes the async consume loop when the ingest pushes FrontEvents (no polling).
     /// Notify 的 permit 语义天然防丢唤醒:push 后的 notify_one 会存一张 permit,
     /// 稍后的 `notified().await` 立即返回;且 notify_one 可从同步代码调用
     /// (ingest 仍是阻塞桥)。
-    pub(crate) ring_notify: Arc<Notify>,
+    pub(crate) front_notify: Arc<Notify>,
+    /// 共同时钟原点(D9):ingest 的 VAD 检测(last_voice_s)与消费循环的
+    /// tracker/settle/onset 用同一把尺 —— run() 重入(idle 复醒)不换原点。
+    pub(crate) start: Instant,
+    /// 流式指令端口(R3):run() 入口安装 tx(随流式 worker 生命周期),退出摘除;
+    /// 拉流线程经它直发 Onset/Feed(门控在前端),大脑持 clone 只发 Finalize/Reset。
+    pub(crate) stream_port: Arc<Mutex<Option<t_mpsc::UnboundedSender<StreamCmd>>>>,
+    /// partial 镜像的原子快照(R4):大脑每迭代刷新,拉流线程作断流喂静音判据。
+    pub(crate) partial_live: Arc<AtomicBool>,
     /// Merge-paragraph gap (s) — see [`Stage1Config::merge_gap_s`].
     pub(crate) merge_gap_s: f64,
     pub(crate) active: Arc<AtomicBool>,
@@ -294,12 +306,17 @@ impl OnnxStage1Recognizer {
             }
         };
         mgr.warm();
-        let ring = Arc::new(Mutex::new(AudioRing::new(cfg.ring_cap_samples)));
-        let ring_notify = Arc::new(Notify::new());
+        let vad: Arc<dyn Stage0VAD> = Arc::new(SileroVAD::new(Arc::clone(&mgr)));
+        let front_q = Arc::new(Mutex::new(VecDeque::new()));
+        let front_notify = Arc::new(Notify::new());
         Ok(Self {
             mgr,
-            ring,
-            ring_notify,
+            vad,
+            front_q,
+            front_notify,
+            start: Instant::now(),
+            stream_port: Arc::new(Mutex::new(None)),
+            partial_live: Arc::new(AtomicBool::new(false)),
             merge_gap_s: cfg.merge_gap_s,
             active: cfg.active,
             running: cfg.running,
@@ -323,12 +340,17 @@ impl OnnxStage1Recognizer {
                 Arc::new(HttpAsr::new(endpoint.clone(), model.clone()))
             }
         };
-        let ring = Arc::new(Mutex::new(AudioRing::new(cfg.ring_cap_samples)));
-        let ring_notify = Arc::new(Notify::new());
+        let vad: Arc<dyn Stage0VAD> = Arc::new(SileroVAD::new(Arc::clone(&mgr)));
+        let front_q = Arc::new(Mutex::new(VecDeque::new()));
+        let front_notify = Arc::new(Notify::new());
         Ok(Self {
             mgr,
-            ring,
-            ring_notify,
+            vad,
+            front_q,
+            front_notify,
+            start: Instant::now(),
+            stream_port: Arc::new(Mutex::new(None)),
+            partial_live: Arc::new(AtomicBool::new(false)),
             merge_gap_s: cfg.merge_gap_s,
             active: cfg.active,
             running: cfg.running,
@@ -356,12 +378,19 @@ impl OnnxStage1Recognizer {
     /// blocking 桥上运行**。循环本体在 VAD 模块([`crate::pipeline::vad::ingest_loop`]);
     /// 这里只做字段收集委托。
     pub fn run_ingest(&self) -> ! {
-        crate::pipeline::vad::ingest_loop(
+        crate::pipeline::front::ingest_loop(
             self.scout_addr.clone(),
             self.scout_chunk_ms,
-            Arc::clone(&self.ring),
-            Arc::clone(&self.ring_notify),
-            Arc::clone(&self.active),
+            FrontBridge {
+                vad: Arc::clone(&self.vad),
+                has_stream: self.mgr.streaming_asr().is_some(),
+                stream_port: Arc::clone(&self.stream_port),
+                partial_live: Arc::clone(&self.partial_live),
+                start: self.start,
+                front_q: Arc::clone(&self.front_q),
+                notify: Arc::clone(&self.front_notify),
+                active: Arc::clone(&self.active),
+            },
         )
     }
 

@@ -17,7 +17,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use audio_aura_core::pipeline::recognizer::{OnnxStage1Recognizer, Stage1Config};
+use audio_aura_core::pipeline::resources::{OnnxStage1Recognizer, Stage1Config};
 use audio_aura_core::{Calibrator, LlmInput, Pipeline, Stage2CalibratorImpl, TurnEvent};
 
 // Repo-relative bench dir (crates/aura-core → desk-pilot/bench). Created on startup.

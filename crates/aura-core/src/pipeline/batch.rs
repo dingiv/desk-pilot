@@ -13,7 +13,8 @@ use tracing::{debug, info, warn};
 
 use crate::hub::{FinalTurn, Storage};
 use crate::pipeline::calibrator::Stage2Calibrator;
-use crate::pipeline::recognizer::OnnxStage1Recognizer;
+use crate::pipeline::types::{ParagraphWaits, RunParagraphBatch, SentenceOutcome, TurnTx};
+use crate::pipeline::resources::OnnxStage1Recognizer;
 use crate::{ParagraphId, SentenceId, TurnEvent, VadParagraph, VadSentence};
 
 
@@ -32,9 +33,6 @@ use crate::{ParagraphId, SentenceId, TurnEvent, VadParagraph, VadSentence};
 //   ParagraphCalibration。live 链尾在定稿前收束 → 该段全部 SC 先于 PCal(契约)。
 //
 // 跨段乱序(段 N 定稿 vs 段 N+1 流式)是物理现实 —— 客户端按 paragraph_id 修订。
-
-/// 段级重跑闭包:_blocking recognize(生产 = `s1.recognize_once`;测试注入 stub)。
-pub(crate) type RunParagraphBatch = Arc<dyn Fn(&[i16], u32, ParagraphId) -> Option<String> + Send + Sync>;
 
 /// 单行事件摘要(统一发射留痕用)。段落 id 是时间戳微秒 —— 日志里的 p 值本身即
 /// 段落创建时刻,时序对表时直接可比大小。
@@ -81,18 +79,9 @@ fn wall(t: chrono::DateTime<chrono::Local>) -> String {
     t.format("%H:%M:%S%.3f").to_string()
 }
 
-pub(crate) type TurnTx = tokio::sync::mpsc::UnboundedSender<TurnEvent<'static>>;
 /// 段级重跑的兜底超时:HttpAsr 自带请求级超时,这里保证"重跑无论挂死/panic,
 /// 段定稿链(PCal/归档)必然继续"—— PCal 必发是客户端 REPLACED 语义的契约前提。
 pub(crate) const PARAGRAPH_RERUN_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// 句任务的产出:batch 识别结果(回填段落句集,供 live/定稿整流)。
-pub(crate) struct SentenceOutcome {
-    pub(crate) sentence_id: SentenceId,
-    pub(crate) batch_text: Option<String>,
-    #[allow(dead_code)]
-    pub(crate) asr_ms: u64,
-}
 
 /// 句任务:取句 clip(AudioStore,EOS → 段关闭之间存活)→ 阻塞 recognize → 回传
 /// `BatchSentence`(经 turn 通道回主循环 emit,单点)。失败/空文本 = 合法 None
@@ -164,13 +153,6 @@ pub(crate) async fn live_calibration_task(
         calibrated,
         route_ms,
     });
-}
-
-/// 段任务的等待集(就绪门):句任务 handles(回填句 batch)+ live 整流链尾
-/// (该段全部 SC 先于 PCal 的契约保证)。
-pub(crate) struct ParagraphWaits {
-    pub(crate) sentences: Vec<tokio::task::JoinHandle<SentenceOutcome>>,
-    pub(crate) live: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// 段任务:join 等待集(就绪门,回填句 batch;SC 先于 PCal)→ 段级重跑(多句段落)→

@@ -3,6 +3,7 @@
 //! 识别侧(流式会话、batch、AudioStore)都在 recognizer;这里只有 SOS/EOS 之上的
 //! 段落划分决策。
 
+use crate::pipeline::types::SettledParagraph;
 use crate::{ParagraphId, SentenceId, VadSentence};
 // ── Paragraph tracker: pure paragraphing decisions over wall-clock SOS/EOS (unit-testable, no I/O) ──
 // The recognizer owns the ASR side (sessions, batch passes, the AudioStore); this tracker owns
@@ -18,13 +19,6 @@ struct OpenParagraph {
     sentences: Vec<VadSentence>,
     active: bool,
     opened_at: f64,
-}
-
-/// A paragraph closed by a big gap or the settle-timeout — the recognizer turns this into a
-/// [`VadParagraph`] (concat PCM + paragraph-level batch re-run) and emits `ParagraphEdge`.
-pub(crate) struct SettledParagraph {
-    pub(crate) paragraph_id: ParagraphId,
-    pub(crate) sentences: Vec<VadSentence>,
 }
 
 pub(crate) struct ParagraphTracker {
@@ -236,3 +230,277 @@ impl ParagraphTracker {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+use super::*;
+
+mod tests {
+use super::*;
+
+fn sentence(id: SentenceId, start_s: f64, end_s: f64) -> VadSentence {
+    VadSentence {
+        id,
+        audio_id: id,
+        start_s,
+        end_s,
+        streaming_text: format!("s{id}"),
+        batch_text: Some(format!("b{id}")),
+    }
+}
+
+#[test]
+fn short_gap_absorbs_into_same_paragraph() {
+    let mut t = ParagraphTracker::new(2.5);
+    let s1 = t.on_sos(0.0);
+    let (settled, w1, sentences) = t.on_eos(sentence(s1, 0.0, 0.5));
+    assert!(settled.is_none());
+    assert_eq!(sentences.len(), 1);
+
+    // gap 1.0−0.5 = 0.5 < 2.5 → same paragraph, second sentence (merge happens at EOS,
+    // where the true onset is back-derived).
+    let s2 = t.on_sos(0.0);
+    let (settled, w, sentences) = t.on_eos(sentence(s2, 1.0, 1.5));
+    assert!(settled.is_none(), "short gap must NOT settle");
+    assert_eq!(w, w1, "same paragraph continues");
+    assert_eq!(sentences.len(), 2, "both sentences in one paragraph");
+}
+
+#[test]
+fn big_gap_settles_previous_paragraph_and_opens_new_one() {
+    let mut t = ParagraphTracker::new(2.5);
+    let s1 = t.on_sos(0.0);
+    let (_, w1, _) = t.on_eos(sentence(s1, 0.0, 0.5));
+    // gap 5.0−0.5 = 4.5 ≥ 2.5 → settle w1 at the next sentence's EOS, open w2.
+    let s2 = t.on_sos(0.0);
+    let (settled, w2, sentences) = t.on_eos(sentence(s2, 5.0, 5.5));
+    let s = settled.expect("big gap settles the previous paragraph");
+    assert_eq!(s.paragraph_id, w1);
+    assert_eq!(s.sentences.len(), 1);
+    assert_ne!(w2, w1, "a fresh paragraph opens (random ids must differ)");
+    assert_eq!(sentences.len(), 1);
+}
+
+#[test]
+fn settle_timeout_closes_trailing_paragraph() {
+    let mut t = ParagraphTracker::new(2.5);
+    let s1 = t.on_sos(0.0);
+    let (_, w1, _) = t.on_eos(sentence(s1, 0.0, 0.5));
+    assert!(
+        t.check_settle(2.0, false).is_none(),
+        "2.0 − 0.5 = 1.5 < 2.5, not yet"
+    );
+    let s = t
+        .check_settle(3.0, false)
+        .expect("3.0 − 0.5 = 2.5 ≥ merge_gap → settle");
+    assert_eq!(s.paragraph_id, w1);
+    assert!(
+        t.check_settle(10.0, false).is_none(),
+        "nothing open anymore"
+    );
+}
+
+#[test]
+fn force_settle_skips_merge_gap_wait() {
+    // 主动归档:远未到 merge_gap 也能立即关段(IME"我说完了"信号)。
+    let mut t = ParagraphTracker::new(2.5);
+    assert!(
+        t.force_settle().is_none(),
+        "无段落 → None(调用方消费掉 flush 标记)"
+    );
+    assert!(!t.has_open_paragraph());
+    let s1 = t.on_sos(0.0);
+    let (_, w1, _) = t.on_eos(sentence(s1, 0.0, 0.5));
+    // 0.2s 后强制归档(gap 0.2 < merge_gap 2.5 —— 常规定稿还早)。
+    let s = t.force_settle().expect("有已定稿句 → 立即归档");
+    assert_eq!(s.paragraph_id, w1);
+    assert_eq!(s.sentences.len(), 1);
+    assert!(!t.has_open_paragraph(), "段已关");
+    assert!(
+        t.check_settle(100.0, false).is_none(),
+        "settle 路径不再重复触发"
+    );
+    // 归档后再次 force → 无段落 → None。
+    assert!(t.force_settle().is_none());
+}
+
+#[test]
+fn force_settle_holds_while_sentence_active() {
+    // 句进行中(SOS 已见 EOS 未到)→ 不动,调用方保持 flush 挂起。
+    let mut t = ParagraphTracker::new(2.5);
+    let s1 = t.on_sos(0.0);
+    let (_, _, _) = t.on_eos(sentence(s1, 0.0, 0.5));
+    let s2 = t.on_sos(0.0); // 第二句开口
+    assert!(t.force_settle().is_none(), "active 句压制强制归档");
+    assert!(t.has_open_paragraph(), "段落仍在 → flush 保持挂起");
+    let (_, w, sentences) = t.on_eos(sentence(s2, 1.0, 1.5));
+    let s = t.force_settle().expect("EOS 落定后重试成功");
+    assert_eq!(s.paragraph_id, w);
+    assert_eq!(sentences.len(), 2);
+}
+
+#[test]
+fn settle_deadline_counts_down_to_merge_gap() {
+    // The condvar wake deadline: exactly when check_settle would fire (consumes loop
+    // parks on the ring condvar instead of polling — this is its only wake source for
+    // the trailing paragraph).
+    let mut t = ParagraphTracker::new(2.5);
+    assert!(t.settle_deadline(0.0, false).is_none(), "nothing open yet");
+    let s1 = t.on_sos(0.0);
+    t.on_eos(sentence(s1, 0.0, 0.5));
+    assert!(
+        (t.settle_deadline(1.0, false).unwrap() - 2.0).abs() < 1e-9,
+        "2.5 − (1.0 − 0.5)"
+    );
+    assert!(
+        (t.settle_deadline(3.0, false).unwrap() - 0.0).abs() < 1e-9,
+        "due now, clamped at 0"
+    );
+    let _s2 = t.on_sos(0.0); // sentence in progress (active=true)
+    assert!(
+        t.settle_deadline(1.2, false).is_none(),
+        "active sentence ⇒ suppressed, no deadline"
+    );
+}
+
+#[test]
+fn active_sentence_suppresses_settle_timeout() {
+    // Regression guard: a long following sentence must not be mistaken for "no
+    // continuation" and force-split the paragraph mid-speech.
+    let mut t = ParagraphTracker::new(2.5);
+    let s1 = t.on_sos(0.0);
+    t.on_eos(sentence(s1, 0.0, 0.5));
+    let _s2 = t.on_sos(0.0); // sentence in progress (active=true)
+    assert!(
+        t.check_settle(100.0, false).is_none(),
+        "active sentence ⇒ settle suppressed"
+    );
+}
+
+#[test]
+fn speaking_suppresses_settle_waiting_for_retroactive_sos() {
+    // 回溯式 VAD 的回归防护:下一句的 SOS 要等它的 EOS 才到——在它到达前,流式
+    // session 的 partial 非空(=speaking=true)必须抑制 settle 超时。否则墙钟超时
+    // 会在下一句说话时定稿,把它错划进新段落(症状:段落永远只有 1 个 sentence)。
+    let mut t = ParagraphTracker::new(2.5);
+    let s1 = t.on_sos(0.0);
+    t.on_eos(sentence(s1, 0.0, 0.5));
+    // 下一句正在说话(SOS 尚未到),墙钟已远超 merge_gap —— speaking=true 抑制。
+    assert!(
+        t.check_settle(100.0, true).is_none(),
+        "speaking ⇒ settle suppressed"
+    );
+    assert!(
+        t.settle_deadline(100.0, true).is_none(),
+        "speaking ⇒ no settle deadline"
+    );
+    // 说话停止(speaking=false)后,同一时刻立刻能定稿。
+    assert!(
+        t.check_settle(100.0, false).is_some(),
+        "not speaking ⇒ settle fires"
+    );
+}
+
+#[test]
+fn merge_gap_zero_makes_every_sentence_its_own_paragraph() {
+    let mut t = ParagraphTracker::new(0.0);
+    let s1 = t.on_sos(0.0);
+    let (_, w1, _) = t.on_eos(sentence(s1, 0.0, 0.5));
+    // Any gap ≥ 0 settles at the next sentence's EOS (gap 0.6 − 0.5 = 0.1 ≥ 0).
+    let s2 = t.on_sos(0.6);
+    let (settled, w2, _) = t.on_eos(sentence(s2, 0.6, 0.7));
+    assert_eq!(settled.expect("gap 0.1 ≥ 0 settles").paragraph_id, w1);
+    assert_ne!(w2, w1);
+    // …and the settle timeout fires immediately after an EOS too.
+    let s3 = t.on_sos(10.0);
+    t.on_eos(sentence(s3, 10.0, 10.5));
+    assert!(
+        t.check_settle(10.5, false).is_some(),
+        "now − end = 0 ≥ 0 → settle"
+    );
+}
+
+// ── round13:起音即开段 + 时间戳 id(§7-A/B 修复)──────────────────────
+
+/// 起音开段 → prospective 返回**真实**段 id;该段后续所有事件(EOS 的
+/// Batch/ParagraphEdge)携带同一 id —— 幽灵段(预测键 ≠ 实际键)不复存在。
+#[test]
+fn onset_opens_paragraph_prospective_returns_real_id() {
+    let mut t = ParagraphTracker::new(2.5);
+    t.on_speech_onset(10.0);
+    let (pid, _sid) = t.prospective();
+    let s1 = t.on_sos(10.4);
+    assert_eq!(t.prospective().0, pid, "段内 prospective 稳定");
+    let (settled, w, _) = t.on_eos(sentence(s1, 10.0, 10.5));
+    assert!(settled.is_none());
+    assert_eq!(w, pid, "EOS 归属段 = 起音开的段(prospective 即真键)");
+    // 静默满 merge_gap 关段,下一次起音 → 新段(时间戳更大)。
+    let _ = t
+        .check_settle(20.0, false)
+        .expect("静默 9.5s ≥ 2.5s → settle");
+    t.on_speech_onset(20.5);
+    let (pid2, _) = t.prospective();
+    assert!(pid2 > pid, "时间戳 id 严格递增 —— id 即顺序");
+}
+
+/// 时间戳 id 严格递增:同微秒连续开段(防御 max(last+1))也绝不重复/回退。
+#[test]
+fn timestamp_win_ids_strictly_increasing() {
+    let mut t = ParagraphTracker::new(2.5);
+    let mut prev = 0u64;
+    for i in 0..8 {
+        t.on_speech_onset(i as f64);
+        let (pid, _) = t.prospective();
+        assert!(pid > prev, "id 必须严格递增(时间戳,防时钟回拨/同微秒)");
+        prev = pid;
+        // 立刻出句并关段,下一轮开新段。
+        let s = t.on_sos(i as f64);
+        t.on_eos(sentence(s, i as f64, i as f64 + 0.5));
+        let _ = t.check_settle(i as f64 + 10.0, false);
+    }
+}
+
+/// 空段 GC:起音开的段从未出句(微弱音频)→ 静默满 merge_gap 静默丢弃;
+/// 不 GC 会让陈旧空段被很久之后的语音复用,id 落后 → 客户端排序错位。
+#[test]
+fn empty_onset_paragraph_gced_after_merge_gap() {
+    let mut t = ParagraphTracker::new(2.5);
+    t.on_speech_onset(0.0);
+    let (pid, _) = t.prospective();
+    assert!(t.check_settle(2.0, false).is_none(), "2.0 < 2.5,未到期");
+    assert!(t.has_open_paragraph(), "GC 前段还在");
+    assert!(
+        t.check_settle(2.6, false).is_none(),
+        "GC 静默:返回 None(无事件)"
+    );
+    assert!(!t.has_open_paragraph(), "空段静默满 merge_gap 即弃");
+    // 下一次起音开**新**段(id 更大),不复用陈旧空段。
+    t.on_speech_onset(100.0);
+    let (pid2, _) = t.prospective();
+    assert!(pid2 > pid, "新段时间戳更大");
+    // settle_deadline 也覆盖空段(消费循环要能在 GC 时点醒来)。
+    assert!(t.check_settle(103.0, false).is_none(), "GC 掉 100.0 的空段");
+    assert!(!t.has_open_paragraph());
+    t.on_speech_onset(200.0);
+    let d = t.settle_deadline(201.0, false).expect("空段也有 GC 截止");
+    assert!((d - 1.5).abs() < 1e-9, "2.5 − (201.0 − 200.0)");
+}
+
+/// 真语音不误伤:partial 非空(speaking)抑制空段 GC —— 长句(> merge_gap)
+/// 说话中不会被墙钟 GC 掉段落。
+#[test]
+fn speaking_suppresses_empty_onset_gc() {
+    let mut t = ParagraphTracker::new(2.5);
+    t.on_speech_onset(0.0);
+    assert!(t.check_settle(100.0, true).is_none());
+    assert!(t.has_open_paragraph(), "speaking ⇒ 空段不 GC");
+    assert!(
+        t.settle_deadline(100.0, true).is_none(),
+        "speaking ⇒ 无 GC 截止"
+    );
+    assert!(t.check_settle(100.0, false).is_none(), "静默后 GC");
+    assert!(!t.has_open_paragraph());
+}
+}
+}
