@@ -101,8 +101,10 @@ fn on_stage1_paragraph_edge<F: Fn(TurnEvent)>(
         live: turns.live_chain.remove(&paragraph.id),
     };
     let s1c = Arc::clone(&ctx.s1);
-    let run_batch: RunParagraphBatch =
-        Arc::new(move |pcm, sr, pid| s1c.recognize_once(pcm, sr, "段落级重跑", pid));
+    let run_batch: RunParagraphBatch = Arc::new(move |pcm, sr, pid| {
+        let s1 = Arc::clone(&s1c);
+        Box::pin(async move { s1.recognize_once_async(&pcm, sr, "段落级重跑", pid).await })
+    });
     tokio::spawn(paragraph_task(
         paragraph, sr, waits, Arc::clone(&ctx.s2), run_batch, ctx.storage.clone(),
         ctx.turn.clone(),
@@ -704,11 +706,11 @@ mod tests {
         let calls = Arc::new(Mutex::new(0));
         let llm = Arc::new(CountingLlm(Arc::clone(&calls)));
         let calibrator: Arc<Mutex<Box<dyn Stage2Calibrator>>> = Arc::new(Mutex::new(Box::new(
-            Stage2CalibratorImpl::new(llm, Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())), LlmInput::Batch),
+            Stage2CalibratorImpl::new(dp_models::AsyncLlm::Blocking(llm), Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())), LlmInput::Batch),
         )));
         let (turn, mut rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent<'static>>();
         let para = tpar(1, vec![tsent(1, None), tsent(2, None)]);
-        let run_batch: RunParagraphBatch = Arc::new(|_pcm, _sr, _pid| Some("整段批式".into()));
+        let run_batch: RunParagraphBatch = Arc::new(|_pcm, _sr, _pid| Box::pin(async { Some("整段批式".into()) }));
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         // 收 4 个事件:2×BatchSentence + BatchParagraph + ParagraphCalibration(SC 由
         // BS 到达触发(turn 臂 live 链),不归段任务)。
@@ -763,11 +765,12 @@ mod tests {
         let calls = Arc::new(Mutex::new(0));
         let llm = Arc::new(CountingLlm(Arc::clone(&calls)));
         let calibrator: Arc<Mutex<Box<dyn Stage2Calibrator>>> = Arc::new(Mutex::new(Box::new(
-            Stage2CalibratorImpl::new(llm, Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())), LlmInput::Batch),
+            Stage2CalibratorImpl::new(dp_models::AsyncLlm::Blocking(llm), Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())), LlmInput::Batch),
         )));
         let (turn, mut rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent<'static>>();
         let para = tpar(1, vec![tsent(1, None)]);
-        let run_batch: RunParagraphBatch = Arc::new(|_pcm, _sr, _pid| panic!("单句段落不得触发段级重跑"));
+        let run_batch: RunParagraphBatch =
+            Arc::new(|_pcm, _sr, _pid| Box::pin(async { panic!("单句段落不得触发段级重跑") }));
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let handles = vec![{
@@ -803,7 +806,8 @@ mod tests {
         let (turn, mut rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent<'static>>();
         // 快照:句 1 只有流式文本(batch_text: None —— ParagraphEdge 时刻的真实形态)。
         let para = tpar(1, vec![tsent(1, None)]);
-        let run_batch: RunParagraphBatch = Arc::new(|_pcm, _sr, _pid| panic!("单句段落不得触发段级重跑"));
+        let run_batch: RunParagraphBatch =
+            Arc::new(|_pcm, _sr, _pid| Box::pin(async { panic!("单句段落不得触发段级重跑") }));
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let handles = vec![{
@@ -845,7 +849,8 @@ mod tests {
             Arc::new(Mutex::new(Box::new(PassThroughCalibrator)));
         let (turn, mut rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent<'static>>();
         let para = tpar(1, vec![tsent(1, None), tsent(2, None)]);
-        let run_batch: RunParagraphBatch = Arc::new(|_pcm, _sr, _pid| panic!("重跑崩了(实测形态)"));
+        let run_batch: RunParagraphBatch =
+            Arc::new(|_pcm, _sr, _pid| Box::pin(async { panic!("重跑崩了(实测形态)") }));
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let handles = vec![
@@ -890,7 +895,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(0));
         let llm = Arc::new(SeqLlm(Arc::clone(&calls)));
         let calibrator: Arc<Mutex<Box<dyn Stage2Calibrator>>> = Arc::new(Mutex::new(Box::new(
-            Stage2CalibratorImpl::new(llm, Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())), LlmInput::Batch),
+            Stage2CalibratorImpl::new(dp_models::AsyncLlm::Blocking(llm), Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())), LlmInput::Batch),
         )));
         let (turn, mut rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent<'static>>();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();

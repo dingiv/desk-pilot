@@ -50,7 +50,7 @@ omni-scout /audio (TCP)
    │  tokio 通道 → main_loop select!(loops.rs;唯一发射点,统一留痕)
    ▼
 ┌──────────────────── 编排任务(batch.rs)──────────────────────────────┐
-│ Batch → 句任务(spawn_blocking recognize_once)→ BatchSentence          │
+│ Batch → 句任务(异步轨 recognize_once_async)→ BatchSentence           │
 │ BS 到达 → live 整流任务(段内链式串行,输入=双通道)→ SentenceCalibration │
 │ ParagraphEdge → 段任务(join 句任务 + live 链尾 → 段重跑(多句)→        │
 │   BatchParagraph → 定稿整流一次 → 归档)→ ParagraphCalibration          │
@@ -85,7 +85,9 @@ types ← spec/tracker/calibrator/vad ← stream/front ← resources ← loops/b
 **常驻阻塞线程只有拉流+检测**(scout TCP → 重切 → Stage0VAD.feed → 门控帧直发流式
 + FrontEvent 入队;断流喂静音也在此);其余都是 tokio 任务协作分时——大脑(分句/段落
 决策)、流式识别任务(与大脑仅一对通道)、每句 batch 任务与纠偏任务、每段重跑与定稿
-任务(内部 `spawn_blocking` 干 `reqwest::blocking` 的真活)。**main_loop select!
+任务。batch/LLM 走**异步路由**(`dp_models::AsyncAsr`/`AsyncLlm`:远程 Http 原生
+await、超时可被 `tokio::time::timeout` 真取消;本地 ONNX/本地 LLM 在路由内部
+`spawn_blocking` 干 CPU 真活;段落落盘亦 spawn_blocking)。**main_loop select!
 是唯一的发射点**,所有发往前端的事件先统一留痕再发。模块不 spawn 线程,全部由
 `pipeline/` 编排创建;宿主:daemon = `rt.spawn(pipeline.run)`,零专用线程。
 
@@ -211,16 +213,17 @@ tokens.txt 必须保持官方"token id"两列格式)。**batch 后端**:`Arc<dyn
    (微弱音频残留/流式幻觉不得卷入下一句)。**说话中无实时纠偏**(S-D2)。
 3. **句定稿**(EOS):流式任务 finalize 交接(PCM + 定稿文本,几十 ms)→ PCM 入 store
    (共享 `Arc`)→ `Batch { paragraph_id, sentences }`(载荷即整段,`batch_text: None`
-   为 in-flight;句级 batch 由 batch.rs 句任务自建,`spawn_blocking(recognize_once)`,
-   结果以 `BatchSentence` 回传)。噪声句不在 EOS 丢弃(异步后 EOS 时刻只有流式文本,
+   为 in-flight;句级 batch 由 batch.rs 句任务自建,`recognize_once_async`(AsyncAsr
+   路由:远程 HttpAsr 原生异步,本地 ONNX spawn_blocking 桥),结果以 `BatchSentence`
+   回传)。噪声句不在 EOS 丢弃(异步后 EOS 时刻只有流式文本,
    丢弃会吞"流式空 batch 有"的真实语音)。
 4. **段定稿**:`ParagraphTracker` 判边界——下一句起音间隔 ≥ merge_gap(用起音墙钟,
    round26),或静默超时(`check_settle`,句进行中/speaking 抑制);起音即开段
    (rising edge 分配时间戳 id,partial 从第一条起携带真键);空段静默满 merge_gap 即 GC。
    `emit_paragraph_edge` 拼 PCM(段落持 `Arc`)→ `ParagraphEdge` → evict。
    **单句段免重跑**:只有一句时拼接 PCM 与该句完全相同,复用句级结果。段任务 join
-   全部句任务(就绪门)+ live 链尾 → 段重跑(多句;`spawn_blocking` + 15s 兜底,
-   **PCal 必发**)→ 定稿整流一次。
+   全部句任务(就绪门)+ live 链尾 → 段重跑(多句;异步 + `tokio::spawn` panic 隔离
+   + 15s 兜底**真取消**,**PCal 必发**)→ 定稿整流一次(异步路由)。
 5. **AudioStore**:`Mutex<BTreeMap<id, PCM>>`,容量按样本(10min ≈19MB),超限逐最旧。
 6. **VAD 门控流式**:`detected()` 实时信号是流式喂帧的唯一门卫(空闲零喂帧零解码);
    起音翻转时补喂最近 ~0.5s lead-in(soft onset 靠它进会话);`accept_waveform` 与
@@ -231,7 +234,7 @@ tokens.txt 必须保持官方"token id"两列格式)。**batch 后端**:`Arc<dyn
 ## 6. Stage2 实现细节(LLM 联合整流)
 
 **位置**:`calibrator.rs`(`Stage2CalibratorImpl`)+ `prompt.rs`;任务壳在 `batch.rs`
-(`spawn_blocking`,LLM 耗时不卡 partial)。
+(异步路由:远程 HttpLlm 原生 await、本地 spawn_blocking 桥,LLM 耗时不卡 partial)。
 
 **无状态**:每次调用都是纯函数式——输入是"整段全部句的文本"(payload 即段落)。
 

@@ -8,7 +8,11 @@
 //! `impl dp_models::XxxProvider`。工厂 (选 local/remote) 在各 app
 //! (aura-daemon / visual-rover-app)。
 //!
-//! 所有 trait **同步** (匹配 Stage1 的同步线程模型；remote 实现用 `reqwest::blocking`)。
+//! 所有 trait **同步**(兼容存量消费方);远程 Http* 家族另提供**原生异步轨**
+//! (`*_async` inherent 方法)+ [`AsyncAsr`]/[`AsyncLlm`] 路由(构造期定型,
+//! 统一异步入口:Http 原生 await,本地同步 provider 走 spawn_blocking 桥)。
+
+use anyhow::anyhow;
 
 pub mod config;
 pub mod http;
@@ -49,18 +53,100 @@ pub trait ModelProvider: Send + Sync {
 }
 
 /// 语音转文字 (ASR): 输入 PCM i16 mono, 返回转写文本。
+///
+/// 同步 trait(兼容存量消费方)。远程实现 [`crate::HttpAsr`] 额外提供原生异步轨
+/// `recognize_async` —— tokio 上下文优先用它(可 await、超时可真取消)。
 pub trait AsrProvider: Send + Sync {
     fn recognize(&self, pcm: &[i16], sample_rate: u32) -> anyhow::Result<String>;
 }
 
 /// 文本 LLM (如 Stage2 整流/路由): (system, user) -> 文本。
+///
+/// 同步 trait(兼容存量消费方)。远程实现 [`crate::HttpLlm`] 额外提供原生异步轨
+/// `complete_async` —— tokio 上下文优先用它。
 pub trait LlmProvider: Send + Sync {
     fn complete(&self, system: &str, user: &str) -> anyhow::Result<String>;
 }
 
 /// 视觉语言模型 (VLM): (system, user, image_png) -> 文本。local 实现留 visual-rover 未来。
+///
+/// 同步 trait(兼容存量消费方)。远程实现 [`crate::HttpVlm`] 额外提供原生异步轨
+/// `complete_async` —— tokio 上下文优先用它。
 pub trait VlmProvider: Send + Sync {
     fn complete(&self, system: &str, user: &str, image_png: &[u8]) -> anyhow::Result<String>;
+}
+
+// ── 异步统一入口(路由,构造期定型)────────────────────────────────────────────
+//
+// 把"任意 provider"变成一个可 await 的调用面:**远程 Http 原生异步**(超时可被
+// `tokio::time::timeout` 真取消);**本地/任意同步 provider 走 spawn_blocking 桥**
+// (Arc 进闭包 = 'static;CPU 密集推理本就该在 blocking pool)。上层(aura-core 的
+// batch 任务)面对路由类型,不必知道部署形态。
+
+/// [`AsrProvider`] 的异步统一入口(ASR 路由)。
+#[derive(Clone)]
+pub enum AsyncAsr {
+    /// 远程 HTTP —— 原生 `reqwest` 异步([`HttpAsr::recognize_async`])。
+    Http(std::sync::Arc<http::HttpAsr>),
+    /// 本地 ONNX 等同步 provider —— `spawn_blocking` 桥。
+    Blocking(std::sync::Arc<dyn AsrProvider>),
+}
+
+impl AsyncAsr {
+    /// 异步轨:Http 原生 await;Blocking = spawn_blocking(Arc clone 进闭包)。
+    pub async fn recognize(&self, pcm: &[i16], sample_rate: u32) -> anyhow::Result<String> {
+        match self {
+            AsyncAsr::Http(h) => h.recognize_async(pcm, sample_rate).await,
+            AsyncAsr::Blocking(p) => {
+                let pcm = pcm.to_vec();
+                let p = std::sync::Arc::clone(p);
+                tokio::task::spawn_blocking(move || p.recognize(&pcm, sample_rate))
+                    .await
+                    .map_err(|e| anyhow!("ASR blocking join error: {e}"))?
+            }
+        }
+    }
+
+    /// 同步轨(同步消费方;Http → 原生同步轨,Blocking → 直调)。
+    pub fn recognize_sync(&self, pcm: &[i16], sample_rate: u32) -> anyhow::Result<String> {
+        match self {
+            AsyncAsr::Http(h) => h.recognize(pcm, sample_rate),
+            AsyncAsr::Blocking(p) => p.recognize(pcm, sample_rate),
+        }
+    }
+}
+
+/// [`LlmProvider`] 的异步统一入口(LLM 路由)。
+#[derive(Clone)]
+pub enum AsyncLlm {
+    /// 远程 HTTP —— 原生 `reqwest` 异步([`HttpLlm::complete_async`])。
+    Http(std::sync::Arc<http::HttpLlm>),
+    /// 本地 LLM 等同步 provider —— `spawn_blocking` 桥。
+    Blocking(std::sync::Arc<dyn LlmProvider>),
+}
+
+impl AsyncLlm {
+    /// 异步轨:Http 原生 await;Blocking = spawn_blocking(Arc clone 进闭包)。
+    pub async fn complete(&self, system: &str, user: &str) -> anyhow::Result<String> {
+        match self {
+            AsyncLlm::Http(h) => h.complete_async(system, user).await,
+            AsyncLlm::Blocking(p) => {
+                let (s, u) = (system.to_string(), user.to_string());
+                let p = std::sync::Arc::clone(p);
+                tokio::task::spawn_blocking(move || p.complete(&s, &u))
+                    .await
+                    .map_err(|e| anyhow!("LLM blocking join error: {e}"))?
+            }
+        }
+    }
+
+    /// 同步轨(同步消费方;Http → 原生同步轨,Blocking → 直调)。
+    pub fn complete_sync(&self, system: &str, user: &str) -> anyhow::Result<String> {
+        match self {
+            AsyncLlm::Http(h) => h.complete(system, user),
+            AsyncLlm::Blocking(p) => p.complete(system, user),
+        }
+    }
 }
 
 #[cfg(test)]

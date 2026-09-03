@@ -46,7 +46,9 @@ aura-core       (全栈流程;round23 起 pipeline/ 文件夹化)
   ├─ hub        Storage: AudioArchive + TurnLog + recent ring
   ├─ archive / wav / tts / scout  辅件
 aura-agent      (Stage3+SDK) 能力 trait + HotwordManager + rules + view (线协议) + AuraClient SDK
-apps/audio-aura (daemon)     config 解析 (CLI/yaml→PipelineSpec) + socket (8 routes) + SSE双面
+apps/audio-aura (daemon)     三层 server: router(axum 8 routes + SSE双面) → service
+                              (DaemonState/双面协议/idle 监控) → repository(DataStore 持久化)
+                              + config(横切:CLI/yaml→PipelineSpec)+ main(组装根)
 crates/native                 napi shim (TS via VOICE_LOCAL_ROUTER)
 ```
 
@@ -81,13 +83,25 @@ dp-models/
 ├── trait VlmProvider  { complete(system, user, image) -> text }
 ├── onnx    OnnxAsr / OnnxRuntimeManager  (本地, feature speech)
 ├── mistral MistralLlm                    (本地, feature mistral)
-└── http    HttpAsr / HttpLlm / HttpVlm   (远程, OpenAI 兼容)
+└── http    HttpAsr / HttpLlm / HttpVlm   (远程, OpenAI 兼容, **双轨 API**)
 ```
 
-上层使用者（aura-core / visual-rover）**按需实例化**具体实现，再按能力 trait 取用。
+上层使用者（aura/visual-rover）**按需实例化**具体实现，再按能力 trait 取用。
 aura-core 里：recognizer `batch_asr: Arc<dyn AsrProvider>`（本地 OnnxAsr / 远程 HttpAsr）；
 pipeline `s2: Box<dyn Stage2Calibrator>` 内的 `Arc<dyn LlmProvider>`（本地 `Calibrator`
 封装 / 远程 HttpLlm）。
+
+**http 家族双轨 API**（网络 I/O 天然异步，trait 兼容存量同步消费方）：
+`HttpAsr::recognize_async` / `HttpLlm::complete_async` / `HttpVlm::complete_async`
+是原生 `reqwest::Client` 异步方法——可在 tokio 上下文安全 `await`，超时能被
+`tokio::time::timeout` **真取消**（连接池层面释放，无阻塞线程残留）。同步 trait 实现
+（`recognize`/`complete`）保留供同步调用方：blocking client **惰性构造**（首次同步
+调用才建），纯异步使用者全程不触碰它，round17 类 "Cannot drop a runtime" panic 从
+构造上不可能。两轨共享 endpoint/model/超时/熔断（Circuit）。
+**`AsyncAsr`/`AsyncLlm` 路由**（构造期定型）把任意 provider 变成统一异步入口：
+Http → 原生异步；本地/任意同步 provider → `spawn_blocking` 桥（Arc 进闭包）。
+aura-core 已接入：`pipeline/batch.rs` 的句 batch/段重跑/SC/PCal 全走路由——远程
+部署下零 spawn_blocking（仅落盘一处），段重跑 15s 超时为真取消。
 
 **Stage2 本地 LLM 分层**：模型本体在 `dp_models::MistralLlm`（通用，命名面向能力）；
 aura-core 的 `Calibrator` 是**封装层**——持有 `MistralLlm`，附加 Stage2 的 prompt 组装

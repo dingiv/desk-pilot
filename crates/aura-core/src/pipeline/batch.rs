@@ -83,7 +83,8 @@ fn wall(t: chrono::DateTime<chrono::Local>) -> String {
 /// 段定稿链(PCal/归档)必然继续"—— PCal 必发是客户端 REPLACED 语义的契约前提。
 pub(crate) const PARAGRAPH_RERUN_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// 句任务:取句 clip(AudioStore,EOS → 段关闭之间存活)→ 阻塞 recognize → 回传
+/// 句任务:取句 clip(AudioStore,EOS → 段关闭之间存活)→ batch recognize(**异步轨**:
+/// 远程 HttpAsr 原生 await;本地 ONNX 在 AsyncAsr 内 spawn_blocking)→ 回传
 /// `BatchSentence`(经 turn 通道回主循环 emit,单点)。失败/空文本 = 合法 None
 /// (消费端回退流式)。
 pub(crate) async fn sentence_task(
@@ -94,16 +95,11 @@ pub(crate) async fn sentence_task(
     sr: u32,
     turn: TurnTx,
 ) -> SentenceOutcome {
-    let out = tokio::task::spawn_blocking(move || {
-        let pcm = s1.audio_store().concat(&[audio_id]);
-        let start = chrono::Local::now();
-        let t0 = Instant::now();
-        let text = s1.recognize_once(&pcm, sr, "句级", paragraph_id);
-        (text, t0.elapsed().as_millis() as u64, start, chrono::Local::now())
-    })
-    .await
-    .unwrap_or_else(|_| (None, 0, chrono::Local::now(), chrono::Local::now()));
-    let (text, asr_ms, start, end) = out;
+    let pcm = s1.audio_store().concat(&[audio_id]);
+    let start = chrono::Local::now();
+    let t0 = Instant::now();
+    let text = s1.recognize_once_async(&pcm, sr, "句级", paragraph_id).await;
+    let (asr_ms, end) = (t0.elapsed().as_millis() as u64, chrono::Local::now());
     info!(paragraph_id, sentence_id,
         start = %wall(start), end = %wall(end), asr_ms,
         batch = text.as_deref().unwrap_or("(none)"),
@@ -121,7 +117,8 @@ pub(crate) async fn sentence_task(
 /// live 联合整流任务(每句 batch 完成后一次 —— BS 到达时由主循环触发;架构需求
 /// "batch 完成 → 之后纠偏,先后明确")。`prev` = 本段
 /// 上一次 live 任务句柄 —— 链式 await 保证段内 SC 按 Batch 顺序(段落生长序)串行,
-/// 后到的 SC 覆盖更早的(REPLACED)。阻塞 LLM 在 `spawn_blocking` + 校准器 Mutex 串行。
+/// 后到的 SC 覆盖更早的(REPLACED)。LLM 走**异步路由**(远程原生 await / 本地
+/// spawn_blocking 桥,见 [`calibrate_paragraph_routed`])。
 pub(crate) async fn live_calibration_task(
     prev: Option<tokio::task::JoinHandle<()>>,
     paragraph_id: ParagraphId,
@@ -137,11 +134,7 @@ pub(crate) async fn live_calibration_task(
     }
     let t = Instant::now();
     let start = chrono::Local::now();
-    let calibrated = tokio::task::spawn_blocking(move || {
-        calibrate.lock().unwrap().calibrate_paragraph(paragraph_id, &sentences)
-    })
-    .await
-    .unwrap_or_default();
+    let calibrated = calibrate_paragraph_routed(&calibrate, paragraph_id, &sentences).await;
     let end = chrono::Local::now();
     let route_ms = t.elapsed().as_secs_f64() * 1000.0;
     info!(paragraph_id, sentence_id = up_to,
@@ -191,36 +184,32 @@ pub(crate) async fn paragraph_task(
     paragraph.sentences = acc;
 
     // 段级重跑(权威 raw):多句段落才跑(单句的拼接 PCM 与句级完全相同,复用句级 batch)。
-    // ★ 必须 spawn_blocking(round17 实测 panic 根因):HttpAsr 是 reqwest::blocking
-    // (内部持 runtime),裸调在 async 上下文触发 "Cannot drop a runtime …" panic →
-    // 段任务崩死,PCal/归档永久丢失(前端:某段永远等不到定稿)。超时兜底:重跑
-    // 挂死/panic 也保证定稿链继续(None 回退句级 batch)—— "PCal 必发"是契约。
+    // ★ 异步轨 + tokio::spawn 隔离:panic 被 JoinError 捕获(与旧 spawn_blocking 同);
+    // 超时兜底为**真取消** —— future 被 drop,远程时连接池即释放(本地 spawn_blocking
+    // 线程残留,无碍)。"PCal 必发"是契约:重跑挂死/panic 也保证定稿链继续(None 回退
+    // 句级 batch)。
     if paragraph.sentences.len() > 1 {
-        let pcm = Arc::clone(&paragraph.pcm);
+        let pcm = (*paragraph.pcm).clone();
         let run = Arc::clone(&run_paragraph_batch);
         // 计时进闭包(round25):起止墙钟 + 耗时;事件字段 batch_asr_ms 落真值。
-        let (batch_text, rerun_ms) = match tokio::time::timeout(
-            PARAGRAPH_RERUN_TIMEOUT,
-            tokio::task::spawn_blocking(move || {
-                let start = chrono::Local::now();
-                let t0 = Instant::now();
-                let text = run(&pcm, sr, paragraph_id);
-                let ms = t0.elapsed().as_millis() as u64;
-                info!(paragraph_id, start = %wall(start), end = %wall(chrono::Local::now()),
-                    rerun_ms = ms, batch = text.as_deref().unwrap_or("(none)"),
-                    "batch[paragraph] 整段重跑完成");
-                (text, ms)
-            }),
-        )
-        .await
-        {
+        let handle = tokio::spawn(async move {
+            let start = chrono::Local::now();
+            let t0 = Instant::now();
+            let text = run(pcm, sr, paragraph_id).await;
+            let ms = t0.elapsed().as_millis() as u64;
+            info!(paragraph_id, start = %wall(start), end = %wall(chrono::Local::now()),
+                rerun_ms = ms, batch = text.as_deref().unwrap_or("(none)"),
+                "batch[paragraph] 整段重跑完成");
+            (text, ms)
+        });
+        let (batch_text, rerun_ms) = match tokio::time::timeout(PARAGRAPH_RERUN_TIMEOUT, handle).await {
             Ok(Ok((t, ms))) => (t, ms),
             Ok(Err(e)) => {
                 warn!(error = %e, paragraph_id, "段级重跑任务 panic → 回退句级 batch");
                 (None, 0)
             }
             Err(_) => {
-                warn!(paragraph_id, "段级重跑超时 → 回退句级 batch(阻塞线程残留,无碍)");
+                warn!(paragraph_id, "段级重跑超时 → 回退句级 batch(远程=连接真取消;本地阻塞线程残留,无碍)");
                 (None, 0)
             }
         };
@@ -234,13 +223,7 @@ pub(crate) async fn paragraph_task(
     // 定稿整流:一次 LLM(全句 best_text —— 句级 batch 已全部回填,live 整流给不了的)。
     let t = Instant::now();
     let start = chrono::Local::now();
-    let calibrated = {
-        let cal = Arc::clone(&calibrate);
-        let para = paragraph.clone();
-        tokio::task::spawn_blocking(move || cal.lock().unwrap().finalize_paragraph(&para))
-            .await
-            .unwrap_or_default()
-    };
+    let calibrated = finalize_paragraph_routed(&calibrate, &paragraph).await;
     let end = chrono::Local::now();
     let route_ms = t.elapsed().as_secs_f64() * 1000.0;
     info!(
@@ -270,4 +253,49 @@ pub(crate) async fn paragraph_task(
         let _ = tokio::task::spawn_blocking(move || st.record_final(record)).await;
     }
     let _ = turn.send(TurnEvent::ParagraphCalibration { paragraph_id, calibrated, route_ms });
+}
+
+// ── Stage2 路由(远程原生异步 / 本地 spawn_blocking 桥)──────────────────────────
+//
+// trait 的异步钩子(`*_async`)返回 'static future —— 不借用 self,Mutex 守卫在
+// 构造点即刻释放(守卫不跨 await,Send 约束成立)。无钩子的实现 → 回落
+// spawn_blocking 桥(同步版,行为与 round12 起完全一致)。
+
+/// live 纠偏路由([`live_calibration_task`] 用)。
+async fn calibrate_paragraph_routed(
+    cal: &Arc<Mutex<Box<dyn Stage2Calibrator>>>,
+    paragraph_id: ParagraphId,
+    sentences: &[VadSentence],
+) -> String {
+    let fut = cal.lock().unwrap().calibrate_paragraph_async(paragraph_id, sentences);
+    match fut {
+        Some(f) => f.await,
+        None => {
+            let cal = Arc::clone(cal);
+            let sent = sentences.to_vec();
+            tokio::task::spawn_blocking(move || {
+                cal.lock().unwrap().calibrate_paragraph(paragraph_id, &sent)
+            })
+            .await
+            .unwrap_or_default()
+        }
+    }
+}
+
+/// 定稿整流路由([`paragraph_task`] 用)。
+async fn finalize_paragraph_routed(
+    cal: &Arc<Mutex<Box<dyn Stage2Calibrator>>>,
+    paragraph: &VadParagraph,
+) -> String {
+    let fut = cal.lock().unwrap().finalize_paragraph_async(paragraph);
+    match fut {
+        Some(f) => f.await,
+        None => {
+            let cal = Arc::clone(cal);
+            let para = paragraph.clone();
+            tokio::task::spawn_blocking(move || cal.lock().unwrap().finalize_paragraph(&para))
+                .await
+                .unwrap_or_default()
+        }
+    }
 }

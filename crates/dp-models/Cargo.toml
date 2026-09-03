@@ -12,6 +12,8 @@ anyhow = "1"
 thiserror = "2"
 base64 = { workspace = true }
 tracing = { workspace = true }
+# AsyncAsr/AsyncLlm 路由的 Blocking 分支桥(spawn_blocking)。只开 rt,不含宏/时间。
+tokio = { version = "1", features = ["rt"] }
 # ONNX 实时语音(VAD/流式 ASR/batch ASR fallback)via sherpa-onnx —— 重依赖,默认不开启;
 # audio-aura 通过其 onnx feature 转发开启。目的:把重依赖从业务进程隔离到 dp-models。
 sherpa-onnx = { version = "1.13", default-features = false, features = ["shared"], optional = true }

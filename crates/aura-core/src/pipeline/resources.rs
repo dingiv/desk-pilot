@@ -239,7 +239,7 @@ pub struct OnnxStage1Recognizer {
     pub(crate) vad: Arc<dyn Stage0VAD>,
     /// Batch ASR as a trait object: local OnnxAsr (from `mgr`) or remote HttpAsr. Streaming/VAD
     /// stay in `mgr` (always local sherpa).
-    batch_asr: Arc<dyn AsrProvider>,
+    batch_asr: dp_models::AsyncAsr,
     /// Stage0 → 大脑的单 FIFO(R2 取代 AudioRing):ingest 逐帧 push FrontEvent
     /// (有界,满丢最旧 = 环回),消费循环 pop。frame/detected/events 同批同序。
     pub(crate) front_q: Arc<Mutex<VecDeque<FrontEvent>>>,
@@ -296,13 +296,13 @@ impl OnnxStage1Recognizer {
                     .build()?, // no local batch ASR — remote HttpAsr or batch-off
             ),
         };
-        let batch_asr: Arc<dyn AsrProvider> = match (&cfg.asr_kind, cfg.batch_enabled) {
-            (_, false) => Arc::new(DisabledAsr),
-            (ProviderKind::Local, _) => {
-                Arc::clone(mgr.asr().expect("local asr just loaded")) as Arc<dyn AsrProvider>
-            }
+        let batch_asr: dp_models::AsyncAsr = match (&cfg.asr_kind, cfg.batch_enabled) {
+            (_, false) => dp_models::AsyncAsr::Blocking(Arc::new(DisabledAsr)),
+            (ProviderKind::Local, _) => dp_models::AsyncAsr::Blocking(
+                Arc::clone(mgr.asr().expect("local asr just loaded")) as Arc<dyn AsrProvider>,
+            ),
             (ProviderKind::Remote { endpoint, model }, _) => {
-                Arc::new(HttpAsr::new(endpoint.clone(), model.clone()))
+                dp_models::AsyncAsr::Http(Arc::new(HttpAsr::new(endpoint.clone(), model.clone())))
             }
         };
         mgr.warm();
@@ -330,14 +330,14 @@ impl OnnxStage1Recognizer {
 
     /// Use an already-loaded [`OnnxRuntimeManager`] (e.g. shared with another stage).
     pub fn new_with_mgr(mgr: Arc<OnnxRuntimeManager>, cfg: Stage1Config) -> Result<Self> {
-        let batch_asr: Arc<dyn AsrProvider> = match (&cfg.asr_kind, cfg.batch_enabled) {
-            (_, false) => Arc::new(DisabledAsr),
-            (ProviderKind::Local, _) => {
+        let batch_asr: dp_models::AsyncAsr = match (&cfg.asr_kind, cfg.batch_enabled) {
+            (_, false) => dp_models::AsyncAsr::Blocking(Arc::new(DisabledAsr)),
+            (ProviderKind::Local, _) => dp_models::AsyncAsr::Blocking(
                 Arc::clone(mgr.asr().expect("local mgr must carry the batch ASR"))
-                    as Arc<dyn AsrProvider>
-            }
+                    as Arc<dyn AsrProvider>,
+            ),
             (ProviderKind::Remote { endpoint, model }, _) => {
-                Arc::new(HttpAsr::new(endpoint.clone(), model.clone()))
+                dp_models::AsyncAsr::Http(Arc::new(HttpAsr::new(endpoint.clone(), model.clone())))
             }
         };
         let vad: Arc<dyn Stage0VAD> = Arc::new(SileroVAD::new(Arc::clone(&mgr)));
@@ -394,7 +394,7 @@ impl OnnxStage1Recognizer {
         )
     }
 
-    /// Run the blocking batch ASR **once** (no retry — real-time: a hang/timeout/circuit-trip
+    /// Run the batch ASR **once** (no retry — real-time: a hang/timeout/circuit-trip
     /// must NOT stall finalization). `Ok(non-empty)` → `Some`; `Ok(empty)` (noise/silence) and
     /// `Err` (timeout / 断链 / 熔断) → `None` (caller falls back to streaming). The timeout +
     /// 断链熔断 live in [`dp_models::http::HttpAsr`] (ASR_TIMEOUT=3s, 断链即窗口内不发送);
@@ -406,26 +406,44 @@ impl OnnxStage1Recognizer {
         what: &str,
         paragraph_id: ParagraphId,
     ) -> Option<String> {
-        match self.batch_asr.recognize(pcm, sr) {
-            Ok(text) if !text.trim().is_empty() => Some(text),
-            Ok(_) => {
-                info!(
-                    what,
-                    paragraph_id, "batch 识别成功但文本为空(噪声/静音)→ 回退流式"
-                );
-                None
-            }
-            Err(e) => {
-                // 失败/超时/熔断 —— 立即回退流式,不等、不重试。这是"丢 BatchSentence"的
-                // 唯一来源;日志区分原因(超时 3s / 断链 / 熔断窗口)。
-                warn!(
-                    error = %e,
-                    what,
-                    paragraph_id,
-                    "batch 失败(超时/断链/熔断)→ 回退流式,立即继续(实时,不等)"
-                );
-                None
-            }
+        surface_asr(self.batch_asr.recognize_sync(pcm, sr), what, paragraph_id)
+    }
+
+    /// [`Self::recognize_once`] 的异步轨(batch 任务用):远程 HttpAsr → 原生异步
+    /// (超时/取消走连接池,无阻塞线程残留);本地 ONNX → `AsyncAsr` 内部的
+    /// `spawn_blocking` 桥(CPU 密集推理的正确归宿)。回退/日志语义与同步版一致。
+    pub async fn recognize_once_async(
+        &self,
+        pcm: &[i16],
+        sr: u32,
+        what: &str,
+        paragraph_id: ParagraphId,
+    ) -> Option<String> {
+        surface_asr(self.batch_asr.recognize(pcm, sr).await, what, paragraph_id)
+    }
+}
+
+/// recognize 结果 → 事件文本(`None` = 回退流式)+ 统一日志(两轨共享)。
+fn surface_asr(res: anyhow::Result<String>, what: &str, paragraph_id: ParagraphId) -> Option<String> {
+    match res {
+        Ok(text) if !text.trim().is_empty() => Some(text),
+        Ok(_) => {
+            info!(
+                what,
+                paragraph_id, "batch 识别成功但文本为空(噪声/静音)→ 回退流式"
+            );
+            None
+        }
+        Err(e) => {
+            // 失败/超时/熔断 —— 立即回退流式,不等、不重试。这是"丢 BatchSentence"的
+            // 唯一来源;日志区分原因(超时 3s / 断链 / 熔断窗口)。
+            warn!(
+                error = %e,
+                what,
+                paragraph_id,
+                "batch 失败(超时/断链/熔断)→ 回退流式,立即继续(实时,不等)"
+            );
+            None
         }
     }
 }

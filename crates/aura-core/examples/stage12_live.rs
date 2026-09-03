@@ -57,7 +57,7 @@ fn main() -> anyhow::Result<()> {
     let calibrator = Calibrator::load(&router_endpoint, &router_model)?;
     let _ = calibrator.calibrate_blocking("你好", None, &[]); // HTTP warmup (避免首轮冷启动)
     let corrections = Arc::new(Mutex::new(Vec::new()));
-    let s2 = Stage2CalibratorImpl::new(Arc::new(calibrator), Arc::clone(&hotwords), corrections, LlmInput::Batch);
+    let s2 = Stage2CalibratorImpl::new(dp_models::AsyncLlm::Blocking(Arc::new(calibrator)), Arc::clone(&hotwords), corrections, LlmInput::Batch);
 
     fs::create_dir_all(REPORT_DIR).ok();
     let epoch = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);

@@ -21,8 +21,8 @@
 //! | blocking pool ×1 · `front.rs` | `s1.run_ingest()` | scout TCP → VAD 检测 → 门控帧直发流式 + FrontEvent 入队 |
 //! | 异步任务 · `loops.rs` `consume_loop` | `consume_loop(&s1, cb)` | 大脑:边界决策(起音即开段,时间戳 id)、Finalize 握手 |
 //! | `run` future(daemon: rt 任务 / 独立宿主: 专用线程)· `loops.rs` `main_loop` | `select!` 主循环 | **唯一 on_turn 调用者**:SF/PC 直通 emit;Batch → 句任务;ParagraphEdge → 段任务 |
-//! | 句任务 · `batch.rs` | `spawn_blocking(recognize_once)` | 每句 EOS 一个;完成即回传 `BatchSentence` |
-//! | live 整流任务 · `batch.rs` | 链式 `spawn_blocking(calibrate_paragraph)` | BS 到达触发(架构要求 batch 完成 → 之后纠偏);回传 `SentenceCalibration` |
+//! | 句任务 · `batch.rs` | `recognize_once_async`(AsyncAsr 路由:远程原生 await / 本地桥) | 每句 EOS 一个;完成即回传 `BatchSentence` |
+//! | live 整流任务 · `batch.rs` | 链式 `calibrate_paragraph_routed`(远程原生异步 / 本地桥) | BS 到达触发(架构要求 batch 完成 → 之后纠偏);回传 `SentenceCalibration` |
 //! | 段任务 · `batch.rs` | join 句任务 + live 链尾 → 段重跑 → LLM 定稿 → 归档 | 就绪门 = `join!` 语义;SC 先于 PCal |
 
 
@@ -220,14 +220,15 @@ fn stage2_calibrator(
     hotwords: Arc<Mutex<Vec<String>>>,
     corrections: Arc<Mutex<Vec<(String, String)>>>,
 ) -> Result<Box<dyn Stage2Calibrator>> {
-    let llm: Arc<dyn dp_models::LlmProvider> = match &spec.llm {
+    let llm = match &spec.llm {
         LlmSpec::Disabled => {
             info!("Stage2 LLM: disabled — pass-through (calibrated = 原文, 零 LLM)");
             return Ok(Box::new(PassThroughCalibrator));
         }
         LlmSpec::Remote { endpoint, model } => {
             info!("Stage2 LLM: remote HTTP {endpoint} (model {model})");
-            Arc::new(HttpLlm::new(endpoint.clone(), model.clone()))
+            // 路由到原生异步轨:batch 任务的 SC/PCal 可 await,超时可被 tokio 真取消。
+            dp_models::AsyncLlm::Http(Arc::new(HttpLlm::new(endpoint.clone(), model.clone())))
         }
     };
     Ok(Box::new(Stage2CalibratorImpl::new(llm, hotwords, corrections, spec.llm_input)))

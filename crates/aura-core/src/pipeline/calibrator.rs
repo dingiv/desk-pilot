@@ -11,6 +11,8 @@
 //! 一次 LLM**。The old ContextWindow (disabled — 3B 复读) is deleted: cross-sentence
 //! context enters through the joint input itself.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -41,6 +43,28 @@ pub trait Stage2Calibrator: Send {
     /// raw joined text on LLM failure (see `joint_calibrate`). **Gated: no LLM when both
     /// streaming and batch are empty for every sentence.**
     fn finalize_paragraph(&mut self, paragraph: &VadParagraph) -> String;
+
+    /// 异步轨(可选覆写):`Some('static future)` = 原生异步(远程 HttpLlm 路径,
+    /// 超时可被 `tokio::time::timeout` **真取消**);`None`(默认)= 无原生异步,
+    /// 调用方回落 spawn_blocking 桥(同步版)。future 拥有全部输入 —— 不借用
+    /// `self`,调用点的 Mutex 守卫可即刻释放(守卫不跨 await)。
+    fn calibrate_paragraph_async(
+        &mut self,
+        paragraph_id: ParagraphId,
+        sentences: &[VadSentence],
+    ) -> Option<Pin<Box<dyn Future<Output = String> + Send>>> {
+        let _ = (paragraph_id, sentences);
+        None
+    }
+
+    /// [`Self::calibrate_paragraph_async`](Self::calibrate_paragraph_async) 的定稿版。
+    fn finalize_paragraph_async(
+        &mut self,
+        paragraph: &VadParagraph,
+    ) -> Option<Pin<Box<dyn Future<Output = String> + Send>>> {
+        let _ = paragraph;
+        None
+    }
 }
 
 /// Stage2 turned off (`llm.backend: disable`): calibration is the identity — no LLM is
@@ -57,6 +81,24 @@ impl Stage2Calibrator for PassThroughCalibrator {
 
     fn finalize_paragraph(&mut self, paragraph: &VadParagraph) -> String {
         paragraph.best_text().into_owned()
+    }
+
+    // 恒等是微秒级纯拼接 —— 直接给即时 future,省一次 spawn_blocking 往返。
+    fn calibrate_paragraph_async(
+        &mut self,
+        _paragraph_id: ParagraphId,
+        sentences: &[VadSentence],
+    ) -> Option<Pin<Box<dyn Future<Output = String> + Send>>> {
+        let joined = sentences.iter().map(|s| s.best_text()).collect::<Vec<_>>().join("");
+        Some(Box::pin(async move { joined }))
+    }
+
+    fn finalize_paragraph_async(
+        &mut self,
+        paragraph: &VadParagraph,
+    ) -> Option<Pin<Box<dyn Future<Output = String> + Send>>> {
+        let text = paragraph.best_text().into_owned();
+        Some(Box::pin(async move { text }))
     }
 }
 
@@ -81,7 +123,8 @@ pub enum LlmInput {
 /// Default Stage2 calibrator over an [`dp_models::LlmProvider`]. Reads the latest hotwords
 /// (shared with Stage3) and user corrections on every call.
 pub struct Stage2CalibratorImpl {
-    llm: Arc<dyn dp_models::LlmProvider>,
+    /// LLM 路由(构造期定型):remote → 原生异步;本地 → spawn_blocking 桥。
+    llm: dp_models::AsyncLlm,
     /// Shared with Stage3 — the feedback channel. Read fresh on every calibrate.
     hotwords: Arc<Mutex<Vec<String>>>,
     /// User corrections (raw→corrected pairs), shared with daemon's POST /api/correct handler.
@@ -92,16 +135,32 @@ pub struct Stage2CalibratorImpl {
 }
 
 impl Stage2CalibratorImpl {
-    /// `hotwords` is shared (clone the Arc from wherever Stage3 holds it); `llm` is the local
-    /// `Calibrator` or a remote `HttpLlm` (as `Arc<dyn LlmProvider>`). `input` selects the
-    /// calibration source text (batch / stream / both).
+    /// `hotwords` is shared (clone the Arc from wherever Stage3 holds it); `llm` is the routed
+    /// provider (remote `AsyncLlm::Http` — 原生异步, or local `AsyncLlm::Blocking`). `input`
+    /// selects the calibration source text (batch / stream / both).
     pub fn new(
-        llm: Arc<dyn dp_models::LlmProvider>,
+        llm: dp_models::AsyncLlm,
         hotwords: Arc<Mutex<Vec<String>>>,
         corrections: Arc<Mutex<Vec<(String, String)>>>,
         input: LlmInput,
     ) -> Self {
         Self { llm, hotwords, corrections, input }
+    }
+}
+
+/// 按输入源收集整流输入(owned,同步/异步两轨共享):每句一行 + 可选流式全文
+/// (`Both` 的双通道信封)。
+fn collect_inputs(input: LlmInput, sentences: &[VadSentence]) -> (Vec<String>, Option<String>) {
+    let lines = |f: &dyn Fn(&VadSentence) -> String| {
+        sentences.iter().map(f).filter(|t| !t.trim().is_empty()).collect()
+    };
+    match input {
+        LlmInput::Batch => (lines(&|s| s.best_text().to_string()), None),
+        LlmInput::Stream => (lines(&|s| s.streaming_text.clone()), None),
+        LlmInput::Both => (
+            lines(&|s| s.best_text().to_string()),
+            Some(sentences.iter().map(|s| s.streaming_text.as_str()).collect::<Vec<_>>().join("")),
+        ),
     }
 }
 
@@ -121,32 +180,8 @@ impl Stage2Calibrator for Stage2CalibratorImpl {
         if !has_recognized_text(sentences) {
             return String::new();
         }
-        match self.input {
-            LlmInput::Batch => {
-                // One line per sentence — the joint input IS the cross-sentence context.
-                let texts: Vec<&str> =
-                    sentences.iter().map(|s| s.best_text()).filter(|t| !t.trim().is_empty()).collect();
-                self.joint_calibrate(&texts, None)
-            }
-            LlmInput::Stream => {
-                let texts: Vec<&str> = sentences
-                    .iter()
-                    .map(|s| s.streaming_text.as_str())
-                    .filter(|t| !t.trim().is_empty())
-                    .collect();
-                self.joint_calibrate(&texts, None)
-            }
-            LlmInput::Both => {
-                let texts: Vec<&str> =
-                    sentences.iter().map(|s| s.best_text()).filter(|t| !t.trim().is_empty()).collect();
-                let streaming = sentences
-                    .iter()
-                    .map(|s| s.streaming_text.as_str())
-                    .collect::<Vec<_>>()
-                    .join("");
-                self.joint_calibrate(&texts, Some(&streaming))
-            }
-        }
+        let (texts, streaming) = collect_inputs(self.input, sentences);
+        self.joint_calibrate(texts, streaming)
     }
 
     fn finalize_paragraph(&mut self, paragraph: &VadParagraph) -> String {
@@ -157,41 +192,40 @@ impl Stage2Calibrator for Stage2CalibratorImpl {
         // 定稿整流:全句 best_text(句级 batch 已由 pipeline 补齐;缺失句回退流式)。
         // batch 异步化后末句 batch 可能晚于最后一个 Batch 到达,不能复用 live 整存档 ——
         // 定稿自己跑一次 LLM。
-        match self.input {
-            LlmInput::Batch => {
-                let texts: Vec<&str> =
-                    paragraph.sentences.iter().map(|s| s.best_text()).filter(|t| !t.trim().is_empty()).collect();
-                self.joint_calibrate(&texts, None)
-            }
-            LlmInput::Stream => {
-                let texts: Vec<&str> = paragraph
-                    .sentences
-                    .iter()
-                    .map(|s| s.streaming_text.as_str())
-                    .filter(|t| !t.trim().is_empty())
-                    .collect();
-                self.joint_calibrate(&texts, None)
-            }
-            LlmInput::Both => {
-                let texts: Vec<&str> = paragraph
-                    .sentences
-                    .iter()
-                    .map(|s| s.best_text())
-                    .filter(|t| !t.trim().is_empty())
-                    .collect();
-                let streaming =
-                    paragraph.sentences.iter().map(|s| s.streaming_text.as_str()).collect::<Vec<_>>().join("");
-                self.joint_calibrate(&texts, Some(&streaming))
-            }
+        let (texts, streaming) = collect_inputs(self.input, &paragraph.sentences);
+        self.joint_calibrate(texts, streaming)
+    }
+
+    fn calibrate_paragraph_async(
+        &mut self,
+        paragraph_id: ParagraphId,
+        sentences: &[VadSentence],
+    ) -> Option<Pin<Box<dyn Future<Output = String> + Send>>> {
+        let _ = paragraph_id;
+        if !has_recognized_text(sentences) {
+            return Some(Box::pin(async { String::new() }));
         }
+        let (texts, streaming) = collect_inputs(self.input, sentences);
+        Some(self.joint_calibrate_async(texts, streaming))
+    }
+
+    fn finalize_paragraph_async(
+        &mut self,
+        paragraph: &VadParagraph,
+    ) -> Option<Pin<Box<dyn Future<Output = String> + Send>>> {
+        if !has_recognized_text(&paragraph.sentences) {
+            return Some(Box::pin(async { String::new() }));
+        }
+        let (texts, streaming) = collect_inputs(self.input, &paragraph.sentences);
+        Some(self.joint_calibrate_async(texts, streaming))
     }
 }
 
 impl Stage2CalibratorImpl {
     /// The shared core: build the prompt (corrections → hotwords → joint text in the XML
-    /// envelope), run the LLM, fall back to the raw text on failure. `streaming_ref` (Some for
+    /// envelope), run the LLM, fall back to the raw text on failure. `streaming` (Some for
     /// [`LlmInput::Both`]) adds the dual-transcript envelope so the LLM can补回 batch 丢的句首.
-    fn joint_calibrate(&mut self, texts: &[&str], streaming_ref: Option<&str>) -> String {
+    fn joint_calibrate(&self, texts: Vec<String>, streaming: Option<String>) -> String {
         // Defense-in-depth:入口门禁(has_recognized_text)已挡"双路全空";此处再按**所选
         // 输入源**挡一次(如 Stream 模式下流式全空 → 无输入)→ 零 LLM,回原文(空)。
         if texts.is_empty() {
@@ -199,23 +233,56 @@ impl Stage2CalibratorImpl {
         }
         let hotwords = self.hotwords.lock().unwrap().clone();
         let corrections = self.corrections.lock().unwrap().clone();
-
-        let mut pb = PromptBuilder::new_multi(texts).hotwords(&hotwords);
-        // Dual-transcript (llm.input: both): streaming head/tail is fuller — the instruction
-        // tells the LLM to补回 real words batch dropped at the sentence head.
-        if let Some(sref) = streaming_ref {
-            pb = pb.streaming_ref(sref);
-        }
-        // User corrections (raw→corrected) — authoritative examples, highest priority.
-        if !corrections.is_empty() {
-            pb = pb.corrections(&corrections);
-        }
-        let (system, user) = pb.build();
+        let (system, user) = build_joint_prompt(&texts, streaming.as_deref(), &hotwords, &corrections);
         tracing::debug!(target: "stage2::prompt", system = %system, user = %user, "calibrate prompt");
 
         // LLM returns plain text — no JSON parsing. Failure → the raw text, unchanged.
-        self.llm.complete(&system, &user).unwrap_or_else(|_| texts.join(""))
+        self.llm.complete_sync(&system, &user).unwrap_or_else(|_| texts.join(""))
     }
+
+    /// [`Self::joint_calibrate`] 的原生异步核:'static future(输入全 owned + LLM 路由
+    /// clone)—— 不借用 self,调用点的锁守卫可即刻释放(守卫不跨 await)。
+    fn joint_calibrate_async(
+        &self,
+        texts: Vec<String>,
+        streaming: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = String> + Send>> {
+        let hotwords = self.hotwords.lock().unwrap().clone();
+        let corrections = self.corrections.lock().unwrap().clone();
+        let llm = self.llm.clone();
+        Box::pin(async move {
+            if texts.is_empty() {
+                return String::new();
+            }
+            let (system, user) =
+                build_joint_prompt(&texts, streaming.as_deref(), &hotwords, &corrections);
+            tracing::debug!(target: "stage2::prompt", system = %system, user = %user, "calibrate prompt");
+            // LLM returns plain text — no JSON parsing. Failure → the raw text, unchanged.
+            llm.complete(&system, &user).await.unwrap_or_else(|_| texts.join(""))
+        })
+    }
+}
+
+/// 组 joint 整流 prompt(纯函数,同步/异步两轨共享):corrections → hotwords → joint
+/// 文本 + 双通道信封(可选 streaming_ref)。
+fn build_joint_prompt(
+    texts: &[String],
+    streaming_ref: Option<&str>,
+    hotwords: &[String],
+    corrections: &[(String, String)],
+) -> (String, String) {
+    let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+    let mut pb = PromptBuilder::new_multi(&refs).hotwords(hotwords);
+    // Dual-transcript (llm.input: both): streaming head/tail is fuller — the instruction
+    // tells the LLM to补回 real words batch dropped at the sentence head.
+    if let Some(sref) = streaming_ref {
+        pb = pb.streaming_ref(sref);
+    }
+    // User corrections (raw→corrected) — authoritative examples, highest priority.
+    if !corrections.is_empty() {
+        pb = pb.corrections(corrections);
+    }
+    pb.build()
 }
 
 #[cfg(test)]
@@ -260,7 +327,7 @@ mod tests {
     fn s2() -> (Stage2CalibratorImpl, Arc<Mutex<usize>>) {
         let calls = Arc::new(Mutex::new(0));
         let s = Stage2CalibratorImpl::new(
-            Arc::new(CountingLlm(Arc::clone(&calls))),
+            dp_models::AsyncLlm::Blocking(Arc::new(CountingLlm(Arc::clone(&calls)))),
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(Mutex::new(Vec::new())),
             LlmInput::Batch,
@@ -281,7 +348,7 @@ mod tests {
     fn s2_with_input(input: LlmInput) -> (Stage2CalibratorImpl, Arc<Mutex<Option<String>>>) {
         let user = Arc::new(Mutex::new(None));
         let s = Stage2CalibratorImpl::new(
-            Arc::new(CapturingLlm(Arc::clone(&user))),
+            dp_models::AsyncLlm::Blocking(Arc::new(CapturingLlm(Arc::clone(&user)))),
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(Mutex::new(Vec::new())),
             input,
@@ -392,7 +459,6 @@ mod tests {
         // The Stage3→Stage2 feedback channel: the same Arc<Mutex<Vec<String>>> is mutated by
         // Stage3 and read by Stage2. (Calibrator construction needs the real model, exercised
         // in the example; here we just prove the sharing primitive.)
-        use std::sync::{Arc, Mutex};
         let store: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec!["Rust".into()]));
         let reader = Arc::clone(&store);
         store.lock().unwrap().push("Bevy".into()); // Stage3 adds

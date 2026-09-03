@@ -1,4 +1,14 @@
-//! OpenAI 兼容的 remote provider 实现 (`reqwest::blocking`, 同步)。
+//! OpenAI 兼容的 remote provider 实现,**双轨 API**(同步 + 异步):
+//!
+//! - **异步**(`*_async` 原生方法,`reqwest::Client`):标准网络 I/O 的正路 —— 可安全在
+//!   tokio 上下文 `await`,超时可被 `tokio::time::timeout` **真取消**(连接池层面释放)。
+//! - **同步**(trait [`AsrProvider`]/[`LlmProvider`]/[`VlmProvider`] 实现,
+//!   `reqwest::blocking`):供同步调用方(examples / 后台 thread)使用。blocking client
+//!   **惰性构造**(首次同步调用时)——纯异步使用者全程不建它,也就不会在 tokio 上下文
+//!   构造/析构 blocking runtime(aura round17 "Cannot drop a runtime" panic 的根源)。
+//!   ⚠️ 反向仍禁止:同步方法不得在 async 上下文调用(会 block worker)。
+//!
+//! 两轨共享 endpoint/model/超时/熔断(`Circuit`),各持独立连接池。
 //!
 //! 适配 vLLM / SGLang / qwen3-asr-rs `asr-server` / 任意 OpenAI 兼容服务。
 //!
@@ -6,7 +16,7 @@
 //! 控制面的预热接口——确保模型已 online 可调用。供上层(aura-daemon 启动、UI 切模型)
 //! 在首次 inference 前主动探活 + 触发动态加载,避免首次请求的 latency spike。
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -52,11 +62,41 @@ impl Circuit {
     fn reset(&mut self) {
         self.open_until = None;
     }
+    /// 入口检查:开窗内直接 `Err`(带服务名与调用方回退提示),不拿已知断链的连接去等。
+    fn check(&self, what: &str, hint: &str) -> Result<()> {
+        if self.is_open() {
+            return Err(anyhow!(
+                "{what} 服务不可用(熔断窗口 {}ms 内不发送)——{hint}",
+                CIRCUIT_OPEN.as_millis()
+            ));
+        }
+        Ok(())
+    }
+    /// 出口结算:成功闭合,失败开窗。
+    fn settle(&mut self, ok: bool) {
+        if ok {
+            self.reset();
+        } else {
+            self.trip();
+        }
+    }
+}
+
+/// 构造异步 client(任何上下文安全,含 tokio worker)。
+fn build_async_client(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .expect("build reqwest async client")
 }
 
 /// ASR via OpenAI `/v1/audio/transcriptions` (multipart wav)。
 pub struct HttpAsr {
-    client: reqwest::blocking::Client,
+    /// 异步 client(构造即建,任何上下文安全)。
+    client: reqwest::Client,
+    /// 同步 client(惰性:首次同步调用才建)。
+    blocking: OnceLock<reqwest::blocking::Client>,
+    timeout: Duration,
     endpoint: String,
     /// 服务端模型名(必传;OpenAI 规范要求 multipart form 里带 `model` 字段)。
     /// 需与目标服务的模型注册名对齐(如 dp-router.yaml `models[].name`)。
@@ -77,14 +117,32 @@ impl HttpAsr {
         timeout: Duration,
     ) -> Self {
         Self {
-            client: reqwest::blocking::Client::builder()
-                .timeout(timeout)
-                .build()
-                .expect("build reqwest blocking client"),
+            client: build_async_client(timeout),
+            blocking: OnceLock::new(),
+            timeout,
             endpoint: endpoint.into(),
             model: model.into(),
             circuit: Mutex::new(Circuit::default()),
         }
+    }
+
+    /// 同步路径的 blocking client(惰性构造)。⚠️ 只能在同步上下文触碰——
+    /// 在 async 上下文构造/使用/析构它正是 round17 panic 的根源。
+    fn blocking(&self) -> &reqwest::blocking::Client {
+        self.blocking.get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(self.timeout)
+                .build()
+                .expect("build reqwest blocking client")
+        })
+    }
+
+    fn check_circuit(&self) -> Result<()> {
+        self.circuit.lock().unwrap().check("ASR", "回退流式")
+    }
+
+    fn settle_circuit(&self, ok: bool) {
+        self.circuit.lock().unwrap().settle(ok)
     }
 
     fn do_recognize(&self, pcm: &[i16], sr: u32) -> Result<String> {
@@ -96,13 +154,42 @@ impl HttpAsr {
             .text("model", self.model.clone())
             .part("file", part);
         let resp: TranscriptionResp = self
-            .client
+            .blocking()
             .post(url(&self.endpoint, "/v1/audio/transcriptions"))
             .multipart(form)
             .send()?
             .error_for_status()?
             .json()?;
         Ok(resp.text)
+    }
+
+    /// **异步轨**:同 [`AsrProvider::recognize`] 的语义(超时/熔断共享),但返回
+    /// future —— 可安全在 tokio 上下文 `await`,且超时可被 `tokio::time::timeout`
+    /// 真取消(future 被 drop 时连接池释放,无阻塞线程残留)。
+    pub async fn recognize_async(&self, pcm: &[i16], sr: u32) -> Result<String> {
+        self.check_circuit()?;
+        let res = async {
+            let wav = pcm_to_wav(pcm, sr);
+            let part = reqwest::multipart::Part::bytes(wav)
+                .file_name("audio.wav")
+                .mime_str("audio/wav")?;
+            let form = reqwest::multipart::Form::new()
+                .text("model", self.model.clone())
+                .part("file", part);
+            let resp: TranscriptionResp = self
+                .client
+                .post(url(&self.endpoint, "/v1/audio/transcriptions"))
+                .multipart(form)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            Ok(resp.text)
+        }
+        .await;
+        self.settle_circuit(res.is_ok());
+        res
     }
 }
 
@@ -115,25 +202,18 @@ impl ModelProvider for HttpAsr {
 impl AsrProvider for HttpAsr {
     fn recognize(&self, pcm: &[i16], sr: u32) -> Result<String> {
         // 熔断:已知服务不可用(断链/刚超时)→ 窗口内不发送,立即 Err(回退流式,不等)。
-        if self.circuit.lock().unwrap().is_open() {
-            return Err(anyhow!(
-                "ASR 服务不可用(熔断窗口 {}ms 内不发送)——回退流式",
-                CIRCUIT_OPEN.as_millis()
-            ));
-        }
+        self.check_circuit()?;
         let res = self.do_recognize(pcm, sr);
-        let mut c = self.circuit.lock().unwrap();
-        match &res {
-            Ok(_) => c.reset(), // 成功 → 闭合
-            Err(_) => c.trip(), // 失败(断链/超时)→ 打开窗口
-        }
+        self.settle_circuit(res.is_ok());
         res
     }
 }
 
 /// LLM via OpenAI `/v1/chat/completions`。
 pub struct HttpLlm {
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
+    blocking: OnceLock<reqwest::blocking::Client>,
+    timeout: Duration,
     endpoint: String,
     model: String,
     circuit: Mutex<Circuit>,
@@ -153,14 +233,23 @@ impl HttpLlm {
         timeout: Duration,
     ) -> Self {
         Self {
-            client: reqwest::blocking::Client::builder()
-                .timeout(timeout)
-                .build()
-                .expect("build reqwest blocking client"),
+            client: build_async_client(timeout),
+            blocking: OnceLock::new(),
+            timeout,
             endpoint: endpoint.into(),
             model: model.into(),
             circuit: Mutex::new(Circuit::default()),
         }
+    }
+
+    /// 同步路径的 blocking client(惰性构造;`warm` 轮询也走它)。⚠️ 只能在同步上下文。
+    fn blocking(&self) -> &reqwest::blocking::Client {
+        self.blocking.get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(self.timeout)
+                .build()
+                .expect("build reqwest blocking client")
+        })
     }
 
     /// 探测/触发 dp-router 加载模型,直到 `self.model` 在线可调用。
@@ -241,7 +330,7 @@ impl HttpLlm {
     fn fetch_snapshot(&self, base: &str) -> Result<AdminSnapshot, WarmError> {
         let url = format!("{}/admin/models", base.trim_end_matches('/'));
         let resp = self
-            .client
+            .blocking()
             .get(&url)
             .send()
             .map_err(|e| WarmError::RouterUnreachable(url.clone(), e))?;
@@ -268,7 +357,7 @@ impl HttpLlm {
         let url = format!("{}/admin/models/load", base.trim_end_matches('/'));
         let body = serde_json::json!({ "name": self.model });
         let resp = self
-            .client
+            .blocking()
             .post(&url)
             .json(&body)
             .send()
@@ -300,45 +389,71 @@ impl LlmProvider for HttpLlm {
     fn complete(&self, system: &str, user: &str) -> Result<String> {
         // 熔断:已知 LLM 不可用(断链/刚超时)→ 窗口内不发送,立即 Err —— 整流回退原文,
         // 不让 Stage2 worker 卡在一个已知断链的连接上(否则定稿"死等")。
-        if self.circuit.lock().unwrap().is_open() {
-            return Err(anyhow!(
-                "LLM 服务不可用(熔断窗口 {}ms 内不发送)——整流回退原文",
-                CIRCUIT_OPEN.as_millis()
-            ));
-        }
+        self.check_circuit()?;
         let res = self.do_complete(system, user);
-        let mut c = self.circuit.lock().unwrap();
-        match &res {
-            Ok(_) => c.reset(),
-            Err(_) => c.trip(),
-        }
+        self.settle_circuit(res.is_ok());
         res
     }
 }
 
 impl HttpLlm {
-    fn do_complete(&self, system: &str, user: &str) -> Result<String> {
-        let body = serde_json::json!({
+    fn check_circuit(&self) -> Result<()> {
+        self.circuit.lock().unwrap().check("LLM", "整流回退原文")
+    }
+
+    fn settle_circuit(&self, ok: bool) {
+        self.circuit.lock().unwrap().settle(ok)
+    }
+
+    /// chat/completions 请求体(两轨共享)。
+    fn chat_body(&self, system: &str, user: &str) -> serde_json::Value {
+        serde_json::json!({
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-        });
+        })
+    }
+
+    fn do_complete(&self, system: &str, user: &str) -> Result<String> {
         let resp: ChatResp = self
-            .client
+            .blocking()
             .post(url(&self.endpoint, "/v1/chat/completions"))
-            .json(&body)
+            .json(&self.chat_body(system, user))
             .send()?
             .error_for_status()?
             .json()?;
-        Ok(resp.choices.into_iter().next().ok_or_else(|| anyhow!("no choices in response"))?.message.content)
+        parse_chat(resp)
+    }
+
+    /// **异步轨**:同 [`LlmProvider::complete`] 的语义(超时/熔断共享),返回 future ——
+    /// 可安全在 tokio 上下文 `await`,超时可被 `tokio::time::timeout` 真取消。
+    pub async fn complete_async(&self, system: &str, user: &str) -> Result<String> {
+        self.check_circuit()?;
+        let res = async {
+            let resp: ChatResp = self
+                .client
+                .post(url(&self.endpoint, "/v1/chat/completions"))
+                .json(&self.chat_body(system, user))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            parse_chat(resp)
+        }
+        .await;
+        self.settle_circuit(res.is_ok());
+        res
     }
 }
 
 /// VLM via OpenAI `/v1/chat/completions` (image as `data:image/png;base64,...` URL)。
 pub struct HttpVlm {
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
+    blocking: OnceLock<reqwest::blocking::Client>,
+    timeout: Duration,
     endpoint: String,
     model: String,
     circuit: Mutex<Circuit>,
@@ -357,14 +472,78 @@ impl HttpVlm {
         timeout: Duration,
     ) -> Self {
         Self {
-            client: reqwest::blocking::Client::builder()
-                .timeout(timeout)
-                .build()
-                .expect("build reqwest blocking client"),
+            client: build_async_client(timeout),
+            blocking: OnceLock::new(),
+            timeout,
             endpoint: endpoint.into(),
             model: model.into(),
             circuit: Mutex::new(Circuit::default()),
         }
+    }
+
+    /// 同步路径的 blocking client(惰性构造)。⚠️ 只能在同步上下文。
+    fn blocking(&self) -> &reqwest::blocking::Client {
+        self.blocking.get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(self.timeout)
+                .build()
+                .expect("build reqwest blocking client")
+        })
+    }
+
+    fn check_circuit(&self) -> Result<()> {
+        self.circuit.lock().unwrap().check("VLM", "跳过视觉推理")
+    }
+
+    fn settle_circuit(&self, ok: bool) {
+        self.circuit.lock().unwrap().settle(ok)
+    }
+
+    /// 请求体(两轨共享;image 以 data-URL 内联)。
+    fn vlm_body(&self, system: &str, user: &str, image_png: &[u8]) -> serde_json::Value {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(image_png);
+        serde_json::json!({
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": [
+                    {"type": "text", "text": user},
+                    {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{b64}")}},
+                ]},
+            ],
+        })
+    }
+
+    fn do_complete(&self, system: &str, user: &str, image_png: &[u8]) -> Result<String> {
+        let resp: ChatResp = self
+            .blocking()
+            .post(url(&self.endpoint, "/v1/chat/completions"))
+            .json(&self.vlm_body(system, user, image_png))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        parse_chat(resp)
+    }
+
+    /// **异步轨**:同 [`VlmProvider::complete`] 的语义(超时/熔断共享),返回 future。
+    pub async fn complete_async(&self, system: &str, user: &str, image_png: &[u8]) -> Result<String> {
+        self.check_circuit()?;
+        let res = async {
+            let resp: ChatResp = self
+                .client
+                .post(url(&self.endpoint, "/v1/chat/completions"))
+                .json(&self.vlm_body(system, user, image_png))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            parse_chat(resp)
+        }
+        .await;
+        self.settle_circuit(res.is_ok());
+        res
     }
 }
 
@@ -377,44 +556,10 @@ impl ModelProvider for HttpVlm {
 impl VlmProvider for HttpVlm {
     fn complete(&self, system: &str, user: &str, image_png: &[u8]) -> Result<String> {
         // 熔断:同 HttpLlm —— 已知 VLM 不可用时窗口内不发送,立即 Err。
-        if self.circuit.lock().unwrap().is_open() {
-            return Err(anyhow!(
-                "VLM 服务不可用(熔断窗口 {}ms 内不发送)",
-                CIRCUIT_OPEN.as_millis()
-            ));
-        }
+        self.check_circuit()?;
         let res = self.do_complete(system, user, image_png);
-        let mut c = self.circuit.lock().unwrap();
-        match &res {
-            Ok(_) => c.reset(),
-            Err(_) => c.trip(),
-        }
+        self.settle_circuit(res.is_ok());
         res
-    }
-}
-
-impl HttpVlm {
-    fn do_complete(&self, system: &str, user: &str, image_png: &[u8]) -> Result<String> {
-        use base64::Engine as _;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(image_png);
-        let body = serde_json::json!({
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": [
-                    {"type": "text", "text": user},
-                    {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{b64}")}},
-                ]},
-            ],
-        });
-        let resp: ChatResp = self
-            .client
-            .post(url(&self.endpoint, "/v1/chat/completions"))
-            .json(&body)
-            .send()?
-            .error_for_status()?
-            .json()?;
-        Ok(resp.choices.into_iter().next().ok_or_else(|| anyhow!("no choices in response"))?.message.content)
     }
 }
 
@@ -422,6 +567,17 @@ impl HttpVlm {
 
 fn url(base: &str, path: &str) -> String {
     format!("{}{}", base.trim_end_matches('/'), path)
+}
+
+/// chat/completions 响应 → 文本(LLM/VLM 共享)。
+fn parse_chat(resp: ChatResp) -> Result<String> {
+    Ok(resp
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no choices in response"))?
+        .message
+        .content)
 }
 
 /// 把 `http://x:8080` / `http://x:8080/` / `http://x:8080/v1` 都规整成 `http://x:8080`

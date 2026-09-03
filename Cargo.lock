@@ -5836,10 +5836,8 @@ name = "swift-ime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "audio-aura-agent",
  "clap",
  "crossterm",
- "futures",
  "ime-core",
  "inputx-fsa",
  "ratatui",
@@ -5847,7 +5845,6 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "shared",
- "tokio",
  "tracing",
  "tracing-subscriber",
 ]

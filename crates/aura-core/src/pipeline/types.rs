@@ -6,6 +6,8 @@
 //! 不在此文件。)
 
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
@@ -161,6 +163,11 @@ pub(crate) struct ParagraphWaits {
 /// 任务 → 主循环的回传通道(发射单点:BS/SC/BP/PCal 全部经它)。
 pub(crate) type TurnTx = tokio::sync::mpsc::UnboundedSender<TurnEvent<'static>>;
 
-/// 段级重跑的调用壳(batch 单发入口的闭包形态,段任务持有)。
-pub(crate) type RunParagraphBatch =
-    Arc<dyn Fn(&[i16], u32, ParagraphId) -> Option<String> + Send + Sync>;
+/// 段级重跑的调用壳(batch 单发入口的闭包形态,段任务持有)。**异步**:远程走原生
+/// HttpAsr(超时 = future 被 drop,连接真取消);本地 ONNX 在 [`dp_models::AsyncAsr`]
+/// 内部 spawn_blocking。
+pub(crate) type RunParagraphBatch = Arc<
+    dyn Fn(Vec<i16>, u32, ParagraphId) -> Pin<Box<dyn Future<Output = Option<String>> + Send>>
+        + Send
+        + Sync,
+>;
