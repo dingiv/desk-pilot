@@ -3,6 +3,7 @@
 //! 每个本地模型一个子进程,独占一个内部 HTTP 端口(在 `LlamaServerConfig.port_range`
 //! 内分配)。dp-router 通过 reqwest 转发 OpenAI 兼容请求到这些端口。
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -73,6 +74,7 @@ impl LlamaProcess {
         gguf: &Path,
         cfg: &LocalModelConfig,
         port: u16,
+        env: &HashMap<String, String>,
     ) -> Command {
         let mut cmd = Command::new(llama_path);
         cmd.arg("-m").arg(gguf)
@@ -108,6 +110,9 @@ impl LlamaProcess {
         for a in &cfg.extra_args {
             cmd.arg(a);
         }
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -116,8 +121,13 @@ impl LlamaProcess {
     }
 
     /// 首次 spawn(或失败后由 [`Self::restart`] 重试)。返回成功后的 PID。
-    pub async fn spawn(&mut self, llama_path: &Path, gguf: &Path) -> Result<u32> {
-        let mut cmd = Self::build_command(llama_path, gguf, &self.config, self.port);
+    pub async fn spawn(
+        &mut self,
+        llama_path: &Path,
+        gguf: &Path,
+        env: &HashMap<String, String>,
+    ) -> Result<u32> {
+        let mut cmd = Self::build_command(llama_path, gguf, &self.config, self.port, env);
         info!(
             "[dp-router] spawning llama-server: model={} port={} gguf={}",
             self.model_name, self.port, gguf.display()
@@ -232,7 +242,7 @@ impl LlamaProcess {
         }
         self.child_exited = true;
         tokio::time::sleep(Duration::from_secs(delay)).await;
-        self.spawn(llama_path, gguf).await?;
+        self.spawn(llama_path, gguf, &ll_cfg.env).await?;
         // 不阻塞等就绪:spawn 已置 status=Starting,健康循环负责 Starting→Online
         // (数据面请求自己轮询子进程 /health,见 router::ensure_online)。
         Ok(())

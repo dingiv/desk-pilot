@@ -622,7 +622,7 @@ async fn spawn_with_config(state: &SharedState, mc: &LocalModelConfig) -> Result
         ));
     }
     let mut proc = LlamaProcess::new(mc.clone(), port, state.http.clone());
-    proc.spawn(&state.config.llama_server.path, &gguf)
+    proc.spawn(&state.config.llama_server.path, &gguf, &state.config.llama_server.env)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn llama-server failed: {e}")))?;
     let proc_lock = Arc::new(RwLock::new(proc));

@@ -15,6 +15,14 @@ llama_server:
   health_check_interval_s: 5
   restart_max_retries: 3
   restart_backoff_base_s: 1
+  # 子进程环境变量(传给所有 llama-server 子进程)。
+  # ROCm / AMD 核显场景示例:
+  #   path 需指向 ROCm 构建(非 CUDA 构建),如:
+  #   path: "/path/to/llama.cpp/build-rocm/bin/llama-server"
+  # env:
+  #   HSA_OVERRIDE_GFX_VERSION: "10.3.0"   # 旧核显(GFX10/11)HSA 兼容
+  #   ROCR_VISIBLE_DEVICES: "0"             # 指定 ROCm 设备编号
+  #   HSA_FORCE_FINE_GRAIN_HEAP: "1"        # 核显共享内存场景
 
 # 模型仓库根目录 — 下方 gguf/mmproj 的相对路径锚点。dev 指向仓库 assets/models/,
 # prod 指向 ~/.desk-pilot/models/。POST /admin/models/load 不带 gguf 时也在其下

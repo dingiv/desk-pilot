@@ -4,6 +4,7 @@
 //! prod: `~/.desk-pilot/dp-router.yaml`。
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// 顶层配置。
@@ -83,6 +84,13 @@ pub struct LlamaServerConfig {
     /// 重启退避基数(秒),实际等待 = `base * 2^attempt`。
     #[serde(default = "default_restart_backoff_base_s")]
     pub restart_backoff_base_s: u64,
+    /// 子进程环境变量(传给所有 llama-server 子进程)。
+    /// ROCm / AMD 核显场景常用:
+    ///   `HSA_OVERRIDE_GFX_VERSION: "10.3.0"` — 旧核显(GFX10/11)HSA 兼容
+    ///   `ROCR_VISIBLE_DEVICES: "0"`           — 指定 ROCm 设备编号
+    ///   `HSA_FORCE_FINE_GRAIN_HEAP: "1"`      — 核显共享内存场景
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 fn default_port_range() -> [u16; 2] { [18001, 18099] }
