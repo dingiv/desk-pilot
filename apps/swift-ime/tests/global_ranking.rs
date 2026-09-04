@@ -20,9 +20,9 @@ fn dict(name: &str) -> Option<String> {
 /// 默认权重 + rime-ice + emoji 词表的引擎。
 fn engine() -> ImeEngine {
     let e = ImeEngine::new();
-    let fst = dict("rime-ice.fst").expect("rime-ice.fst missing (run fetch_dict.sh)");
+    let fst = dict("rime/rime-ice.fst").expect("rime-ice.fst missing (run build_rime_dict.sh)");
     e.load_dict(&fst).expect("load rime-ice");
-    if let Some(emoji) = dict("emoji.tsv") {
+    if let Some(emoji) = dict("emoji/emoji.tsv") {
         e.load_emoji_dict(&emoji).expect("load emoji.tsv");
     }
     e
@@ -104,7 +104,8 @@ fn english_exact_above_its_prefixes() {
     let mut e = engine();
     let r = rank(&mut e, "swift");
     top1_is("swift", &r, "swift");
-    assert_above("swift", &r, "swift", "swifts");
+    // swifts(count<150)已被 en_freq 长尾门槛滤掉,用 swiftly 同验。
+    assert_above("swift", &r, "swift", "swiftly");
 }
 
 // ── emoji 层次:en exact > emoji exact > 简拼 > emoji 前缀 ──────────────

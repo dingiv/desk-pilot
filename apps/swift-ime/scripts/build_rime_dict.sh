@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# fetch_dict.sh — Download and convert RIME dictionaries to swift-ime TSV format.
+# build_rime_dict.sh — Download and convert RIME dictionaries to swift-ime TSV format.
 #
 # Usage:
-#   ./scripts/fetch_dict.sh [output.tsv]
+#   ./scripts/build_rime_dict.sh [output.tsv]
 #
 # Sources:
 #   - rime-ice (雾凇拼音): https://github.com/iDvel/rime-ice

@@ -10,8 +10,8 @@ use std::path::Path;
 fn rime_ice_path() -> Option<String> {
     let pkg = env!("CARGO_MANIFEST_DIR");
     for candidate in &[
-        format!("{pkg}/assets/dict/rime-ice.fst"),
-        "apps/swift-ime/assets/dict/rime-ice.fst".to_string(),
+        format!("{pkg}/assets/dict/rime/rime-ice.fst"),
+        "apps/swift-ime/assets/dict/rime/rime-ice.fst".to_string(),
     ] {
         if Path::new(candidate).exists() {
             return Some(candidate.to_string());

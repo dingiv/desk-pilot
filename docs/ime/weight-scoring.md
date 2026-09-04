@@ -263,7 +263,7 @@ TUI 始终显示;mock `--verbose` 同样输出。
 
 ```
 rime-ice YAML (word, pinyin, weight)
-  │ fetch_dict.sh: awk 去声调 + 保留 weight
+  │ build_rime_dict.sh: awk 去声调 + 保留 weight
   ↓
 rime-ice.tsv → build_dict.rs → rime-ice.fst (~22MB)
   ↓

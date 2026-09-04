@@ -61,7 +61,7 @@ impl Default for EnglishWeights {
             user_boost: 1.0,
             prefix_base: 0.60,
             prefix_quality: 0.25,
-            short_word_penalty: 0.6,
+            short_word_penalty: 0.5,
         }
     }
 }
@@ -214,72 +214,20 @@ impl EnglishFamily {
 
     pub fn with_default_dict() -> Self {
         let mut fam = Self::new();
+        // 单一来源:en_freq.tsv(hermitdave en_full, count>=30, 纯字母)。
+        // raw 词频 decile 归一后直接作为 base 词表 —— 词条与频率同源,
+        // prefix 的 frequency_band 天然反映真实使用频率。
         let count = fam.load_into_base(Self::EMBEDDED_EN_DICT);
         if count > 0 {
             tracing::info!(count, "english: loaded embedded dictionary");
-        }
-        // W2(round10):嵌入 hermitdave 高频词表(带真实词频)。词条源
-        // (SCOWL)与频率源不同源 —— poland/danny/easter 等大量常用专名词
-        // 只在 hermitdave 有,此前无词条、查不到(评测 21% 缺词)。
-        // raw_freq ≥ 1000 过滤(剔 clea/ofthe 级语料噪声与粘连伪影),
-        // 十分位归一后并入 base(同词取 max:SCOWL grade 保留,hermitdave
-        // 补缺 + 让 prefix 的 frequency_band 反映真实使用频率)。
-        let freq_count = fam.merge_freq_list(Self::EMBEDDED_FREQ_DICT, 1000);
-        if freq_count > 0 {
-            tracing::info!(freq_count, "english: merged embedded frequency list");
         }
         fam
     }
 
     /// Load TSV data into the base word list (for the embedded dict).
+    /// `word\tcount` raw 频率,decile 归一到 1000-10000。
     fn load_into_base(&mut self, data: &[u8]) -> usize {
-        self.base_words = Self::parse_and_normalize(data, DictType::Grade);
-        self.base_words.len()
-    }
-
-    /// Parse a raw-frequency TSV (`word\tcount`), keep entries with
-    /// `min_raw` ≤ count, decile-normalize, merge into the base word list
-    /// (case-insensitive, same word keeps the higher score). Returns the
-    /// merged total size.
-    fn merge_freq_list(&mut self, data: &[u8], min_raw: u32) -> usize {
-        let s = match std::str::from_utf8(data) {
-            Ok(s) => s,
-            Err(_) => return self.base_words.len(),
-        };
-        let mut entries: Vec<(String, u32)> = Vec::new();
-        for line in s.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let parts: Vec<&str> = line.split('\t').collect();
-            let word = parts.first().copied().unwrap_or("").trim().to_string();
-            if word.is_empty() || word.len() < 2 {
-                continue;
-            }
-            let raw: u32 = parts.get(1).and_then(|c| c.trim().parse().ok()).unwrap_or(0);
-            if raw >= min_raw {
-                entries.push((word, raw));
-            }
-        }
-        if entries.is_empty() {
-            return self.base_words.len();
-        }
-        let incoming = decile_normalize(entries);
-        let mut merged: std::collections::HashMap<String, (String, u32)> = self
-            .base_words
-            .iter()
-            .map(|(w, s)| (w.to_ascii_lowercase(), (w.clone(), *s)))
-            .collect();
-        for (w, s) in incoming {
-            let entry = merged.entry(w.to_ascii_lowercase()).or_insert_with(|| (w.clone(), 0));
-            if s > entry.1 {
-                entry.0 = w;
-                entry.1 = s;
-            }
-        }
-        self.base_words = merged.into_values().collect();
-        sort_case_insensitive(&mut self.base_words);
+        self.base_words = Self::parse_and_normalize(data, DictType::Frequency);
         self.base_words.len()
     }
 
@@ -518,13 +466,11 @@ impl EnglishFamily {
         Ok(count)
     }
 
-    /// Embedded base dict (SCOWL, pre-normalized).
+    /// Embedded base dict — hermitdave en_full 词频表,单一来源(P0 清洗:
+    /// SCOWL 词表退役 —— 其 grade 全 10000 零区分度,且与频率源不同源)。
+    /// `word\tcount` raw 词频,装配时 decile 归一(见 load_into_base)。
     const EMBEDDED_EN_DICT: &[u8] =
-        include_bytes!("../../../../apps/swift-ime/assets/dict/en_words.tsv");
-
-    /// Embedded raw-frequency word list (hermitdave top-50K, W2)。
-    const EMBEDDED_FREQ_DICT: &[u8] =
-        include_bytes!("../../../../apps/swift-ime/assets/dict/hermitdave.tsv");
+        include_bytes!("../../../../apps/swift-ime/assets/dict/hermitdave/en_freq.tsv");
 
     // ── Frequency-to-score ─────────────────────────────────────────────
 
@@ -603,9 +549,17 @@ impl EnglishFamily {
                 && (word.chars().count() <= 2
                     || (wl != input && input.chars().count() <= 2));
 
+            // 拼音 IME 语义(P0 清洗遗留修复):输入本身是**单个合法拼音
+            // 音节**(mo/tang/pan/gang…)时,几乎总在打中文 —— 拼音同形的
+            // 英文本尊 exact 降 short_word_penalty 档,让位中文单字。多音节
+            // 可切分词(make/more)与非法切分(she/hi/cool)不受影响 —— 它
+            // 们是正常英文词;user(学习)层豁免(用户明确的英文意图)。
+            let pinyin_shaped =
+                input.len() >= 2 && inputx_pinyin::is_valid_syllable(input);
+
             if wl == input {
                 let exact_score = exact_base + exact_quality * Self::frequency_band(*freq);
-                let score = if short {
+                let score = if short || (pinyin_shaped && !user_layer) {
                     (exact_score).min(1.0) * w.short_word_penalty
                 } else {
                     exact_score.min(1.0)
@@ -1031,21 +985,23 @@ mod tests {
 
     #[test]
     fn short_base_words_are_penalized() {
-        // 词典里的 1~2 字母短词降权:exact(词频化后 0.88+0.08×0.25=0.90)
-        // → ×0.6=0.54(两字母输入几乎总是中文简拼,英文短词不该压过它们)。
+        // 词典里的 1~2 字母短词降权:load_into_base 走 Frequency(decile 归一)
+        // —— 两条词中最大者 cd → 10000 → band 0.9 → exact 0.88+0.08×0.9=0.952
+        // → ×0.6=0.5712(两字母输入几乎总是中文简拼,英文短词不该压过它们)。
         let mut fam = EnglishFamily::new();
         fam.load_into_base(b"cd\t3000\ncat\t1000\n");
         let cands = fam.predict("cd", &InputContext::new());
         let cd = cands.iter().find(|c| c.text == "cd").expect("cd in base");
         assert!(
-            (cd.raw_score - 0.90 * 0.6).abs() < 1e-9,
+            (cd.raw_score - 0.952 * 0.5).abs() < 1e-9,
             "2-letter word penalized: {}",
             cd.raw_score,
         );
 
         let cands = fam.predict("cat", &InputContext::new());
         let cat = cands.iter().find(|c| c.text == "cat").expect("cat in base");
-        assert!((cat.raw_score - 0.90).abs() < 1e-9, "long word keeps full exact score");
+        // decile 两条数据各成一组:cat → 8500 → band 0.7 档 → 0.88+0.08×0.7=0.936。
+        assert!((cat.raw_score - 0.936).abs() < 1e-9, "long word keeps full exact score: {}", cat.raw_score);
     }
 
     #[test]

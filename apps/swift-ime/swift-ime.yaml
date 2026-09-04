@@ -110,7 +110,7 @@ weights:
     user_boost: 1.0         # user-dict words (all get max priority)
     prefix_base: 0.6        # prefix quality floor (aligned with emoji prefix base)
     prefix_quality: 0.25    # quality term: freq × match-ratio scale
-    short_word_penalty: 0.6 # 1~2 letter words (dict layer only)
+    short_word_penalty: 0.5 # 1~2 letter words (dict layer only)
 
   # Recent member:近期指数按距上次使用时间分档(10s→5,1h→4,5h→3,1d→2,
   # 3d→1,>3d 移出),权重合成公式固定:z = (1-a)(a+b)/8 + a —— 无需配置。

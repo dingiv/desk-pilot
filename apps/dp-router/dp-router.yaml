@@ -4,25 +4,38 @@ server:
   addr: "127.0.0.1:8080"
 
 llama_server:
-  # 可执行文件。四种写法:
-  #   "LLAMA::llama-server"  命名空间 — dev 指仓库 CUDA 构建,prod 指 /usr/local/bin(推荐)
+  # ── 后端选择:按显卡改 path + models[*].extra_args + env 三处 ──────────────
+  # [CUDA · NVIDIA 独显] 最快(RTX 5070 Ti 实测 80-120 tok/s)
+  #   path: "LLAMA::llama-server"                        # dev=build-cuda/, prod=/usr/local/bin
+  #   env: { CUDA_VISIBLE_DEVICES: "0" }                 # 可选;多卡指定用哪张
+  #   models[*].extra_args: []                            # 不需要 --device,靠 gpu_layers 上卡
+  #
+  # [Vulkan · AMD 核显/独显] 9800X3D RDNA3 iGPU 实测 ~19 tok/s
+  #   path: "<repo>/thirdparty/llama.cpp/build-vulkan/bin/llama-server"
+  #   env: { DISPLAY: "", RADV_PERFTEST: "gpl", AMD_VULKAN_ICD: "RADV" }
+  #   models[*].extra_args: ["--device", "Vulkan1"]      # 编号先用 llama-server --list-devices 确认
+  #   (ASR 模型再补 --mmproj-device Vulkan1)
+  #
+  # [CPU-only · 无 GPU 兜底]
+  #   path: "<repo>/thirdparty/llama.cpp/build/bin/llama-server"   # build/ 而非 build-cuda/
+  #   models[*].gpu_layers: 0                                 # >0 会被静默忽略(日志 "no usable GPU")
+  # ─────────────────────────────────────────────────────────────────────────
+  # path 四种写法:
+  #   "LLAMA::llama-server"  命名空间 — dev 指仓库构建,prod 指 /usr/local/bin(推荐)
   #   "llama-server"         裸命令名 — 搜 $PATH(prod 装进 PATH 最省心)
   #   "/abs" 或 "~/x"        绝对 / 家目录 — 显式覆盖
-  #   注意:build-cuda = CUDA 版(配合下方 gpu_layers);build/ 是 CPU-only 版,
-  #        用它会静默忽略 gpu_layers(日志 "no usable GPU found, ...ignored")。
+  # 当前 dev 切到 Vulkan 构建以支持 AMD 核显(RDNA3 核显走 RADV/Mesa Vulkan)。
   path: "LLAMA::llama-server"
   port_range: [18001, 18099]
   health_check_interval_s: 5
   restart_max_retries: 3
   restart_backoff_base_s: 1
-  # 子进程环境变量(传给所有 llama-server 子进程)。
-  # ROCm / AMD 核显场景示例:
-  #   path 需指向 ROCm 构建(非 CUDA 构建),如:
-  #   path: "/path/to/llama.cpp/build-rocm/bin/llama-server"
-  # env:
-  #   HSA_OVERRIDE_GFX_VERSION: "10.3.0"   # 旧核显(GFX10/11)HSA 兼容
-  #   ROCR_VISIBLE_DEVICES: "0"             # 指定 ROCm 设备编号
-  #   HSA_FORCE_FINE_GRAIN_HEAP: "1"        # 核显共享内存场景
+  # 子进程环境变量(传给所有 llama-server 子进程)。按后端:
+  #   CUDA   → 通常留空 {} 即可(多卡加 CUDA_VISIBLE_DEVICES)
+  #   Vulkan → 见下方 AMD 核显示例(headless 容器 + RADV 性能调优)
+  #   CPU    → 留空 {}
+  # 当前配置 = Vulkan AMD 核显:
+  env: {}
 
 # 模型仓库根目录 — 下方 gguf/mmproj 的相对路径锚点。dev 指向仓库 assets/models/,
 # prod 指向 ~/.desk-pilot/models/。POST /admin/models/load 不带 gguf 时也在其下
@@ -47,6 +60,7 @@ models:
     threads: 8
     gpu_layers: 99
     batch_size: 512
+    extra_args: []
 
   - name: "qwen3-asr"
     type: asr
@@ -56,6 +70,7 @@ models:
     threads: 8
     gpu_layers: 99
     batch_size: 512
+    extra_args: []
 
 remote_upstream:
   base_url: ""

@@ -8,10 +8,10 @@
 
 // ── FileLoader 命名空间键 ──────────────────────────────────────────────
 
-/// rime-ice 全拼 FST 词典(assets,build_dict.rs 编译产物)。
-pub const DICT_RIME_ICE: &str = "DICT::rime-ice.fst";
-/// Emoji 关键词表(CLDR 生成,assets)。
-pub const DICT_EMOJI: &str = "DICT::emoji.tsv";
+/// rime-ice 全拼 FST 词典(assets/dict/rime/,build_dict.rs 编译产物)。
+pub const DICT_RIME_ICE: &str = "DICT::rime/rime-ice.fst";
+/// Emoji 关键词表(CLDR 生成,assets/dict/emoji/)。
+pub const DICT_EMOJI: &str = "DICT::emoji/emoji.tsv";
 /// Emoji 用户自定义映射(conf)。
 pub const CONF_EMOJI_USER: &str = "CONF::emoji_user.tsv";
 /// 英文自生词用户词典(conf)。

@@ -17,7 +17,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."  # apps/swift-ime/
-OUT="assets/dict/emoji.tsv"
+OUT="assets/dict/emoji/emoji.tsv"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 

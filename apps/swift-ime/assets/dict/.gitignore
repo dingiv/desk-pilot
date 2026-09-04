@@ -1,0 +1,3 @@
+# 运行时缓存:由 LatticeDecoder 从 .fst 现场构建(~46s),永不入库
+*.fst.idx
+*.fst
