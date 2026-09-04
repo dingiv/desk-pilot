@@ -100,35 +100,12 @@ if [ "$DO_INSTALL" = true ]; then
 fi
 
 # ── Step 4 (optional): Debian package ─────────────────────────────────────
+# All packaging logic lives in release/debian/ (control template + staging
+# script). This step only invokes it and reports the artifact path.
 if [ "$DO_DEB" = true ]; then
-    echo "── [4/4] Building .deb package …"
-
-    if ! command -v dpkg-buildpackage &>/dev/null; then
-        echo "   ⚠  dpkg-buildpackage not found (apt install dpkg-dev)"
-        echo "   The .so is ready: $BUILD_DIR/release/fcitx/libswift-ime.so"
-        exit 0
-    fi
-
-    cd "$PROJECT_DIR"
-    # Assemble .deb from cmake install output (avoids dpkg-buildpackage dep resolution).
-    STAGING="$BUILD_DIR/deb-staging"
-    rm -rf "$STAGING"
-    mkdir -p "$STAGING/DEBIAN"
-
-    # Install cmake outputs into staging
-    DESTDIR="$STAGING" cmake --install "$BUILD_DIR"
-
-    # Use the binary-package control template (no source/Build-Depends fields needed)
-    cp "$PROJECT_DIR/debian/control.in" "$STAGING/DEBIAN/control"
-
-    # Generate md5sums
-    (cd "$STAGING" && find usr -type f -exec md5sum {} \;) > "$STAGING/DEBIAN/md5sums"
-
-    DEB_FILE="$PROJECT_DIR/build/fcitx5-swift-ime_0.1.0-1_amd64.deb"
-    dpkg-deb --build --root-owner-group "$STAGING" "$DEB_FILE"
-    rm -rf "$STAGING"
-
-    if [ -f "$DEB_FILE" ]; then
+    echo "── [4/4] Building .deb package (release/debian/build_deb.sh) …"
+    DEB_FILE="$("$PROJECT_DIR/release/debian/build_deb.sh" --build-dir "$BUILD_DIR" | tail -n 1)"
+    if [ -n "$DEB_FILE" ] && [ -f "$DEB_FILE" ]; then
         echo "   → $DEB_FILE"
     fi
     echo ""

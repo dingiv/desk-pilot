@@ -252,6 +252,14 @@ impl LatticeDecoder {
         self.save_cache();
     }
 
+    /// 该 FST 是否携带**真实词频梯度**(rime-ice 类,max_freq 为实际最大
+    /// 词频,数十万级)。base.tsv 这类无词频表建的 FST 全条目占位权重,
+    /// max_freq 只有几百 —— 此时词频域不可信,single 兜底不能垫底。
+    /// (词典级判定,与查询音节无关 —— single 兜底锚点的依据。)
+    pub fn has_freq_signal(&self) -> bool {
+        self.max_freq > 1000.0
+    }
+
     /// Cache format v1 (pre-2026-08-04): `# swift-ime idx v1 <fst_len>\n` — no
     /// max_freq; `FreqScale` auto-mode falls back to a fixed denominator.
     const CACHE_MAGIC_V1: &str = "# swift-ime idx v1";

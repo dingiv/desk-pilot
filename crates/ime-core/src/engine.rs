@@ -96,6 +96,9 @@ pub struct ImeEngine {
     /// 共享语音会话状态 —— voice server(IoThread)折叠 SSE 段写入,
     /// VoiceMember 在主线程同步读。
     voice_state: Arc<crate::family::magic::SharedTranscript>,
+    /// Stage3 候选过滤链(round10 W7):默认空链零成本直通;经
+    /// `add_filter` 注册,postprocess 在合成/置顶之后跑链。
+    filters: crate::fsm::post::FilterChain,
 }
 
 impl ImeEngine {
@@ -236,6 +239,7 @@ impl ImeEngine {
             frontend,
             io_thread,
             voice_state,
+            filters: crate::fsm::post::FilterChain::with_flood_control(),
         };
         // Load embedded base dictionary (5KB, compiled into binary).
         let count = engine
@@ -256,16 +260,6 @@ impl ImeEngine {
     /// 前端句柄(引擎 I/O 线程经它推送刷新 / 请求剪贴板)。
     pub fn frontend(&self) -> Arc<dyn crate::frontend::FrontEndHandle> {
         Arc::clone(&self.frontend)
-    }
-
-    /// 释放引擎对前端的强引用 —— 前端 destroy 路径调用:让 I/O 线程下次的
-    /// `refresh_ui` / `get_clipboard_item` 触达一个空的 C 回调槽(no-op)而
-    /// 不是悬空的 C++ `this`。IoThread 自身在最后一个 Arc 释放后回收。
-    pub fn detach_frontend(&self) {
-        // 通知 magic 资源释放引用,使得前端 Arc 计数减少。
-        // 这里不需要清空 magic 内部:它们持有的 Arc 与 self.frontend 是同一份。
-        // 通过 Arc::new(NoopFrontend) 覆盖 self.frontend 需要 &mut self,
-        // 而 frontend 字段是 private —— 留给前端 destroy 走自己的清理路径。
     }
 
     /// 共享 voice state 句柄。voice listener task 与魔法成员都通过它读 / 写。
@@ -308,6 +302,26 @@ impl ImeEngine {
         if let Some(fam) = self.scorer.family(name) {
             fam.set_family_enabled(on);
         }
+    }
+
+    /// 配置某家族进入统一排序的候选宽度(round10:`weights.family_top_n`)。
+    /// 这是跨家族竞争宽度的语义截断入口;视图槽位(CANDIDATE_SLOTS=48)是
+    /// 翻页窗口硬顶,两者独立。0 = 回落家族默认。
+    pub fn set_family_top_n(&self, name: &str, n: usize) {
+        self.scorer.set_family_top_n(name, n);
+    }
+
+    /// 注册 stage3 候选过滤器(round10 W7 框架):postprocess 在合成/置顶
+    /// 之后按注册序跑链,Drop 移除、Demote 调分。需 `&mut self` —— 在引擎
+    /// 发布为 Arc 前的配置阶段调用(fcitx5 `swift_ime_create` /
+    /// TUI `build_engine` 均有该窗口)。
+    pub fn add_filter(&mut self, f: Box<dyn crate::fsm::post::CandidateFilter>) {
+        self.filters.push(f);
+    }
+
+    /// 已注册的过滤器数(调试/日志)。
+    pub fn filter_count(&self) -> usize {
+        self.filters.len()
     }
 
     /// 临时关闭/恢复上下文感知(swift-ime.yaml → input.context_aware)。
@@ -843,6 +857,9 @@ impl crate::family::FamilyEnv for ImeEngine {
 impl crate::fsm::family::StepEnv for ImeEngine {
     fn scorer(&self) -> &crate::family::UnifiedScorer {
         &self.scorer
+    }
+    fn filters(&self) -> &crate::fsm::post::FilterChain {
+        &self.filters
     }
     fn magic(&self) -> &MagicFamily {
         &self.magic

@@ -146,25 +146,9 @@ fn english_black_still_works() {
 }
 
 // ── 前缀整词联想(上下文感知)───────────────────────────────────────────
-
-#[test]
-fn context_prefix_association_boosts_tail_word() {
-    // 提交 是(shi)后输入 de → "shide" → 是的(350380)→ 尾字"的"以整词
-    // 权重提升(高于单字候选的词典分)。
-    let mut e = engine_with_rime();
-    for c in "shi".chars() { e.predict(KeyEvent::char(c)); }
-    let idx = e.candidates().iter().position(|c| *c == "是").expect("是 present");
-    e.select_candidate(idx);
-
-    for c in "de".chars() { e.predict(KeyEvent::char(c)); }
-    let detailed = e.candidates_detailed();
-    let di = detailed.iter().find(|d| d.text == "的").expect("的 present");
-    assert_eq!(di.source, "context_comp",
-        "的 should come from prefix association (shide→是的): {:?}",
-        detailed.iter().map(|d| (&d.text, d.source)).take(5).collect::<Vec<_>>());
-    // 整词权重经线性重标(顶流封顶 0.90):是的 350380 → ~0.81。
-    assert!(di.score >= 0.78, "整词权重(是的 350380, rescaled): {}", di.score);
-}
+// (round10 W1 后,单字凭自身词频即可顶格 —— de→的 不再依赖 context_comp
+// 抬分;原 context_prefix_association_boosts_tail_word 断言的实现路径失效,
+// 按规移除。上下文联想机制本身仍在,对词组候选生效。)
 
 // ── 全拼前缀联想(naozh → 闹钟)────────────────────────────────────────
 

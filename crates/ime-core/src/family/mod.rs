@@ -25,7 +25,8 @@
 //!            [最终排序列表]
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 // ── ScoredCandidate ─────────────────────────────────────────────────────
 
@@ -224,6 +225,9 @@ pub struct UnifiedScorer {
     /// Configurable per-family priority overrides (from `swift-ime.yaml`);
     /// families without an entry keep their own `priority()`.
     priorities: FamilyPriorities,
+    /// Per-family `top_n` overrides(round10:`weights.family_top_n`)——
+    /// 跨家族竞争宽度的配置入口;无覆盖时回落家族自己的 `top_n()`。
+    top_ns: Mutex<HashMap<String, usize>>,
 }
 
 impl UnifiedScorer {
@@ -234,7 +238,28 @@ impl UnifiedScorer {
         UnifiedScorer {
             families,
             priorities,
+            top_ns: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 配置某家族进入统一排序的候选宽度(0 = 取消覆盖,回落家族默认)。
+    pub fn set_family_top_n(&self, name: &str, n: usize) {
+        let mut map = self.top_ns.lock().unwrap();
+        if n == 0 {
+            map.remove(name);
+        } else {
+            map.insert(name.to_string(), n);
+        }
+    }
+
+    /// 家族生效的 top_n(override 优先)。
+    pub fn family_top_n(&self, family: &dyn CandidateFamily) -> usize {
+        self.top_ns
+            .lock()
+            .unwrap()
+            .get(family.name())
+            .copied()
+            .unwrap_or_else(|| CandidateFamily::top_n(family))
     }
 
     /// Rank all candidates (context-free). Returns deduplicated texts.
@@ -278,7 +303,7 @@ impl UnifiedScorer {
                     .partial_cmp(&a.raw_score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            candidates.truncate(family.top_n());
+            candidates.truncate(self.family_top_n(&**family));
             out.push(FamilyCandidates {
                 bonus: priority as f64 / 100.0,
                 candidates,

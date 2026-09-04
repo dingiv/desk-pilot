@@ -246,7 +246,8 @@ impl CandidateFamily for EmojiFamily {
     }
 
     fn top_n(&self) -> usize {
-        4
+        // round10 放宽 4 → 8;可经 `weights.family_top_n.emoji` 覆盖。
+        8
     }
 
     fn predict(&self, input: &str, _ctx: &InputContext) -> Vec<ScoredCandidate> {

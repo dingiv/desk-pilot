@@ -1,8 +1,28 @@
 # 权重评价系统
 
-> **状态: ✅ 已实现(2026-08-10 大改版)。** 打分参数全部可配(`swift-ime.yaml` →
-> `weights`);调试模式(`debug.candidate_meta`)可在候选词后直接显示
-> `[score family/source]`。
+> **状态: ✅ 已实现(2026-08-10 大改版;2026-09-01 round10 精准度改版)。**
+> 打分参数全部可配(`swift-ime.yaml` → `weights`);调试模式
+> (`debug.candidate_meta`)可在候选词后直接显示 `[score family/source]`。
+
+## round10 改版摘要(2026-09-01,评测驱动)
+
+| # | 改动 | 位置 |
+|---|---|---|
+| W1 | **单音节词频驱动**:single 分数 = rime FST 单字词频经 `freq_to_score`(与 lattice 同刻度);内嵌词典序仅兜底 FST 没有的字 | `pinyin/mod.rs predict_inner` |
+| W2 | **hermitdave 高频词表并入英文词条层**(raw_freq≥1000 过滤 + decile 归一),专名词(poland/danny)从"查不到"变可达 | `english.rs with_default_dict` |
+| W3 | **英文 exact 词频化**:`exact + exact_quality × frequency_band(词分)` —— 高频词(make)压过拼音谐音词(马克),低频词(sou)让位中文顶流(搜) | `english.rs query_layer` |
+| W4 | **前缀联想条件折扣**:同查询存在 lattice Full 精确命中时,prefix 候选再折一次 `prefix_lookup`("打全了让联想让位";duchun→杜淳、zhucede→注册的) | `pinyin/mod.rs predict_inner` |
+
+**评测基线**(`apps/swift-ime/tmp/tc_dict_sample.txt` 789 条词典分层抽样 +
+`tmp/tc_en_sample.txt` 170 条,纯净状态,`--cases` 跑):
+
+| | 基线 | round10 后 |
+|---|---|---|
+| pinyin Top-1 / Top-3 | 92.8% / 96.7% | **97.5% / 98.1%** |
+| english Top-1 / Top-3 | 77.1% / 79.0%(21% 缺词) | **99.4% / 99.4%** |
+
+评测注意:`run_cases` 每条用 Escape 复位(Enter 会 raw 提交并学习,污染同批
+后续 case);评测前移开 `data/swift-ime.db`(用户 recency/学习词托底)。
 
 ## 总览:三层打分架构
 
@@ -188,7 +208,14 @@ z = (1-a) × (a+b) / 8 + a        a = 候选原权重, b = 近期指数
 - 关键词表 = 内置 28 + CLDR 生成(`emoji.tsv`,英文+**拼音**关键词,汉字
   关键词无法在拼音 buffer 触发所以转换) + 用户表
 
-**english**(优先级 70):exact 0.88,prefix 按匹配比例(≤0.6)。
+**english**(优先级 70):
+- exact **词频化**(W3):`exact(0.88) + exact_quality(0.08) × frequency_band(词分)`,
+  顶档 0.952×0.70=0.666 压拼音谐音(马克 0.654),低档 0.908×0.70=0.636
+  让位中文顶流(搜 0.647);≤2 字母短词再 ×`short_word_penalty`(0.6),
+  短输入(≤2 字母)捞出的英文前缀长尾同罚
+- prefix 按匹配比例(0.60 地板 + 0.25×词频×匹配率)
+- 词条层 = SCOWL en_words(grade 分)+ **hermitdave 高频表**(raw_freq≥1000,
+  decile 归一,W2)取 max 合并 + en_user 学习层
 
 ---
 
@@ -204,10 +231,14 @@ weights:
     phrase_book: 0.88       # 自生词封顶
     large_dict: 0.85
     jianpin: 0.50           # 混写/简拼折扣
-    prefix_lookup: 0.75     # 前缀联想折扣(naozh→闹钟)
+    prefix_lookup: 0.75     # 前缀联想折扣(naozh→闹钟;有 Full 命中时再折一次,W4)
     single_syl_decay: 0.5
     short_word_bonus: 0.01
     # …(viterbi/context/stopword 等见 yaml 注释)
+  english:
+    exact: 0.88
+    exact_quality: 0.08     # exact 词频质量系数(W3)
+    # …
   freq_scale:
     max_weight: 0           # 0=auto(实际最大词频), >0 显式分母
     min_score: 0.25
@@ -247,8 +278,12 @@ predict(input)
 
 ## 历史基线
 
-2026-07-31(rime-ice 权重修复后):Top-1 87.5%, Top-3 100%
-(用例 `assets/testcase/tc_draft.txt`,16 条;`jishi→即使`、`chushi→初始` #2)。
+- 2026-07-31(rime-ice 权重修复后):Top-1 87.5%, Top-3 100%
+  (用例 `assets/testcase/tc_draft.txt`,16 条;`jishi→即使`、`chushi→初始` #2)
+- 2026-09-01(round10 评测体系):词典分层抽样 789 条基线 Top-1 92.8%;
+  W1-W4 改版后 **97.5%**(english 210 条 77.1% → 170 条 99.4%)。
+  tc_draft 手工 16 条维持 14/16(`jishi→即使`/`chushi→初始` #2:语料词频
+  及时≈即使、出示≈初始,log₂ 刻度同分,属数据粒度问题非排序逻辑)。
 
 ## 分数来源对照表(第六轮 D3)
 

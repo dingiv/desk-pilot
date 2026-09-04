@@ -171,6 +171,7 @@ pub extern "C" fn swift_ime_create(
     let weights = cfg.weights.pinyin.to_engine();
     let eng_weights = ime_core::family::english::EnglishWeights {
         exact: cfg.weights.english.exact,
+        exact_quality: cfg.weights.english.exact_quality,
         prefix_ratio: cfg.weights.english.prefix_ratio,
         user_boost: cfg.weights.english.user_boost,
         prefix_base: cfg.weights.english.prefix_base,
@@ -227,6 +228,11 @@ pub extern "C" fn swift_ime_create(
         eng.set_candidate_meta(cfg.debug.candidate_meta);
         eng.set_req_base(&cfg.magic.req_base);
         eng.set_scout_inject_url(&cfg.magic.scout_inject_url);
+        // 跨家族竞争宽度(weights.family_top_n;0 = 回落引擎默认)。
+        let tn = &cfg.weights.family_top_n;
+        if tn.pinyin > 0 { eng.set_family_top_n("pinyin", tn.pinyin); }
+        if tn.english > 0 { eng.set_family_top_n("english", tn.english); }
+        if tn.emoji > 0 { eng.set_family_top_n("emoji", tn.emoji); }
     } else {
         tracing::error!(target: "swift_ime", "engine not sole owner at config time — 应用默认配置");
     }

@@ -106,6 +106,7 @@ pub fn build_engine(cfg: &TuiConfig) -> (ImeEngine, Arc<ime_core::family::magic:
     let weights = sw_cfg.weights.pinyin.to_engine();
     let eng_weights = ime_core::family::english::EnglishWeights {
         exact: sw_cfg.weights.english.exact,
+        exact_quality: sw_cfg.weights.english.exact_quality,
         prefix_ratio: sw_cfg.weights.english.prefix_ratio,
         user_boost: sw_cfg.weights.english.user_boost,
         prefix_base: sw_cfg.weights.english.prefix_base,
@@ -151,6 +152,11 @@ pub fn build_engine(cfg: &TuiConfig) -> (ImeEngine, Arc<ime_core::family::magic:
     engine.set_context_aware(sw_cfg.input.context_aware);
     // 调试 meta(候选来源/分数)—— view_json / TUI 候选注释据此显示。
     engine.set_candidate_meta(sw_cfg.debug.candidate_meta);
+    // 跨家族竞争宽度(weights.family_top_n;0 = 回落引擎默认)。
+    let tn = &sw_cfg.weights.family_top_n;
+    if tn.pinyin > 0 { engine.set_family_top_n("pinyin", tn.pinyin); }
+    if tn.english > 0 { engine.set_family_top_n("english", tn.english); }
+    if tn.emoji > 0 { engine.set_family_top_n("emoji", tn.emoji); }
 
     if sw_cfg.dicts.rime_ice {
         let loader = shared::loader!("assets");
@@ -375,7 +381,9 @@ fn run_cases(engine: &mut ImeEngine, path: &str, verbose: bool) {
                 println!("     got: {:?}", top);
             }
         }
-        engine.predict(KeyEvent::enter());
+        // Escape 复位(非 Enter):Enter 会 raw 提交并学习("sou" 进
+        // en_user),污染同批次后续 case 的评测纯度;Escape 零副作用。
+        engine.predict(KeyEvent::escape());
     }
 
     println!();

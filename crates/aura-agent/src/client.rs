@@ -68,8 +68,16 @@ impl AuraClient {
     /// `base` is the daemon origin, e.g. `http://127.0.0.1:9091` (trailing slash trimmed).
     pub fn new(base: impl Into<String>) -> Result<Self> {
         let base = base.into().trim_end_matches('/').to_string();
-        let http = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
+        // no_proxy:本地 daemon 永远不走系统代理。桌面会话环境可能带 HTTP(S)_PROXY
+        //(且 no_proxy 不含 127.0.0.1),reqwest 默认会 honor 它 —— 对 localhost 的
+        // 请求被劫去一个不可达的代理,表现为 "error sending request" 连接失败
+        //(swift-ime 实测形态,2026-09-04)。
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(30))
+            .build()?;
         let stream_http = reqwest::Client::builder()
+            .no_proxy()
             .connect_timeout(Duration::from_secs(10))
             .build()?;
         Ok(Self { base, http, stream_http })

@@ -12,8 +12,8 @@ pub trait FrontEndHandle: Send + Sync {
 
     /// 通知前端:上下文 `state_view.ctx` 的异步状态推进了(voice 流式 / req
     /// 结果落地 / 剪贴板回填),请重渲染。这是**轻量信号** —— I/O 线程不碰
-    /// 状态机,前端收到后在主循环调 [`crate::engine::ImeEngine::get_live_view`]
-    /// 拉取最新视图再渲染。
+    /// 状态机,前端收到后在主循环调
+    /// [`crate::engine::ImeEngine::magic_tick_ctx`]拉取最新视图再渲染。
     ///
     /// **返回值**:`false` = 该 ctx 已没有可更新的活跃会话 —— 调用方(voice
     /// server)据此把缓存的目标 ctx 失效(`active_ctx = -1`),不再继续推送。
@@ -80,7 +80,13 @@ pub mod action {
 
 // ── ImeView: the cross-platform UI state snapshot ─────────────────────────
 
-pub const CANDIDATE_SLOTS: usize = 16;
+/// 视图候选槽位 —— 翻页窗口的硬顶(round10:16 → 48)。
+///
+/// 这是 `#[repr(C)]` 的一部分:**必须与 `apps/swift-ime/release/fcitx/swift-ime.h`
+/// 的 `CANDIDATE_SLOTS` 镜像同步改**(自有 ABI,同仓同构建,build_fcitx.sh
+/// 一起编译两侧)。扩槽后翻页可及的候选深度 = 每页 page_size × 总页数,
+/// 池深由家族 `top_n` 与 `weights.family_top_n` 决定,不受此槽位限制。
+pub const CANDIDATE_SLOTS: usize = 48;
 
 /// One candidate in the ImeView. Fixed-size for C ABI compatibility. `text` is 128 bytes so a
 /// full voice sentence (~40+ CJK chars) fits; longer candidates truncate cleanly at a char
@@ -137,6 +143,14 @@ pub struct ImeView {
     /// 产生上屏时再或上 `COMMIT`。
     pub action: u32,
 }
+
+// ABI 防漂移:布局 = 3×512 字节缓冲 + 8×u32 + CANDIDATE_SLOTS×CandidateSlot。
+// C++ 镜像(release/fcitx/swift-ime.h)有同款 static_assert,两侧任一失配
+// 在构建期报错。
+const _: () = assert!(
+    std::mem::size_of::<ImeView>()
+        == 512 * 3 + 4 * 8 + CANDIDATE_SLOTS * std::mem::size_of::<CandidateSlot>()
+);
 
 impl ImeView {
     /// Empty view — no commit, no preedit, no candidates, key not through.

@@ -142,6 +142,11 @@ impl Default for MagicConfig {
 pub struct WeightsConfig {
     #[serde(default)]
     pub family_priority: FamilyPriorityConfig,
+    /// 各家族进入统一排序的候选宽度(round10)。不设的家族回落引擎内置默认
+    /// (pinyin 128 / english 32 / emoji 8)。这是跨家族竞争宽度的语义截断;
+    /// 视图翻页窗口另受 CANDIDATE_SLOTS(48)限制。
+    #[serde(default)]
+    pub family_top_n: FamilyTopNConfig,
     #[serde(default)]
     pub pinyin: PinyinWeightConfig,
     #[serde(default)]
@@ -149,6 +154,20 @@ pub struct WeightsConfig {
     /// 字典词频 → 内部分值的映射参数。
     #[serde(default)]
     pub freq_scale: FreqScaleConfig,
+}
+
+/// `weights.family_top_n` — 0 表示回落引擎默认。
+#[derive(Debug, Clone, Deserialize)]
+pub struct FamilyTopNConfig {
+    #[serde(default)] pub pinyin: usize,
+    #[serde(default)] pub english: usize,
+    #[serde(default)] pub emoji: usize,
+}
+
+impl Default for FamilyTopNConfig {
+    fn default() -> Self {
+        FamilyTopNConfig { pinyin: 0, english: 0, emoji: 0 }
+    }
 }
 
 /// 各家族的全局优先级(最终分 = raw_score × priority/100)。
@@ -254,6 +273,7 @@ impl PinyinWeightConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct EnglishWeightConfig {
     #[serde(default = "default_0_88")] pub exact: f64,
+    #[serde(default = "default_0_08")] pub exact_quality: f64,
     #[serde(default = "default_0_6")] pub prefix_ratio: f64,
     #[serde(default = "default_1_0")] pub user_boost: f64,
     #[serde(default = "default_0_6")] pub prefix_base: f64,
@@ -268,6 +288,7 @@ fn default_100() -> u32 { 100 }
 fn default_70() -> u32 { 70 }
 fn default_60() -> u32 { 60 }
 fn default_0_88() -> f64 { 0.88 }
+fn default_0_08() -> f64 { 0.08 }
 fn default_0_85() -> f64 { 0.85 }
 fn default_0_5() -> f64 { 0.5 }
 fn default_0_7() -> f64 { 0.7 }
@@ -290,6 +311,7 @@ impl Default for WeightsConfig {
     fn default() -> Self {
         WeightsConfig {
             family_priority: FamilyPriorityConfig::default(),
+            family_top_n: FamilyTopNConfig::default(),
             pinyin: PinyinWeightConfig {
                 phrase_book: 0.88, large_dict: 0.85, viterbi_base: 0.40, viterbi_scale: 0.05,
                 jianpin: 0.50, prefix_lookup: 0.75, bigram_weight: 1.0, single_syl_decay: 0.5, context_boost: 0.12,
@@ -299,6 +321,7 @@ impl Default for WeightsConfig {
             },
             english: EnglishWeightConfig {
                 exact: 0.88,
+                exact_quality: 0.08,
                 prefix_ratio: 0.6,
                 user_boost: 1.0,
                 prefix_base: 0.6,

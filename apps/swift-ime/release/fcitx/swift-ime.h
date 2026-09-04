@@ -26,7 +26,9 @@ struct ImeHandle; // defined in libswift-ime-core.so, created/destroyed via C AB
 
 // ── ImeView: cross-platform UI state snapshot (must match Rust #[repr(C)]) ─
 
-static const unsigned int CANDIDATE_SLOTS = 16;
+// round10: 16 → 48. MUST stay in sync with ime-core/src/frontend.rs
+// (own ABI, both sides built together by scripts/build_fcitx.sh).
+static const unsigned int CANDIDATE_SLOTS = 48;
 
 struct CandidateSlot {
     char text[128];
@@ -48,6 +50,12 @@ struct ImeView {
     char           aux_up[512];
     uint32_t       action;             // action bitflags — see SWIFT_ACTION_* below
 };
+
+// ABI drift guard: 8 u32 fields (cursors/counts/page/action) + 3×512 byte
+//   buffers + slots×168. If the Rust side changes a field and this mirror
+//   lags, the static_assert fails the C++ build first.
+static_assert(sizeof(ImeView) == 512u * 3 + 4u * 8 + CANDIDATE_SLOTS * sizeof(CandidateSlot),
+              "ImeView mirror out of sync with ime-core frontend.rs");
 
 // ── Action bitflags (mirror of Rust platform::action) ─────────────────────
 // The engine owns ALL key policy; C++ reacts to these bits only.

@@ -75,6 +75,14 @@ weights:
     english: 70
     emoji: 50
 
+  # 各家族进入统一排序的候选宽度(round10)。0/不写 = 引擎默认
+  # (pinyin 128 / english 32 / emoji 8)。视图每页最多显示
+  # CANDIDATE_SLOTS=48 个(翻页由 page_size 切)。
+  # family_top_n:
+  #   pinyin: 128
+  #   english: 32
+  #   emoji: 8
+
   # Pinyin family internal scores (0.0-1.0)
   pinyin:
     phrase_book: 0.88       # user-learned phrases

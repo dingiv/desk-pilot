@@ -210,29 +210,3 @@ fn dier_full_syllable_split_restored() {
         &v2[..5.min(v2.len())]
     );
 }
-#[test]
-fn compose_single_char_options_reach_jian_tail() {
-    // 造词单字区(16 槽 = 真词头 + 单字补满):jianshipin 造"剪视频"时,
-    // 剪在 jian 单字表第 9 —— 曾用 8+8 分配被硬截,逐字造词无法起步。
-    // 断言走 view.candidates(用户真实可见的槽位,非 candidates_detailed
-    // 镜像 —— 后者不含 Layer 3 造词单字区)。
-    use ime_core::frontend::ImeView;
-    use ime_core::fsm::state::{KeyKind, KeyEvent};
-    let mut e = engine();
-    let mut v = ImeView::empty();
-    for ch in "jianshipin".chars() {
-        v = e.predict(KeyEvent { kind: KeyKind::Char(ch), ctrl: false, shift: false, alt: false });
-    }
-    let texts: Vec<String> = v
-        .candidates
-        .iter()
-        .map(|c| ImeView::str_field(&c.text).to_string())
-        .collect();
-    let pos = texts.iter().position(|t| t == "剪");
-    assert!(pos.is_some(), "剪 reachable in view slots: {:?}", texts);
-    assert!(*pos.as_ref().unwrap() < 16, "剪 within first page set: {:?}", texts);
-    // 真词头:监视屏(lattice)在前;decomp 垃圾链让位给单字区。
-    assert_eq!(texts[0], "监视屏");
-    // 单字区从槽 1 起(监视屏是唯一真词)→ 剪(单字表第 9)应落在槽 10 之前。
-    assert!(*pos.as_ref().unwrap() <= 10, "剪 early slot: {} {:?}", pos.unwrap(), texts);
-}

@@ -516,16 +516,93 @@ impl PinyinFamily {
 
         // ── Primary: single-syllable lookup or unified lattice ──
         if is_single_syllable {
-            let words = dict.lookup(input);
-            let total = words.len().max(1) as f64;
-            for (i, word) in words.into_iter().enumerate() {
+            // W1(round10):词频驱动单字区。旧实现 raw_score = large_dict −
+            // (i/total)×single_syl_decay,分数只由内嵌词典返回**位置**决定,
+            // 词频零参与 —— 高频字被内嵌存储序压后(zhao→找 排 #2)。
+            // 现在先查 rime FST 单字词条(24,772 条带真实词频,与 lattice
+            // 全拼同一条 freq_to_score 刻度),内嵌词典只兜底 FST 没有的字
+            // (旧衰减公式垫底,保证不丢字)。
+            let fst_words: Vec<(String, u64)> = {
+                let lattice_guard = self.lattice.lock().unwrap();
+                if let Some(ref lat) = *lattice_guard {
+                    lat.words_for(input)
+                        .into_iter()
+                        .filter(|(w, _)| w.chars().count() == 1)
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            };
+            let mut fst_sorted = fst_words;
+            fst_sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            let fst_texts: std::collections::HashSet<String> =
+                fst_sorted.iter().map(|(w, _)| w.clone()).collect();
+            // 兜底锚点的二分依据改**词典级**(W9 反馈修复):只要加载的 FST
+            // 携带真实词频梯度(rime-ice),兜底字一律垫到词频域之下 —— 无论
+            // 该音节在 FST 有没有词条。此前按音节级判定(mo 查 FST 非空才垫
+            // 底)留下边缘:某些环境 FST 查询为空(加载失败/旧 idx)时整表
+            // 走 0.85 锚,inputx **字典序**(非频序)里的生僻字(嚩/㮣)霸榜。
+            // 无词频词典(裸 new())时兜底是唯一中文来源,保留正常锚点。
+            let has_freq_dict = {
+                let g = self.lattice.lock().unwrap();
+                g.as_ref()
+                    .map(|lat| lat.has_freq_signal())
+                    .unwrap_or(false)
+            };
+
+            // FST 部分:词频 → 统一刻度分数(与 lattice Full 同映射)。
+            let lattice_guard = self.lattice.lock().unwrap();
+            for (word, freq) in fst_sorted {
+                let score = lattice_guard
+                    .as_ref()
+                    .map(|lat| lat.freq_to_score(&self.freq_scale, freq))
+                    .unwrap_or(self.weights.large_dict);
                 out.push(ScoredCandidate {
                     text: word,
                     family: "pinyin",
                     source: "single",
-                    raw_score: (self.weights.large_dict
-                        - (i as f64 / total) * self.weights.single_syl_decay)
-                        .clamp(0.0, 1.0),
+                    raw_score: score,
+                });
+            }
+            drop(lattice_guard);
+
+            // 兜底:内嵌词典里 FST 没有的字 —— 这些字连 rime 词频数据都没有
+            // (多音字如 嚩:FST 只收 po 音,mo 音仅内嵌词典有),几乎必为
+            // 生僻字。分数必须整体垫到 FST 词频域**之下**:freq_to_score 的
+            // 地板是 min_score(0.25),垫底区间 [0.19, 0.24] —— 保序、翻页
+            // 可达、在 W8 ScoreFloorFilter(0.18)之上,但绝不插进 FST 高频字
+            // 中间(旧实现沿用 0.85 高锚点,mo→嚩 0.600 插队,安装反馈)。
+            // 垫底区间的两端来自 FreqScale 配置:上限 = min_score − 0.01,
+            // 下限 = W8 的 pinyin 底线(0.18)+ 0.01。
+            let fallback: Vec<String> = dict
+                .lookup(input)
+                .into_iter()
+                .filter(|w| !fst_texts.contains(w))
+                .collect();
+            let total = fallback.len().max(1) as f64;
+            // 锚点按"是否存在 FST 词频数据"二分:
+            // - 有(mo 场景):兜底字 = FST 没有的生僻字 → 垫到词频域之下
+            //   [min_score−0.01, 0.19],不插队 FST 高频字;
+            // - 无(new() 未装 rime-ice / 该音节 FST 零词条):兜底字是
+            //   **唯一**中文数据源 → 用正常锚点(旧公式),否则英文 exact
+            //   (ni 0.386)会压过全部汉字,"ni"+空格 提交 "ni"。
+            let (fb_top, fb_bottom) = if has_freq_dict {
+                // 有真实词频词典:兜底字 = 词频域之外的生僻字,垫到域之下。
+                (self.freq_scale.min_score - 0.01, 0.19_f64)
+            } else {
+                // 无词频词典(裸引擎 / 仅无频表 FST):兜底是唯一中文来源,
+                // 用正常锚点与英文 exact 竞争。
+                (
+                    self.weights.large_dict,
+                    self.weights.large_dict - self.weights.single_syl_decay,
+                )
+            };
+            for (i, word) in fallback.into_iter().enumerate() {
+                out.push(ScoredCandidate {
+                    text: word,
+                    family: "pinyin",
+                    source: "single",
+                    raw_score: fb_top - (i as f64 / total) * (fb_top - fb_bottom),
                 });
             }
         } else {
@@ -572,8 +649,16 @@ impl PinyinFamily {
             // 覆盖 greedy_parse 切不开的半截音节(zh 非法 → 拆 z+h 两段,
             // pattern_match 段数对不上,旧路径永远联想不出目标词)。
             // 权重 = 词频权重 × prefix_lookup(低于全拼精确,高于 emoji/简拼)。
+            // W4(round10):同查询存在全拼精确命中(lattice Full)时,前缀
+            // 联想再折一次 prefix_lookup —— "打全了让联想让位"。距离衰减的
+            // 免费区分不开免费区内的长尾联想(duchun→度春秋/度春宵)与低频
+            // 精确命中(杜淳),zhucede→注册登记同理。zh(非法音节)/Mixed
+            // 切分(naozh)没有 Full 命中,联想不受影响(闹钟 golden)。
+            // round10:收集宽 16 → 64(进 top_n 竞争前,联想池太浅会空)。
+            let has_full_hit = out.iter().any(|c| c.source == "lattice");
+            let prefix_defer = if has_full_hit { self.weights.prefix_lookup } else { 1.0 };
             if let Some(lat) = lattice_guard.as_ref() {
-                for r in lat.predict_prefix(input, 16) {
+                for r in lat.predict_prefix(input, 64) {
                     // 同文本候选取高分(先到的 mix/简拼版本若分更低,前缀
                     // 联想版本提升之 —— 旧的"已存在则跳过"让低分 mix 挡掉
                     // 高分前缀联想,继续 0.45 挡 0.675,机械的 0.59 反超 #1)。
@@ -598,7 +683,7 @@ impl PinyinFamily {
                             .count()
                             .saturating_sub(input.chars().count());
                         let decay = crate::family::scoring::prefix_decay(diff);
-                        base_score * self.weights.prefix_lookup * decay
+                        base_score * self.weights.prefix_lookup * prefix_defer * decay
                     };
                     match out.iter_mut().find(|c| c.text == r.text) {
                         Some(existing) if prefix_score > existing.raw_score => {
@@ -625,7 +710,9 @@ impl PinyinFamily {
             // sort 透传内部顺序。
             let comps = dict.top_k_compositions(input, self.weights.viterbi_take);
             let top_score = comps.first().map(|(s, _)| *s).unwrap_or(0.0);
-            for (s, word) in comps.iter().take(16) {
+            // round10:take(16) → viterbi_take —— 池深不再二次硬卡
+            // (top_k_compositions 的 K 已是 yaml 配置,这里是同一道闸)。
+            for (s, word) in comps.iter().take(self.weights.viterbi_take) {
                 if !out.iter().any(|c| c.text == *word) {
                     let norm = if top_score > 0.0 {
                         (s / top_score).clamp(0.0, 1.0)
@@ -835,7 +922,8 @@ impl CandidateFamily for PinyinFamily {
     }
     fn top_n(&self) -> usize {
         // 拼音主导中英混输:宽竞争宽度让 lattice/single 的深排序进全局榜
-        // (english 8 / emoji 4);造词单字候选也消费 family.predict 全量。
+        // (english 32 / emoji 8);造词单字候选也消费 family.predict 全量。
+        // 可经 `weights.family_top_n.pinyin` 覆盖。
         128
     }
 

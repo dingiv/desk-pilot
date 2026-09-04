@@ -26,13 +26,9 @@ serde_yaml = "0.9"
 anyhow = "1"
 ratatui = "0.28"
 crossterm = "0.28.1"
-# ── aura voice integration ── the audio-aura-agent SDK owns the whole connection (its own
-# background driver + tokio runtime); the bridge only drains poll_events → AsrBuffer for `#asr`.
-audio-aura-agent = { path = "../../crates/aura-agent" }
-futures = "0.3"
-# bridge.rs 在引擎 I/O 线程的 runtime 上跑定时 drain,需要直接拿 sleep / JoinHandle。
-# 通过 ime-core 的 io_thread.handle() 拿到 runtime handle,tokio 子集够用。
-tokio = { version = "1", features = ["time", "rt"] }
+# ── aura voice integration ── voice 不在本 crate:连接、SSE 折叠、定时器全部
+# 住在 ime-core 的 io_thread(它自己依赖 audio-aura-agent SDK + tokio)。
+# swift-ime 只经 ImeEngine 读 SharedTranscript / magic_tick,无需直接依赖。
 
 [build-dependencies]
 shared = { path = "../../crates/shared" }

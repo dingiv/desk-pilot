@@ -1,6 +1,11 @@
 # IME 输入法子系統 :设计文档
 
-> **状态：设计阶段（2026-07-22）。** 本文档描述 desk-pilot 第四子系统 — 输入法增强引擎的架构设计和跨平台路线。
+> **状态：设计阶段（2026-07-22）定稿。实现已演进,以代码与 as-built 文档为准** ——
+> 引擎落地为 `crates/ime-core` + `apps/swift-ime`(fcitx5 C ABI 手写在
+> `apps/swift-ime/src/frontends/fcitx5.rs`,没有 cbindgen/ime-core-ffi;
+> voice 走 `ime-core` io_thread 的推送刷新,没有 bridge.rs/100ms 轮询)。
+> 逐轮变更见 `docs/ime/issues-round*.md`;as-built 见
+> `fcitx5-integration.md` / `input-router.md` / `eventloop.md`。
 
 ## 定位：秘书系统的"写"之手
 
@@ -102,11 +107,11 @@ IME 是秘书系统里"产出最终文本"的那只手 —— 语音听进来、
 空格 → 提交 1 号候选（最近 final，或 live）→ 文本上屏 → 回 Idle
 ```
 
-**数据通路**：IME 进程内（`apps/swift-ime/src/bridge.rs`）通过 `audio-aura-agent` SDK 在后台线程维持一条持久连接到 aura-daemon 的**数据面** `GET /api/asr_stream`（每事件直推、不节流）；按段类型写入 `AsrBuffer`（挂在 `MagicFamily` 的共享 `VoiceSlot` 上，成员实例延迟 attach）：
-- `Interim{partial}` / `CalibratedInterim{calibrated}` → `set_live(..)`（流式候选）
-- `Final{calibrated}` → `push_final(..)`（成 1 号候选）
+**数据通路**：voice listener 由 `ImeEngine::with_config` 启动,住在引擎的单条异步 I/O 线程上（`crates/ime-core/src/io_thread.rs` 的 `VoiceSession`,经 `audio-aura-agent` SDK 维持一条到 aura-daemon **数据面** `GET /api/asr_stream` 的持久连接,每事件直推、不节流）;SSE 事件折叠进 `SharedTranscript`（`MagicResources` 上的共享语音状态,成员实例延迟 attach）：
+- `Interim{partial}` / `CalibratedInterim{calibrated}` → live 流式候选
+- `Final{calibrated}` → 插入成 1 号候选
 
-`AsrBuffer`（`crates/ime-core/src/asr_buffer.rs`）是富状态 `{live, finals[], version}`，version 计数让前端无按键也能刷新。引擎 `#asr` 完成（matcher `Match::Complete` + expansion `__ASR_BUFFER__`）→ `MagicFamily::spawn("__ASR_BUFFER__")` 出新 `VoiceMember` 实例；`ImeEngine::magic_tick()` 在 Magic 态 + version 变化时重建视图（TUI `run_loop` 每 100ms 调一次；fcitx5 由 C++ `startMagicPoll` 的 100ms TimeEvent 轮询 `swift_ime_magic_tick`）。空格走成员 `on_key` 提交 1 号。控制面 `/api/stream`（settings 快照）不经此路——识别文字只走数据面。
+`SharedTranscript` 每次推进都经 `FrontEndHandle::refresh_ui` **推送**通知前端（fcitx5 走 wake pipe 唤醒 → `swift_ime_magic_tick`;TUI server 由渲染循环按 pending 标记拉取）,前端再调 `ImeEngine::magic_tick(_ctx)` 拿最新视图重建候选窗 —— 无按键也能刷新（一次性 CLI 模式以 200ms 探询兜底）。空格提交 1 号。控制面 `/api/stream`（settings 快照）不经此路——识别文字只走数据面。
 
 ### #req — 本地 HTTP 后端请求
 
@@ -422,28 +427,7 @@ IME 侧启动一个 TCP server，familiar 作为 client 连接。协议：JSON l
 
 ### IME ↔ aura（HTTP/SSE，连 daemon :9091）
 
-IME 启动时（`bridge.rs::spawn_aura_client`）通过 `audio-aura-agent` SDK 建立持久连接到数据面 `GET /api/asr_stream`（在后台 std 线程的 current-thread tokio runtime 上驱动），每收到 `AsrSegment::Final` 就 `AsrBuffer::update(calibrated)`：
-
-```rust
-struct AsrBuffer {
-    // 按 seq 组织的未完成 partials
-    partials: BTreeMap<u64, String>,
-    // 最近 N 秒的 final 文本
-    finals: VecDeque<FinalEntry>,
-    max_age: Duration,  // 默认 60s
-}
-
-struct FinalEntry {
-    seq: u64,
-    text: String,      // calibrated 文本
-    at: Instant,
-}
-```
-
-SSE 事件处理：
-- `interim{seq,partial}` → 更新 `partials[seq]`
-- `final{seq,calibrated}` → 移除对应 partial，追加 `finals`，清理过期条目
-- `#asr` 触发时 → 拼接 `finals` 中 `max_age` 内的 `calibrated` 文本
+实现(以代码为准):连接由引擎的单条异步 I/O 线程托管（`crates/ime-core/src/io_thread.rs` 的 `VoiceSession`,经 `audio-aura-agent` SDK）。`#asr` 首次触发懒 attach（`VoiceCmd::Attach{ctx}`）:健康探测 → 历史对账（`GET /api/results`）→ 订阅数据面 `GET /api/asr_stream`。SSE 事件折叠进 `SharedTranscript`（`audio-aura-agent` 的共享转写状态,挂在 `MagicResources` 上,原设计的本地 `AsrBuffer` 已由它取代）,每次推进经 `FrontEndHandle::refresh_ui` 推送通知前端,前端调 `ImeEngine::magic_tick_ctx` 拉新视图。闲置超时（默认 30s,可配 `voice.idle_time`）自动断连,再次触发即重连;整段 flush（`'`）与 detach 由 `VoiceCmd` 驱动。
 
 ### Snippet 文件格式（`ime.json`）
 
@@ -628,14 +612,6 @@ Espanso 分析后，`ime-core` Phase 1 的实现路径更明确了：
 - [imekit](https://lib.rs/crates/imekit) — Rust 跨平台 IME 抽象库（支持 TSF/IMK/ibus）
 - [objc2-input-method-kit](https://lib.rs/crates/objc2-input-method-kit) — macOS IMK framework 的 Rust 绑定
 - [windows-rs ITfTextInputProcessor](https://microsoft.github.io/windows-docs-rs/doc/windows/Win32/UI/TextServices/struct.ITfTextInputProcessor.html) — Windows TSF 的 Rust COM 绑定
-- desk-pilot 架构与设计原则见 `CLAUDE.md`、`docs/README.md`
-- audio-aura 架构见 `docs/aura/architecture.md`
-- geek-familiar 设计见 `docs/familiar/index.md`
-
-- [Espanso](https://github.com/espanso/espanso) — Rust 跨平台 Text Expander（13.7k stars），trigger→expansion 架构可参考
-- [imekit](https://lib.rs/crates/imekit) — Rust 跨平台 IME 抽象库（支持 TSF/IMK/ibus）
-- [objc2-input-method-kit](https://lib.rs/crates/objc2-input-method-kit) — macOS IMK framework 的 Rust 绑定
-- [windows-rs ITfTextInputProcessor](https://microsoft.github.io/windows-docs-rs/doc/windows/Win32/UI/TextServices/struct.ITfTextInputProcessor.html) — Windows TSF 的 Rust COM 绑定
-- desk-pilot 架构与设计原则见 `CLAUDE.md`、`docs/README.md`
+- desk-pilot 架构与设计原则见 `AGENTS.md`、`docs/README.md`
 - audio-aura 架构见 `docs/aura/architecture.md`
 - geek-familiar 设计见 `docs/familiar/index.md`

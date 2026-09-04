@@ -1134,6 +1134,13 @@ pub trait StepEnv: crate::family::FamilyEnv {
     /// Unified candidate scorer — combines all families.
     fn scorer(&self) -> &crate::family::UnifiedScorer;
 
+    /// Stage3 候选过滤链(round10 W7 骨架):postprocess 在合成/置顶之后、
+    /// PanelItem 化之前跑链。默认空链零成本直通;引擎侧经
+    /// `ImeEngine::add_filter` 注册。
+    fn filters(&self) -> &crate::fsm::post::FilterChain {
+        &crate::fsm::post::EMPTY_FILTERS
+    }
+
     /// Extract the first valid pinyin syllable from the input.
     /// (纯函数:最长合法音节前缀,见 `family::pinyin::first_syllable_of`。)
     fn first_syllable(&self, pinyin: &str) -> Option<String> {

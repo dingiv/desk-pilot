@@ -38,9 +38,9 @@ hello, my name is ${name}. I am ${age} years old.
 
 输出如下:
 
-    O
-O
-O
+   O
+  O
+ O
 OOOO
 
 #/env/HOME   , 不包括首行换行符, 不包括结尾换行符, 但是包括中间的那个换行符号
