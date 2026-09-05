@@ -250,19 +250,25 @@ impl LlamaProcess {
 
     /// 等子进程就绪:轮询 `/health` 直到成功(置 Online)或超时。
     /// 加载期间子进程死亡 → 立即返回 false(交给健康循环带预算重启)。
-    pub async fn wait_ready(&mut self, timeout_s: u64) -> bool {
+    ///
+    /// 每次探活短暂持写锁,探活间隙(500ms sleep)释放锁 — 避免慢加载时长时间
+    /// 独占进程锁,阻塞健康循环探活 / 数据面 `wait_online` 读状态 / admin 查询。
+    pub async fn wait_ready(lock: &RwLock<LlamaProcess>, timeout_s: u64) -> bool {
         let deadline = Instant::now() + Duration::from_secs(timeout_s);
         loop {
-            if self.health_check().await {
-                self.status = ModelRuntimeStatus::Online;
-                self.online_since = Some(Instant::now());
-                self.failed_checks = 0;
+            let mut p = lock.write().await;
+            if p.health_check().await {
+                p.status = ModelRuntimeStatus::Online;
+                p.online_since = Some(Instant::now());
+                p.failed_checks = 0;
                 return true;
             }
-            if !self.check_alive() {
-                self.status = ModelRuntimeStatus::Offline;
+            if !p.check_alive() {
+                p.status = ModelRuntimeStatus::Offline;
                 return false;
             }
+            // 探活间隙释放锁,再 sleep
+            drop(p);
             if Instant::now() >= deadline {
                 return false;
             }
@@ -331,7 +337,10 @@ fn parse_n_layer(line: &str) -> Option<u32> {
     rest.trim().split_whitespace().next()?.parse().ok()
 }
 
-/// 端口分配器(线性扫描 `port_range`,已被占用的跳过 — `bind` 失败时回收)。
+/// 端口分配器(从 `port_range` 起点单调递增发号,耗尽返回 None)。
+///
+/// 注意:不做"端口是否已被占用"的预检,也不回收(无卸载端点,端口只发不回收)。
+/// 若某端口被外部进程占用,子进程 `bind` 失败 → 退出 → 健康循环带预算重启兜底。
 pub struct PortAllocator {
     next: u16,
     end: u16,

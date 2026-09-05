@@ -40,11 +40,6 @@ impl UpstreamClient {
         format!("{}/v1/chat/completions", self.base_url)
     }
 
-    #[allow(dead_code)]
-    pub fn models_url(&self) -> String {
-        format!("{}/v1/models", self.base_url)
-    }
-
     /// 转发请求。返回 (status, content_type, body_bytes)。
     pub async fn forward_chat(
         &self,

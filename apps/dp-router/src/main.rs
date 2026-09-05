@@ -134,12 +134,20 @@ async fn async_main() -> Result<()> {
         .with_context(|| format!("bind {}", state.config.server.addr))?;
     info!("[dp-router] listening on {}", state.config.server.addr);
 
-    let serve = axum::serve(listener, app);
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+        info!("[dp-router] 收到退出信号,graceful shutdown…");
+    });
     if let Err(e) = serve.await {
         error!("[dp-router] serve error: {e}");
     }
 
     // 退出时清理子进程
     router::shutdown_all(&processes).await;
+    info!("[dp-router] 已退出");
     Ok(())
 }

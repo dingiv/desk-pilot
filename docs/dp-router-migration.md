@@ -145,7 +145,7 @@
   - 启动:读 yaml → 对每个本地 model spawn `llama-server --port <auto> --model <gguf> ...` → 等 `/health` 通 → 注册到路由表
   - `/v1/chat/completions`:按 body 里 `model` 字段找本地;命中则 reqwest 转发到子进程端口;未命中则转发到 yaml 中声明的 `remote_upstream`(无则 404)
   - `/v1/models`:返回本地 + 远程已知模型清单
-  - `/admin/models`:列出当前在线子进程 + PID + 端口
+  - `/admin/models`:列出已加载子进程的运行快照(name/gguf/port/status/restarts)+ 目录中未加载模型
   - 子进程异常退出:tracing 记录 + 自动重启(指数退避,3 次后停止)
 - **验证**:
   - `cargo build -p dp-router` 通过

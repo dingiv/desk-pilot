@@ -31,8 +31,8 @@ llama_server:
 
 # 模型仓库根目录 — 下方 gguf/mmproj 相对路径的锚点。dev 指向仓库 assets/models/,
 # prod 指向 ~/.desk-pilot/models/。POST /admin/models/load 不带 gguf 字段时,服务端
-# 在此目录下按 name 寻找匹配 GGUF(规则:`${root}/${name}.gguf` →
-# `${root}/${name}/*.gguf` → 大小写不敏感前缀匹配,首个命中即返)。
+# 在此目录下递归搜索(深度≤4、不跟符号链接、排除 mmproj),按 name 匹配 GGUF:
+# 优先文件 stem 与 name 完全一致,否则取文件名包含 name 的首个(大小写敏感子串)。
 # 支持 MODELS:: 命名空间或绝对路径。留空 = 模型路径必须写绝对路径,且不支持按名动态加载。
 models_root: "MODELS::"
 

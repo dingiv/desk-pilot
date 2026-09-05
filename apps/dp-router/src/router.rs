@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -54,6 +54,10 @@ pub struct AppState {
 
 pub type SharedState = Arc<AppState>;
 
+/// 请求 body 上限(bytes)。覆盖 ASR 长音频(1h @16kHz mono ≈ 113MB)并防止
+/// 异常/恶意请求 OOM 路由器。axum 0.8 默认仅 2MB,对音频过小,故显式放宽。
+const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+
 /// 路由装配。
 pub fn build_router(state: SharedState) -> Router {
     Router::new()
@@ -63,6 +67,8 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/admin/models", get(admin_list_models))
         .route("/admin/models/load", post(admin_load_model))
         .route("/health", get(health))
+        // 全局 body 上限:同时约束 chat 的 Bytes 与 ASR 的 multipart(默认 2MB 过小)
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 
@@ -628,8 +634,7 @@ async fn spawn_with_config(state: &SharedState, mc: &LocalModelConfig) -> Result
     let proc_lock = Arc::new(RwLock::new(proc));
     state.processes.write().await.insert(mc.name.clone(), proc_lock.clone());
     tokio::spawn(async move {
-        let mut p = proc_lock.write().await;
-        let _ = p.wait_ready(LOAD_WAIT_TIMEOUT_S).await;
+        let _ = LlamaProcess::wait_ready(&proc_lock, LOAD_WAIT_TIMEOUT_S).await;
     });
     Ok(port)
 }
@@ -641,10 +646,7 @@ async fn wait_online(state: &SharedState, name: &str, port: u16) -> Result<u16, 
         let status = {
             let map = state.processes.read().await;
             match find_process(&map, name) {
-                Some(pl) => {
-                    let s = pl.write().await.status;
-                    s
-                }
+                Some(pl) => pl.read().await.status,
                 None => ModelRuntimeStatus::Offline,
             }
         };
@@ -791,10 +793,18 @@ async fn run_once(state: &SharedState) {
                 }
             }
             ModelRuntimeStatus::Starting => {
-                // 就绪由 wait_ready task 负责;这里只兜"加载期间子进程死亡"
+                // 初始加载由 wait_ready task 负责;但 restart() 后无 wait_ready task,
+                // 所以这里兜底探 /health — 若已就绪则推进 Online(覆盖两种来源的 Starting)。
                 if !proc.check_alive() {
                     proc.status = ModelRuntimeStatus::Offline;
                     do_restart(&mut proc, &llama_path, &ll_cfg).await;
+                    continue;
+                }
+                if proc.health_check().await {
+                    info!("[dp-router] model ready (Starting→Online): model={}", proc.model_name);
+                    proc.status = ModelRuntimeStatus::Online;
+                    proc.online_since = Some(Instant::now());
+                    proc.failed_checks = 0;
                 }
             }
             ModelRuntimeStatus::Available => {
@@ -854,19 +864,6 @@ pub async fn shutdown_all(processes: &ProcessMap) {
         let mut p = proc_lock.write().await;
         p.shutdown().await;
     }
-}
-
-/// 用于辅助 `list_models` 输出稳定顺序(按 name 排序)。
-#[allow(dead_code)]
-fn _sort_models(mut v: Vec<LocalModelStatus>) -> Vec<LocalModelStatus> {
-    v.sort_by(|a, b| a.name.cmp(&b.name));
-    v
-}
-
-/// 内部辅助:把 `processes: ProcessMap` 在 admin 查询里复制后保持顺序无关的视图。
-#[allow(dead_code)]
-fn _as_map(v: &[LocalModelStatus]) -> HashMap<String, ModelRuntimeStatus> {
-    v.iter().map(|s| (s.name.clone(), s.status)).collect()
 }
 
 #[cfg(test)]
