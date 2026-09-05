@@ -98,6 +98,29 @@ impl Default for FreqScale {
 pub struct ScoringConfig {
     pub priorities: FamilyPriorities,
     pub freq_scale: FreqScale,
+    /// W8 防洪底线(merge 后分数,按家族)。default = round10 实测值;
+    /// yaml `weights.floors` 可覆盖(emoji 调低可放行短 kw 低频 emoji)。
+    pub floors: ScoreFloors,
+}
+
+/// 各家族 merge 后分数底线(W8 ScoreFloorFilter)。
+#[derive(Debug, Clone, Copy)]
+pub struct ScoreFloors {
+    pub pinyin: f64,
+    pub english: f64,
+    pub emoji: f64,
+    pub default: f64,
+}
+
+impl Default for ScoreFloors {
+    fn default() -> Self {
+        ScoreFloors {
+            pinyin: 0.18,
+            english: 0.35,
+            emoji: 0.25,
+            default: 0.30,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -116,5 +139,7 @@ mod tests {
             (s.freq_scale.min_score, s.freq_scale.max_score),
             (0.25, 0.90)
         );
+        let f = s.floors;
+        assert_eq!((f.pinyin, f.english, f.emoji, f.default), (0.18, 0.35, 0.25, 0.30));
     }
 }

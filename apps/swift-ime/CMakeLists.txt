@@ -45,11 +45,17 @@ install(FILES "${RUST_BUILD_DIR}/libswift-ime-core.so"
 # into ~/.desk-pilot (the system /usr/share/swift-ime/dict is read-only, so shipping it would
 # never be written anyway). See LatticeDecoder::cache_path.
 set(SWIFT_IME_DICT_DIR "${CMAKE_INSTALL_DATADIR}/swift-ime/dict")
-install(FILES assets/dict/base.tsv
-        DESTINATION "${SWIFT_IME_DICT_DIR}")
 install(FILES assets/dict/rime/rime-ice.fst
         DESTINATION "${SWIFT_IME_DICT_DIR}/rime")
+install(FILES assets/dict/rime/readme.md
+                assets/dict/rime/LICENSE.txt
+        DESTINATION "${SWIFT_IME_DICT_DIR}/rime")
+install(FILES assets/dict/hermitdave/en_freq.tsv
+                assets/dict/hermitdave/LICENSE.txt
+                assets/dict/hermitdave/readme.md
+        DESTINATION "${SWIFT_IME_DICT_DIR}/hermitdave")
 install(FILES assets/dict/emoji/emoji.tsv
+                assets/dict/emoji/readme.md
         DESTINATION "${SWIFT_IME_DICT_DIR}/emoji")
 
 # ── Install default config ────────────────────────────────────────────────────

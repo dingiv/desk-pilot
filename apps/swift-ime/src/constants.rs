@@ -10,6 +10,8 @@
 
 /// rime-ice 全拼 FST 词典(assets/dict/rime/,build_dict.rs 编译产物)。
 pub const DICT_RIME_ICE: &str = "DICT::rime/rime-ice.fst";
+/// 英文 base 词表(hermitdave en_freq.tsv,assets/dict/hermitdave/)。
+pub const DICT_EN_FREQ: &str = "DICT::hermitdave/en_freq.tsv";
 /// Emoji 关键词表(CLDR 生成,assets/dict/emoji/)。
 pub const DICT_EMOJI: &str = "DICT::emoji/emoji.tsv";
 /// Emoji 用户自定义映射(conf)。

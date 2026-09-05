@@ -208,9 +208,14 @@ pub extern "C" fn swift_ime_create(
             cmds: a.cmds.clone(),
         })
         .collect();
+    // 英文 base 词表(hermitdave en_freq.tsv,外置文件;缺失 → 空 base + warn)。
+    let en_wordlist = shared::loader!("assets")
+        .resolve(crate::constants::DICT_EN_FREQ)
+        .map(|p| p.to_string_lossy().into_owned());
     let mut engine = Arc::new(ImeEngine::with_config(
         weights,
         eng_weights,
+        en_wordlist,
         Box::new(FcitxProvider::default()),
         snippets,
         cfg.weights.to_scoring(),
@@ -225,6 +230,8 @@ pub extern "C" fn swift_ime_create(
     // 降级用默认配置(不 panic,IME 里 panic 会拖垮整个 fcitx5)。
     if let Some(eng) = Arc::get_mut(&mut engine) {
         eng.set_context_aware(cfg.input.context_aware);
+        // emoji 打分参数(yaml weights.emoji)。
+        eng.set_emoji_weights(cfg.weights.emoji.to_emoji());
         eng.set_candidate_meta(cfg.debug.candidate_meta);
         eng.set_req_base(&cfg.magic.req_base);
         eng.set_scout_inject_url(&cfg.magic.scout_inject_url);

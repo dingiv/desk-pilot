@@ -6,7 +6,7 @@
 dicts:
   base: true          # embedded base dictionary (compiled into binary)
   rime_ice: true      # rime-ice large dictionary (loaded from disk at startup)
-  emoji: false        # emoji 家族总开关:false = 整个家族禁用(无 emoji 候选);true = 加载 emoji.tsv
+  emoji: true        # emoji 家族总开关:false = 整个家族禁用(无 emoji 候选);true = 加载 emoji.tsv
 
 # ── Magic commands ──────────────────────────────────────────────────────
 magic:
@@ -73,7 +73,27 @@ weights:
   family_priority:
     pinyin: 80
     english: 70
-    emoji: 50
+    emoji: 55
+
+  # W8 各家族 merge 后分数底线。emoji 底线越低,短触发词(≤2 字母)的
+  # 低频 emoji 越容易存活(两字母表情包)。
+  floors:
+    pinyin: 0.18
+    english: 0.35
+    emoji: 0.18
+    default: 0.30
+
+  # emoji 家族打分参数(v2,见 family/emoji.rs):
+  #   exact  = exact + exact_quality × band(freq)
+  #   prefix = prefix_base × decay × (0.55 + prefix_band_mix × band)
+  #   short_kw_penalty:≤2 字母触发词即使完整命中也乘此折扣 —— 调低则
+  #   两字母表情包更容易冒头(ok→👍、cd→📀 类)。
+  emoji:
+    exact: 0.88
+    exact_quality: 0.08
+    prefix_base: 0.6
+    prefix_band_mix: 0.45
+    short_kw_penalty: 0.6
 
   # 各家族进入统一排序的候选宽度(round10)。0/不写 = 引擎默认
   # (pinyin 128 / english 32 / emoji 8)。视图每页最多显示

@@ -17,14 +17,29 @@ fn dict(name: &str) -> Option<String> {
     Path::new(&p).exists().then_some(p)
 }
 
-/// 默认权重 + rime-ice + emoji 词表的引擎。
+/// 默认权重 + 英文词表 + rime-ice + emoji 词表的引擎。
 fn engine() -> ImeEngine {
-    let e = ImeEngine::new();
+    use ime_core::family::{emoji::EmojiWeights, english::EnglishWeights, pinyin::PinyinWeights};
+    let wordlist = dict("hermitdave/en_freq.tsv");
+    let mut e = ImeEngine::with_config(
+        PinyinWeights::default(),
+        EnglishWeights::default(),
+        wordlist,
+        Box::new(ime_core::family::magic::expander::DefaultProvider),
+        Vec::new(),
+        ime_core::family::scoring::ScoringConfig::default(),
+        std::sync::Arc::new(ime_core::frontend::NoopFrontend::default()),
+        ime_core::engine::DEFAULT_VOICE_AURA_BASE.to_string(),
+        ime_core::io_thread::DEFAULT_IDLE_TIMEOUT_SECS,
+        Vec::new(),
+        7,
+    );
     let fst = dict("rime/rime-ice.fst").expect("rime-ice.fst missing (run build_rime_dict.sh)");
     e.load_dict(&fst).expect("load rime-ice");
     if let Some(emoji) = dict("emoji/emoji.tsv") {
         e.load_emoji_dict(&emoji).expect("load emoji.tsv");
     }
+    e.set_emoji_weights(EmojiWeights::default());
     e
 }
 
@@ -93,10 +108,9 @@ fn prefix_association_prefers_high_frequency() {
 fn english_word_outranks_its_emoji_namesake() {
     let mut e = engine();
     let r = rank(&mut e, "clea");
-    // clean 是英文词本尊(0.441),🧼 的 CLDR 关键词恰好也是 clean ——
-    // 本尊必须压过 emoji 前缀命中。
+    // clean 是英文词本尊,必须 #1(v2 emoji 清洗后 🫧 的弱关联关键词
+    // clean 已被剔除,本场景不再有 emoji 竞争者)。
     top1_is("clea", &r, "clean");
-    assert_above("clea", &r, "clean", "🫧");
 }
 
 #[test]
@@ -114,17 +128,19 @@ fn english_exact_above_its_prefixes() {
 fn emoji_exact_below_english_exact() {
     let mut e = engine();
     let r = rank(&mut e, "smile");
-    // emoji.tsv 里 smile 关键词 → 🥲(外部表覆盖内置表 😊)。
+    // v2 清洗表:smile 关键词命中的 emoji(😀 等)exact = 0.88+0.08×band,
+    // ×priority 0.60 ≈ 0.571,必须压在英文本尊(0.666)之下。
     top1_is("smile", &r, "smile");
-    assert_above("smile", &r, "smile", "🥲");
+    assert_above("smile", &r, "smile", "😀");
 }
 
 #[test]
 fn two_letter_emoji_keyword_demoted_below_jianpin() {
     let mut e = engine();
     let r = rank(&mut e, "cd");
-    // cd 是 📀 的关键词(≤2 字母,即使完整命中也降前缀档)—— 中文简拼
-    // (承担 0.503)必须压过它(0.36)。
+    // cd 是 📀 的关键词(≤2 字母,即使完整命中也乘 short_kw_penalty)。
+    // 中文简拼(承担)必须压过它;📀 本身存活(floor 0.18 + 短 kw 折扣
+    // 后 ≈0.27,见 swift-ime.yaml weights.floors/emoji 段)。
     top1_is("cd", &r, "承担");
     assert_above("cd", &r, "承担", "📀");
 }

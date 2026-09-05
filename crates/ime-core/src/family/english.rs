@@ -212,14 +212,26 @@ impl EnglishFamily {
         }
     }
 
-    pub fn with_default_dict() -> Self {
+    /// 外置 base 词表装配(hermitdave/en_freq.tsv,单一来源):`word\tcount`
+    /// raw 词频 decile 归一后直接作为 base 词表 —— 词条与频率同源,
+    /// prefix 的 frequency_band 天然反映真实使用频率。
+    /// `path = None`(文件缺失/裸引擎)→ 空 base + warn,英文仅剩 user 层。
+    pub fn with_base_wordlist(path: Option<&str>) -> Self {
         let mut fam = Self::new();
-        // 单一来源:en_freq.tsv(hermitdave en_full, count>=30, 纯字母)。
-        // raw 词频 decile 归一后直接作为 base 词表 —— 词条与频率同源,
-        // prefix 的 frequency_band 天然反映真实使用频率。
-        let count = fam.load_into_base(Self::EMBEDDED_EN_DICT);
-        if count > 0 {
-            tracing::info!(count, "english: loaded embedded dictionary");
+        let Some(p) = path else {
+            tracing::warn!("english: no base wordlist configured, base layer empty");
+            return fam;
+        };
+        match std::fs::read(p) {
+            Ok(data) => {
+                let count = fam.load_into_base(&data);
+                if count > 0 {
+                    tracing::info!(count, path = p, "english: loaded base wordlist");
+                } else {
+                    tracing::warn!(path = p, "english: base wordlist parsed empty");
+                }
+            }
+            Err(e) => tracing::warn!(path = p, error = %e, "english: base wordlist unreadable"),
         }
         fam
     }
@@ -466,12 +478,6 @@ impl EnglishFamily {
         Ok(count)
     }
 
-    /// Embedded base dict — hermitdave en_full 词频表,单一来源(P0 清洗:
-    /// SCOWL 词表退役 —— 其 grade 全 10000 零区分度,且与频率源不同源)。
-    /// `word\tcount` raw 词频,装配时 decile 归一(见 load_into_base)。
-    const EMBEDDED_EN_DICT: &[u8] =
-        include_bytes!("../../../../apps/swift-ime/assets/dict/hermitdave/en_freq.tsv");
-
     // ── Frequency-to-score ─────────────────────────────────────────────
 
     /// 词频(1~10000,decile 归一化)→ 分档质量分。
@@ -597,11 +603,7 @@ impl EnglishFamily {
     }
 }
 
-impl Default for EnglishFamily {
-    fn default() -> Self {
-        Self::with_default_dict()
-    }
-}
+
 
 impl CandidateFamily for EnglishFamily {
     fn name(&self) -> &'static str {
@@ -746,6 +748,13 @@ impl CandidateFamily for std::sync::Arc<EnglishFamily> {
 mod tests {
     use super::*;
 
+    /// 小词表家族(内嵌 43K 词表外置后,测试用最小数据集驱动)。
+    fn fam_with_words(data: &[u8]) -> EnglishFamily {
+        let mut fam = EnglishFamily::new();
+        fam.load_into_base(data);
+        fam
+    }
+
     /// Unique per-test temp dict — tests run in parallel threads, and a shared
     /// `en_test_{pid}.tsv` made writers race (one test's content could be
     /// overwritten before the other read it → flaky `user_dict_overrides_base`).
@@ -759,7 +768,7 @@ mod tests {
     fn english_recency_lifts_recently_committed_word() {
         // E2:刚提交过的词在候选里获得 recency 合成(z = (1-a)(a+b)/8 + a,
         // 天然 <1 不顶满);关闭上下文感知后 boost 消失。
-        let fam = EnglishFamily::with_default_dict();
+        let fam = fam_with_words(b"present\t50000\npresented\t40000\n");
         let base = fam.predict("prese", &InputContext::new());
         let p_base = base.iter().find(|c| c.text == "present").expect("present in dict");
         let a = p_base.raw_score;
@@ -827,7 +836,7 @@ mod tests {
     fn single_letter_self_and_case_lead() {
         // 单字母输入:字母本尊 + 大小写互换置顶(self/case 成员),字典
         // prefix 候选(单字母开头的词)排其后。
-        let fam = EnglishFamily::with_default_dict();
+        let fam = fam_with_words(b"apple\t5000\n");
         let cands = fam.predict("a", &InputContext::new());
         assert_eq!(cands[0].text, "a");
         assert_eq!(cands[0].source, "self");
@@ -842,7 +851,7 @@ mod tests {
 
     #[test]
     fn exact_match_black() {
-        let fam = EnglishFamily::with_default_dict();
+        let fam = fam_with_words(b"black\t50000\n");
         let cands = fam.predict("black", &InputContext::new());
         assert!(cands
             .iter()
@@ -851,7 +860,9 @@ mod tests {
 
     #[test]
     fn common_words_found() {
-        let fam = EnglishFamily::with_default_dict();
+        let fam = fam_with_words(
+            b"hello\t50000\nworld\t40000\npython\t30000\ncode\t20000\ndata\t10000\nserver\t5000\nlanguage\t3000\ncomputer\t2000\n",
+        );
         for word in &[
             "hello", "world", "python", "code", "data", "server", "language", "computer",
         ] {
@@ -866,7 +877,7 @@ mod tests {
 
     #[test]
     fn user_dict_overrides_base() {
-        let fam = EnglishFamily::with_default_dict();
+        let fam = fam_with_words(b"code\t5000\n");
         fam.load_user_dict_file(&temp_dict("user", "github\nkubernetes\n"))
             .unwrap();
         let cands = fam.predict("github", &InputContext::new());
@@ -877,7 +888,7 @@ mod tests {
 
     #[test]
     fn load_external_decile_normalizes() {
-        let fam = EnglishFamily::with_default_dict();
+        let fam = fam_with_words(b"base\t1000\n");
         // Create a fake frequency dict
         let d = temp_dict(
             "decile",
@@ -897,7 +908,7 @@ mod tests {
         // B1 回归:缓存重载必须与首次加载分数完全一致。曾用 Grade 重Parse
         // 缓存,decile 归一化分数(任意 1~10000)被 grade_to_score 塌缩到
         // 2000/5500/8000/9500 四档 —— 重启后前缀排序退化。
-        let fam = EnglishFamily::with_default_dict();
+        let fam = fam_with_words(b"base\t1000\n");
         // 12 个词、频率拉开差距 → decile 归一化后分数落在多个档位。
         let content: String = (0..12)
             .map(|i| format!("w{i:02}\t{}\n", 100_000u32 >> i))
@@ -922,7 +933,7 @@ mod tests {
     #[test]
     fn legacy_cache_header_invalidates() {
         // v1 缓存(无版本号)必须被视为无效 → 触发重建,存量污染自愈。
-        let fam = EnglishFamily::with_default_dict();
+        let fam = fam_with_words(b"base\t1000\n");
         let d = temp_dict("legacy", "# @type: frequency\nhello\t100000\n");
         let cache_path = format!("{d}.en_cache");
         std::fs::write(&cache_path, "# @cache: /stale/path 12345\nhello\t2000\n").unwrap();
@@ -937,14 +948,14 @@ mod tests {
 
     #[test]
     fn empty_returns_nothing() {
-        assert!(EnglishFamily::with_default_dict()
+        assert!(fam_with_words(b"apple\t5000\n")
             .predict("", &InputContext::new())
             .is_empty());
     }
 
     #[test]
     fn no_match_garbage() {
-        assert!(EnglishFamily::with_default_dict()
+        assert!(fam_with_words(b"apple\t5000\n")
             .predict("zzzzz", &InputContext::new())
             .is_empty());
     }
@@ -953,7 +964,7 @@ mod tests {
     fn uppercase_dict_words_match_case_insensitively_and_preserve_case() {
         // 词表里的专有名词(iPhone、NASA)保留原始大小写:小写输入也能
         // 匹配,候选回词典原始大小写。
-        let fam = EnglishFamily::with_default_dict();
+        let fam = fam_with_words(b"iphone\t5000\nnasa\t4000\n");
         fam.load_user_dict_file(&temp_dict("proper", "iPhone\nNASA\n"))
             .unwrap();
 

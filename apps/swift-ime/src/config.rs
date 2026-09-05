@@ -151,10 +151,66 @@ pub struct WeightsConfig {
     pub pinyin: PinyinWeightConfig,
     #[serde(default)]
     pub english: EnglishWeightConfig,
+    /// `weights.emoji` — emoji 家族打分参数(v2,见 family/emoji.rs)。
+    #[serde(default)]
+    pub emoji: EmojiWeightConfig,
+    /// `weights.floors` — W8 各家族 merge 后分数底线;emoji 调低可放行
+    /// 短触发词的低频 emoji(两字母表情包)。
+    #[serde(default)]
+    pub floors: ScoreFloorsConfig,
     /// 字典词频 → 内部分值的映射参数。
     #[serde(default)]
     pub freq_scale: FreqScaleConfig,
 }
+
+/// `weights.emoji` — 打分常数默认与 family/emoji.rs::EmojiWeights 一致。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct EmojiWeightConfig {
+    #[serde(default = "default_0_88")] pub exact: f64,
+    #[serde(default = "default_0_08")] pub exact_quality: f64,
+    #[serde(default = "default_0_6")] pub prefix_base: f64,
+    #[serde(default = "default_0_45")] pub prefix_band_mix: f64,
+    #[serde(default = "default_0_6")] pub short_kw_penalty: f64,
+}
+
+impl EmojiWeightConfig {
+    pub fn to_emoji(&self) -> ime_core::family::emoji::EmojiWeights {
+        ime_core::family::emoji::EmojiWeights {
+            exact: self.exact,
+            exact_quality: self.exact_quality,
+            prefix_base: self.prefix_base,
+            prefix_band_mix: self.prefix_band_mix,
+            short_kw_penalty: self.short_kw_penalty,
+        }
+    }
+}
+
+fn default_0_45() -> f64 { 0.45 }
+
+/// `weights.floors` — 默认值 = W8 ScoreFloorFilter 的 round10 实测值。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScoreFloorsConfig {
+    #[serde(default = "default_floor_pinyin")] pub pinyin: f64,
+    #[serde(default = "default_floor_english")] pub english: f64,
+    #[serde(default = "default_floor_emoji")] pub emoji: f64,
+    #[serde(default = "default_floor_default")] pub default: f64,
+}
+
+impl Default for ScoreFloorsConfig {
+    fn default() -> Self {
+        ScoreFloorsConfig {
+            pinyin: 0.18,
+            english: 0.35,
+            emoji: 0.25,
+            default: 0.30,
+        }
+    }
+}
+
+fn default_floor_pinyin() -> f64 { 0.18 }
+fn default_floor_english() -> f64 { 0.35 }
+fn default_floor_emoji() -> f64 { 0.25 }
+fn default_floor_default() -> f64 { 0.30 }
 
 /// `weights.family_top_n` — 0 表示回落引擎默认。
 #[derive(Debug, Clone, Deserialize)]
@@ -239,6 +295,12 @@ impl WeightsConfig {
                 max_weight: self.freq_scale.max_weight,
                 min_score: self.freq_scale.min_score,
                 max_score: self.freq_scale.max_score,
+            },
+            floors: ime_core::family::scoring::ScoreFloors {
+                pinyin: self.floors.pinyin,
+                english: self.floors.english,
+                emoji: self.floors.emoji,
+                default: self.floors.default,
             },
         }
     }
@@ -329,6 +391,8 @@ impl Default for WeightsConfig {
                 short_word_penalty: 0.6,
             },
             freq_scale: FreqScaleConfig { max_weight: 0.0, min_score: 0.25, max_score: 1.0 },
+            emoji: EmojiWeightConfig::default(),
+            floors: ScoreFloorsConfig::default(),
         }
     }
 }

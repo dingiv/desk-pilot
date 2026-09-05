@@ -137,9 +137,14 @@ pub fn build_engine(cfg: &TuiConfig) -> (ImeEngine, Arc<ime_core::family::magic:
             cmds: a.cmds.clone(),
         })
         .collect();
+    // 英文 base 词表(hermitdave en_freq.tsv,外置文件;缺失 → 空 base + warn)。
+    let en_wordlist = shared::loader!("assets")
+        .resolve(crate::constants::DICT_EN_FREQ)
+        .map(|p| p.to_string_lossy().into_owned());
     let mut engine = ImeEngine::with_config(
         weights,
         eng_weights,
+        en_wordlist,
         Box::new(ime_core::family::magic::expander::DefaultProvider),
         snippets,
         sw_cfg.weights.to_scoring(),
@@ -150,6 +155,8 @@ pub fn build_engine(cfg: &TuiConfig) -> (ImeEngine, Arc<ime_core::family::magic:
         sw_cfg.input.page_size,
     );
     engine.set_context_aware(sw_cfg.input.context_aware);
+    // emoji 打分参数(yaml weights.emoji)。
+    engine.set_emoji_weights(sw_cfg.weights.emoji.to_emoji());
     // 调试 meta(候选来源/分数)—— view_json / TUI 候选注释据此显示。
     engine.set_candidate_meta(sw_cfg.debug.candidate_meta);
     // 跨家族竞争宽度(weights.family_top_n;0 = 回落引擎默认)。

@@ -106,9 +106,16 @@ pub static EMPTY_FILTERS: FilterChain = FilterChain {
 impl FilterChain {
     /// 出厂防洪配置:各家族绝对分数底线 + 家族配额 + 全局池顶。引擎构造
     /// 默认注册;想换策略就自组(或 add_filter 叠加)。
-    pub fn with_flood_control() -> Self {
+    pub fn with_flood_control(floors: crate::family::scoring::ScoreFloors) -> Self {
         let mut chain = FilterChain::default();
-        chain.push(Box::new(ScoreFloorFilter::default()));
+        chain.push(Box::new(ScoreFloorFilter {
+            floors: HashMap::from([
+                ("pinyin", floors.pinyin),
+                ("english", floors.english),
+                ("emoji", floors.emoji),
+            ]),
+            default_floor: floors.default,
+        }));
         chain.set_quota_per_family(Some(DEFAULT_FAMILY_QUOTA));
         chain.set_pool_cap(Some(DEFAULT_POOL_CAP));
         chain

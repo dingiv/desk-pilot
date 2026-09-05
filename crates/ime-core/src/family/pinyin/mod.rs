@@ -1121,7 +1121,7 @@ mod tests {
         let scorer = crate::family::UnifiedScorer::new(
             vec![
                 Box::new(PinyinFamily::new()),
-                Box::new(EnglishFamily::with_default_dict()),
+                Box::new(EnglishFamily::new()),
             ],
             crate::family::scoring::FamilyPriorities::default(),
         );

@@ -72,6 +72,7 @@ pub struct ImeEngine {
     /// 直调,不经 trait 对象。scorer 持同一 Arc 当 trait 对象参与排序。
     pinyin_family: std::sync::Arc<crate::family::pinyin::PinyinFamily>,
     english_family: std::sync::Arc<crate::family::english::EnglishFamily>,
+    emoji_family: std::sync::Arc<crate::family::emoji::EmojiFamily>,
     contexts: Mutex<HashMap<usize, PerContext>>,
     /// Unified persistence manager — owns the SQLite store and coordinates all
     /// user-model persistence (recency / bigrams / phrases / L0). `None` until
@@ -114,6 +115,7 @@ impl ImeEngine {
         Self::with_config(
             weights,
             crate::family::english::EnglishWeights::default(),
+            None,
             Box::new(crate::family::magic::expander::DefaultProvider),
             Vec::new(),
             crate::family::scoring::ScoringConfig::default(),
@@ -151,6 +153,8 @@ impl ImeEngine {
     pub fn with_config(
         pinyin_weights: crate::family::pinyin::PinyinWeights,
         english_weights: crate::family::english::EnglishWeights,
+        // 英文 base 词表路径(hermitdave en_freq.tsv;None = 空 base)。
+        english_wordlist: Option<String>,
         provider: Box<dyn crate::family::magic::expander::VariableProvider>,
         extra_snippets: Vec<crate::store::snippet_md::SnippetEntry>,
         scoring: crate::family::scoring::ScoringConfig,
@@ -213,15 +217,17 @@ impl ImeEngine {
             scoring,
         ));
         let english_family = Arc::new(
-            crate::family::english::EnglishFamily::with_default_dict()
-                .with_config(scoring.priorities.english, english_weights),
+            crate::family::english::EnglishFamily::with_base_wordlist(
+                english_wordlist.as_deref(),
+            )
+            .with_config(scoring.priorities.english, english_weights),
         );
-        let emoji_family = crate::family::emoji::EmojiFamily::new();
+        let emoji_family = std::sync::Arc::new(crate::family::emoji::EmojiFamily::new());
         let scorer = crate::family::UnifiedScorer::new(
             vec![
                 Box::new(Arc::clone(&pinyin_family)),
                 Box::new(Arc::clone(&english_family)),
-                Box::new(emoji_family),
+                Box::new(Arc::clone(&emoji_family)),
             ],
             scoring.priorities,
         );
@@ -230,6 +236,7 @@ impl ImeEngine {
             scorer,
             pinyin_family,
             english_family,
+            emoji_family,
             contexts: Mutex::new(HashMap::new()),
             persistence: Mutex::new(None),
             magic,
@@ -239,23 +246,10 @@ impl ImeEngine {
             frontend,
             io_thread,
             voice_state,
-            filters: crate::fsm::post::FilterChain::with_flood_control(),
+            filters: crate::fsm::post::FilterChain::with_flood_control(scoring.floors),
         };
-        // Load embedded base dictionary (5KB, compiled into binary).
-        let count = engine
-            .scorer
-            .family("pinyin")
-            .map(|f| f.load_dict_bytes(Self::EMBEDDED_BASE_DICT))
-            .unwrap_or(0);
-        if count > 0 {
-            tracing::info!(count, "loaded embedded base dictionary");
-        }
         engine
     }
-
-    /// Embedded base phrase dictionary (TSV format), compiled into the binary.
-    const EMBEDDED_BASE_DICT: &[u8] =
-        include_bytes!("../../../apps/swift-ime/assets/dict/base.tsv");
 
     /// 前端句柄(引擎 I/O 线程经它推送刷新 / 请求剪贴板)。
     pub fn frontend(&self) -> Arc<dyn crate::frontend::FrontEndHandle> {
@@ -763,8 +757,13 @@ impl ImeEngine {
             .and_then(|f| f.load_user_dict(path))
     }
 
-    /// Load the emoji keyword table (CLDR-generated `emoji.tsv`):
-    /// `keyword<TAB>emoji`, overriding the embedded base for the same keyword.
+    /// yaml `weights.emoji` → emoji 家族打分参数。
+    pub fn set_emoji_weights(&self, w: crate::family::emoji::EmojiWeights) {
+        self.emoji_family.set_weights(w);
+    }
+
+    /// Load the emoji keyword table (v2: `emoji freq kw...`, whitespace-
+    /// separated; see family/emoji.rs).
     pub fn load_emoji_dict(&self, path: &str) -> std::io::Result<usize> {
         self.scorer
             .load_dict_to("emoji", path)
@@ -872,8 +871,33 @@ impl crate::fsm::family::StepEnv for ImeEngine {
 mod tests {
     use super::*;
 
+    /// 英文词表就绪的引擎(内嵌词表外置后,测试用临时文件提供小词表)。
+    /// 文件名含线程 id 且只写一次 —— 并行测试共享同路径会互相截断读取。
     fn eng() -> ImeEngine {
-        ImeEngine::new()
+        let tid = format!("{:?}", std::thread::current().id());
+        let path = std::env::temp_dir()
+            .join(format!("eng_words_{}_{tid}.tsv", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        if !std::path::Path::new(&path).exists() {
+            let words = "world\t50000\nhello\t40000\nthe\t30000\na\t20000\ni\t10000\n\
+                         test\t9000\napple\t5000\nblack\t4000\nok\t3000\ncase\t2000\n\
+                         english\t8000\n";
+            std::fs::write(&path, words).unwrap();
+        }
+        ImeEngine::with_config(
+            crate::family::pinyin::PinyinWeights::default(),
+            crate::family::english::EnglishWeights::default(),
+            Some(path.to_string_lossy().into_owned()),
+            Box::new(crate::family::magic::expander::DefaultProvider),
+            Vec::new(),
+            crate::family::scoring::ScoringConfig::default(),
+            Arc::new(crate::frontend::NoopFrontend::default()),
+            DEFAULT_VOICE_AURA_BASE.to_string(),
+            crate::io_thread::DEFAULT_IDLE_TIMEOUT_SECS,
+            Vec::new(),
+            7,
+        )
     }
 
     #[test]
@@ -1202,6 +1226,7 @@ mod tests {
         let e = ImeEngine::with_config(
             crate::family::pinyin::PinyinWeights::default(),
             crate::family::english::EnglishWeights::default(),
+            None,
             Box::new(NoVars),
             vec![SnippetEntry {
                 name: "hello".into(),

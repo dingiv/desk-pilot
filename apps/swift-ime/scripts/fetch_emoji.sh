@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # fetch_emoji.sh — 从 Unicode CLDR annotations 生成 emoji 关键词词表。
 #
-# 输出: assets/dict/emoji.tsv — 每行 `keyword<TAB>emoji`:
+# 输出:tmp/emoji_cldr_raw.tsv — CLDR 平表(keyword<TAB>emoji),仅作
+# clean_emoji_llm.py 清洗管线的**原料**(平表 → LLM 精选 kw + 流行度 →
+# merge/refine → assets/dict/emoji/emoji.tsv v2)。不再直接产出引擎词典。
 #   - en 主注释关键词(竖线分隔拆分)+ en tts 短名
 #   - zh 主注释关键词 + zh tts 短名,经 pypinyin 转成**拼音**
 #     (输入法 buffer 里永远是拼音/字母,汉字关键词"微笑"永远无法被触发,
@@ -17,7 +19,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."  # apps/swift-ime/
-OUT="assets/dict/emoji/emoji.tsv"
+OUT="tmp/emoji_cldr_raw.tsv"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 

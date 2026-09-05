@@ -49,6 +49,7 @@ fn eng_with_aura(base: &str) -> ImeEngine {
     ImeEngine::with_config(
         ime_core::family::pinyin::PinyinWeights::default(),
         ime_core::family::english::EnglishWeights::default(),
+        None,
         Box::new(ime_core::family::magic::expander::DefaultProvider),
         Vec::new(),
         ime_core::family::scoring::ScoringConfig::default(),
@@ -185,7 +186,22 @@ fn enter_commits_raw_pinyin() {
 
 #[test]
 fn english_word_black() {
-    let mut eng = ImeEngine::new();
+    // 词表已外置(en_freq.tsv):测试自备最小词表走运行时加载。
+    let path = std::env::temp_dir().join(format!("black_{}.tsv", std::process::id()));
+    std::fs::write(&path, "black\t50000\n").unwrap();
+    let mut eng = ImeEngine::with_config(
+        ime_core::family::pinyin::PinyinWeights::default(),
+        ime_core::family::english::EnglishWeights::default(),
+        Some(path.to_string_lossy().into_owned()),
+        Box::new(ime_core::family::magic::expander::DefaultProvider),
+        Vec::new(),
+        ime_core::family::scoring::ScoringConfig::default(),
+        std::sync::Arc::new(ime_core::frontend::NoopFrontend::default()),
+        "127.0.0.1:9091".to_string(),
+        ime_core::io_thread::DEFAULT_IDLE_TIMEOUT_SECS,
+        Vec::new(),
+        7,
+    );
     for c in "blac".chars() {
         eng.predict(KeyEvent::char(c));
     }
@@ -193,6 +209,7 @@ fn english_word_black() {
         eng.candidates().contains(&"black".to_string()),
         "black should be in candidates for 'blac'"
     );
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
