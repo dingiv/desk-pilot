@@ -429,6 +429,7 @@ impl SessionState {
     }
 
     pub fn reset(&mut self) {
+        self.chain_flow.clear();
         self.clear_active_command();
         self.state = ComposeState::Idle;
         self.comp.buffer.clear();

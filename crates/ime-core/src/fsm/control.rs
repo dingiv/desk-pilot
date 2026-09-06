@@ -55,6 +55,10 @@ pub struct SessionState {
     /// 待结算学习回执(round14):stage2 提交路径产出,ControlPane 在
     /// 事件处理后统一交后处理 `learn_commit` 结算。
     pub(crate) pending_learning: Vec<crate::fsm::post::CommitReceipt>,
+    /// 链式流控(round15):链式预测 × 魔法异步的刷新闸门 + 上游折叠缓存。
+    /// `abc'#asr'#translate` 中语音段更新时,上游 abc 命中缓存不重算,
+    /// 只有语音段之后的流水线在防抖/节流放行后重新预测。
+    pub(crate) chain_flow: crate::fsm::chain::ChainFlow,
 }
 
 /// 系统控制(round13,原 `StateMachine`):**分发三大事件类型** ——

@@ -182,12 +182,29 @@ impl SessionState {
     /// `First` 上下文传给最后一段;文本段走统一打分(`'` 组合由拼音家族
     /// 处理,即 P0),命令段临时 spawn 求值(级联中间命令不保异步会话 —
     /// 会话态只有活动命令有)。
-    fn eval_upstream(&self, upstream: &str, env: &dyn StepEnv) -> Vec<String> {
-        use crate::fsm::chain::{join_segments, split_segments, ChainSeg};
+    ///
+    /// 部分重算(round15):结果进 [`ChainFlow::cache`](按 upstream buffer
+    /// 内容寻址)。`abc'#asr'#translate` 反复刷新时,abc 前缀段命中缓存
+    /// 跳过打分/命令求值 —— 只有源变化之后的段真正重算。
+    fn eval_upstream(&mut self, upstream: &str, env: &dyn StepEnv) -> Vec<String> {
+        
 
         if upstream.is_empty() {
             return Vec::new();
         }
+        // 内容寻址缓存:命中即上游段完全不重算(abc 不随语音刷新)。
+        if let Some(hit) = self.chain_flow.cached(upstream) {
+            return hit;
+        }
+        let computed = self.eval_upstream_uncached(upstream, env);
+        self.chain_flow.store(upstream, computed.clone());
+        computed
+    }
+
+    /// 无缓存折叠(上函数的纯求值体;递归内层调用仍走带缓存版本)。
+    fn eval_upstream_uncached(&mut self, upstream: &str, env: &dyn StepEnv) -> Vec<String> {
+        use crate::fsm::chain::{join_segments, split_segments, ChainSeg};
+
         let segs = split_segments(upstream);
         let Some((last, prefix)) = segs.split_last() else {
             return Vec::new();
@@ -307,6 +324,11 @@ impl SessionState {
         if self.state != ComposeState::Snippet {
             return None;
         }
+        // 链式命令态(abc'#asr'#translate):走链式流控 tick(防抖/节流 +
+        // 部分重算),不走单命令 tick —— 下方逻辑假设 buffer 即命令。
+        if crate::fsm::chain::is_chain_command(&self.comp.buffer) {
+            return self.chained_flow_tick(disp);
+        }
         // 成员被取走以便自由变更状态机,随后放回(成员可能自行退出)。
         let mut member = self.magic.active.take()?;
         let new_preds = member.tick(self.ctx, &self.comp.buffer.clone(), disp);
@@ -317,6 +339,36 @@ impl SessionState {
         self.magic.active = Some(member);
         self.magic.predictions = preds;
         Some(self.rebuild_magic_view())
+    }
+
+    /// 链式流控 tick(round15):`abc'#asr'#translate` 场景的异步刷新门面。
+    ///
+    /// - **部分重算**:源指纹 = 上游折叠候选序列(缓存命中 → abc 段零重算);
+    ///   指纹不变 → Quiet,不做任何事(面板不被语音噪声打搅);
+    /// - **防抖 + 节流**:`ChainFlow::gate` 压制连发 —— 源停顿
+    ///   [`DEBOUNCE_MS`] 后、且距上次刷新超过 [`THROTTLE_MS`] 才放行,
+    ///   放行即重走 [`query_chained_magic`](只有语音段之后的流水线重预测);
+    /// - 非 Snippet 态 / 非链式 buffer → None(调用方 magic_tick 已分流,
+    ///   此为防御)。
+    pub(crate) fn chained_flow_tick(&mut self, disp: &dyn StepEnv) -> Option<ImeView> {
+        use crate::fsm::chain::{join_segments, split_segments, ChainSeg, FlowDecision};
+
+        if self.state != ComposeState::Snippet || !crate::fsm::chain::is_chain_command(&self.comp.buffer) {
+            return None;
+        }
+        let input = self.comp.buffer.clone();
+        let segs = split_segments(&input);
+        let Some((ChainSeg::Command(_), prefix)) = segs.split_last() else {
+            return None;
+        };
+        let upstream_buf = join_segments(prefix);
+        // 源指纹:上游折叠后的候选序列(缓存命中;abc 不重算)。
+        let source = self.eval_upstream(&upstream_buf, disp).join("\u{1f}");
+        if self.chain_flow.gate(&source, crate::family::now_ms()) != FlowDecision::Fire {
+            return None;
+        }
+        // 放行:重走链式预测(缓存让上游零成本,最后段全量重预测)。
+        Some(self.query_chained_magic(&input, disp))
     }
 
     /// 从 `magic_predictions` / `magic_hints` 重建候选列表 + preedit + 视图。

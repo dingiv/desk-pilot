@@ -94,6 +94,8 @@ impl LargeDict {
             .unwrap_or_default()
     }
 
+
+    // FIXME: IO 操作不要在字典中进行, 移动到持久化模块中去;
     /// Load from a file — auto-detects TSV vs FST by extension.
     pub fn load_from_tsv_file(&mut self, path: &str) -> std::io::Result<usize> {
         if path.ends_with(".fst") {
