@@ -8,7 +8,6 @@ pub mod lattice;
 pub mod phrase;
 pub mod recency;
 
-use recency::RecentStore;
 
 use dict::LargeDict;
 use std::sync::{Arc, Mutex};
@@ -34,14 +33,13 @@ pub const DICT_LARGE_BYTES: u64 = 100_000;
 /// - PhraseBook prefix: `raw_score = 0.85`
 pub struct PinyinFamily {
     engine: inputx_pinyin::PinyinEngine,
-    phrase_book: Mutex<PhraseBook>,
+    /// 单词本(round14:存储外置,本家族持引用;所有权归持久化模块)。
+    wordbook: std::sync::Arc<crate::store::wordbook::WordBook>,
     large_dict: Mutex<LargeDict>,
     lattice: Mutex<Option<lattice::LatticeDecoder>>,
-    recency: Mutex<RecentStore>,
     /// 运行时开关(AtomicBool:trait `set_family_enabled` 经 `&self` 写入)。
     enabled: AtomicBool,
     weights: PinyinWeights,
-    store: Mutex<Option<Arc<WeightStore>>>,
     /// freq→score 映射参数(swift-ime.yaml → weights.freq_scale)。
     freq_scale: crate::family::scoring::FreqScale,
     /// 上下文感知开关(swift-ime.yaml → input.context_aware,默认开)。
@@ -51,6 +49,7 @@ pub struct PinyinFamily {
     context_aware: Mutex<bool>,
     /// 上一次提交的 (word, pinyin) —— 前缀整词联想的上下文来源。
     /// 例:提交 中(zhong)后输入 de,联想 zhong+de="zhongde" 的整词。
+    /// FIXME: 生命周期不对呀，这个变量。这个拼音family啊，它直接放在了引擎里面了。但是你这个last commit这个是属于什么？跟session相关的, 这个东西应该放在session里面啊。
     last_commit: Mutex<(String, String)>,
 }
 
@@ -119,64 +118,68 @@ impl Default for PinyinWeights {
 
 impl PinyinFamily {
     pub fn new() -> Self {
-        Self::with_scoring(
+        Self::with_wordbook(std::sync::Arc::new(
+            crate::store::wordbook::WordBook::default(),
+        ))
+    }
+
+    /// 持共享单词本引用构造(引擎装配时分发;所有权在持久化模块)。
+    pub fn with_wordbook(wordbook: std::sync::Arc<crate::store::wordbook::WordBook>) -> Self {
+        Self::with_scoring_and_phrase_book(
             PinyinWeights::default(),
             crate::family::scoring::ScoringConfig::default(),
+            None,
+            wordbook,
         )
     }
 
     pub fn with_weights(weights: PinyinWeights) -> Self {
-        Self::with_scoring(weights, crate::family::scoring::ScoringConfig::default())
+        Self::with_scoring_and_phrase_book(
+            weights,
+            crate::family::scoring::ScoringConfig::default(),
+            None,
+            std::sync::Arc::new(crate::store::wordbook::WordBook::default()),
+        )
     }
 
     /// Full construction: pinyin weights + the unified scoring config (recency
     /// boosts, bigram ceiling, freq→score scale) from `swift-ime.yaml`.
-    pub fn with_scoring(weights: PinyinWeights, scoring: crate::family::scoring::ScoringConfig) -> Self {
-        PinyinFamily {
-            engine: inputx_pinyin::PinyinEngine::with_fuzzy(
-                inputx_pinyin::FuzzyConfig::permissive(),
-            ),
-            phrase_book: Mutex::new(PhraseBook::default_phrases()),
-            large_dict: Mutex::new(LargeDict::new()),
-            lattice: Mutex::new(None),
-            recency: Mutex::new(RecentStore::new()),
-            enabled: AtomicBool::new(true),
-            weights,
-            store: Mutex::new(None),
-            freq_scale: scoring.freq_scale,
-            context_aware: Mutex::new(true),
-            last_commit: Mutex::new((String::new(), String::new())),
-        }
-    }
-
-    pub fn set_weights(&mut self, w: PinyinWeights) {
-        self.weights = w;
+    pub fn with_scoring(
+        weights: PinyinWeights,
+        scoring: crate::family::scoring::ScoringConfig,
+    ) -> Self {
+        Self::with_scoring_and_phrase_book(weights, scoring, None, {
+            std::sync::Arc::new(crate::store::wordbook::WordBook::default())
+        })
     }
 
     pub fn with_phrase_book(phrase_book: PhraseBook) -> Self {
         Self::with_scoring_and_phrase_book(
             PinyinWeights::default(),
             crate::family::scoring::ScoringConfig::default(),
-            phrase_book,
+            Some(phrase_book),
+            std::sync::Arc::new(crate::store::wordbook::WordBook::default()),
         )
     }
 
-    fn with_scoring_and_phrase_book(
+    pub fn with_scoring_and_phrase_book(
         weights: PinyinWeights,
         scoring: crate::family::scoring::ScoringConfig,
-        phrase_book: PhraseBook,
+        phrase_book: Option<PhraseBook>,
+        wordbook: std::sync::Arc<crate::store::wordbook::WordBook>,
     ) -> Self {
+        if let Some(book) = phrase_book {
+            *wordbook.pinyin.phrase_book.lock().unwrap() = book;
+        }
         PinyinFamily {
             engine: inputx_pinyin::PinyinEngine::with_fuzzy(
                 inputx_pinyin::FuzzyConfig::permissive(),
             ),
-            phrase_book: Mutex::new(phrase_book),
+            wordbook,
             large_dict: Mutex::new(LargeDict::new()),
             lattice: Mutex::new(None),
-            recency: Mutex::new(RecentStore::new()),
             enabled: AtomicBool::new(true),
             weights,
-            store: Mutex::new(None),
             freq_scale: scoring.freq_scale,
             context_aware: Mutex::new(true),
             last_commit: Mutex::new((String::new(), String::new())),
@@ -185,16 +188,16 @@ impl PinyinFamily {
 
     /// Attach the weight store for persisting learned phrases.
     pub fn set_store(&self, store: Arc<WeightStore>) {
-        *self.store.lock().unwrap() = Some(store);
+        self.wordbook.pinyin.set_store(store);
     }
 
     /// Warm the phrase book from persisted SQLite data (internal helper).
     fn do_warm_phrases(&self) {
-        let guard = self.store.lock().unwrap();
+        let guard = self.wordbook.pinyin.store.lock().unwrap();
         if let Some(ref store) = *guard {
             let entries = store.load_all_phrases();
             if !entries.is_empty() {
-                let mut book = self.phrase_book.lock().unwrap();
+                let mut book = self.wordbook.pinyin.phrase_book.lock().unwrap();
                 for (pinyin, word, priority, count) in &entries {
                     // 存量过滤:早期版本把 emoji 也学进了 phrase(见
                     // learn_phrase_inner),加载时丢弃。
@@ -215,9 +218,9 @@ impl PinyinFamily {
     /// wall-clock time and double-writes the table to SQLite (full-snapshot
     /// replace, ≤512 rows) so the time-decay survives restarts.
     pub fn record_commit(&self, word: &str) {
-        let mut rec = self.recency.lock().unwrap();
+        let mut rec = self.wordbook.pinyin.recency.lock().unwrap();
         rec.record(word, super::now_ms());
-        if let Some(ref store) = *self.store.lock().unwrap() {
+        if let Some(ref store) = *self.wordbook.pinyin.store.lock().unwrap() {
             store.save_recency(&rec.dump());
         }
     }
@@ -322,7 +325,7 @@ impl PinyinFamily {
         &self.engine
     }
     pub fn phrase_count(&self) -> usize {
-        self.phrase_book.lock().unwrap().len()
+        self.wordbook.pinyin.phrase_book.lock().unwrap().len()
     }
     pub fn large_dict_len(&self) -> usize {
         self.large_dict.lock().unwrap().len()
@@ -349,16 +352,16 @@ impl PinyinFamily {
         if !is_learnable_word(hanzi) {
             return;
         }
-        let mut book = self.phrase_book.lock().unwrap();
+        let mut book = self.wordbook.pinyin.phrase_book.lock().unwrap();
         if book.count(pinyin, hanzi) > 0 {
             book.bump_count(pinyin, hanzi);
-            if let Some(ref store) = *self.store.lock().unwrap() {
+            if let Some(ref store) = *self.wordbook.pinyin.store.lock().unwrap() {
                 store.bump_phrase_count(pinyin, hanzi);
             }
         } else {
             book.insert(pinyin, hanzi);
             // Persist to SQLite if store is attached.
-            if let Some(ref store) = *self.store.lock().unwrap() {
+            if let Some(ref store) = *self.wordbook.pinyin.store.lock().unwrap() {
                 store.record_phrase(pinyin, hanzi, 0);
             }
         }
@@ -413,7 +416,7 @@ impl PinyinFamily {
         *self.last_commit.lock().unwrap() = (word.to_string(), pinyin.to_string());
         // Persist the L0 user model (pins + pick counters) — same double-write
         // cadence as recency, so the 3-pick auto-pin survives restarts.
-        if let Some(ref store) = *self.store.lock().unwrap() {
+        if let Some(ref store) = *self.wordbook.pinyin.store.lock().unwrap() {
             store.save_l0(&self.export_l0_json());
         }
     }
@@ -479,7 +482,7 @@ impl PinyinFamily {
     pub fn warm_recencies(&self, entries: Vec<(String, i64)>) {
         if !entries.is_empty() {
             let count = entries.len();
-            self.recency.lock().unwrap().load_bulk(entries, super::now_ms());
+            self.wordbook.pinyin.recency.lock().unwrap().load_bulk(entries, super::now_ms());
             eprintln!("[ime-core] pinyin: warmed {count} recency entries from store");
         }
     }
@@ -534,7 +537,7 @@ impl PinyinFamily {
                 }
             };
             let mut fst_sorted = fst_words;
-            fst_sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            fst_sorted.sort_by_key(|w| std::cmp::Reverse(w.1));
             let fst_texts: std::collections::HashSet<String> =
                 fst_sorted.iter().map(|(w, _)| w.clone()).collect();
             // 兜底锚点的二分依据改**词典级**(W9 反馈修复):只要加载的 FST
@@ -736,7 +739,7 @@ impl PinyinFamily {
         // the dict hit scores LOWER (rare/low-frequency word the user favors)
         // does the phrase entry take over.
         {
-            let book = self.phrase_book.lock().unwrap();
+            let book = self.wordbook.pinyin.phrase_book.lock().unwrap();
             for w in book.exact(input) {
                 // 使用次数驱动的 phrase 分(首次 0.70,随使用升到 phrase_book)。
                 let score = self.phrase_score(book.count(input, &w));
@@ -854,7 +857,7 @@ impl CandidateFamily for PinyinFamily {
         // b = 近期指数(1-5,按距上次使用时间分档;>3d 条目在查询时被移出)。
         // 合成公式:z = (1-a)(a+b)/8 + a —— 增量与 (1-a) 成比例,低权重词
         // 获得更大加成,高权重词增量趋零,z 天然 < 1(不会顶满 1.0)。
-        let mut recency = self.recency.lock().unwrap();
+        let mut recency = self.wordbook.pinyin.recency.lock().unwrap();
         if !recency.is_empty() {
             let now = super::now_ms();
             for c in &mut candidates {
@@ -934,7 +937,7 @@ impl CandidateFamily for PinyinFamily {
 
     /// Attach the weight store(跨家族生命周期钩子,留在 trait)。
     fn attach_store(&self, store: std::sync::Arc<WeightStore>) {
-        *self.store.lock().unwrap() = Some(store);
+        *self.wordbook.pinyin.store.lock().unwrap() = Some(store);
     }
 
     fn load_dict_bytes(&self, data: &[u8]) -> usize {
@@ -945,14 +948,14 @@ impl CandidateFamily for PinyinFamily {
             // For now, lattice is built when loading from file (load_fst_file).
             n
         } else {
-            self.phrase_book.lock().unwrap().load_from_tsv_bytes(data)
+            self.wordbook.pinyin.phrase_book.lock().unwrap().load_from_tsv_bytes(data)
         }
     }
 
     fn load_dict(&self, path: &str) -> std::io::Result<usize> {
         if path.ends_with(".json") {
             let json = std::fs::read_to_string(path)?;
-            let mut book = self.phrase_book.lock().unwrap();
+            let mut book = self.wordbook.pinyin.phrase_book.lock().unwrap();
             book.load_from_json_str(&json)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         } else if path.ends_with(".fst") {
@@ -968,7 +971,7 @@ impl CandidateFamily for PinyinFamily {
             if meta.len() > DICT_LARGE_BYTES {
                 self.large_dict.lock().unwrap().load_from_tsv_file(path)
             } else {
-                self.phrase_book.lock().unwrap().load_from_tsv(path)
+                self.wordbook.pinyin.phrase_book.lock().unwrap().load_from_tsv(path)
             }
         }
     }

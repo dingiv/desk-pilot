@@ -9,7 +9,7 @@
 //! ```text
 //! # @type: emoji-freq
 //! emoji<TAB or space>freq<TAB>kw1[<TAB>kw2[<TAB>kw3]]
-//! 😍	4543	hearteye	chimi	huachi
+//! 😍  4543  hearteye  chimi  huachi
 //! ```
 //!
 //! One line per emoji (emoji is the PRIMARY key), carrying its popularity
@@ -126,7 +126,7 @@ impl EmojiFamily {
             }
             count += 1;
         }
-        entries.sort_by(|a, b| b.freq.cmp(&a.freq));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.freq));
         count
     }
 

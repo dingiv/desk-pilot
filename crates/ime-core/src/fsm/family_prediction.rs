@@ -1,41 +1,28 @@
-//! IME composition state machine.
+//! family — 第一路键处理:FamilyPrediction(打分家族预测,round13)。
 //!
-//! ## State Transition Table
+//! 双路键处理之一:`#` 之外的普通键进这里,做拼音/英文/emoji 家族预测。
+//! 本模块**不依赖 ControlPane** —— 只吃 [`SessionState`](会话纯数据);
+//! 三个家族对象自身持有状态(pinyin/english/emoji Arc,跨会话共享),
+//! 由引擎持有,经 [`StepEnv`] 注入。
 //!
-//! **输入路由(哪个键进到这里、修饰键策略、透传判定)由
-//! [`crate::router`](crate::router) 的状态机表统一决定** —— 本模块只描述
-//! 字符进入组合后的内部迁移:
+//! 路径:收集(`collect_pinyin` 产出交付件)→ 路由层转 stage3 →
+//! [`apply_post_outcome`] 落位 → `render` 出视图。
 //!
-//! | Current  | Input      | → Next   | View filled                |
-//! |----------|------------|----------|----------------------------|
-//! | Idle     | `/` `#`    | Snippet  | preedit_text               |
-//! | Idle     | a-z        | Pinyin   | candidates or preedit_text  |
-//! | Idle     | other      | Idle     | action=PASSTHROUGH        |
-//! | Snippet  | letter/dig | Snippet  | trie step → commit/preedit |
-//! | Snippet  | dead-end   | Idle     | commit_text                |
-//! | Pinyin   | a-z        | Pinyin   | extend + fill_view         |
-//! | Pinyin   | Space      | Idle     | commit_text                |
-//! | Pinyin   | Enter      | Idle     | commit_text                |
-//! | Pinyin   | Backspace  | P/Idle   | pop + fill_view            |
-//! | Pinyin   | other      | Idle     | commit_text                |
+//! | 组合状态 | 键 | 迁移 | 视图 |
+//! |---|---|---|---|
+//! | Idle      | `#`/`/`    | Snippet  | (转第二路 MagicFlow)       |
+//! | Idle      | a-z        | Pinyin   | collect + render           |
+//! | Pinyin    | a-z        | Pinyin   | extend + render            |
+//! | Pinyin    | Space      | Idle     | commit_text                |
+//! | Pinyin    | Enter      | Idle     | commit_text                |
+//! | Pinyin    | Backspace  | P/Idle   | pop + render               |
+//! | Pinyin    | other      | Idle     | commit_text                |
 //!
-//! ## Incremental composition (造词)
-//!
-//! When the buffer contains 2+ syllables, the candidate list shows BOTH:
-//!  - Full Viterbi compositions (select → commit entire word)
-//!  - First-syllable single characters (select → commit that char, reduce buffer)
-//!
-//! After each partial commit the buffer shrinks and the query repeats.
-//! When the last syllable is committed, the resulting phrase is saved to
-//! the PhraseBook for future sessions.
-
-use crate::family::magic::{
-    ChainContext, LiveCommand, MagicMatch, MagicMember, Prediction,
-};
 
 use crate::frontend::ImeView;
 use super::key::KeyKind;
-use super::post::CandMeta;
+use super::control::SessionState;
+use super::post::{commit_view, passthrough_view, render, CandMeta};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ComposeState {
@@ -45,47 +32,6 @@ pub enum ComposeState {
     Pinyin,
 }
 
-#[derive(Default)]
-pub struct FamilyPipeline {
-    /// 所属输入上下文(引擎 `with_ctx` 每次操作前设置)。魔法命令成员用它
-    /// 把异步工作事件发到正确的 ctx 并 refresh 对应上下文。
-    pub ctx: usize,
-    pub state: ComposeState,
-    /// 组合会话(S4 下沉):原始键入/预测串/预编辑/光标/造词半成品。
-    pub(crate) comp: Composition,
-
-    /// 调试模式:候选词显示提供者与权重(`[score family/source]`)。
-    pub candidate_meta_enabled: bool,
-
-    /// 候选面板(S4 下沉):items/meta/partial 同源同序 + 高亮/分页。
-    pub(crate) panel: CandidatePanel,
-
-    /// postprocess → query_pinyin 的带出槽(stage3 内部中间值,非持久状态)。
-    pub(crate) pending_full_comp_count: usize,
-    /// Short-term input context — accumulates recently committed text.
-    pub context: crate::family::InputContext,
-    /// 魔法命令会话(S4 下沉):snippet 态的补全提示 / 预测选项 / live
-    /// 命令实例 / 数字键语义。
-    pub(crate) magic: MagicSession,
-
-}
-
-/// 魔法命令会话(S4 状态下沉):snippet 态(`#…`)的会话状态。
-/// hints/predictions 的候选语义与 CandidatePanel 分离 —— 命令候选不是
-/// scorer 产物(Matcher→Expander 路径),提交/改写规则也不同。
-#[derive(Default)]
-pub(crate) struct MagicSession {
-    /// 补全提示(输入是某命令触发串的严格前缀):候选 = [补全名…, rollback]。
-    /// 选中补全名 → **改写输入**(不提交)。
-    pub hints: Vec<String>,
-    /// 精确匹配命令时的预测选项(不含 rollback)。
-    pub predictions: Vec<crate::family::magic::Prediction>,
-    /// 当前精确匹配的 live 命令实例(保 req 异步态等);静态命令 / 前缀 /
-    /// 未知时为 None。
-    pub active: Option<Box<dyn MagicMember>>,
-    /// 数字键是否用于选中候选(精确无参 / 前缀时 true;拼参数时 false)。
-    pub selectable: bool,
-}
 
 /// 组合会话(S4 状态下沉):一次输入组合的文本状态 —— 原始键入、预测串、
 /// 预编辑展示、光标、造词半成品。生命周期:idle 起步,提交/重置终。
@@ -105,6 +51,15 @@ pub(crate) struct Composition {
     pub committed_text: String,
     /// 已提交部分对应的拼音(如 "lizheng")。
     pub committed_pinyin: String,
+}
+
+impl Composition {
+    /// 展示预编辑同步(round11 消重):`preedit = committed + raw`,
+    /// 光标到尾。拼音组合每次文本变化(入字/退格/逐字提交)后调用。
+    pub(crate) fn sync_preedit(&mut self) {
+        self.preedit = format!("{}{}", self.committed_text, self.raw_buffer);
+        self.cursor = self.preedit.len();
+    }
 }
 
 /// 候选面板(S4 状态下沉):items/meta/partial 三列表同源同序
@@ -131,10 +86,34 @@ pub(crate) struct CandidatePanel {
     pub fresh: bool,
 }
 
-impl FamilyPipeline {
+impl SessionState {
     /// 面板镜像(S3 统一):last_meta → RankedCandidate,与 candidates
     /// 同序同源 —— 用户看见什么,这里就是什么。
+    ///
+    /// round12 规范化:Snippet 会话分支(命令预测 / 补全不经 scorer)
+    /// 从 engine 壳下沉至此 —— 会话语义归 stage2,壳只调门面。
     pub(crate) fn detailed(&self) -> Vec<crate::family::RankedCandidate> {
+        // Snippet 态(命令组合):candidates 来自命令预测 / 补全,不是 scorer。
+        // 直接返回面板,让 #asr 语音 / 命令补全提示正确显示。
+        if self.state == ComposeState::Snippet && self.panel.fresh {
+            let family: &'static str = self
+                .magic
+                .active
+                .as_ref()
+                .map(|m| if m.name().is_empty() { "snippet" } else { "magic" })
+                .unwrap_or("magic");
+            return self
+                .panel
+                .items
+                .iter()
+                .map(|c| crate::family::RankedCandidate {
+                    text: c.clone(),
+                    score: 1.0,
+                    family,
+                    source: "exact",
+                })
+                .collect();
+        }
         self.panel.meta
             .iter()
             .map(|m| crate::family::RankedCandidate {
@@ -147,9 +126,9 @@ impl FamilyPipeline {
     }
 }
 
-impl std::fmt::Debug for FamilyPipeline {
+impl std::fmt::Debug for SessionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FamilyPipeline")
+        f.debug_struct("SessionState")
             .field("state", &self.state)
             .field("buffer", &self.comp.buffer)
             .field("preedit", &self.comp.preedit)
@@ -165,21 +144,22 @@ impl std::fmt::Debug for FamilyPipeline {
     }
 }
 
-impl FamilyPipeline {
-    pub fn new() -> Self {
-        FamilyPipeline::with_page_size(7)
-    }
-
+// FIXME: family.rs 为什么会有状态机的结构体实现? 保持单向依赖
+impl SessionState {
     /// Construct with a configurable candidate page size (default 7).
     /// The engine passes `swift-ime.yaml → input.page_size` via
     /// [`ImeEngine::set_page_size`](crate::engine::ImeEngine::set_page_size).
-    pub fn with_page_size(page_size: u32) -> Self {
-        FamilyPipeline {
+    pub fn with_page_size(
+        page_size: u32,
+        wordbook: std::sync::Arc<crate::store::wordbook::WordBook>,
+    ) -> Self {
+        SessionState {
+            wordbook,
             panel: CandidatePanel {
                 page_size: page_size.max(1) as usize,
                 ..CandidatePanel::default()
             },
-            ..FamilyPipeline::default()
+            ..SessionState::default()
         }
     }
 
@@ -189,7 +169,7 @@ impl FamilyPipeline {
     pub fn step_key(&mut self, key: KeyKind, env: &dyn StepEnv) -> ImeView {
         match self.state {
             // idle 的控制键属于应用(stage1 已放行;防御兜底)。
-            ComposeState::Idle => Self::passthrough_view(),
+            ComposeState::Idle => passthrough_view(),
             ComposeState::Snippet => self.snippet_key(key, env),
             ComposeState::Pinyin => self.pinyin_key(key, env),
         }
@@ -202,388 +182,6 @@ impl FamilyPipeline {
             ComposeState::Snippet => self.snippet_char(ch, env),
             ComposeState::Pinyin => self.pinyin_char(ch, env),
         }
-    }
-
-    // ── Magic command prediction (Snippet state) ────────────────────────
-
-    /// 每次字符变化后重查:精确匹配 → 命令预测;前缀 → 补全提示;未知 → raw。
-    fn query_magic(&mut self, env: &dyn StepEnv) -> ImeView {
-        let input = self.comp.buffer.clone();
-
-        // ── 链式命令模式(X'#cmd):上游折叠求值 + 上下文传递 ──────────
-        if crate::fsm::chain::is_chain_command(&input) {
-            return self.query_chained_magic(&input, env);
-        }
-
-        // 链式上游回退:`#` 被删空后 buffer 只剩上游文本(含 `'`,非 `#`/`/`
-        // 开头)→ 回拼音组合继续编辑上游。
-        if input.contains('\'') && !input.starts_with('#') && !input.starts_with('/') {
-            self.state = ComposeState::Pinyin;
-            self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
-            self.comp.cursor = self.comp.preedit.len();
-            return self.query_pinyin(env);
-        }
-
-        // ── Stage 2:家族统一查询(ensure/predict 内聚 MagicFamily,S5)──
-        let answer = env
-            .magic()
-            .query(&mut self.magic.active, self.ctx, &input, env);
-        // ── Stage 3:答案落位面板 ──
-        self.magic.predictions = answer.predictions;
-        self.magic.hints = answer.hints;
-        self.magic.selectable = answer.selectable;
-        self.rebuild_magic_view()
-    }
-
-    /// 链式命令模式(`X'#cmd`):上游折叠求值 → 命令段匹配 → 按上下文声明
-    /// 分流(替换 / 拼接)。候选最终形态(`magic_predictions`)在此构造完成,
-    /// `select_magic` / `rebuild_magic_view` 无需感知链式。
-    ///
-    /// - 感知上下文的命令([`MagicMember::wants_context`] = Some):拿上游
-    ///   候选页(`first_text()` = 高亮首选;空链 `X''#t` 语义即整页),预测
-    ///   **替换**候选列表;
-    /// - 不感知的命令:普通 `predict`,非交互预测与上游首选**拼接**;
-    ///   interactive 预测(命令会话内部导航)不参与拼接,原样显示;
-    /// - 命令段未完成(`#`、`#x` 前缀/未知):候选 = 上游预测(用户可提前
-    ///   选上游结果)或补全提示。
-    ///
-    /// MVP 注:上游取其候选 top1(命令模式下不导航上游;改上游请回格)。
-    /// 链式进入前的造词半成品(`committed_text`)不参与上游求值。
-    fn query_chained_magic(&mut self, input: &str, env: &dyn StepEnv) -> ImeView {
-        use crate::fsm::chain::{join_segments, split_segments, ChainSeg};
-
-        let segs = split_segments(input);
-        let Some((ChainSeg::Command(cmd), prefix)) = segs.split_last() else {
-            return self.rebuild_magic_view(); // 防御:is_chain_command 已保证
-        };
-        let (cmd, prefix) = (cmd.clone(), prefix.to_vec());
-        let upstream_buf = join_segments(&prefix);
-        let upstream_cands = self.eval_upstream(&upstream_buf, env);
-        let upstream_first = upstream_cands.first().cloned().unwrap_or_default();
-
-        match env.magic().match_command(&cmd) {
-            MagicMatch::Exact(LiveCommand { token, name }) => {
-                self.ensure_command(name, Some(token), env);
-                // 上下文与语法严格对应:普通链(X'#cmd)只传高亮首选;
-                // 空链(X''#cmd)传上游整页(#concat 类成员消费)。
-                let upstream = ChainContext {
-                    items: chain_context_items(&upstream_buf, &upstream_cands),
-                };
-                let wants = self.magic.active
-                    .as_ref()
-                    .and_then(|m| m.wants_context());
-                let preds = match self.magic.active.as_mut() {
-                    Some(member) => match wants {
-                        Some(_) => member.predict_with_context(self.ctx, &cmd, &upstream, env),
-                        None => member
-                            .predict(self.ctx, &cmd, env)
-                            .into_iter()
-                            .map(|p| {
-                                if p.interactive {
-                                    p
-                                } else {
-                                    p.chained_prefix(&upstream_first)
-                                }
-                            })
-                            .collect(),
-                    },
-                    None => Vec::new(),
-                };
-                self.magic.predictions = preds;
-                self.magic.hints.clear();
-                self.magic.selectable = cmd == format!("#{name}");
-            }
-            // 片段命令(X'#/hello):片段展开 × 上游拼接(片段不感知上下文)。
-            MagicMatch::Snippet => {
-                self.ensure_command("", Some("__SNIPPET__"), env);
-                self.magic.predictions = self.magic.active
-                    .as_mut()
-                    .map(|m| m.predict(self.ctx, &cmd, env))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|p| {
-                        if p.interactive {
-                            p
-                        } else {
-                            p.chained_prefix(&upstream_first)
-                        }
-                    })
-                    .collect();
-                self.magic.hints.clear();
-                self.magic.selectable = false;
-            }
-            MagicMatch::Args(LiveCommand { token, name }) => {
-                self.ensure_command(name, Some(token), env);
-                // 参数输入态(#del/15):裸输入提交候选;提交时 force_fire 带
-                // 上游上下文强触发。
-                self.magic.predictions = vec![Prediction::submit(input.to_string())];
-                self.magic.hints.clear();
-                self.magic.selectable = false;
-            }
-            MagicMatch::Prefix(hints) => {
-                self.clear_active_command();
-                self.magic.predictions.clear();
-                self.magic.hints = hints;
-                self.magic.selectable = true;
-            }
-            MagicMatch::Unknown => {
-                // 命令段未知(# / #zzz):显示上游预测 —— 用户可选中上游结果
-                // 直接提交,或继续编辑命令段。
-                self.clear_active_command();
-                self.magic.predictions = upstream_cands
-                    .iter()
-                    .take(7)
-                    .map(|t| Prediction::commit(t.clone()))
-                    .collect();
-                self.magic.hints.clear();
-                self.magic.selectable = !self.magic.predictions.is_empty();
-            }
-        }
-        self.rebuild_magic_view()
-    }
-
-    /// 上游链折叠求值 → 候选文本列表(top8)。递归左折叠:前缀求值 →
-    /// `First` 上下文传给最后一段;文本段走统一打分(`'` 组合由拼音家族
-    /// 处理,即 P0),命令段临时 spawn 求值(级联中间命令不保异步会话 —
-    /// 会话态只有活动命令有)。
-    fn eval_upstream(&self, upstream: &str, env: &dyn StepEnv) -> Vec<String> {
-        use crate::fsm::chain::{join_segments, split_segments, ChainSeg};
-
-        if upstream.is_empty() {
-            return Vec::new();
-        }
-        let segs = split_segments(upstream);
-        let Some((last, prefix)) = segs.split_last() else {
-            return Vec::new();
-        };
-        let prefix_buf = join_segments(prefix);
-        // 命令段的上游 = 前缀折叠整页;文本段不需要上游对象(直接拼接)。
-        let upstream_page = match last {
-            ChainSeg::Command(_) if prefix_buf.is_empty() => Vec::new(),
-            ChainSeg::Command(_) => self.eval_upstream(&prefix_buf, env),
-            ChainSeg::Text(_) => Vec::new(),
-        };
-        let upstream_first = upstream_page.first().cloned().unwrap_or_default();
-        match last {
-            // 尾空链(X''):透传前缀整页 —— 空链语义:下一命令的上下文
-            // 不是首选,是整页候选(X''#concat)。
-            ChainSeg::Text(t) if t.is_empty() => {
-                if prefix_buf.is_empty() {
-                    Vec::new()
-                } else {
-                    self.eval_upstream(&prefix_buf, env)
-                }
-            }
-            ChainSeg::Text(t) => {
-                let ranked = env.scorer().rank_detailed(t, &self.context);
-                let texts: Vec<String> = ranked.into_iter().map(|c| c.text).take(8).collect();
-                if upstream_first.is_empty() {
-                    texts
-                } else {
-                    texts
-                        .into_iter()
-                        .map(|t| format!("{upstream_first}{t}"))
-                        .collect()
-                }
-            }
-            ChainSeg::Command(c) => {
-                let ctx = (!upstream_page.is_empty())
-                    .then(|| ChainContext { items: upstream_page.clone() });
-                self.eval_command(c, ctx.as_ref(), env)
-            }
-        }
-    }
-
-    /// 命令段求值(级联中间命令):临时 spawn + 上下文分流,产出候选文本
-    /// (interactive 项是命令会话导航,中间级联无意义,过滤)。
-    fn eval_command(
-        &self,
-        cmd: &str,
-        upstream: Option<&ChainContext>,
-        env: &dyn StepEnv,
-    ) -> Vec<String> {
-        match env.magic().match_command(cmd) {
-            MagicMatch::Exact(LiveCommand { token, .. }) => {
-                let Some(mut m) = env.magic().spawn(token) else {
-                    return Vec::new();
-                };
-                let wants = m.wants_context();
-                let preds = match (upstream, wants) {
-                    (Some(u), Some(_)) => m.predict_with_context(self.ctx, cmd, u, env),
-                    (Some(u), None) => {
-                        let up = u.first_text().to_string();
-                        m.predict(self.ctx, cmd, env)
-                            .into_iter()
-                            .map(|p| {
-                                if p.interactive {
-                                    p
-                                } else {
-                                    p.chained_prefix(&up)
-                                }
-                            })
-                            .collect()
-                    }
-                    _ => m.predict(self.ctx, cmd, env),
-                };
-                preds
-                    .into_iter()
-                    .filter(|p| !p.interactive)
-                    .map(|p| p.commit_value().to_string())
-                    .take(8)
-                    .collect()
-            }
-            _ => Vec::new(),
-        }
-    }
-
-    /// 精确匹配时复用同名命令实例(保 req 异步态),否则新建。
-    fn ensure_command(
-        &mut self,
-        name: &'static str,
-        token: Option<&'static str>,
-        env: &dyn StepEnv,
-    ) {
-        let keep = self.magic.active
-            .as_ref()
-            .map(|m| m.name() == name)
-            .unwrap_or(false);
-        if keep {
-            return;
-        }
-        self.clear_active_command();
-        if let Some(tok) = token {
-            self.magic.active = env.magic().spawn(tok);
-        }
-    }
-
-    fn clear_active_command(&mut self) {
-        if let Some(mut m) = self.magic.active.take() {
-            m.deactivate(self.ctx);
-        }
-    }
-
-    /// 选中候选(index):补全改写 / 预测提交(交互 or 上屏)/ rollback 提交。
-    pub fn select_magic(&mut self, index: usize, env: &dyn StepEnv) -> ImeView {
-        let n_preds = self.magic.predictions.len();
-        let n_hints = self.magic.hints.len();
-        // 1. 精确匹配的预测选项。
-        if index < n_preds {
-            let pred = self.magic.predictions[index].clone();
-            // 参数输入态的裸输入提交 → 用完整输入重新解析,忽略 `/…` 参数,
-            // 前缀匹配命令并**强制触发**(predict 会用完整输入解析删除/请求)。
-            if pred.submit {
-                return self.force_fire(env);
-            }
-            if pred.interactive {
-                // 交互式:传给命令 → 重新预测,替换选项(不上屏)。
-                if let Some(mut m) = self.magic.active.take() {
-                    m.pick(index, &pred.text, self.ctx, env);
-                    self.magic.active = Some(m);
-                }
-                return self.query_magic(env);
-            }
-            self.clear_active_command();
-            self.reset();
-            // `#del` 等删除选项:不提交文本,只让前端删 N 个字符。
-            if pred.delete_count > 0 {
-                return Self::delete_view(pred.delete_count);
-            }
-            // 提交用 commit_text(展示转义时原文提交),光标针对展示文本。
-            let commit = pred.commit_value().to_string();
-            self.commit_text(&commit, env, None);
-            return match pred.cursor {
-                Some(c) => Self::commit_view_at(&commit, c),
-                None => Self::commit_view(&commit),
-            };
-        }
-        // 2. 补全提示:改写输入(不提交)。
-        if index < n_preds + n_hints {
-            let hint = self.magic.hints[index - n_preds].clone();
-            self.comp.buffer = hint;
-            self.magic.hints.clear();
-            return self.query_magic(env);
-        }
-        // 3. rollback:提交原始缓冲。
-        let raw = std::mem::take(&mut self.comp.buffer);
-        self.reset();
-        self.commit_text(&raw, env, None);
-        Self::commit_view(&raw)
-    }
-
-    /// 参数输入态的**裸输入提交**(`#del/15` + Space):用完整输入重新调用成员
-    /// `predict` —— 成员解析参数后决定动作(删除 / 提交 / 交互请求)。取首条
-    /// 预测执行;无预测则提交原始缓冲。
-    fn force_fire(&mut self, env: &dyn StepEnv) -> ImeView {
-        use crate::fsm::chain::{join_segments, split_segments, ChainSeg};
-
-        let input = self.comp.buffer.clone();
-
-        // 链式参数态(X'#del/15):命令段(含参数)提取,上游求值后带上下文
-        // 强触发;不感知的命令照旧拼接。
-        let preds = if crate::fsm::chain::is_chain_command(&input) {
-            let segs = split_segments(&input);
-            let (cmd, prefix) = match segs.split_last() {
-                Some((ChainSeg::Command(c), p)) => (c.clone(), p.to_vec()),
-                _ => (input.clone(), vec![]),
-            };
-            let upstream_buf = join_segments(&prefix);
-            let upstream = ChainContext {
-                items: chain_context_items(
-                    &upstream_buf,
-                    &self.eval_upstream(&upstream_buf, env),
-                ),
-            };
-            match self.magic.active.as_mut() {
-                Some(m) => {
-                    if m.wants_context().is_some() {
-                        m.predict_with_context(self.ctx, &cmd, &upstream, env)
-                    } else {
-                        let up = upstream.first_text().to_string();
-                        m.predict(self.ctx, &cmd, env)
-                            .into_iter()
-                            .map(|p| {
-                                if p.interactive {
-                                    p
-                                } else {
-                                    p.chained_prefix(&up)
-                                }
-                            })
-                            .collect()
-                    }
-                }
-                None => Vec::new(),
-            }
-        } else {
-            self.magic.active
-                .as_mut()
-                .map(|m| m.predict(self.ctx, &input, env))
-                .unwrap_or_default()
-        };
-        if let Some(head) = preds.first().cloned() {
-            if head.interactive {
-                // 交互(如 addon 请求中…):展示为候选,等待异步落地。
-                self.magic.predictions = preds;
-                self.magic.hints.clear();
-                self.magic.selectable = false;
-                return self.rebuild_magic_view();
-            }
-            self.clear_active_command();
-            self.reset();
-            if head.delete_count > 0 {
-                return Self::delete_view(head.delete_count);
-            }
-            let commit = head.commit_value().to_string();
-            self.commit_text(&commit, env, None);
-            return match head.cursor {
-                Some(c) => Self::commit_view_at(&commit, c),
-                None => Self::commit_view(&commit),
-            };
-        }
-        // 无预测 → 提交原始输入。
-        let raw = std::mem::take(&mut self.comp.buffer);
-        self.reset();
-        self.commit_text(&raw, env, None);
-        Self::commit_view(&raw)
     }
 
     /// Select candidate at `index`.
@@ -624,36 +222,46 @@ impl FamilyPipeline {
                 .iter()
                 .find(|m| m.text == picked)
                 .map(|m| m.family);
-            // L0 频率加成只对拼音族提交生效 —— 英文候选提交不写拼音模型。
+            // round14:stage2 只产出学习回执(纯数据),不调学习接口 ——
+            // 分发结算在后处理(post::learn_commit),家族不感知 commit。
+            // L0 频率加成只对拼音族提交生效;自生词(逐字选择后整体提交)
+            // 无条件入本;直接空格选 top **不学**(decomp 会被 Viterbi 重组)。
             if commit_family == Some("pinyin") {
-                env.record_pick(&full_pinyin, &final_text);
+                self.pending_learning
+                    .push(crate::fsm::post::CommitReceipt::PinyinPick {
+                        pinyin: full_pinyin.clone(),
+                        word: final_text.clone(),
+                    });
             }
-            // 自生词模式(拼音族):唯一的学习入口。经历过 ≥1 次数字键逐字选择
-            // (committed_text 非空)后提交,整体无条件加入单词本。
-            // 直接提交(空格选 top,未逐字选择)**不学** —— decomp 选项
-            // 下次输入时 Viterbi 会重新组合出同样的候选,无需入本。
             if !self.comp.committed_text.is_empty() {
-                env.learn_composed_phrase(&full_pinyin, &final_text);
+                self.pending_learning
+                    .push(crate::fsm::post::CommitReceipt::ComposedPhrase {
+                        pinyin: full_pinyin,
+                        text: final_text.clone(),
+                    });
             }
             self.reset();
-            self.commit_text(&final_text, env, commit_family);
-            Self::commit_view(&final_text)
+            self.commit_text(&final_text, commit_family);
+            commit_view(&final_text)
         } else {
             // Partial commit: append this single character, shrink buffer.
             self.comp.committed_text.push_str(&picked);
             let first_syl = env.first_syllable(&self.comp.buffer).unwrap_or_default();
             let first_len = first_syl.len();
             if first_len > 0 && first_len <= self.comp.buffer.len() {
-                // Record this single-char pick in L0.
+                // 逐字选择的 L0 记录(round14:回执化,后处理结算)。
                 let consumed = self.comp.buffer[..first_len].to_string();
-                env.record_pick(&consumed, &picked);
+                self.pending_learning
+                    .push(crate::fsm::post::CommitReceipt::PinyinPick {
+                        pinyin: consumed.clone(),
+                        word: picked.clone(),
+                    });
                 self.comp.committed_pinyin.push_str(&consumed);
                 self.comp.buffer = self.comp.buffer[first_len..].to_string();
                 // 同步收缩 raw_buffer(consumed 是小写音节,等字节长)。
                 self.comp.raw_buffer = self.comp.raw_buffer[first_len..].to_string();
             }
-            self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
-            self.comp.cursor = self.comp.preedit.len();
+            self.comp.sync_preedit();
             self.panel.fresh = false;
             self.panel.highlight = 0;
             self.query_pinyin(env)
@@ -667,13 +275,157 @@ impl FamilyPipeline {
     /// `family` = 提交内容的来源家族:`Some("english")` 只进英文 recency、
     /// 不学自生词;`None`(raw 强选 / snippet 文本)按拼音族 recency、
     /// ASCII 时学英文自生词 —— 与旧引擎回写行为一致。
-    pub(crate) fn commit_text(&mut self, text: &str, env: &dyn StepEnv, family: Option<&'static str>) {
+    pub(crate) fn commit_text(&mut self, text: &str, family: Option<&'static str>) {
         self.context.update(text);
-        env.record_commit_text(text, family);
-        env.record_commit_len(text);
-        if family != Some("english") {
-            env.learn_ascii_word(text);
+        // round14:学习回执化 —— recency 分流 / ASCII 自生词 / 长度统计
+        // 的策略与分发都在后处理(post::learn_commit)。
+        self.pending_learning
+            .push(crate::fsm::post::CommitReceipt::Commit {
+                text: text.to_string(),
+                family,
+            });
+    }
+
+    /// 强提文本并结束组合(round11 统一出口):reset 全部会话态 → 提交 →
+    /// COMMIT 视图。适用一切"绕过候选直接上屏"的路径 —— Enter 原文强选、
+    /// rollback、未知命令提交、拼音符号终结、空格无候选提交。调用方负责
+    /// 先拼好文本(含 committed+raw 拼接与大小写回填),reset 由这里统一做
+    /// (含 active 命令清理)。
+    pub(crate) fn commit_raw_and_reset(&mut self, text: &str) -> ImeView {
+        self.reset();
+        self.commit_text(text, None);
+        commit_view(text)
+    }
+
+    // ── 状态派生与 stage1 门面(round11:自 state.rs 迁入)─────────────
+
+    /// 从组合状态机提取状态标志位(路由前查表、路由后同步都用这里)。
+    pub fn state_flags(&self) -> crate::fsm::key::StateFlags {
+        use crate::fsm::key::StateFlags;
+        let mut f = StateFlags::empty();
+        if self.state != ComposeState::Idle || !self.comp.buffer.is_empty() {
+            f |= StateFlags::COMPOSING;
         }
+        if !self.panel.items.is_empty() {
+            f |= StateFlags::PANEL_OPEN;
+        }
+        match self.state {
+            ComposeState::Idle => {}
+            ComposeState::Pinyin => f |= StateFlags::PINYIN,
+            ComposeState::Snippet => f |= StateFlags::SNIPPET,
+        }
+        if !self.comp.committed_text.is_empty() {
+            f |= StateFlags::WORD_BUILDING;
+        }
+        if self.has_pending_choices() {
+            f |= StateFlags::PENDING;
+        }
+        f
+    }
+
+    /// 是否有"待确认"的选项(命令预测 / 补全提示)。
+    fn has_pending_choices(&self) -> bool {
+        !self.magic.predictions.is_empty() || !self.magic.hints.is_empty()
+    }
+
+    /// 翻页(方向翻页键 / `-` `+`):页号 clamp,高亮跳到新页首。
+    pub fn change_page(&mut self, delta: i32) {
+        let n = self.panel.items.len();
+        if n == 0 || self.panel.page_size == 0 {
+            return;
+        }
+        let total_pages = n.div_ceil(self.panel.page_size);
+        if total_pages <= 1 {
+            return;
+        }
+        let new_page =
+            (self.panel.page as i32 + delta).clamp(0, total_pages as i32 - 1) as usize;
+        if new_page != self.panel.page {
+            self.panel.page = new_page;
+            self.panel.highlight = new_page * self.panel.page_size;
+            self.sync_magic_preedit();
+        }
+    }
+
+    /// **stage1 门面**:页内数字选词(`1..9` 按**当前页内**序号换算全局序)。
+    /// 越界(页内无此序号)返回透传 —— idle 的裸数字属于应用。
+    pub fn select_page_digit(&mut self, d: usize, env: &dyn StepEnv) -> ImeView {
+        let base = self.panel.page.saturating_mul(self.panel.page_size);
+        let idx = base + d.saturating_sub(1);
+        if self.panel.items.len() > idx {
+            self.select(idx, env)
+        } else {
+            passthrough_view()
+        }
+    }
+
+    /// **stage1 门面**:preedit 光标左右移动(`[` / `]`),clamp 内聚于
+    /// 组合会话 —— stage1 不触碰 `comp` 内部字段。
+    ///
+    /// 语义保持历史行为:字节偏移步进,右界按 chars 数(混合标准是历史
+    /// quirk,行为不变原则下保留)。
+    pub fn nudge_cursor(&mut self, delta: i32) {
+        if delta < 0 {
+            self.comp.cursor = self
+                .comp
+                .cursor
+                .saturating_sub(delta.unsigned_abs() as usize);
+        } else {
+            let max = self.comp.preedit.chars().count();
+            if self.comp.cursor < max {
+                self.comp.cursor = (self.comp.cursor + delta as usize).min(max);
+            }
+        }
+    }
+
+    /// 页大小(round12:stage2 门面)—— 面板是会话状态,唯一写口在此。
+    /// Build a view from the current state (no key processed). Used by the state
+    /// machine itself and by magic members rendering their candidates.
+    pub(crate) fn make_view(&self) -> ImeView {
+        let mut v = render(&self.panel_snapshot());
+        v.action = crate::frontend::action::HANDLED;
+        v
+    }
+
+    /// 只读快照视图(round12 规范化):与 [`Self::make_view`] 同源
+    /// `render`(含翻页窗口 / partial 标 / meta / preedit 转义),但不设
+    /// action —— 供 engine `view()` 等被动查询出口复用,禁止在壳里手工
+    /// 拼装 ImeView。
+    pub(crate) fn snapshot_view(&self) -> ImeView {
+        render(&self.panel_snapshot())
+    }
+
+    /// 组装只读面板快照(交付件 3:stage2 → 渲染)。
+    pub(crate) fn panel_snapshot(&self) -> crate::fsm::post::PanelSnapshot {
+        crate::fsm::post::PanelSnapshot {
+            items: self.panel.items.clone(),
+            meta: self.panel.meta.clone(),
+            partial: self.panel.partial.clone(),
+            highlight: self.panel.highlight,
+            page: self.panel.page,
+            page_size: self.panel.page_size,
+            preedit: self.comp.preedit.clone(),
+            cursor: self.comp.cursor,
+            state: self.state,
+            raw_buffer: self.comp.raw_buffer.clone(),
+            buffer: self.comp.buffer.clone(),
+            candidate_meta: self.candidate_meta_enabled,
+        }
+    }
+
+    /// 待提交文本(round12 规范化):候选首条按键入原始大小写回填,
+    /// 无候选时回退原始缓冲。应用侧失焦前的 pending commit 语义单点。
+    pub(crate) fn pending_commit_text(&self) -> String {
+        crate::fsm::post::pending_commit_text(&self.panel_snapshot())
+    }
+
+    pub fn set_page_size(&mut self, page_size: usize) {
+        self.panel.page_size = page_size;
+    }
+
+    /// 候选 meta 调试开关(round12:stage2 门面,壳不直写字段)。
+    pub fn set_candidate_meta(&mut self, on: bool) {
+        self.candidate_meta_enabled = on;
     }
 
     pub fn reset(&mut self) {
@@ -718,86 +470,9 @@ impl FamilyPipeline {
         self.sync_magic_preedit();
     }
 
-    /// 魔法预测模式下,preedit(应用高亮"将提交")跟随候选高亮:
-    /// 高亮在预测上 → 显示该预测;高亮在 rollback/补全上 → 显示原始输入。
-    /// 拼音态不适用(拼音 preedit 是组合,不是候选)。
-    pub(crate) fn sync_magic_preedit(&mut self) {
-        if self.state != ComposeState::Snippet || self.magic.predictions.is_empty() {
-            return;
-        }
-        let hl = self.panel.highlight;
-        if let Some(p) = self.magic.predictions.get(hl) {
-            self.comp.preedit = p.text.clone();
-        } else {
-            self.comp.preedit = self.comp.buffer.clone();
-        }
-        self.comp.cursor = self.comp.preedit.len();
-    }
-
     /// Full pinyin for the committed portion.
     fn committed_pinyin(&self) -> String {
         self.comp.committed_pinyin.clone()
-    }
-
-    /// 把 preedit 里的字面换行转义成 `\n` 文本(展示用),并同步调整光标字节偏移:
-    /// 每个**光标之前**的 `\n`(1 字节)→ `\n` 两字符(2 字节),光标后移 1 字节。
-    /// 提交/拼写等不含 `\n` 的场景原样返回,零开销。
-    pub(crate) fn escape_preedit(text: &str, cursor: usize) -> (String, usize) {
-        if !text.contains('\n') {
-            return (text.to_string(), cursor);
-        }
-        let mut escaped = String::with_capacity(text.len() + 4);
-        let mut out_cursor = cursor;
-        for (i, ch) in text.char_indices() {
-            if ch == '\n' {
-                escaped.push_str("\\n");
-                if i < cursor {
-                    out_cursor += 1; // 光标前的 `\n` 扩成两字节,光标后移 1
-                }
-            } else {
-                escaped.push(ch);
-            }
-        }
-        (escaped, out_cursor)
-    }
-
-    // ── view helpers ────────────────────────────────────────────────────
-
-    pub(crate) fn commit_view(text: &str) -> ImeView {
-        // Default: caret at the end of the committed text.
-        let mut v = ImeView::empty();
-        ImeView::set_str(&mut v.commit_text, text);
-        v.commit_cursor = ImeView::str_field(&v.commit_text).len() as u32;
-        v.action = crate::frontend::action::COMMIT | crate::frontend::action::HANDLED;
-        v
-    }
-
-    /// Commit with the application caret placed at `cursor` (byte offset into the
-    /// committed text) — snippet templates with `$CURSOR` land here. Clamped to
-    /// the actually-committed length (the buffer may truncate long text).
-    pub(crate) fn commit_view_at(text: &str, cursor: usize) -> ImeView {
-        let mut v = ImeView::empty();
-        ImeView::set_str(&mut v.commit_text, text);
-        let len = ImeView::str_field(&v.commit_text).len();
-        v.commit_cursor = cursor.min(len) as u32;
-        v.action = crate::frontend::action::COMMIT | crate::frontend::action::HANDLED;
-        v
-    }
-
-    /// View that passes the current key through to the application untouched.
-    pub(crate) fn passthrough_view() -> ImeView {
-        let mut v = ImeView::empty();
-        v.action = crate::frontend::action::PASSTHROUGH;
-        v
-    }
-
-    /// 删除视图:不提交文本,只让前端删掉文本框中 `count` 个字符(`#del`)。
-    pub(crate) fn delete_view(count: u32) -> ImeView {
-        tracing::debug!(count, "delete_view → ImeView.delete_count");
-        let mut v = ImeView::empty();
-        v.delete_count = count;
-        v.action = crate::frontend::action::HANDLED;
-        v
     }
 
     // ── Idle ───────────────────────────────────────────────────────────
@@ -821,7 +496,7 @@ impl FamilyPipeline {
             self.panel.fresh = false;
             return self.query_pinyin(env);
         }
-        Self::passthrough_view()
+        passthrough_view()
     }
 
     // ── Snippet ────────────────────────────────────────────────────────
@@ -846,9 +521,7 @@ impl FamilyPipeline {
             // Enter: force raw text.
             KeyKind::Enter => {
                 let raw = std::mem::take(&mut self.comp.buffer);
-                self.reset();
-                self.commit_text(&raw, env, None);
-                Self::commit_view(&raw)
+                self.commit_raw_and_reset(&raw)
             }
             // Space: commit the highlighted candidate.
             KeyKind::Space => {
@@ -857,7 +530,7 @@ impl FamilyPipeline {
                     .min(self.panel.items.len().saturating_sub(1));
                 self.select_magic(hl, env)
             }
-            _ => Self::passthrough_view(),
+            _ => passthrough_view(),
         }
     }
 
@@ -893,9 +566,9 @@ impl FamilyPipeline {
     fn pinyin_key(&mut self, key: KeyKind, env: &dyn StepEnv) -> ImeView {
         match key {
             KeyKind::Backspace => self.pinyin_backspace(env),
-            KeyKind::Enter => self.pinyin_enter(env),
+            KeyKind::Enter => self.pinyin_enter(),
             KeyKind::Space => self.pinyin_space(env),
-            _ => Self::passthrough_view(),
+            _ => passthrough_view(),
         }
     }
 
@@ -913,8 +586,7 @@ impl FamilyPipeline {
             }
             self.comp.buffer.push('\'');
             self.comp.raw_buffer.push('\'');
-            self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
-            self.comp.cursor = self.comp.preedit.len();
+            self.comp.sync_preedit();
             self.panel.fresh = false;
             return self.query_pinyin(env);
         }
@@ -925,35 +597,51 @@ impl FamilyPipeline {
             self.comp.buffer.push('#');
             self.comp.raw_buffer.push('#');
             self.state = ComposeState::Snippet;
-            self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
-            self.comp.cursor = self.comp.preedit.len();
+            self.comp.sync_preedit();
             self.panel.fresh = false;
             return self.query_magic(env);
         }
         if ch.is_ascii_alphabetic() {
             self.comp.buffer.push(ch.to_ascii_lowercase());
             self.comp.raw_buffer.push(ch);
-            self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
-            self.comp.cursor = self.comp.preedit.len();
+            self.comp.sync_preedit();
             self.panel.fresh = false;
             return self.query_pinyin(env);
         }
-        self.pinyin_terminator(ch, env)
+        self.pinyin_terminator(ch)
     }
 
-    fn query_pinyin(&mut self, env: &dyn StepEnv) -> ImeView {
+    /// 便捷组合:收集 + 交路由层解析(stage3 编排仍发生在
+    /// [`SessionState::resolve`],stage2 不直接调 stage3)。
+    pub(crate) fn query_pinyin(&mut self, env: &dyn StepEnv) -> ImeView {
+        let request = self.collect_pinyin(env);
+        crate::fsm::pre::resolve(self, request, env)
+    }
+
+    /// 打分路径收集(round12):家族收集后产出交付件,不落位、不调 stage3
+    /// —— 由路由层(SessionState::resolve)转 stage3 并交回回执。
+    pub(crate) fn collect_pinyin(
+        &mut self,
+        env: &dyn StepEnv,
+    ) -> Option<crate::fsm::post::PostRequest> {
         // ── Stage 2:家族收集(各家族独立预测 + top_n 预过滤,未合成)──
         let collected = env.scorer().collect(&self.comp.buffer, &self.context);
-        // ── Stage 3:后处理统一管线(合成 → 调整 → 造词重排)──
-        let items = self.postprocess(collected, env);
+        Some(crate::fsm::post::PostRequest {
+            buffer: self.comp.buffer.clone(),
+            context: self.context.clone(),
+            state: self.state,
+            collected,
+        })
+    }
 
-        // 三列表同源同序落位 —— fill_view 的窗口偏移 / select 的家族判定 /
-        // ">" 部分提交标记全从同一 PanelItem 序列出发,不再有独立数组间的
-        // 对齐假设(修复:meta 采样曾在重排前,last_meta 与 candidates 错位)。
-        self.panel.full_comp_count = self.pending_full_comp_count;
-        self.panel.items = items.iter().map(|i| i.text.clone()).collect();
-        self.panel.partial = items.iter().map(|i| i.partial).collect();
-        self.panel.meta = items.iter().map(|i| i.meta.clone()).collect();
+    /// 落位回执(round12):把 stage3 的 PostOutcome 写入面板(唯一写口),
+    /// 三列表同源同序 —— fill_view 的窗口偏移 / select 的家族判定 /
+    /// ">" 部分提交标记全从同一 PanelItem 序列出发。
+    pub(crate) fn apply_post_outcome(&mut self, outcome: crate::fsm::post::PostOutcome) -> ImeView {
+        self.panel.full_comp_count = outcome.full_comp_count;
+        self.panel.items = outcome.items.iter().map(|i| i.text.clone()).collect();
+        self.panel.partial = outcome.items.iter().map(|i| i.partial).collect();
+        self.panel.meta = outcome.items.iter().map(|i| i.meta.clone()).collect();
 
         let cands = self.panel.items.clone();
         if !cands.is_empty() {
@@ -980,16 +668,14 @@ impl FamilyPipeline {
                 self.comp.buffer = format!("{syl}{}", self.comp.buffer);
                 self.comp.raw_buffer = format!("{syl}{}", self.comp.raw_buffer);
             }
-            self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
-            self.comp.cursor = self.comp.preedit.len();
+            self.comp.sync_preedit();
             self.panel.fresh = false;
             return self.query_pinyin(env);
         }
 
         self.comp.buffer.pop();
         self.comp.raw_buffer.pop();
-        self.comp.preedit = format!("{}{}", self.comp.committed_text, self.comp.raw_buffer);
-        self.comp.cursor = self.comp.preedit.len();
+        self.comp.sync_preedit();
         self.panel.fresh = false;
         if self.comp.buffer.is_empty() {
             self.reset();
@@ -999,7 +685,7 @@ impl FamilyPipeline {
         }
     }
 
-    fn pinyin_enter(&mut self, env: &dyn StepEnv) -> ImeView {
+    fn pinyin_enter(&mut self) -> ImeView {
         // Enter 强选 raw 文本:提交原始大小写(raw_buffer),非小写 buffer。
         let raw = std::mem::take(&mut self.comp.raw_buffer);
         let committed = std::mem::take(&mut self.comp.committed_text);
@@ -1008,9 +694,7 @@ impl FamilyPipeline {
         } else {
             format!("{committed}{raw}")
         };
-        self.reset();
-        self.commit_text(&text, env, None);
-        Self::commit_view(&text)
+        self.commit_raw_and_reset(&text)
     }
 
     fn pinyin_space(&mut self, env: &dyn StepEnv) -> ImeView {
@@ -1019,16 +703,12 @@ impl FamilyPipeline {
             let committed = std::mem::take(&mut self.comp.committed_text);
             let raw = std::mem::take(&mut self.comp.raw_buffer);
             let _ = std::mem::take(&mut self.comp.buffer);
-            self.panel.items.clear();
-            self.state = ComposeState::Idle;
             let text = if committed.is_empty() {
                 raw
             } else {
                 format!("{committed}{raw}")
             };
-            self.panel.fresh = false;
-            self.commit_text(&text, env, None);
-            return Self::commit_view(&text);
+            return self.commit_raw_and_reset(&text);
         }
 
         // Fresh candidates: commit the highlighted one.
@@ -1040,15 +720,12 @@ impl FamilyPipeline {
         self.select(idx, env)
     }
 
-    fn pinyin_terminator(&mut self, ch: char, env: &dyn StepEnv) -> ImeView {
+    fn pinyin_terminator(&mut self, ch: char) -> ImeView {
         let fresh = self.panel.fresh;
         let top = self.panel.items.first().cloned();
         let committed = std::mem::take(&mut self.comp.committed_text);
         let raw = std::mem::take(&mut self.comp.raw_buffer);
         let _ = std::mem::take(&mut self.comp.buffer);
-        self.panel.fresh = false;
-        self.state = ComposeState::Idle;
-        self.panel.items.clear();
 
         let prefix = if committed.is_empty() {
             String::new()
@@ -1057,32 +734,20 @@ impl FamilyPipeline {
         };
         if !fresh {
             let text = format!("{prefix}{raw}{ch}");
-            self.commit_text(&text, env, None);
-            return Self::commit_view(&text);
+            return self.commit_raw_and_reset(&text);
         }
         let text = match top {
             Some(t) => format!("{prefix}{}{ch}", apply_input_casing(&t, &raw)),
             None => format!("{prefix}{raw}{ch}"),
         };
-        self.commit_text(&text, env, None);
-        Self::commit_view(&text)
-    }
-}
-
-/// 链式上下文的裁剪:空链(`X''#cmd`,上游串以 `'` 结尾)→ 整页;普通链
-/// (`X'#cmd`)→ 仅高亮首选。与语法语义严格一致(#concat 单链只拼首选)。
-fn chain_context_items(upstream_buf: &str, cands: &[String]) -> Vec<String> {
-    if upstream_buf.ends_with('\'') {
-        cands.to_vec()
-    } else {
-        cands.first().cloned().into_iter().collect()
+        self.commit_raw_and_reset(&text)
     }
 }
 
 /// 提交英文候选时,把用户键入的大小写回填到词典(小写)单词上。
 ///
 /// `word` 是候选文本(词典小写,如 "english"),`raw_input` 是当前未提交
-/// 输入的原始大小写([`FamilyPipeline::raw_buffer`])。仅当 `word` 的小写形式
+/// 输入的原始大小写([`SessionState::raw_buffer`])。仅当 `word` 的小写形式
 /// 以 `raw_input` 的小写形式为前缀时,逐字符回填前缀的大小写;余下部分
 /// (用户没打完、由词典补全的段)保持词典小写。汉字等非 ASCII 候选天然
 /// no-op("好".starts_with("hao") 为 false)。
@@ -1232,7 +897,7 @@ mod step_env_tests {
         }
         /// 模拟 stage1(pre)的分流:控制键走 step_key,字符走 step_char,
         /// snippet 态命令字符经 as_command_char hoist —— 与生产路径一致。
-        fn process_key(&self, ch: char, sm: &mut FamilyPipeline) -> ImeView {
+        fn process_key(&self, ch: char, sm: &mut SessionState) -> ImeView {
             let kind = KeyKind::from_char(ch);
             if sm.state == ComposeState::Snippet {
                 if let Some(c) = kind.as_command_char() {
@@ -1244,13 +909,13 @@ mod step_env_tests {
                     sm.step_key(kind, self)
                 }
                 KeyKind::Char(c) => sm.step_char(c, self),
-                _ => FamilyPipeline::passthrough_view(),
+                _ => passthrough_view(),
             }
         }
-        fn select_candidate(&self, index: usize, sm: &mut FamilyPipeline) -> ImeView {
+        fn select_candidate(&self, index: usize, sm: &mut SessionState) -> ImeView {
             sm.select(index, self)
         }
-        fn reset(&self, sm: &mut FamilyPipeline) {
+        fn reset(&self, sm: &mut SessionState) {
             sm.reset();
         }
         fn magic(&self) -> &MagicFamily {
@@ -1280,8 +945,10 @@ mod step_env_tests {
         TestEnv::new()
     }
 
-    fn sm() -> FamilyPipeline {
-        FamilyPipeline::new()
+    fn sm() -> SessionState {
+        SessionState::with_page_size(7, std::sync::Arc::new(
+            crate::store::wordbook::WordBook::default(),
+        ))
     }
 
     #[test]

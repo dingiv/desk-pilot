@@ -217,6 +217,7 @@ fn keysym_to_kind(sym: u32, unicode: u32) -> KeyKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StateFlags(u32);
 
+// FIXME: 别搞这个什么二进制位运算了啊，没有那么寒酸啊，一个布尔代表一个开关。
 impl StateFlags {
     /// 组合中(拼音/词组/snippet/magic 任一)。
     pub const COMPOSING: StateFlags = StateFlags(1 << 0);

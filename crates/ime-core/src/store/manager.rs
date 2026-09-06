@@ -9,7 +9,10 @@
 //! ```
 //! use ime_core::store::PersistenceManager;
 //! // engine startup: open once, warm everything
-//! let pm = PersistenceManager::open("/tmp/swift-ime-docex.db")?;
+//! let pm = PersistenceManager::open_with_wordbook(
+//!     "/tmp/swift-ime-docex.db",
+//!     std::sync::Arc::new(ime_core::store::wordbook::WordBook::default()),
+//! )?;
 //! // pm.warm_all(&dispatcher);  // the engine does this in init_store
 //! let store = pm.store();
 //! # Ok::<(), rusqlite::Error>(())
@@ -25,14 +28,27 @@ use crate::engine::ImeEngine;
 #[derive(Clone)]
 pub struct PersistenceManager {
     store: Arc<WeightStore>,
+    /// 单词本本体(round14:**所有权在此**)——引擎/SessionState/两家族
+    /// 只持引用克隆;学习路径经后处理直接写册,双写经内置 store 槽。
+    wordbook: Arc<crate::store::wordbook::WordBook>,
 }
 
 impl PersistenceManager {
     /// Open (or create) the user database — schema migration happens here.
-    pub fn open(path: &str) -> rusqlite::Result<Self> {
+    /// `wordbook` 的所有权随本调用移入持久化模块。
+    pub fn open_with_wordbook(
+        path: &str,
+        wordbook: Arc<crate::store::wordbook::WordBook>,
+    ) -> rusqlite::Result<Self> {
         Ok(PersistenceManager {
             store: Arc::new(WeightStore::open(path)?),
+            wordbook,
         })
+    }
+
+    /// 单词本句柄(与所有者共享同一 Arc)。
+    pub fn wordbook(&self) -> Arc<crate::store::wordbook::WordBook> {
+        Arc::clone(&self.wordbook)
     }
 
     /// The underlying store — families hold this Arc for inline double-writes.
@@ -99,14 +115,14 @@ mod tests {
     #[test]
     fn open_creates_schema_and_roundtrips() {
         let path = temp_path();
-        let pm = PersistenceManager::open(&path).expect("open");
+        let pm = PersistenceManager::open_with_wordbook(&path, std::sync::Arc::new(crate::store::wordbook::WordBook::default())).expect("open");
         // All five tables exist (schema migration ran).
         let store = pm.store();
         store.save_recency(&[("a".into(), 1000), ("b".into(), 2000)]);
         store.record_phrase("ceshi", "测试", 0);
         store.save_l0(r#"{"pins":[],"picks":[]}"#);
 
-        let pm2 = PersistenceManager::open(&path).expect("reopen");
+        let pm2 = PersistenceManager::open_with_wordbook(&path, std::sync::Arc::new(crate::store::wordbook::WordBook::default())).expect("reopen");
         assert_eq!(
             pm2.store().load_recency(),
             vec![("a".to_string(), 1000), ("b".to_string(), 2000)]
@@ -120,7 +136,7 @@ mod tests {
 
     #[test]
     fn forwarding_accessors_work() {
-        let pm = PersistenceManager::open(&temp_path()).expect("open");
+        let pm = PersistenceManager::open_with_wordbook(&temp_path(), std::sync::Arc::new(crate::store::wordbook::WordBook::default())).expect("open");
         pm.store().record_phrase("ceshi", "测试", 0);
         assert_eq!(pm.phrase_count(), 1);
         pm.store().record_en_user("cd");

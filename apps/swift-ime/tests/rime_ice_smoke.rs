@@ -21,7 +21,26 @@ fn rime_ice_path() -> Option<String> {
 }
 
 fn engine_with_rime() -> ImeEngine {
-    let engine = ImeEngine::new();
+    use ime_core::family::{emoji::EmojiWeights, english::EnglishWeights, pinyin::PinyinWeights};
+    let pkg = env!("CARGO_MANIFEST_DIR");
+    // 英文词表已外置(en_freq.tsv):构造期装配,同生产路径。
+    let wordlist = Path::new(&format!("{pkg}/assets/dict/hermitdave/en_freq.tsv"))
+        .exists()
+        .then(|| format!("{pkg}/assets/dict/hermitdave/en_freq.tsv"));
+    let mut engine = ImeEngine::with_config(
+        PinyinWeights::default(),
+        EnglishWeights::default(),
+        wordlist,
+        Box::new(ime_core::family::magic::expander::DefaultProvider),
+        Vec::new(),
+        ime_core::family::scoring::ScoringConfig::default(),
+        std::sync::Arc::new(ime_core::frontend::NoopFrontend::default()),
+        ime_core::engine::DEFAULT_VOICE_AURA_BASE.to_string(),
+        ime_core::io_thread::DEFAULT_IDLE_TIMEOUT_SECS,
+        Vec::new(),
+        7,
+    );
+    engine.set_emoji_weights(EmojiWeights::default());
     let path = rime_ice_path().expect("rime-ice.fst not found — run from workspace root");
     engine.load_dict(&path).expect("failed to load rime-ice");
     engine

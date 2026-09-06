@@ -102,6 +102,12 @@ impl Expander {
         Expander { provider }
     }
 
+    /// 运行时更新变量(round12:provider Arc 由 Expander 独持,
+    /// 引擎经这里写,不再另存一份 provider 字段)。
+    pub fn set_variable(&self, name: &str, value: &str) {
+        self.provider.set(name, value);
+    }
+
     /// Expand a template string. Variables are `$NAME` or `${NAME}`.
     /// `$CURSOR` is replaced with an empty string (the caller is expected to
     /// record the cursor position — see [`expand_with_cursor`]).

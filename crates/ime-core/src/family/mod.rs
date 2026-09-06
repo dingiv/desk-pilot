@@ -25,7 +25,7 @@
 //!            [最终排序列表]
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 // ── ScoredCandidate ─────────────────────────────────────────────────────
@@ -310,33 +310,6 @@ impl UnifiedScorer {
             });
         }
         out
-    }
-
-    /// Stage 3 合成(后处理第一步):×priority 乘数、全局排序、跨家族去重。
-    pub fn merge(&self, collected: Vec<FamilyCandidates>) -> Vec<RankedCandidate> {
-        let mut scored: Vec<(f64, RankedCandidate)> = Vec::new();
-        for fc in collected {
-            for c in fc.candidates {
-                let final_score = c.raw_score * fc.bonus;
-                scored.push((
-                    final_score,
-                    RankedCandidate {
-                        text: c.text,
-                        score: final_score,
-                        family: c.family,
-                        source: c.source,
-                    },
-                ));
-            }
-        }
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-        let mut seen = HashSet::new();
-        scored
-            .into_iter()
-            .filter(|(_, rc)| seen.insert(rc.text.clone()))
-            .map(|(_, rc)| rc)
-            .collect()
     }
 
     /// Number of registered families (including disabled ones).

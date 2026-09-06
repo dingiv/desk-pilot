@@ -28,7 +28,6 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::pinyin::recency::RecentStore;
 use super::{now_ms, CandidateFamily, InputContext, ScoredCandidate};
 
 // ── EnglishWeights ──────────────────────────────────────────────────────
@@ -185,17 +184,23 @@ pub struct EnglishFamily {
     /// 运行时开关(AtomicBool:trait `set_family_enabled` 经 `&self` 写入)。
     enabled: AtomicBool,
     base_words: Vec<(String, u32)>,
-    user_words: Mutex<Vec<(String, u32)>>,
+    /// 单词本(round14:存储外置,本家族持引用;所有权归持久化模块)。
+    wordbook: std::sync::Arc<crate::store::wordbook::WordBook>,
     priority: u32,
     weights: EnglishWeights,
     /// 近期使用加权(E2):刚提交过的英文词在 prefix/exact 候选里获得
     /// recency 合成(z = (1-a)(a+b)/8 + a,天然 <1)。复用拼音侧 RecentStore
     /// 的五档时间指数;进程内生命周期,不持久化。
-    recency: Mutex<RecentStore>,
     /// 上下文感知开关(`input.context_aware`,与拼音共用同一个 yaml 键)。
     context_aware: Mutex<bool>,
     /// 持久化句柄(英文自生词 en_user 表),init_store 后由 dispatcher 注入。
     store: Mutex<Option<Arc<crate::store::WeightStore>>>,
+}
+
+impl Default for EnglishFamily {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EnglishFamily {
@@ -203,13 +208,17 @@ impl EnglishFamily {
         EnglishFamily {
             enabled: AtomicBool::new(true),
             base_words: Vec::new(),
-            user_words: Mutex::new(Vec::new()),
+            wordbook: std::sync::Arc::new(crate::store::wordbook::WordBook::default()),
             priority: 70,
             weights: EnglishWeights::default(),
-            recency: Mutex::new(RecentStore::new()),
             context_aware: Mutex::new(true),
             store: Mutex::new(None),
         }
+    }
+
+    /// 注入共享单词本引用(引擎装配时分发;所有权在持久化模块)。
+    pub fn set_wordbook(&mut self, wordbook: std::sync::Arc<crate::store::wordbook::WordBook>) {
+        self.wordbook = wordbook;
     }
 
     /// 外置 base 词表装配(hermitdave/en_freq.tsv,单一来源):`word\tcount`
@@ -342,7 +351,7 @@ impl EnglishFamily {
 
     /// Record a committed word(引擎提交路径按家族分派到这里)。
     pub fn record_commit(&self, word: &str) {
-        self.recency.lock().unwrap().record(word, now_ms());
+        self.wordbook.english.recency.lock().unwrap().record(word, now_ms());
     }
 
     /// 临时关闭/恢复上下文感知(recency boost;`input.context_aware` 与
@@ -357,7 +366,7 @@ impl EnglishFamily {
         if !*self.context_aware.lock().unwrap() {
             return;
         }
-        let mut recency = self.recency.lock().unwrap();
+        let mut recency = self.wordbook.english.recency.lock().unwrap();
         if recency.is_empty() {
             return;
         }
@@ -374,7 +383,7 @@ impl EnglishFamily {
     /// Merge `words` into the user word layer(大小写不敏感去重:小写为键,
     /// 分数取最大,同分时后见的大小写胜出)。
     fn merge_into_user(&self, words: &[(String, u32)]) {
-        let mut user = self.user_words.lock().unwrap();
+        let mut user = self.wordbook.english.user_words.lock().unwrap();
         let mut merged: std::collections::HashMap<String, (String, u32)> = user
             .iter()
             .map(|(w, s)| (w.to_ascii_lowercase(), (w.clone(), *s)))
@@ -660,7 +669,7 @@ impl CandidateFamily for EnglishFamily {
         }
 
         // Layer 1: user dict (highest priority). 自生词不降权(学习语义保留)。
-        let user = self.user_words.lock().unwrap();
+        let user = self.wordbook.english.user_words.lock().unwrap();
         Self::query_layer(
             &user,
             &input_lower,
@@ -916,10 +925,10 @@ mod tests {
         let d = temp_dict("cache-b1", &format!("# @type: frequency\n{content}"));
 
         fam.load_dict_file(&d).unwrap(); // 首次:parse + 写缓存
-        let first: Vec<(String, u32)> = fam.user_words.lock().unwrap().clone();
+        let first: Vec<(String, u32)> = fam.wordbook.english.user_words.lock().unwrap().clone();
 
         fam.load_dict_file(&d).unwrap(); // 二次:命中缓存
-        let second: Vec<(String, u32)> = fam.user_words.lock().unwrap().clone();
+        let second: Vec<(String, u32)> = fam.wordbook.english.user_words.lock().unwrap().clone();
 
         assert_eq!(first, second, "缓存重载后分数必须与首次加载一致");
         // 钉死档位多样性:若修复回退(分数塌缩),中间档会被抹平。

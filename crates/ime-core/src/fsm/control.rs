@@ -1,8 +1,8 @@
-//! 输入路由层 —— StateMachine(状态机表)。
+//! 输入路由层 —— ControlPane(系统控制)+ SessionState(会话数据)。
 //!
 //! 所有前端(fcitx5、TUI、mock)**不再拦截任何键**:特殊键、Ctrl/Shift/Alt
 //! 修饰状态一律忠实地转成 [`KeyEvent`] 喂进引擎。本模块持有一张状态机表
-//! ([`StateMachine`]),表上是若干状态标志位([`StateFlags`])—— 一个
+//! ([`ControlPane`]),表上是若干状态标志位([`StateFlags`])—— 一个
 //! bit 意味着"当前处于某种输入状态"。每个键事件驱动一次状态迁移
 //! ([`StateMachine::step`]),返回带 [`action`](crate::frontend::action)
 //! 位标志的 [`ImeView`];外界只按 action 反应:
@@ -10,52 +10,85 @@
 //! - fcitx5:`action & HANDLED == 0` → 不 `filterAndAccept`,键自然到达应用;
 //! - TUI:`COMMIT` → 追加历史;`PASSTHROUGH` 的 Esc(idle)→ 退出。
 //!
-//! ## 路由决策矩阵(自上而下,首条匹配生效)
-//!
-//! | 状态            | 键                        | 路由                        | action          |
-//! |----------------|---------------------------|-----------------------------|-----------------|
-//! | (任意)          | 裸修饰键 / F1-F12 / Other  | 透传                        | PASSTHROUGH    |
-//! | (任意)          | Ctrl 或 Alt 组合           | 透传(应用快捷键)           | PASSTHROUGH    |
-//! | COMPOSING      | Space / Enter / Backspace | `pipeline.step`(提交/删除)       | HANDLED,COMMIT |
-//! | idle           | Space / Enter / Backspace | 透传                        | PASSTHROUGH    |
-//! | COMPOSING      | Escape                    | reset(取消组合)            | HANDLED        |
-//! | idle           | Escape                    | 透传                        | PASSTHROUGH    |
-//! | MAGIC          | Digit 1-9                 | member `on_key`             | HANDLED        |
-//! | PANEL_OPEN     | Digit 1-9                 | `select(idx)`               | HANDLED,COMMIT |
-//! | 其余            | Digit 1-9                 | 透传                        | PASSTHROUGH    |
-//! | PANEL_OPEN     | 方向/Tab/PgUp/PgDn/`[`/`]`/`+`/`-` | 导航/翻页/移光标   | HANDLED        |
-//! | !PANEL_OPEN    | 同上                       | 透传(应用的光标/翻页)      | PASSTHROUGH    |
-//! | (任意)          | Char(c)                   | `pipeline.step(c)`(idle 内自分流)| 视 step 结果    |
-//!
-//! Digit 0 与其余可打印字符统一走 Char 路径(历史 quirk:拼音中 `0` 是终止符)。
-//! Escape 的门控是 **COMPOSING**(而非面板开合)—— 组合中但无候选时 Esc
-//! 也应取消组合,否则 preedit 会卡在屏上。
+//! 路由决策矩阵(哪个键怎么分流)的权威版本在
+//! [`fsm::pre`](crate::fsm::pre) 模块头 —— 随实现走。本模块只剩两件事:
+//! 键迁移入口 [`StateMachine::step`](含 **action 归一化**与 flags 镜像
+//! 两个收口职责)与状态标志位的查询。
 
 use crate::frontend::{action, ImeView};
 
 // 按键类型定义在 [`super::key`](键枚举的家);此处 re-export 保持
 // `fsm::state::KeyEvent` 等既有引用路径稳定。
 pub use super::key::{KeyEvent, KeyKind, StateFlags};
-use crate::fsm::family::{ComposeState, FamilyPipeline, StepEnv};
+use super::family_prediction::{CandidatePanel, ComposeState, Composition};
+use super::magic_flow::MagicSession;
+use crate::fsm::event::ImeEvent;
+use crate::fsm::family_prediction::StepEnv;
 
-// ── StateMachine:状态机表 ──────────────────────────────────────────
+// ── SessionState / ControlPane ─────────────────────────────────────
 
-/// 状态机表 —— 输入路由层的状态寄存器。
-///
-/// 表上记录 [`StateFlags`];[`step`](StateMachine::step) 是唯一的键
-/// 迁移入口:查表决定这枚键属于输入法还是应用,驱动 [`StateMachine`] 迁移,
-/// 返回带 action 位标志的 [`ImeView`]。每个输入上下文(engine 的
-/// `PerContext`)各持一张。
-#[derive(Debug, Default)]
-pub struct StateMachine {
-    pub(crate) flags: StateFlags,
-    /// stage1 系统控制(显式成员:每枚键先经它判定消费/透传)。
-    pub(crate) control: crate::fsm::pre::ControlStage,
+/// 会话数据(round13):**纯数据**,无行为归属 —— 双路键处理
+/// ([`super::family`] FamilyPrediction / [`super::magic`] MagicFlow)
+/// 都只吃它,不依赖 [`ControlPane`]。
+#[derive(Default)]
+pub struct SessionState {
+    /// 组合状态(Idle / Snippet / Pinyin)。
+    pub state: ComposeState,
+    /// 组合会话:原始键入/预测串/预编辑/光标/造词半成品。
+    pub(crate) comp: Composition,
+    /// 调试模式:候选词显示提供者与权重(`[score family/source]`)。
+    pub candidate_meta_enabled: bool,
+    /// 候选面板:items/meta/partial 同源同序 + 高亮/分页。
+    pub(crate) panel: CandidatePanel,
+    /// Short-term input context — accumulates recently committed text
+    /// (上下文构建:预测前经 `scorer.collect` 注入各家族,家族据此做
+    /// 上下文感知)。
+    pub context: crate::family::InputContext,
+    /// 魔法命令会话:snippet 态的补全提示 / 预测选项 / live 命令实例。
+    pub(crate) magic: MagicSession,
+    /// 单词本引用(round14:存储归持久化模块所有,双路/后处理共享;
+    /// 引擎装配时分发 Arc 克隆)。
+    pub wordbook: std::sync::Arc<crate::store::wordbook::WordBook>,
+    /// 所属输入上下文(引擎 `with_ctx` 每次操作前设置)。魔法命令成员用它
+    /// 把异步工作事件发到正确的 ctx 并 refresh 对应上下文。
+    pub ctx: usize,
+    /// 待结算学习回执(round14):stage2 提交路径产出,ControlPane 在
+    /// 事件处理后统一交后处理 `learn_commit` 结算。
+    pub(crate) pending_learning: Vec<crate::fsm::post::CommitReceipt>,
 }
 
-impl StateMachine {
+/// 系统控制(round13,原 `StateMachine`):**分发三大事件类型** ——
+/// ①普通键 → 第一路 FamilyPrediction(打分家族预测);
+/// ②`#` 触发键 → 第二路 MagicFlow 同步数据流,异步信号(IoThread 注入)
+///   → 第二路 MagicFlow 异步数据流;
+/// ③系统控制事件(Control)提前拦截并返回(提交/选词/翻页/复位),
+///   不进双路。
+/// 处理完成后统一封装 [`ImeView`] 返回。每个输入上下文(engine 的
+/// `Session`)各持一台。
+#[derive(Default)]
+pub struct ControlPane {
+    /// 会话数据(双路共享;含 ctx 挂号)。
+    pub(crate) session: SessionState,
+    /// 状态标志位镜像(路由后同步;派生值,非状态本体)。
+    pub(crate) flags: StateFlags,
+}
+
+impl ControlPane {
     pub fn new() -> Self {
-        StateMachine::default()
+        ControlPane::default()
+    }
+
+    /// Construct with a configurable candidate page size (default 7).
+    /// The engine passes `swift-ime.yaml → input.page_size` here, plus the
+    /// shared wordbook reference(所有权在持久化模块)。
+    pub fn with_page_size(
+        page_size: u32,
+        wordbook: std::sync::Arc<crate::store::wordbook::WordBook>,
+    ) -> Self {
+        ControlPane {
+            session: SessionState::with_page_size(page_size, wordbook),
+            ..ControlPane::default()
+        }
     }
 
     /// 当前状态标志位(最近一次路由后同步)。
@@ -63,79 +96,48 @@ impl StateMachine {
         self.flags
     }
 
-    /// 从组合状态机重新同步标志位。路由之外修改 pipeline 的入口(选词、reset、
-    /// magic tick)也调用它 —— 表永远是当前状态的镜像。
-    pub fn sync_from(&mut self, pipeline: &FamilyPipeline) {
-        self.flags = pipeline.state_flags();
+    /// 重新镜像标志位(路由之外的变更入口 —— 选词、reset、magic tick ——
+    /// 也调用它)。flags 是派生值,状态本体就是自己身上的字段。
+    pub fn sync_from(&mut self) {
+        self.flags = self.session.state_flags();
     }
 
-    /// 路由一枚键:驱动状态迁移,返回新视图。决策矩阵见模块文档。
-    /// stage1(系统控制)委托给 [`ControlStage`](crate::fsm::pre::ControlStage)。
-    pub fn step(&mut self, pipeline: &mut FamilyPipeline, key: KeyEvent, env: &dyn StepEnv) -> ImeView {
-        let control = self.control;
-        let mut view = control.route_key(self, pipeline, key, env);
+    /// 路由一枚键:驱动状态迁移,返回新视图。stage1 委托给
+    /// [`ControlStage`](crate::fsm::pre::ControlStage);**action 归一化与
+    /// flags 同步在此唯一收口**(round11:旧实现 route_key 尾部与这里
+    /// 各一份完全相同的逻辑)。
+    pub fn step(&mut self, key: KeyEvent, env: &dyn StepEnv) -> ImeView {
+        self.handle_event(ImeEvent::Key(key), env)
+            .unwrap_or_else(ImeView::empty)
+    }
+
+    /// 统一事件入口(round12):键盘 / 控制 / 异步三类事件,一律从 stage1
+    /// 进。键路径同 [`Self::step`](action 归一化 + flags 同步);控制 /
+    /// 异步路径直达 stage2 门面,路由外变更后重新镜像 flags。
+    pub fn handle_event(&mut self, event: ImeEvent, env: &dyn StepEnv) -> Option<ImeView> {
+        let is_key = matches!(event, ImeEvent::Key(_));
+        let mut view = event.handle(&mut self.session, env)?;
+        // 学习结算(round14):stage2 产出的回执统一交后处理分发。
+        for receipt in self.session.pending_learning.drain(..) {
+            crate::fsm::post::learn_commit(&receipt, &self.session.wordbook, env);
+        }
         // 不变式:键路径返回的视图必须带明确的 action 位。组合状态机里
         // "消费了键但无可渲染"的路径(退格清空 buffer 后 reset、snippet
         // 退空、magic 成员退出)返回的是空视图 —— action 为 NONE 时前端
         // 会把键放行给应用(退格漏过去,应用里已输入的字被删掉)。
-        if view.action == action::NONE {
+        if is_key && view.action == action::NONE {
             view.action = action::HANDLED;
         }
-        self.flags = pipeline.state_flags();
-        view
+        if is_key {
+            // 键路径与旧 step 一致:无条件镜像 flags。
+            self.flags = self.session.state_flags();
+        } else {
+            // 路由之外的变更(选词/复位/tick)—— 重新镜像 flags。
+            self.sync_from();
+        }
+        Some(view)
     }
 
-}
-
-// ── StateMachine 辅助(随 special_key.rs 一并迁入)─────────────────────
-
-impl FamilyPipeline {
-    /// 从组合状态机提取状态标志位(路由前查表、路由后同步都用这里)。
-    pub fn state_flags(&self) -> StateFlags {
-        let mut f = StateFlags::empty();
-        if self.state != ComposeState::Idle || !self.comp.buffer.is_empty() {
-            f |= StateFlags::COMPOSING;
-        }
-        if !self.panel.items.is_empty() {
-            f |= StateFlags::PANEL_OPEN;
-        }
-        match self.state {
-            ComposeState::Idle => {}
-            ComposeState::Pinyin => f |= StateFlags::PINYIN,
-            ComposeState::Snippet => f |= StateFlags::SNIPPET,
-        }
-        if !self.comp.committed_text.is_empty() {
-            f |= StateFlags::WORD_BUILDING;
-        }
-        if self.has_pending_choices() {
-            f |= StateFlags::PENDING;
-        }
-        f
-    }
-
-    /// 是否有"待确认"的选项(命令预测 / 补全提示)。
-    fn has_pending_choices(&self) -> bool {
-        !self.magic.predictions.is_empty() || !self.magic.hints.is_empty()
-    }
-
-    /// Change page by delta.
-    pub fn change_page(&mut self, delta: i32) {
-        let n = self.panel.items.len();
-        if n == 0 || self.panel.page_size == 0 {
-            return;
-        }
-        let total_pages = n.div_ceil(self.panel.page_size);
-        if total_pages <= 1 {
-            return;
-        }
-        let new_page =
-            (self.panel.page as i32 + delta).clamp(0, total_pages as i32 - 1) as usize;
-        if new_page != self.panel.page {
-            self.panel.page = new_page;
-            self.panel.highlight = new_page * self.panel.page_size;
-            self.sync_magic_preedit();
-        }
-    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────

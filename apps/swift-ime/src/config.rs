@@ -213,17 +213,11 @@ fn default_floor_emoji() -> f64 { 0.25 }
 fn default_floor_default() -> f64 { 0.30 }
 
 /// `weights.family_top_n` — 0 表示回落引擎默认。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct FamilyTopNConfig {
     #[serde(default)] pub pinyin: usize,
     #[serde(default)] pub english: usize,
     #[serde(default)] pub emoji: usize,
-}
-
-impl Default for FamilyTopNConfig {
-    fn default() -> Self {
-        FamilyTopNConfig { pinyin: 0, english: 0, emoji: 0 }
-    }
 }
 
 /// 各家族的全局优先级(最终分 = raw_score × priority/100)。

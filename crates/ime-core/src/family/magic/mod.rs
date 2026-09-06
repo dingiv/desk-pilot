@@ -13,14 +13,14 @@
 mod clip;
 mod concat;
 mod del;
-mod member;
 pub mod expander;
+mod member;
 mod req;
 
 // 语音识别事件折叠已归位 aura-agent(round11):五类 AsrEvent 的段落组装是
 // aura 协议细节,上层只读高级状态。此处 re-export 供 ime-core 内部引用。
-pub use audio_aura_agent::VoiceConn;
 pub use audio_aura_agent::SharedTranscript;
+pub use audio_aura_agent::VoiceConn;
 mod snippet;
 mod translate;
 mod voice;
@@ -28,6 +28,7 @@ mod voice;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+pub use crate::family::FamilyEnv;
 pub use clip::{ClipMember, CLIP_HISTORY_CAP};
 pub use concat::ConcatMember;
 pub use del::DelMember;
@@ -37,7 +38,6 @@ pub use member::{
 };
 pub use req::{AddonCmdSpec, AddonConfig, ReqFetcher, DEFAULT_REQ_BASE};
 pub use snippet::SnippetMember;
-pub use crate::family::FamilyEnv;
 pub use translate::TranslateMember;
 pub use voice::VoiceMember;
 
@@ -60,10 +60,16 @@ impl VoiceStateSlot {
     }
 }
 
+pub trait AsyncState: Send + Sync {
+    fn name(&self) -> String;
+}
+
 /// Resources shared between the engine and all member instances (across input
 /// contexts): the shared voice state and the `#req` backend config. Members grab
 /// `Arc` clones at spawn, so late attachment (start-up ordering) is fine.
 pub struct MagicResources {
+    // TODO: 将 voice_state 放入 AsyncState 里面, 做成多态数据
+    pub async_states: Arc<HashMap<String, Box<dyn AsyncState>>>,
     pub voice_state: Arc<VoiceStateSlot>,
     pub req_base: Mutex<String>,
     pub req_fetcher: Mutex<Arc<dyn ReqFetcher>>,
@@ -133,6 +139,7 @@ impl Default for MagicResources {
             voice_tx: Mutex::new(None),
             last_commit_len: Mutex::new(0),
             scout_inject_url: Mutex::new("http://127.0.0.1:7878".to_string()),
+            async_states: Arc::new(HashMap::new()),
         }
     }
 }
@@ -427,15 +434,16 @@ impl MagicFamily {
                 if path.len() > rp.len()
                     && path.starts_with(rp.as_str())
                     && path.as_bytes()[rp.len()] == b'/'
-                    && best.as_ref().is_none_or(|(bl, _)| rp.len() > *bl) {
-                        best = Some((
-                            rp.len(),
-                            LiveCommand {
-                                token,
-                                name: m.name(),
-                            },
-                        ));
-                    }
+                    && best.as_ref().is_none_or(|(bl, _)| rp.len() > *bl)
+                {
+                    best = Some((
+                        rp.len(),
+                        LiveCommand {
+                            token,
+                            name: m.name(),
+                        },
+                    ));
+                }
             }
         }
         best.map(|(_, cmd)| cmd)
@@ -591,7 +599,9 @@ mod tests {
         let entries: Vec<(String, String)> = fam.matcher_entries();
         // 静态命令已整体移除(原 #date/#password sentinel 不复存在)。
         assert!(
-            !entries.iter().any(|(t, _)| t == "#date" || t == "#password"),
+            !entries
+                .iter()
+                .any(|(t, _)| t == "#date" || t == "#password"),
             "static commands removed: {entries:?}"
         );
         assert!(entries.contains(&("#asr".into(), "__ASR_BUFFER__".into())));
@@ -623,7 +633,10 @@ mod tests {
         let clone = fam.clone();
         let state = Arc::new(SharedTranscript::new());
         fam.set_voice_state(Arc::clone(&state));
-        assert!(clone.resources().voice_state.get().is_some(), "voice state shared");
+        assert!(
+            clone.resources().voice_state.get().is_some(),
+            "voice state shared"
+        );
         fam.set_req_base("http://example.test:9/x");
         assert_eq!(
             *clone.resources().req_base.lock().unwrap(),

@@ -15,7 +15,10 @@
 //! ```
 //! use ime_core::store::PersistenceManager;
 //! // engine startup: open once, warm everything
-//! let pm = PersistenceManager::open("/tmp/swift-ime-docex.db")?;
+//! let pm = PersistenceManager::open_with_wordbook(
+//!     "/tmp/swift-ime-docex.db",
+//!     std::sync::Arc::new(ime_core::store::wordbook::WordBook::default()),
+//! )?;
 //! // pm.warm_all(&dispatcher);  // the engine does this in init_store
 //! let store = pm.store();
 //! # Ok::<(), rusqlite::Error>(())
@@ -23,7 +26,9 @@
 
 mod manager;
 mod sqlite;
+pub mod wordbook;
 pub mod snippet_md;
 
 pub use manager::PersistenceManager;
+pub use wordbook::WordBook;
 pub use sqlite::WeightStore;
