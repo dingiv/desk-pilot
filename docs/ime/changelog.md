@@ -210,3 +210,19 @@
    up/100000 → 接口 0.518→0.541 巩固。跨进程持久(L2 链路)。
 
 验证:222 测试全绿;clippy 0;eval 持平 98.0/99.4。
+
+## round 24 续 — 自生词即时混写/简拼召回(L1 进旁路词典)
+
+用户场景:gaicanhanshu → 改参函数(造词)后,gaicanhs 混写召回不到。
+根因:lattice overlay 旁路词典只从 L2 同步(生成号驱动),自生词造完
+还躺在 L1、要等 flush —— 混写/简拼两头够不着(merged 注入只做全拼
+精确)。
+
+- MemoryLayer 加频率表生成号(记录/登记/手工调整/淘汰/flush 递增);
+  sync_lattice_overlay 指纹 = hash(L2 gen, L1 gen),行集 = L2 全量
+  + L1 覆盖同词(越热越权威);条目 ≤512+L2,重灌轻量。
+- 真 FST 端到端(rime_ice_smoke):造 改参函数 → gaicanhs(lattice_mix)
+  与 gchs(简拼)均召回。
+- 另查明:gaicanhs 在纯净 seed 下无 lattice_mix 是正确行为(Full 段
+  要求音节精确,gai+can 开头的种子词不存在,工厂函数需 gchs 纯简拼)。
+- 验证:223 测试全绿;clippy 0;eval 持平 98.0/99.4。

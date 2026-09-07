@@ -111,6 +111,10 @@ pub struct MemoryLayer {
     recent: HashMap<String, i64>,
     /// Σcount 累加器(⑤ 相对增量的分母材料;增删改时同步维护)。
     total_count: u64,
+    /// 频率表生成号(round24):任何 freq 表变更(记录/登记/手工调整/淘汰/
+    /// flush)递增 —— lattice 旁路词典据此感知 L1 变化(自生词刚造出来
+    /// 就能混写/简拼召回,不等 flush 进 L2)。
+    gen: u64,
 }
 
 impl MemoryLayer {
@@ -171,6 +175,8 @@ impl MemoryLayer {
         let rel = (e.count as f64 / mean).clamp(REL_FLOOR, REL_CEIL);
         let incr = (FREQ_GAIN_UNIT * rel / (e.count as f64 + FREQ_HARMONIC_SAT)) as i64;
         e.delta = (e.delta + incr).min(DELTA_ORGANIC_CAP);
+        drop(e);
+        self.bump();
         // 时间表:独立一行(分表,不与频率统计混存)。
         self.recent.insert(word.to_string(), now_ms);
         self.evict_overflow();
@@ -201,6 +207,8 @@ impl MemoryLayer {
             e.base = seed_base.unwrap_or(SELF_GEN_FREQUENCY).max(1);
         }
         e.delta = (e.delta + step).clamp(-DELTA_CEIL, DELTA_CEIL);
+        drop(e);
+        self.bump();
     }
 
     /// 自生词登记(后处理学习路径):入册但不计提交(count = 0),
@@ -210,6 +218,7 @@ impl MemoryLayer {
         if word.is_empty() {
             return;
         }
+        let fresh = !self.freq.contains_key(word);
         let e = self
             .freq
             .entry(word.to_string())
@@ -222,6 +231,26 @@ impl MemoryLayer {
         if !pinyin.is_empty() {
             e.pinyin = pinyin.to_string();
         }
+        if fresh {
+            self.bump();
+        }
+    }
+
+    /// 频率表生成号(旁路词典同步指纹的一半;另一半在 L2)。
+    pub fn generation(&self) -> u64 {
+        self.gen
+    }
+
+    /// 频率表生成号递增(freq 表结构/内容变更)。
+    fn bump(&mut self) {
+        self.gen = self.gen.wrapping_add(1);
+    }
+
+    /// 频率表整表迭代(旁路词典合并同步用:L1 ∪ L2,L1 更热覆盖同词)。
+    pub fn freq_iter(
+        &self,
+    ) -> impl Iterator<Item = (&String, &FreqEntry)> {
+        self.freq.iter()
     }
 
     /// 近期增益(round21 单公式):`g = GAIN_MAX × 2^(−age/半衰期)`,
@@ -280,6 +309,7 @@ impl MemoryLayer {
             recent: std::mem::take(&mut self.recent),
         });
         self.total_count = 0;
+        self.bump();
         n
     }
 
@@ -307,6 +337,7 @@ impl MemoryLayer {
             self.freq.remove(w);
             self.recent.remove(w);
         }
+        self.bump();
     }
 }
 

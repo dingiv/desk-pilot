@@ -526,21 +526,42 @@ impl PinyinFamily {
     /// 候选施加 `dict.bigram_boost(prev, word)` 的词频量纲加成 —— 语料里
     /// (今天,天气) 这类相邻对把"天气"抬过同侪。无 bigram 数据的候选
     /// boost = 0,纯增益不伤现有排序。单音节表 / 造词 / 单词本不适用。
-    /// L2 → lattice overlay 旁路同步(round19):生成号变了才重灌。
-    /// predict 入口各调一次;L2 冷加载 / flush(absorb)都会 bump 生成号。
+    /// L1 ∪ L2 → lattice overlay 旁路同步(round24 扩展):同步指纹 =
+    /// (L2 生成号, L1 生成号),任一变化才重灌。predict 入口各调一次;
+    /// L2 冷加载 / flush(absorb) bump L2 号,**L1 的记录/登记/手工调整
+    /// bump L1 号** —— 自生词刚造出来(还在 L1、未 flush)即可被混写/
+    /// 简拼召回(round24 修复:此前只同步 L2,`gaicanhanshu → 改参函数`
+    /// 造词后 `gaicanhs` 召回不到)。行集:L2 全量 + L1 覆盖同词(越热
+    /// 越权威)。条目 ≤512+L2,重灌为轻量操作。
     pub(crate) fn sync_lattice_overlay(&self) {
-        let l2 = self.wordbook.overlay_dict.lock().unwrap();
-        let gen = l2.generation();
-        if gen == self.overlay_gen.load(std::sync::atomic::Ordering::Relaxed) {
+        let (l2_gen, l1_gen) = {
+            let l2 = self.wordbook.overlay_dict.lock().unwrap();
+            let g2 = l2.generation();
+            drop(l2);
+            let g1 = self.wordbook.memory.lock().unwrap().generation();
+            (g2, g1)
+        };
+        // 指纹混合成单个 u64(碰撞最坏漏一次同步,下一变更即恢复)。
+        let fp = l2_gen.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ l1_gen;
+        if fp == self.overlay_gen.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        drop(l2);
-        let snap = self.wordbook.overlay_dict.lock().unwrap().dump();
+        // L2 全量打底,L1 覆盖同词/新增。
+        let mut rows = self.wordbook.overlay_dict.lock().unwrap().dump().freq;
+        let l1 = self.wordbook.memory.lock().unwrap();
+        for (w, e) in l1.freq_iter() {
+            let row = (w.clone(), e.pinyin.clone(), e.base, e.delta, e.count);
+            match rows.iter_mut().find(|(rw, ..)| rw == w) {
+                Some(slot) => *slot = row,
+                None => rows.push(row),
+            }
+        }
+        drop(l1);
         if let Some(lat) = self.lattice.lock().unwrap().as_ref() {
-            lat.set_overlay_entries(&snap.freq);
+            lat.set_overlay_entries(&rows);
         }
         self.overlay_gen
-            .store(gen, std::sync::atomic::Ordering::Relaxed);
+            .store(fp, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn predict_inner(&self, input: &str, prev_word: &str) -> Vec<ScoredCandidate> {

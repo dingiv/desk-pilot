@@ -243,3 +243,39 @@ fn learned_phrase_does_not_downgrade_dict_hit() {
     assert_eq!(cands.first().map(String::as_str), Some("继续"),
         "learned 继续 stays #1 after being picked: {cands:?}");
 }
+
+// ── round24:自生词造词后立即支持混写/简拼召回(L1 旁路)────────────────
+
+#[test]
+fn self_generated_word_mixed_and_initials_recall() {
+    // 场景:gaicanhanshu 逐字造 改参函数(自生词,还在 L1、未 flush)→
+    // 混写 gaicanhs / 简拼 gchs 都应召回(此前旁路词典只同步 L2)。
+    let mut eng = engine_with_rime();
+    for c in "gaicanhanshu".chars() {
+        eng.predict(KeyEvent::char(c));
+    }
+    let mut last = String::new();
+    for ch in ["改", "参", "函", "数"] {
+        let cands = eng.candidates();
+        let idx = cands.iter().position(|c| *c == ch).unwrap_or_else(|| {
+            panic!("{ch} not in panel: {:?}", cands.iter().take(8).collect::<Vec<_>>())
+        });
+        let v = eng.select_candidate(idx);
+        last = ime_core::ImeView::str_field(&v.commit_text).to_string();
+    }
+    assert_eq!(last, "改参函数", "末字选择即整词提交");
+
+    let cands = candidates_for(&mut eng, "gaicanhs");
+    assert!(
+        cands.iter().take(8).any(|c| c == "改参函数"),
+        "mixed gaicanhs should recall 改参函数: {:?}",
+        cands.iter().take(8).collect::<Vec<_>>()
+    );
+    eng.predict(KeyEvent::escape());
+    let cands = candidates_for(&mut eng, "gchs");
+    assert!(
+        cands.iter().take(8).any(|c| c == "改参函数"),
+        "initials gchs should recall 改参函数: {:?}",
+        cands.iter().take(8).collect::<Vec<_>>()
+    );
+}
