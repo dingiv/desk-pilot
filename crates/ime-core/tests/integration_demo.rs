@@ -690,27 +690,30 @@ fn freq_magic_adjusts_word_frequency() {
     }
     let panel = eng.candidates();
     assert!(
-        panel.iter().any(|c| c.contains("异步:") && c.contains("+10000")),
+        panel.iter().any(|c| c.contains("异步:") && c.contains("+100000")),
         "step menu shows quantized options: {panel:?}"
     );
     // 数字键 5 选第 5 档(+10000)→ 结果视图(不上屏)。
-    eng.predict(KeyEvent { kind: ime_core::fsm::key::KeyKind::Digit(5), ctrl: false, shift: false, alt: false });
+    eng.predict(KeyEvent { kind: ime_core::fsm::key::KeyKind::Digit(4), ctrl: false, shift: false, alt: false });
     let result = eng.candidates();
     assert!(
-        result.iter().any(|c| c.contains("'#freq/up/10000") && c.contains("30000 → 40000")),
+        result.iter().any(|c| c.contains("'#freq/up/100000") && c.contains("30000 → 130000")),
         "applied view echoes the complete command form: {result:?}"
     );
-    // 空格提交 → 结果视图的 raw(异步)上屏。
+    // 元命令无提交副作用:空格不提交文本(interactive),Esc 收尾。
+    eprintln!("PROBE post-digit cands={:?}", eng.candidates());
     let v = eng.predict(KeyEvent::space());
-    assert_eq!(commit(&v), "异步", "space commits the adjusted word");
+    eprintln!("PROBE space commit={:?} after={:?}", commit(&v), eng.candidates());
+    assert!(commit(&v).is_empty(), "meta command must not commit text");
+    eng.predict(KeyEvent { kind: ime_core::fsm::key::KeyKind::Escape, ctrl: false, shift: false, alt: false });
 
-    // 复查(同一引擎,账本在 L1):yibu 预测中异步的位次显著提前。
+    // 复查(同一引擎,账本在 L1,无 recency 污染):yibu 中异步位次提前。
     for c in "yibu".chars() {
         eng.predict(KeyEvent::char(c));
     }
     let cands2 = eng.candidates();
     let pos2 = cands2.iter().position(|c| c == "异步").expect("异步 still present");
-    assert!(pos2 <= 3, "异步 boosted after #freq/up +10000 (was {pos}, now {pos2}): {:?}",
+    assert!(pos2 <= 3, "异步 boosted after #freq/up +100000 (was {pos}, now {pos2}): {:?}",
         cands2.iter().take(5).collect::<Vec<_>>());
 }
 
@@ -730,8 +733,13 @@ fn freq_magic_direct_magnitude_arg_form() {
     for c in "'#freq/down/1000".chars() {
         eng.predict(KeyEvent::char(c));
     }
-    // 参数输入态 submit(空格 force_fire):#freq 带参形态沿用 #del 语义
-    // —— 触发即提交(操作对象 = 锚定的高亮词,非上游 top1)。
+    // 参数输入态 submit(空格 force_fire):#freq 结果为 interactive ——
+    // 只展示记账结果,不提交文本(元命令;操作对象 = 锚定的高亮词)。
     let v = eng.predict(KeyEvent::space());
-    assert_eq!(commit(&v), "异步", "fires the anchored word in one step");
+    assert!(commit(&v).is_empty(), "meta command fires without committing");
+    assert!(
+        eng.candidates().iter().any(|c| c.contains("yibu'#freq/down/1000")),
+        "result view echoes the complete command: {:?}",
+        eng.candidates()
+    );
 }

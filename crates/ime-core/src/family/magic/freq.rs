@@ -8,9 +8,10 @@
 //! women'           → 页面不变(链式透明透传)
 //! women'#f         → 补全提示(#freq / #freq/up / #freq/down + 回滚)
 //! women'#freq      → 查询视图:1. women:[有效频率]±0  2…3. up/down 补全
-//! women'#freq/up   → 步长菜单:±0 / +10 / +100 / +1000 / +10000(数字键选)
-//! women'#freq/down → 步长菜单:±0 / −10 / −100 / −1000 / −10000
-//!   选中步长 → 记账 → 结果视图「women ↑ 15000 → 16000」→ 空格提交该词
+//! women'#freq/up   → 步长菜单:±0 / +1k / +1w / +10w / +100w(数字键选)
+//! women'#freq/down → 同档取负
+//!   选中步长 → 记账 → 结果视图「women'#freq/up/10000 · 15000 → 16000」
+//!   (interactive:元命令无文本提交副作用,Esc 退出)
 //! ```
 //!
 //! 步长是**量化菜单**而非一次性大步:细调(+10/+100)粗调(+1000/+10000)
@@ -19,8 +20,9 @@
 use super::member::{ChainContext, ContextKind, MagicMember, Prediction};
 use super::FamilyEnv;
 
-/// 步长档位(量化菜单;0 = 不改只查)。
-pub const FREQ_STEPS: [i64; 5] = [0, 10, 100, 1_000, 10_000];
+/// 步长档位(量化菜单;0 = 不改只查)。按 log₂ 评分刻度标定:种子词
+/// base 数万~数十万,±10/±100 无感,±10 万 ≈ 0.05 分(足以换位)。
+pub const FREQ_STEPS: [i64; 5] = [0, 1_000, 10_000, 100_000, 1_000_000];
 
 /// 菜单态:最近一次 `#freq/up|down` 预测的上下文(pick 时据此记账)。
 struct MenuState {
@@ -72,15 +74,19 @@ impl FreqMember {
         env.adjust_word_freq(root, word, 0).map(|(_, after)| after)
     }
 
-    /// 结果视图(单一出口:完整命令 · before → after,提交 raw = 词)。
+    /// 结果视图(单一出口:完整命令 · before → after)。**interactive**:
+    /// #freq 是元命令,不得有文本提交副作用 —— force_fire 的
+    /// fire-and-commit 语义会把被调词顺手提交,recency(g≈0.70)与有机
+    /// 增量会当场淹没调整(down 变净升,round23 实测 0.545 → 0.717)。
+    /// Esc 退出会话即可。
     fn result_view(&self) -> Vec<Prediction> {
         let Some(a) = &self.applied else {
             return Vec::new();
         };
-        vec![Prediction::commit_raw(
-            format!("{} · {} → {}", a.cmd, a.before, a.after),
-            a.word.clone(),
-        )]
+        vec![Prediction::interactive(format!(
+            "{} · {} → {}",
+            a.cmd, a.before, a.after
+        ))]
     }
 }
 
@@ -130,10 +136,7 @@ impl MagicMember for FreqMember {
         // 空格提交该词(round23:选中档位后提示补全为 women'#freq/down/1000)。
         if let Some(a) = &self.applied {
             if a.word == word && a.input == input {
-                return vec![Prediction::commit_raw(
-                    format!("{} · {} → {}", a.cmd, a.before, a.after),
-                    a.word.clone(),
-                )];
+                return self.result_view();
             }
         }
         self.applied = None;

@@ -35,10 +35,14 @@ pub const FREQ_HARMONIC_SAT: f64 = 4.0;
 pub const DELTA_ORGANIC_CAP: i64 = 50_000;
 /// 手工调整步长(#freq/up|down,round22 ④):一笔 ≈ 30 次使用的累计量。
 pub const FREQ_MANUAL_STEP: i64 = 25_000;
-/// 增量总上限(有机 + 手工合计;手工允许突破有机封顶)。
-pub const DELTA_CEIL: i64 = 100_000;
-/// 增量下限比例(round22 ④:负向只降到基础的一半,不埋葬)。
-pub const DELTA_FLOOR_RATIO: f64 = 0.5;
+/// 增量总上限(有机 + 手工合计;手工允许突破有机封顶)。round23 放宽到
+/// ±100 万:freq_to_score 是 log₂ 刻度,种子词 base 数万~数十万,旧上限
+/// 10 万在刻度上只值 ~0.02 分 —— `#freq/down/100000` 必须真的压得动。
+pub const DELTA_CEIL: i64 = 1_000_000;
+/// 负向下限(round23 修正:绝对地板 1,允许强力降权)。旧 round22 的
+/// base×0.5 相对下限对多字词(手工等级 base 仅几千)只挪 ~0.02 分,
+/// `#freq/down/50000` 压不动 —— 用户语义是"把它摁下去",账本本身仍夹
+/// 在 ±DELTA_CEIL 内,可反复 up 恢复。
 /// 相对增量夹限(round22 ⑤):rel = count/均值 ∈ [0.5, 2.0]。
 pub const REL_FLOOR: f64 = 0.5;
 pub const REL_CEIL: f64 = 2.0;
@@ -66,15 +70,14 @@ pub struct FreqEntry {
     pub count: u32,
 }
 
-/// 有效频率 = 基础 + 增量,夹在 [基础×[`DELTA_FLOOR_RATIO`],
-/// 基础+[`DELTA_CEIL`]](负向只降到一半,不埋葬;正向有总顶,不霸榜)。
+/// 有效频率 = 基础 + 增量,夹在 [1, 基础+[`DELTA_CEIL`]]
+///(负向可压到地板分 —— 降权要真的降得动;正向有总顶,不霸榜)。
 pub fn effective_frequency(base: u64, delta: i64) -> u64 {
     if base == 0 {
         return 0;
     }
-    let floor = (base as f64 * DELTA_FLOOR_RATIO) as i64;
     let ceil = base as i64 + DELTA_CEIL;
-    (base as i64 + delta).clamp(floor, ceil) as u64
+    (base as i64 + delta).clamp(1, ceil).max(0) as u64
 }
 
 impl FreqEntry {
@@ -433,16 +436,17 @@ mod tests {
         assert_eq!((e.base, e.delta, e.count), (100_000, FREQ_MANUAL_STEP, 0), "手工不计 count");
         m.apply_manual_adjust("异步", "yibu", FREQ_MANUAL_STEP, Some(100_000));
         assert_eq!(m.freq_entry("异步").unwrap().delta, 2 * FREQ_MANUAL_STEP);
-        // 连续 down 穿过 0:底限在 effective 读取时夹取,账本只夹 ±CEIL。
-        for _ in 0..10 {
+        // 连续 down 穿过 0:底限在 effective 读取时夹取,账本只夹 ±CEIL
+        //(round23 CEIL 放宽到 ±100 万;2×25k − 12×25k = −250k 未触底)。
+        for _ in 0..12 {
             m.apply_manual_adjust("异步", "yibu", -FREQ_MANUAL_STEP, None);
         }
         let e = m.freq_entry("异步").unwrap();
-        assert_eq!(e.delta, -DELTA_CEIL, "账本夹总顶/总底");
+        assert_eq!(e.delta, -10 * FREQ_MANUAL_STEP, "2 上 12 下 = −250k(未触 −CEIL)");
         assert_eq!(
             e.effective_frequency(),
-            (100_000.0 * DELTA_FLOOR_RATIO) as u64,
-            "有效频率底限 = base×0.5(④不埋葬)"
+            1,
+            "有效频率可压到绝对地板(降权要降得动;账本可 up 恢复)"
         );
     }
 
