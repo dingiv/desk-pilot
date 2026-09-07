@@ -80,19 +80,6 @@ impl PersistenceManager {
             eng.warm_overlay_dict(of, or);
         }
 
-        // 统一记忆层(round16):overlay dict 主表。
-        let memory = self.store.load_memory();
-        if !memory.is_empty() {
-            eng.warm_memory(memory);
-        }
-
-        // 旧 recency 表迁移种子(仅补 memory 表中没有的键;首次升级后
-        // 该表不再写入,自然枯竭)。
-        let recency = self.store.load_recency();
-        if !recency.is_empty() {
-            eng.warm_recencies(recency);
-        }
-
         // L0 user model (pins + pick counters) → inputx-pinyin.
         if let Some(json) = self.store.load_l0() {
             let pins = eng.import_l0(&json);
@@ -130,15 +117,15 @@ mod tests {
     fn open_creates_schema_and_roundtrips() {
         let path = temp_path();
         let pm = PersistenceManager::open_with_wordbook(&path, std::sync::Arc::new(crate::store::wordbook::WordBook::default())).expect("open");
-        // All five tables exist (schema migration ran).
+        // Schema + 常驻表往返。
         let store = pm.store();
-        store.save_recency(&[("a".into(), 1000), ("b".into(), 2000)]);
+        store.save_overlay_recent(&[("a".into(), 1000), ("b".into(), 2000)]);
         store.record_phrase("ceshi", "测试", 0);
         store.save_l0(r#"{"pins":[],"picks":[]}"#);
 
         let pm2 = PersistenceManager::open_with_wordbook(&path, std::sync::Arc::new(crate::store::wordbook::WordBook::default())).expect("reopen");
         assert_eq!(
-            pm2.store().load_recency(),
+            pm2.store().load_overlay_recent(),
             vec![("a".to_string(), 1000), ("b".to_string(), 2000)]
         );
         assert_eq!(pm2.store().load_all_phrases().len(), 1);

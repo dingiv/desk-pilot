@@ -406,20 +406,6 @@ impl ImeEngine {
         self.filters.len()
     }
 
-    /// 旧 memory 表迁移种子(round16 单表 → round19 分表):灌 L1。
-    pub fn warm_memory(&self, entries: Vec<(String, String, i64, u32, u64)>) {
-        if entries.is_empty() {
-            return;
-        }
-        let count = entries.len();
-        self.wordbook
-            .memory
-            .lock()
-            .unwrap()
-            .load_legacy(entries, crate::family::now_ms());
-        eprintln!("[ime-core] memory: migrated {count} legacy overlay entries");
-    }
-
     /// L2 OverlayDict 冷加载(round19 三级架构)。
     pub fn warm_overlay_dict(&self, freq: Vec<(String, String, u64, i64, u32)>, recent: Vec<(String, i64)>) {
         if freq.is_empty() && recent.is_empty() {
@@ -610,19 +596,15 @@ impl ImeEngine {
     pub(crate) fn warm_phrases_from_store(&self) {
         self.pinyin_family.warm_phrases_from_store();
     }
+    /// L0 user model(pins + pick counters)导入(inputx 引擎词典)。
+    pub(crate) fn import_l0(&self, json: &str) -> usize {
+        self.pinyin_family.import_l0_json(json)
+    }
     /// Warm the english user layer from persisted 英文自生词。
     pub(crate) fn warm_en_user(&self, words: Vec<(String, u32)>) {
         self.english_family.warm_learned_words(&words);
     }
     /// Warm the pinyin family's recency ring from persisted data。
-    pub(crate) fn warm_recencies(&self, entries: Vec<(String, i64)>) {
-        self.pinyin_family.warm_recencies(entries);
-    }
-    /// Restore the inputx-pinyin L0 user model from persisted JSON。
-    pub(crate) fn import_l0(&self, json: &str) -> usize {
-        self.pinyin_family.import_l0_json(json)
-    }
-
     /// 候选元数据(与 [`candidates`](Self::candidates) 同序)—— 测试断言
     /// meta 对齐用;调试视图经 view.candidates[].meta 走 fill_view。
     #[cfg(test)]

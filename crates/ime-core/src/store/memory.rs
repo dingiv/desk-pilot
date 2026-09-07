@@ -280,32 +280,6 @@ impl MemoryLayer {
         n
     }
 
-    /// 旧 memory 表迁移(round16 单表形态 → round19 分表):一行拆两表。
-    pub fn load_legacy(&mut self, rows: Vec<(String, String, i64, u32, u64)>, now_ms: i64) {
-        for (w, p, t, c, freq) in rows {
-            if now_ms - t > T3D {
-                continue;
-            }
-            let legacy_boost = (c as u64 * 10).min(5_000) as i64; // 旧公式的增强折入增量
-            self.freq.entry(w.clone()).or_insert_with(|| FreqEntry {
-                pinyin: p,
-                count: c,
-                base: freq,
-                delta: legacy_boost,
-            });
-            self.total_count = self.total_count.saturating_add(c as u64);
-            self.recent.entry(w).or_insert(t);
-        }
-    }
-
-    /// 旧 recency 表迁移种子(仅时间表;首次提交后进频次通道)。
-    pub fn load_legacy_recent(&mut self, rows: Vec<(String, i64)>, now_ms: i64) {
-        for (w, t) in rows {
-            if now_ms - t <= T3D {
-                self.recent.entry(w).or_insert(t);
-            }
-        }
-    }
 
     /// 会话复位:两表全清。
     pub fn clear(&mut self) {
@@ -536,19 +510,5 @@ mod tests {
         assert_eq!(l2.freq_entry("自生词").unwrap().base, SELF_GEN_FREQUENCY);
     }
 
-    #[test]
-    fn legacy_migration_splits_row_into_two_tables() {
-        let t = now();
-        let mut m = MemoryLayer::default();
-        m.load_legacy(
-            vec![("有效".into(), "youxiao".into(), t - 1_000, 2, 7_000)],
-            t,
-        );
-        m.load_legacy_recent(vec![("旧表词".into(), t - 60_000)], t);
-        assert_eq!(m.freq_entry("有效").unwrap().base, 7_000);
-        assert_eq!(m.recent_ms("有效"), Some(t - 1_000));
-        assert!((m.recency_boost("旧表词", t) - RECENCY_GAIN_MAX).abs() < 0.01, "旧 recency 表迁移种子生效(仅时间表)");
-        assert!(m.freq_entry("旧表词").is_none(), "旧表种子不进频率表");
-    }
 }
 

@@ -7,7 +7,6 @@
 //! - `bigrams`: (prev_word, next_word) → occurrence count
 //! - `pins`:    pinyin → preferred word
 //! - `phrases`: (pinyin, word) → priority order
-//! - `recency`: recent-member table — word → last-used wall-clock ms (unix
 //!   epoch). Full-snapshot replaced on every commit (≤512 rows, one
 //!   transaction); the 3-day window is the store's own eviction rule.
 //! - `en_user`: 英文自生词 word → 使用次数(Enter 强选 raw 文本时学习)
@@ -28,27 +27,11 @@ impl WeightStore {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
-        // 迁移 1:老库的 phrases 表没有 count 列(SQLite 的 ADD COLUMN 无
-        // IF NOT EXISTS —— 已存在时报错,忽略即可)。
+        // schema 同步:round22 前的库文件没有 delta 列(仅补列,不做数据迁移)。
         let _ = conn.execute(
-            "ALTER TABLE phrases ADD COLUMN count INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE overlay_freq ADD COLUMN delta INTEGER NOT NULL DEFAULT 0",
             [],
         );
-        // 迁移 2:老格式的 recency (pos, word) 无时间戳 → 重建为 (word, used_at)。
-        // 只在旧结构存在时 DROP —— 每次 open 都删会清掉刚写入的数据。
-        let has_used_at: bool = conn
-            .prepare("PRAGMA table_info(recency)")
-            .map(|mut stmt| {
-                let cols: Vec<String> = stmt
-                    .query_map([], |r| r.get::<_, String>(1))
-                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                    .unwrap_or_default();
-                cols.iter().any(|c| c == "used_at")
-            })
-            .unwrap_or(false);
-        if !has_used_at {
-            let _ = conn.execute("DROP TABLE IF EXISTS recency", []);
-        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS bigrams (
                 prev  TEXT NOT NULL,
@@ -68,10 +51,6 @@ impl WeightStore {
                 count    INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (pinyin, word)
             );
-            CREATE TABLE IF NOT EXISTS recency (
-                word     TEXT NOT NULL PRIMARY KEY,
-                used_at  INTEGER NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS overlay_freq (
                 word      TEXT NOT NULL PRIMARY KEY,
                 pinyin    TEXT NOT NULL DEFAULT '',
@@ -82,13 +61,6 @@ impl WeightStore {
             CREATE TABLE IF NOT EXISTS overlay_recent (
                 word    TEXT NOT NULL PRIMARY KEY,
                 last_ms INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS memory (
-                word     TEXT NOT NULL PRIMARY KEY,
-                pinyin   TEXT NOT NULL DEFAULT '',
-                last_ms  INTEGER NOT NULL,
-                count    INTEGER NOT NULL DEFAULT 0,
-                frequency INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS en_user (
                 word  TEXT NOT NULL PRIMARY KEY,
@@ -197,113 +169,11 @@ impl WeightStore {
         .collect()
     }
 
-    // ── Recency (recent member) ─────────────────────────────────────────
-
-    /// Persist the recent table as a full snapshot — `(word, last_used_ms)`
-    /// pairs. Replaced wholesale on every commit (≤512 rows, one transaction);
-    /// the 3-day window is the store's own eviction rule.
-    pub fn save_recency(&self, entries: &[(String, i64)]) {
-        if entries.is_empty() {
-            self.clear_recency();
-            return;
-        }
-        let conn = self.conn.lock().unwrap();
-        let _ = conn.execute("DELETE FROM recency", []);
-        let mut stmt = match conn.prepare("INSERT INTO recency (word, used_at) VALUES (?1, ?2)") {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        for (w, t) in entries {
-            let _ = stmt.execute(params![w, t]);
-        }
-    }
-
-    /// Load the persisted recent entries as `(word, last_used_ms)`.
-    pub fn load_recency(&self) -> Vec<(String, i64)> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare("SELECT word, used_at FROM recency") {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
-        .ok()
-        .into_iter()
-        .flat_map(|rows| rows.filter_map(|r| r.ok()))
-        .collect()
-    }
-
-    /// Save the unified memory overlay(全量快照替换;≤512 行单事务)。
-    pub fn save_memory(&self, entries: &[(String, String, i64, u32, u64)]) {
-        let conn = self.conn.lock().unwrap();
-        let _ = conn.execute("DELETE FROM memory", []);
-        let mut stmt = match conn
-            .prepare(
-                "INSERT INTO memory (word, pinyin, last_ms, count, frequency) VALUES (?1, ?2, ?3, ?4, ?5)",
-            )
-        {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        for (w, p, t, c, wt) in entries {
-            let _ = stmt.execute(params![w, p, t, c, wt]);
-        }
-    }
-
-    /// Load the persisted memory overlay entries。
-    pub fn load_memory(&self) -> Vec<(String, String, i64, u32, u64)> {
-        let conn = self.conn.lock().unwrap();
-        // 迁移链:旧库 memory 表可能缺 frequency 列(round17 引入时叫
-        // weight,round18 改名)→ 逐一补齐/改名,默认 0 = 无权威频率。
-        let cols: Vec<String> = {
-            conn.prepare("SELECT name FROM pragma_table_info('memory')")
-                .and_then(|mut stmt| {
-                    stmt.query_map([], |r| r.get::<_, String>(0))
-                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                })
-                .unwrap_or_default()
-        };
-        if cols.iter().any(|c| c == "weight") && !cols.iter().any(|c| c == "frequency") {
-            let _ = conn.execute("ALTER TABLE memory RENAME COLUMN weight TO frequency", []);
-        } else if !cols.iter().any(|c| c == "frequency") {
-            let _ = conn.execute("ALTER TABLE memory ADD COLUMN frequency INTEGER NOT NULL DEFAULT 0", []);
-        }
-        let mut stmt = match conn
-            .prepare("SELECT word, pinyin, last_ms, count, frequency FROM memory")
-        {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, u32>(3)?,
-                row.get::<_, u64>(4)?,
-            ))
-        })
-        .ok()
-        .into_iter()
-        .flat_map(|rows| rows.filter_map(|r| r.ok()))
-        .collect()
-    }
-
     // ── L2 OverlayDict(round19 三级架构;分表:频率/时间)──────────────
 
     /// Save the L2 frequency table(全量快照替换;行含 delta 账本)。
-    /// 旧库迁移:无 delta 列时补列,旧行的旧公式增强折入 delta。
     pub fn save_overlay_freq(&self, rows: &[(String, String, u64, i64, u32)]) {
         let conn = self.conn.lock().unwrap();
-        let _ = conn.execute(
-            "ALTER TABLE overlay_freq ADD COLUMN delta INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "UPDATE overlay_freq SET delta = MIN(count * 10, 5000) WHERE delta = 0 AND count > 0",
-            [],
-        );
         let _ = conn.execute("DELETE FROM overlay_freq", []);
         let mut stmt = match conn.prepare(
             "INSERT INTO overlay_freq (word, pinyin, frequency, delta, count) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -319,15 +189,6 @@ impl WeightStore {
     /// Load the L2 frequency table(行 = word, pinyin, base, delta, count)。
     pub fn load_overlay_freq(&self) -> Vec<(String, String, u64, i64, u32)> {
         let conn = self.conn.lock().unwrap();
-        // 旧库迁移:补列 + 旧公式增强折入 delta(幂等:delta=0 且有 count)。
-        let _ = conn.execute(
-            "ALTER TABLE overlay_freq ADD COLUMN delta INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "UPDATE overlay_freq SET delta = MIN(count * 10, 5000) WHERE delta = 0 AND count > 0",
-            [],
-        );
         let Ok(mut stmt) = conn
             .prepare("SELECT word, pinyin, frequency, delta, count FROM overlay_freq")
         else {
@@ -374,11 +235,6 @@ impl WeightStore {
             .into_iter()
             .flat_map(|rows| rows.filter_map(|r| r.ok()))
             .collect()
-    }
-
-    /// Drop the table (used when the in-memory store is empty).
-    pub fn clear_recency(&self) {
-        let _ = self.conn.lock().unwrap().execute("DELETE FROM recency", []);
     }
 
     // ── 英文自生词 ──────────────────────────────────────────────────────
@@ -457,27 +313,6 @@ mod tests {
         s.record_phrase("ceshi", "侧室", 1);
         let phrases = s.phrases_for("ceshi");
         assert_eq!(phrases[0].0, "测试"); // priority 0 first
-    }
-
-    #[test]
-    fn recency_snapshot_roundtrip_preserves_timestamps() {
-        let s = temp_store();
-        let entries: Vec<(String, i64)> = vec![
-            ("最新".into(), 1000),
-            ("次新".into(), 2000),
-            ("旧".into(), 3000),
-        ];
-        s.save_recency(&entries);
-        assert_eq!(s.load_recency(), entries, "word + timestamp preserved");
-
-        // Replacement semantics: a newer snapshot fully replaces the old.
-        s.save_recency(&[("另一个".into(), 4000)]);
-        assert_eq!(s.load_recency(), vec![("另一个".to_string(), 4000)]);
-        s.save_recency(&[]);
-        assert!(
-            s.load_recency().is_empty(),
-            "empty snapshot clears the table"
-        );
     }
 
     #[test]

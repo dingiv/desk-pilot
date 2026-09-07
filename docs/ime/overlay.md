@@ -77,7 +77,7 @@ pub struct MemEntry {
   下滑(无需事件级惩罚);② 手工 —— `yibu'#freq/up|down`(分链时的
   面板高亮词为操作对象,ChainContext.root_text 提供拼音绑定);
 - base 永不改写(absorb 的「频率取大」已删,base 仅补 0 值);
-- 存储:`overlay_freq` 加 delta 列(幂等迁移,旧公式增强折入)。
+- 存储:`overlay_freq` 含 delta 列(旧库仅补列,不做数据迁移)。
 
 关键 API:
 
@@ -178,8 +178,9 @@ L3 命中        → 查 lattice(FST)words_for(pinyin) 继承原始频率
   → 下一次预测:三级覆盖 + lattice 旁路 + tier 微调 + 上下文感知
 ```
 
-启动:`SeedDict 加载 → L2 冷加载(overlay_freq/overlay_recent)→ L1 空`;
-`warm_memory` 做旧表(memory 单表 / recency 表)一次性迁移。
+启动:`SeedDict 加载 → L2 冷加载(overlay_freq/overlay_recent)→ L1 空`。
+(round22 起不再保留旧表迁移:memory 单表 / recency 表 / 旧公式增强折算
+全部删除,存储只有 overlay_freq/overlay_recent 一套最新逻辑。)
 
 **所有权链**:PersistenceManager(所有者)→ `Arc<WordBook>` →
 `{ pinyin: PinyinBook, english: EnglishBook, memory: Mutex<MemoryLayer>,

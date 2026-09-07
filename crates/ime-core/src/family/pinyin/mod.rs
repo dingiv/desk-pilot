@@ -506,20 +506,6 @@ impl PinyinFamily {
         }
     }
 
-    /// Warm the recent-member table from persisted data(过期 >3d 条目在
-    /// load_bulk 里丢弃)。
-    pub fn warm_recencies(&self, entries: Vec<(String, i64)>) {
-        if !entries.is_empty() {
-            let count = entries.len();
-            self.wordbook
-                .memory
-                .lock()
-                .unwrap()
-                .load_legacy_recent(entries, super::now_ms());
-            eprintln!("[ime-core] pinyin: migrated {count} legacy recency entries");
-        }
-    }
-
     /// 临时关闭/恢复上下文感知(swift-ime.yaml → input.context_aware)。
     pub fn set_context_aware(&self, on: bool) {
         *self.context_aware.lock().unwrap() = on;

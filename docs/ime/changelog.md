@@ -161,3 +161,13 @@
   `异步 ↑ 词频 before→after`,空格提交该词;幂等防重复记账。
 - 验证:223 测试全绿(端到端:yibu 高亮异步 → '#freq/up → 提交 →
   异步 top-3);clippy 0;eval 持平 98.0/99.4。
+
+## round 22 续 — 删除旧表迁移链
+
+- 按用户指令不保留迁移:SQLite `memory` 表 / `recency` 表及其读写
+  (save/load_recency、save/load_memory)、weight→frequency 改名链、
+  旧公式增强折算 delta 的 UPDATE、phrases 补列迁移全部删除;
+  `warm_memory` / `warm_recencies` / `load_legacy(_recent)` 一并清除。
+- 存储只剩一套最新逻辑:overlay_freq(base/delta/count)+
+  overlay_recent;旧库文件仅补 delta 列(schema 同步,无数据迁移)。
+- 验证:221 测试全绿;clippy 0;eval 持平 98.0/99.4。
