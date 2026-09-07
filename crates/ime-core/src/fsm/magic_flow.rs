@@ -94,8 +94,23 @@ impl SessionState {
         };
         let (cmd, prefix) = (cmd.clone(), prefix.to_vec());
         let upstream_buf = join_segments(&prefix);
-        let upstream_cands = self.eval_upstream(&upstream_buf, env);
+        let mut upstream_cands = self.eval_upstream(&upstream_buf, env);
+        // round22 链式高亮锚点:分链时捕获的高亮词(如 yibu 面板移到异步)
+        // 提到上游首位 —— first_text() 即用户锚定的操作对象。
+        if let Some(anchor) = self.chain_anchor.clone() {
+            if let Some(pos) = upstream_cands.iter().position(|c| *c == anchor) {
+                upstream_cands.swap(0, pos);
+            }
+        }
         let upstream_first = upstream_cands.first().cloned().unwrap_or_default();
+        // 根文本段(纯文本拼音根;#freq 类命令据它把词条绑回拼音映射对)。
+        let root_text = segs
+            .iter()
+            .find_map(|s| match s {
+                ChainSeg::Text(t) if !t.is_empty() => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
 
         match env.magic().match_command(&cmd) {
             MagicMatch::Exact(LiveCommand { token, name }) => {
@@ -104,6 +119,7 @@ impl SessionState {
                 // 空链(X''#cmd)传上游整页(#concat 类成员消费)。
                 let upstream = ChainContext {
                     items: chain_context_items(&upstream_buf, &upstream_cands),
+                    root_text,
                 };
                 let wants = self.magic.active
                     .as_ref()
@@ -241,7 +257,16 @@ impl SessionState {
             }
             ChainSeg::Command(c) => {
                 let ctx = (!upstream_page.is_empty())
-                    .then(|| ChainContext { items: upstream_page.clone() });
+                    .then(|| ChainContext {
+                        items: upstream_page.clone(),
+                        root_text: split_segments(&prefix_buf)
+                            .into_iter()
+                            .find_map(|s| match s {
+                                ChainSeg::Text(t) if !t.is_empty() => Some(t),
+                                _ => None,
+                            })
+                            .unwrap_or_default(),
+                    });
                 self.eval_command(c, ctx.as_ref(), env)
             }
         }
@@ -482,6 +507,13 @@ impl SessionState {
                     &upstream_buf,
                     &self.eval_upstream(&upstream_buf, env),
                 ),
+                root_text: split_segments(&input)
+                    .into_iter()
+                    .find_map(|s| match s {
+                        ChainSeg::Text(t) if !t.is_empty() => Some(t),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
             };
             match self.magic.active.as_mut() {
                 Some(m) => {

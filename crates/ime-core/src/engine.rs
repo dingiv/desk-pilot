@@ -841,6 +841,11 @@ impl crate::family::FamilyEnv for ImeEngine {
         // 家族私有方法(D5):经具体句柄直调 —— 学习语义只有 pinyin 有。
         self.pinyin_family.record_pick(pinyin, word);
     }
+    fn adjust_word_freq(&self, pinyin: &str, word: &str, step: i64) -> Option<(u64, u64)> {
+        // round22 #freq/up|down:种子频率补继承 + 单词本账本记账。
+        let seed = self.pinyin_family.seed_frequency(pinyin, word);
+        self.wordbook.adjust_freq(pinyin, word, step, seed)
+    }
     fn compose_single_chars(
         &self,
         input: &str,

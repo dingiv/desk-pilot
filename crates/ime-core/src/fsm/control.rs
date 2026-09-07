@@ -59,6 +59,10 @@ pub struct SessionState {
     /// `abc'#asr'#translate` 中语音段更新时,上游 abc 命中缓存不重算,
     /// 只有语音段之后的流水线在防抖/节流放行后重新预测。
     pub(crate) chain_flow: crate::fsm::chain::ChainFlow,
+    /// 链式高亮锚点(round22):用户在拼音面板把高亮移到某候选(如
+    /// yibu → 异步)后键入 `'` 开链 —— 分链那一刻捕获高亮词,供链式
+    /// 上下文命令(#freq/up|down)作为操作对象;reset/提交后清空。
+    pub(crate) chain_anchor: Option<String>,
 }
 
 /// 系统控制(round13,原 `StateMachine`):**分发三大事件类型** ——

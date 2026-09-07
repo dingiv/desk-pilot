@@ -22,6 +22,7 @@ mod req;
 pub use audio_aura_agent::SharedTranscript;
 pub use audio_aura_agent::VoiceConn;
 mod snippet;
+mod freq;
 mod translate;
 mod voice;
 
@@ -38,6 +39,7 @@ pub use member::{
 };
 pub use req::{AddonCmdSpec, AddonConfig, ReqFetcher, DEFAULT_REQ_BASE};
 pub use snippet::SnippetMember;
+pub use freq::FreqMember;
 pub use translate::TranslateMember;
 pub use voice::VoiceMember;
 
@@ -198,6 +200,7 @@ impl MagicFamily {
             Arc::new(ClipMember::new(Arc::clone(&resources))),
             Arc::new(ConcatMember::new()),
             Arc::new(TranslateMember::new()),
+            Arc::new(FreqMember::new()),
             // 片段命令:空名魔法命令(`#/hello?name=Mike`),经 `#` + `/` 路由。
             Arc::new(SnippetMember::new(Arc::clone(&resources))),
         ];

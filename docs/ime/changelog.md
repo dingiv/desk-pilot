@@ -146,3 +146,18 @@
   effective_frequency 一处)、powf→exp2 直取(省内部 log2 换算)。
   不变式钉死:>3d 惰性移出只删时间表,频率表统计不动。验证 218 全绿,
   eval 持平,CLI 复测 0.572→0.729(与手算一致)。
+
+## round 22 — overlay 频率增量账本 + #freq 手工微调
+
+- **22a 账本核心**:FreqEntry{base, delta, count};base 不可改写(种子
+  继承 / 自生词中频 30k);提交记调和级数正笔 δ=8000×rel/(count+4)
+  (对数增长自然涌现,有机封顶 50k);rel = count/全体均值 ∈[0.5,2.0]
+  (相对增量:冷库重度偏好满加成、热库温和;他人使用→自己 rel 走低 =
+  有机负向);effective 夹 [base×0.5, base+100k]。absorb 改 delta 累加;
+  overlay_freq 加 delta 列(幂等迁移)。
+- **22b #freq/up|down**:链式 `yibu'#freq/up` —— 分链时捕获面板高亮词
+  (chain_anchor)提为上游首选,ChainContext 新增 root_text(拼音根);
+  freq 成员 wants_context,对 (yibu↔异步) 记 ±25k 手工账,预览
+  `异步 ↑ 词频 before→after`,空格提交该词;幂等防重复记账。
+- 验证:223 测试全绿(端到端:yibu 高亮异步 → '#freq/up → 提交 →
+  异步 top-3);clippy 0;eval 持平 98.0/99.4。

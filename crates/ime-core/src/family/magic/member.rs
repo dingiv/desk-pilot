@@ -187,6 +187,10 @@ pub enum ContextKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainContext {
     pub items: Vec<String>,
+    /// 链的根文本段(round22):链式输入 `yibu'#freq/up` 的拼音根
+    /// (`yibu`;空串 = 链首即命令)。上下文命令据此把上游词条绑定
+    /// 回它的拼音映射对。
+    pub root_text: String,
 }
 
 impl ChainContext {

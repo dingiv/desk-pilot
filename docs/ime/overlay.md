@@ -59,16 +59,25 @@ pub struct MemEntry {
 > frequency → 运行时权重。**最终决定预测顺序的是运行时权重**;
 > frequency 只是它的词典域来源。
 
-**频次增强(round18)**:有效频率在基础频率上线性增强,读取时派生,
-存储只存基础值(无写放大):
+**增量账本(round22)**:一条记忆 = base(不可改写)+ delta(可正可负)
++ count(原始统计):
 
 ```text
-effective_frequency = frequency + min(count × 10, 5_000)
-                      // FREQ_ENHANCE_STEP=10, FREQ_ENHANCE_CAP=5_000
+每词:base(种子继承 / 自生词 SELF_GEN_FREQUENCY = 30_000,中频档)
+     delta(账本:提交记正笔,手工 #freq 可记负笔)
+     count(诊断 + rel 分母材料,不直接驱动分数)
+
+提交正笔:δ = 8000 × rel / (count + 4)      rel = count/全体均值 ∈ [0.5, 2.0]
+  → 调和级数累计 ≈ 对数增长(从记账方式自然涌现),有机总量封顶 50k
+手工正/负笔(#freq/up|down,链式高亮锚定):±25_000,一笔 ≈ 30 次使用
+有效频率 = clamp(base + delta, base×0.5, base+100k)   // 不埋葬/不霸榜
 ```
 
-- 自生词(基础 `SELF_GEN_FREQUENCY = 100`)随使用稳步爬升;
-- 常用种子词(频次数千)相对漂移可忽略 → 排序近似稳定(eval 持平)。
+- **负向增量的两个来源**:① 有机 —— rel 随全体均值此消彼长,排名自然
+  下滑(无需事件级惩罚);② 手工 —— `yibu'#freq/up|down`(分链时的
+  面板高亮词为操作对象,ChainContext.root_text 提供拼音绑定);
+- base 永不改写(absorb 的「频率取大」已删,base 仅补 0 值);
+- 存储:`overlay_freq` 加 delta 列(幂等迁移,旧公式增强折入)。
 
 关键 API:
 

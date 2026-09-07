@@ -332,6 +332,17 @@ impl PinyinFamily {
         self.large_dict.lock().unwrap().len()
     }
 
+    /// 种子词频率查询(round22 #freq):该词在 SeedDict 的原始频率
+    /// (#freq 手工记账时给未入册词条补 base 继承)。
+    pub fn seed_frequency(&self, pinyin: &str, word: &str) -> Option<u64> {
+        self.lattice.lock().unwrap().as_ref().and_then(|lat| {
+            lat.words_for(pinyin)
+                .into_iter()
+                .find(|(w, _)| w == word)
+                .map(|(_, f)| f)
+        })
+    }
+
     /// 该词是否已存在于词典(inputx 嵌入大词典或 rime-ice lattice)?
     fn in_dictionary(&self, pinyin: &str, word: &str) -> bool {
         if self.engine.dict().lookup(pinyin).iter().any(|w| w == word) {

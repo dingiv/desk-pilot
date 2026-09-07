@@ -276,6 +276,7 @@ impl SessionState {
     /// 不学自生词;`None`(raw 强选 / snippet 文本)按拼音族 recency、
     /// ASCII 时学英文自生词 —— 与旧引擎回写行为一致。
     pub(crate) fn commit_text(&mut self, text: &str, family: Option<&'static str>) {
+        self.chain_anchor = None;
         self.context.update(text);
         // round14:学习回执化 —— recency 分流 / ASCII 自生词 / 长度统计
         // 的策略与分发都在后处理(post::learn_commit)。
@@ -430,6 +431,7 @@ impl SessionState {
 
     pub fn reset(&mut self) {
         self.chain_flow.clear();
+        self.chain_anchor = None;
         self.clear_active_command();
         self.state = ComposeState::Idle;
         self.comp.buffer.clear();
@@ -582,6 +584,16 @@ impl SessionState {
         // 附带"我说完了"信号:语音会话在听时让 aura 立即归档开放窗口
         // (整窗 batch,跳过 merge_gap 等待);无语音会话 → tx 为 None,跳过。
         if ch == '\'' {
+            // round22 链式高亮锚点:分链那一刻捕获面板高亮词(供
+            // `yibu'#freq/up` 类上下文命令定位操作对象)。
+            if let Some(word) = self
+                .panel
+                .items
+                .get(self.panel.highlight)
+                .filter(|w| !w.is_empty())
+            {
+                self.chain_anchor = Some(word.clone());
+            }
             if let Some(tx) = env.voice_cmd_tx() {
                 tx.send(crate::io_thread::VoiceCmd::FlushParagraph);
             }

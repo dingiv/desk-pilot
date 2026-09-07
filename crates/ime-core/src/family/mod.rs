@@ -131,6 +131,12 @@ pub trait FamilyEnv: Send + Sync {
     fn record_pick(&self, pinyin: &str, word: &str) {
         let _ = (pinyin, word);
     }
+    /// 手工频率调整(round22 #freq/up|down):对 (pinyin ↔ word) 映射对
+    /// 记一笔增量;返回 (调整前有效频率, 调整后有效频率)。
+    /// 默认 None = 未接线(测试 mock)。
+    fn adjust_word_freq(&self, _pinyin: &str, _word: &str, _step: i64) -> Option<(u64, u64)> {
+        None
+    }
     /// 学短语(已在词典的词不入本)。
     fn learn_phrase(&self, _pinyin: &str, _hanzi: &str) {}
     /// 造词学习(逐字选择完成后整词入单词本)。

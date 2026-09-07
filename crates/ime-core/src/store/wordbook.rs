@@ -111,6 +111,26 @@ impl WordBook {
         n
     }
 
+    /// 手工频率调整(round22 ④,#freq/up|down):一笔 ±FREQ_MANUAL_STEP
+    /// 记入 L1 增量账本;`seed_base` 在词条尚无基础频率时补继承。
+    /// 返回调整前后的有效频率(未接线/空词 → None)。
+    pub fn adjust_freq(
+        &self,
+        pinyin: &str,
+        word: &str,
+        step: i64,
+        seed_base: Option<u64>,
+    ) -> Option<(u64, u64)> {
+        if word.is_empty() {
+            return None;
+        }
+        let mut m = self.memory.lock().unwrap();
+        let before = m.freq_entry(word).map(|e| e.effective_frequency()).unwrap_or(0);
+        m.apply_manual_adjust(word, pinyin, step, seed_base);
+        let after = m.freq_entry(word).map(|e| e.effective_frequency()).unwrap_or(0);
+        Some((before, after))
+    }
+
     /// 近期增益三级穿透(round21):L1 时间表 miss → L2 时间表
     /// (flush 清空 L1 后,刚沉淀的词不丢近期加成)。返回值直接就是
     /// 合成系数:`score' = a + (1-a) × g`(g ∈ [0, GAIN_MAX])。

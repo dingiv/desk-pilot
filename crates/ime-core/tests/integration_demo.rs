@@ -671,3 +671,41 @@ fn phrase_initials_recall() {
         cands.iter().take(5).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn freq_magic_adjusts_word_frequency() {
+    // round22:yibu 面板高亮移到「异步」→ 键入 '#freq/up →
+    // ① #freq 预览出现;② 账本 +25k;③ 空格提交「异步」;④ 再查 yibu,
+    // 异步排名显著上移(有效频率逼近顶流档)。
+    let mut eng = ImeEngine::new();
+    for c in "yibu".chars() {
+        eng.predict(KeyEvent::char(c));
+    }
+    let cands = eng.candidates();
+    let pos = cands.iter().position(|c| c == "异步").expect("异步 in yibu panel");
+    // 高亮移到异步(DOWN 键 × offset;面板可能不止一页,逐键走到目标)。
+    for _ in 0..pos {
+        eng.predict(KeyEvent { kind: ime_core::fsm::key::KeyKind::Down, ctrl: false, shift: false, alt: false });
+    }
+    for c in "'#freq/up".chars() {
+        eng.predict(KeyEvent::char(c));
+    }
+    let panel = eng.candidates();
+    assert!(
+        panel.iter().any(|c| c.contains("异步") && c.contains("↑")),
+        "#freq preview shows adjustment: {panel:?}"
+    );
+    // 空格提交 → 预览的 raw(异步)上屏。
+    let v = eng.predict(KeyEvent::space());
+    assert_eq!(commit(&v), "异步", "space commits the adjusted word");
+
+    // 复查(同一引擎,账本在 L1):yibu 预测中异步的位次显著提前
+    //(手工 +25k ≈ 30 次使用的累计量)。
+    for c in "yibu".chars() {
+        eng.predict(KeyEvent::char(c));
+    }
+    let cands2 = eng.candidates();
+    let pos2 = cands2.iter().position(|c| c == "异步").expect("异步 still present");
+    assert!(pos2 <= 2, "异步 boosted to top-3 after #freq/up (was {pos}, now {pos2}): {:?}",
+        cands2.iter().take(5).collect::<Vec<_>>());
+}
