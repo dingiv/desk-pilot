@@ -111,17 +111,17 @@ impl WordBook {
         n
     }
 
-    /// 近期指数(连续 0..=5,round20 连续衰减;见
-    /// [`crate::store::memory::MemoryLayer::tier`]):L1 时间表 miss →
-    /// L2 时间表(flush 清空 L1 后,刚沉淀的词不丢近期加成)。
-    pub fn tier(&self, word: &str, now_ms: i64) -> f64 {
+    /// 近期增益三级穿透(round21):L1 时间表 miss → L2 时间表
+    /// (flush 清空 L1 后,刚沉淀的词不丢近期加成)。返回值直接就是
+    /// 合成系数:`score' = a + (1-a) × g`(g ∈ [0, GAIN_MAX])。
+    pub fn recency_boost(&self, word: &str, now_ms: i64) -> f64 {
         let mut l1 = self.memory.lock().unwrap();
-        let t = l1.tier(word, now_ms);
-        if t > 0.0 {
-            return t;
+        let g = l1.recency_boost(word, now_ms);
+        if g > 0.0 {
+            return g;
         }
         drop(l1);
-        self.overlay_dict.lock().unwrap().tier(word, now_ms)
+        self.overlay_dict.lock().unwrap().recency_boost(word, now_ms)
     }
 }
 

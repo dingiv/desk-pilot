@@ -370,12 +370,12 @@ impl EnglishFamily {
         }
         let now = now_ms();
         for c in out.iter_mut() {
-            // 近期指数(round20 连续化:指数衰减 + count 线性增强;三级穿透
-            // L1→L2)。
-            let b = self.wordbook.tier(&c.text, now);
-            if b > 0.0 {
+            // round21 单公式:g = GAIN_MAX × 2^(−age/半衰期),
+            // score' = a + (1-a) × g(与拼音侧同一条公式,常量同源)。
+            let g = self.wordbook.recency_boost(&c.text, now);
+            if g > 0.0 {
                 let a = c.raw_score;
-                c.raw_score = (1.0 - a) * (a + b) / 8.0 + a;
+                c.raw_score = a + (1.0 - a) * g;
             }
         }
     }

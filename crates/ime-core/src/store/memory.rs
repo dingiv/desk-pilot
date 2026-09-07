@@ -58,16 +58,17 @@ impl FreqEntry {
     }
 }
 
-/// 衰减窗口(wall-clock 毫秒):超 3 天的近期加成归零(惰性移出)。
+/// 衰减窗口(wall-clock 毫秒):超 3 天的近期加成归零(惰性移出 ——
+/// **只删时间表**,频率表的统计不受影响)。
 const T3D: i64 = 259_200_000;
 
-/// 连续衰减半衰期(round20):b(t) = 5 × 2^(−t/HALF_LIFE)。取 18h
-/// 对齐旧五档阶梯的中段锚点(5h≈4.1、1d≈2.2、3d≈0.3),但档内不再
-/// 同分 —— 时间维度连续生效,两词只差几分钟也有可分辨的先后。
+/// 连续衰减半衰期(round20):g(t) = 2^(−t/HALF_LIFE),每 18h 减半
+/// (对齐旧五档阶梯的中段手感:5h≈0.82、1d≈0.40、3d≈0.06)。
 pub const RECENCY_HALF_LIFE_MS: i64 = 64_800_000;
 
-/// 近期指数上颙(b 空间的最大值,与旧阶梯档位上限一致)。
-pub const RECENCY_MAX: f64 = 5.0;
+/// 近期增益上限(round21 单公式):score' = a + (1-a) × g × GAIN_MAX。
+/// 取 0.70 对齐旧 z 公式 b=5 档的等效增益((a+5)/8 ≈ 0.67~0.74)。
+pub const RECENCY_GAIN_MAX: f64 = 0.70;
 
 /// 记录上限(3 天窗口内使用词的自然上限;保险起见截断)。
 const MAX_ENTRIES: usize = 512;
@@ -141,29 +142,23 @@ impl MemoryLayer {
         }
     }
 
-    /// 近期指数(连续, 0.0..=5.0;0 = 不在时间表或超 3 天)。
-    /// round20 起为**连续指数衰减**:`b(t) = 5 × 2^(−t/半衰期)`
-    /// (半衰期 [`RECENCY_HALF_LIFE_MS`] = 18h),取代旧五档阶梯
-    /// (10s/1h/5h/1d/3d 同档同分,两词只差几分钟也无法区分)。
-    /// **提交次数参与加成**:`(count/3).min(1)` 连续逼近(取代旧
-    /// ≥3 次的 +1 阶跃),封顶 [`RECENCY_MAX`];超 3 天惰性移出(消减)。
-    /// 计数查频率表 —— 分表但联合判档。
-    pub fn tier(&mut self, word: &str, now_ms: i64) -> f64 {
+    /// 近期增益(round21 单公式):`g = GAIN_MAX × 2^(−age/半衰期)`,
+/// 直接就是合成公式的系数(`score' = a + (1-a) × g`),取代旧三段链
+    /// (档位 b → z 合成)与 count 双计(频次增强只在
+    /// [`FreqEntry::effective_frequency`] 一处)。超 3 天惰性移出
+    /// (消减)——**只删本层时间表条目,频率表统计不动**。
+    pub fn recency_boost(&mut self, word: &str, now_ms: i64) -> f64 {
         let Some(&last) = self.recent.get(word) else {
             return 0.0;
         };
         let age = now_ms - last;
         if age > T3D {
-            // 超过 3d:移出(惰性淘汰),不再有加成。
+            // 超过 3d:移出时间表(惰性淘汰),不再有加成;
+            // 频率表(freq)不受影响 —— 分表语义的核心不变式。
             self.recent.remove(word);
             return 0.0;
         }
-        // 连续衰减:刚提交 b=5,每过半衰期减半。
-        let b_time = RECENCY_MAX * 0.5f64.powf(age as f64 / RECENCY_HALF_LIFE_MS as f64);
-        // 频次增强:count→3 线性爬升到 +1(旧版 ≥3 阶跃的连续化)。
-        let count = self.freq.get(word).map(|e| e.count).unwrap_or(0);
-        let bonus = (count as f64 / 3.0).min(1.0);
-        (b_time + bonus).min(RECENCY_MAX)
+        RECENCY_GAIN_MAX * f64::exp2(-(age as f64) / RECENCY_HALF_LIFE_MS as f64)
     }
 
     /// 频率表条目(只读;诊断 / 覆盖层)。
@@ -277,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn tier_decays_continuously() {
+    fn recency_boost_decays_continuously() {
         let mut m = MemoryLayer::default();
         let t = now();
         m.record_commit("你", "ni", t - 5_000);
@@ -285,49 +280,52 @@ mod tests {
         m.record_commit("的", "de", t - 2 * 3_600_000);
         m.record_commit("中", "zhong", t - 12 * 3_600_000);
         m.record_commit("国", "guo", t - 2 * 86_400_000);
-        let b_ni = m.tier("你", t);
-        let b_hao = m.tier("好", t);
-        let b_de = m.tier("的", t);
-        let b_zhong = m.tier("中", t);
-        let b_guo = m.tier("国", t);
-        // 刚提交(分钟级)封顶在 RECENCY_MAX。
-        assert!((b_ni - RECENCY_MAX).abs() < 1e-9);
-        assert!((b_hao - RECENCY_MAX).abs() < 1e-6, "分钟级仍封顶(含 count 增强被 cap)");
-        // 2h ≈ 4.63 + count 增強 1/3 ≈ 4.96(旧阶梯:整档 3)。
-        assert!((b_de - 4.96).abs() < 0.05, "2h: {b_de}");
-        // 12h ≈ 3.15 + 1/3 ≈ 3.48(旧阶梯:整档 2)。
-        assert!((b_zhong - 3.48).abs() < 0.05, "12h: {b_zhong}");
-        // 2d ≈ 0.78 + 1/3 ≈ 1.12(旧阶梯:整档 1)。
-        assert!((b_guo - 1.12).abs() < 0.05, "2d: {b_guo}");
+        let g_ni = m.recency_boost("你", t);
+        let g_hao = m.recency_boost("好", t);
+        let g_de = m.recency_boost("的", t);
+        let g_zhong = m.recency_boost("中", t);
+        let g_guo = m.recency_boost("国", t);
+        // 刚提交(分钟级)≈ GAIN_MAX。
+        assert!((g_ni - RECENCY_GAIN_MAX).abs() < 1e-4, "5s 近顶: {g_ni}");
+        assert!((g_hao - RECENCY_GAIN_MAX * 0.9999).abs() < 1e-3, "分钟级仍近顶");
+        // g(t) = GAIN_MAX × 2^(−t/18h):2h≈0.553、12h≈0.278、2d≈0.11。
+        assert!((g_de - 0.70 * 0.9258).abs() < 1e-3, "2h: {g_de}");
+        assert!((g_zhong - 0.70 * 0.6300).abs() < 1e-3, "12h: {g_zhong}");
+        assert!((g_guo - 0.70 * 0.1575).abs() < 1e-3, "2d: {g_guo}");
         // 连续性:单调递减,无同档同分。
-        assert!(b_ni >= b_hao && b_hao > b_de && b_de > b_zhong && b_zhong > b_guo);
+        assert!(g_ni >= g_hao && g_hao > g_de && g_de > g_zhong && g_zhong > g_guo);
+        // 半衰期锚点:18h 处恰减半。
+        let mut m2 = MemoryLayer::default();
+        m2.record_commit("半", "ban", t - RECENCY_HALF_LIFE_MS);
+        assert!((m2.recency_boost("半", t) - RECENCY_GAIN_MAX / 2.0).abs() < 1e-9);
     }
 
     #[test]
-    fn tier_same_age_differs_by_minutes() {
+    fn recency_boost_same_age_differs_by_minutes() {
         // 连续化核心性质:同档窗口内几分钟之差也能分辨(旧阶梯同分)。
         let mut m = MemoryLayer::default();
         let t = now();
-        // 5h 窗口(旧阶梯同为档 3):先用的衰减更多。
         m.record_commit("先用", "xianyong", t - 5 * 3_600_000);
         m.record_commit("后用", "houyong", t - 3 * 3_600_000);
-        assert!(m.tier("后用", t) > m.tier("先用", t), "同档窗口内连续可分");
+        assert!(m.recency_boost("后用", t) > m.recency_boost("先用", t), "同档窗口内连续可分");
     }
 
     #[test]
-    fn frequent_commit_boosts_tier_continuously() {
+    fn recency_boost_is_pure_time_count_lives_in_freq_domain() {
+        // round21 去双计:count 不再进时间增益,只走 effective_frequency。
         let mut m = MemoryLayer::default();
         let t = now();
-        for _ in 0..3 {
+        for _ in 0..10 {
             m.record_commit("高频", "gaopin", t - 86_400_000);
         }
         m.record_commit("低频", "dipin", t - 86_400_000);
-        let lo = m.tier("低频", t);
-        let hi = m.tier("高频", t);
-        // 1d:b_time ≈ 1.98;低频(count=1)≈ +1/3,高频(count=3)= +1.0。
-        assert!((lo - 2.31).abs() < 0.05, "低频: {lo}");
-        assert!((hi - 2.98).abs() < 0.05, "高频: {hi}");
-        assert!(hi > lo, "count 线性增强(旧版 ≥3 阶跃的连续化)");
+        // 同 age、不同 count → 增益相同(差异由 effective_frequency 承担)。
+        let g_hi = m.recency_boost("高频", t);
+        let g_lo = m.recency_boost("低频", t);
+        assert!((g_hi - g_lo).abs() < 1e-12, "时间增益不含 count: {g_hi} vs {g_lo}");
+        let e_hi = m.freq_entry("高频").unwrap().effective_frequency();
+        let e_lo = m.freq_entry("低频").unwrap().effective_frequency();
+        assert!(e_hi > e_lo, "频次差异由频率域承担: {e_hi} vs {e_lo}");
     }
 
     #[test]
@@ -336,9 +334,9 @@ mod tests {
         let t = now();
         m.record_commit("旧词", "", t - 4 * 86_400_000);
         m.record_commit("新词", "", t - 1_000);
-        assert_eq!(m.tier("旧词", t), 0.0, ">3d 无加成");
+        assert_eq!(m.recency_boost("旧词", t), 0.0, ">3d 无加成");
         assert!(m.freq_entry("旧词").is_some(), "频率表仍在(分表:淘汰只发生在时间表)");
-        assert!((m.tier("新词", t) - RECENCY_MAX).abs() < 1e-9);
+        assert!((m.recency_boost("新词", t) - RECENCY_GAIN_MAX).abs() < 1e-4);
     }
 
     #[test]
@@ -368,7 +366,7 @@ mod tests {
         let t = now();
         m.register_self_generated("自生词", "zishengci");
         assert_eq!(m.freq_entry("自生词").unwrap().count, 0);
-        assert_eq!(m.tier("自生词", t), 0.0, "不在时间表 → 无近期加成");
+        assert_eq!(m.recency_boost("自生词", t), 0.0, "不在时间表 → 无近期加成");
         m.record_commit("自生词", "", t);
         assert_eq!(m.freq_entry("自生词").unwrap().count, 1);
     }
@@ -415,7 +413,7 @@ mod tests {
         m.load_legacy_recent(vec![("旧表词".into(), t - 60_000)], t);
         assert_eq!(m.freq_entry("有效").unwrap().frequency, 7_000);
         assert_eq!(m.recent_ms("有效"), Some(t - 1_000));
-        assert!((m.tier("旧表词", t) - RECENCY_MAX).abs() < 0.01, "旧 recency 表迁移种子生效(仅时间表)");
+        assert!((m.recency_boost("旧表词", t) - RECENCY_GAIN_MAX).abs() < 0.01, "旧 recency 表迁移种子生效(仅时间表)");
         assert!(m.freq_entry("旧表词").is_none(), "旧表种子不进频率表");
     }
 }

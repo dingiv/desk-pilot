@@ -907,21 +907,18 @@ impl CandidateFamily for PinyinFamily {
             return candidates;
         }
 
-        // ── Layer 1: Recent member boost (近期指数 → 权重合成) ──
-        // b = 近期指数(1-5,按距上次使用时间分档;>3d 条目在查询时被移出)。
-        // 合成公式:z = (1-a)(a+b)/8 + a —— 增量与 (1-a) 成比例,低权重词
-        // 获得更大加成,高权重词增量趋零,z 天然 < 1(不会顶满 1.0)。
-        // tier 三级穿透(round19):L1 时间表 miss → L2 时间表
-        //(flush 清空 L1 后,刚沉淀的词不丢近期加成)。
+        // ── Layer 1: Recent member boost(近期增益 → 单公式合成)──
+        // round21 单公式:g = GAIN_MAX × 2^(−age/半衰期)(三级穿透
+        // L1→L2,常量在 store::memory),合成 score' = a + (1-a) × g
+        // —— 增量与 (1-a) 成比例:低权重词获更大加成、高权重词增量趋零,
+        // 天然 < 1 不顶满。取代旧 z=(1-a)(a+b)/8+a(五档时代遗产)。
         {
             let now = super::now_ms();
             for c in &mut candidates {
-                // 近期指数(round20 连续化:指数衰减 + count 线性增强,
-                // 取代旧五档阶梯;三级穿透 L1→L2)。
-                let b = self.wordbook.tier(&c.text, now);
-                if b > 0.0 {
+                let g = self.wordbook.recency_boost(&c.text, now);
+                if g > 0.0 {
                     let a = c.raw_score;
-                    c.raw_score = (1.0 - a) * (a + b) / 8.0 + a;
+                    c.raw_score = a + (1.0 - a) * g;
                 }
             }
         }

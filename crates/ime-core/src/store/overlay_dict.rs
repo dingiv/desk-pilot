@@ -104,10 +104,10 @@ impl OverlayDict {
         self.recent.get(word).copied()
     }
 
-    /// 近期指数(连续 0..=5,与 L1 同一半衰期/同频次增强公式;见
-    /// [`crate::store::memory::MemoryLayer::tier`])。L2 只读:过期条目
-    /// 不惰性删,留待下次 flush 清理。
-    pub fn tier(&self, word: &str, now_ms: i64) -> f64 {
+    /// 近期增益(与 L1 同一公式/同一常量,见
+    /// [`crate::store::memory::MemoryLayer::recency_boost`];只读 ——
+    /// 过期条目不惰性删,留待下次 flush 清理。**频率表不受影响**)。
+    pub fn recency_boost(&self, word: &str, now_ms: i64) -> f64 {
         const T3D: i64 = 259_200_000;
         let Some(&last) = self.recent.get(word) else {
             return 0.0;
@@ -116,12 +116,8 @@ impl OverlayDict {
         if age > T3D {
             return 0.0;
         }
-        let b_time =
-            crate::store::memory::RECENCY_MAX * 0.5f64.powf(age as f64
-                / crate::store::memory::RECENCY_HALF_LIFE_MS as f64);
-        let count = self.freq.get(word).map(|e| e.count).unwrap_or(0);
-        let bonus = (count as f64 / 3.0).min(1.0);
-        (b_time + bonus).min(crate::store::memory::RECENCY_MAX)
+        crate::store::memory::RECENCY_GAIN_MAX
+            * f64::exp2(-(age as f64) / crate::store::memory::RECENCY_HALF_LIFE_MS as f64)
     }
 
     /// 冷加载(启动)。
@@ -230,15 +226,15 @@ mod tests {
     }
 
     #[test]
-    fn tier_penetrates_to_l2() {
+    fn recency_boost_reads_l2_recent() {
         let t = now();
         let mut l2 = OverlayDict::default();
         l2.load(
             vec![("刚用".into(), "gangyong".into(), 500, 1)],
             vec![("刚用".into(), t - 5_000)],
         );
-        assert!((l2.tier("刚用", t) - crate::store::memory::RECENCY_MAX).abs() < 1e-6, "L1 miss → L2 时间表穿透");
-        assert_eq!(l2.tier("不存在", t), 0.0);
+        assert!((l2.recency_boost("刚用", t) - crate::store::memory::RECENCY_GAIN_MAX).abs() < 1e-4, "L2 直查(穿透测试在 wordbook 层)");
+        assert_eq!(l2.recency_boost("不存在", t), 0.0);
     }
 
     #[test]
