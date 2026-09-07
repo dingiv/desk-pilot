@@ -21,7 +21,7 @@ fn dict(name: &str) -> Option<String> {
 fn engine() -> ImeEngine {
     use ime_core::family::{emoji::EmojiWeights, english::EnglishWeights, pinyin::PinyinWeights};
     let wordlist = dict("hermitdave/en_freq.tsv");
-    let mut e = ImeEngine::with_config(
+    let e = ImeEngine::with_config(
         PinyinWeights::default(),
         EnglishWeights::default(),
         wordlist,

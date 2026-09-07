@@ -11,7 +11,7 @@
 //! 方式调用(全拼精确命中 → (词, 有效频率)),自生词即使不在 seed
 //! 也能出候选。查找优先级:L1 > L2 > L3(越热越权威)。
 
-use super::memory::{FreqEntry, FREQ_ENHANCE_CAP, FREQ_ENHANCE_STEP};
+use super::memory::FreqEntry;
 use std::collections::HashMap;
 
 /// L2:频率表 + 时间表。
@@ -46,23 +46,26 @@ pub struct FlushBatch {
 
 /// L2 全量快照(落盘 / 冷加载的行集;与 SQLite 两表一一对应)。
 pub struct Snapshot {
-    /// 频率表行:(word, pinyin, 基础频率, count)。
-    pub freq: Vec<(String, String, u64, u32)>,
+    /// 频率表行:(word, pinyin, 基础频率, delta, count)。
+    pub freq: Vec<(String, String, u64, i64, u32)>,
     /// 时间表行:(word, last_ms)。
     pub recent: Vec<(String, i64)>,
 }
 
 impl OverlayDict {
-    /// L1 flush 吸收:同词合并(count 累加,频率取大者,拼音补齐),
-    /// 时间取新。吸收后由调用方全量快照落盘。
+    /// L1 flush 吸收(round22 账本):同词合并 —— **base 不改写**
+    /// (仅补 0 值)、**delta 累加**(增量账本语义,取代旧「频率取大」
+    /// hack)、count 累加、拼音补齐,时间取新。吸收后由调用方全量
+    /// 快照落盘。
     pub fn absorb(&mut self, batch: FlushBatch) {
         let FlushBatch { freq, recent } = batch;
         for (w, e) in freq {
             match self.freq.get_mut(&w) {
                 Some(old) => {
                     old.count = old.count.saturating_add(e.count);
-                    if e.frequency > old.frequency {
-                        old.frequency = e.frequency;
+                    old.delta = old.delta.saturating_add(e.delta);
+                    if old.base == 0 {
+                        old.base = e.base;
                     }
                     if old.pinyin.is_empty() {
                         old.pinyin = e.pinyin;
@@ -120,15 +123,16 @@ impl OverlayDict {
             * f64::exp2(-(age as f64) / crate::store::memory::RECENCY_HALF_LIFE_MS as f64)
     }
 
-    /// 冷加载(启动)。
-    pub fn load(&mut self, freq: Vec<(String, String, u64, u32)>, recent: Vec<(String, i64)>) {
-        for (w, p, f, c) in freq {
+    /// 冷加载(启动;行 = (word, pinyin, base, delta, count))。
+    pub fn load(&mut self, freq: Vec<(String, String, u64, i64, u32)>, recent: Vec<(String, i64)>) {
+        for (w, p, b, d, c) in freq {
             self.freq.insert(
                 w,
                 FreqEntry {
                     pinyin: p,
+                    base: b,
+                    delta: d,
                     count: c,
-                    frequency: f,
                 },
             );
         }
@@ -138,13 +142,13 @@ impl OverlayDict {
         self.bump();
     }
 
-    /// 全量快照(落盘用;基础频率,增强派生不落盘)。
+    /// 全量快照(落盘用;base/delta/count 全存 —— 增量账本无派生)。
     pub fn dump(&self) -> Snapshot {
         Snapshot {
             freq: self
                 .freq
                 .iter()
-                .map(|(w, e)| (w.clone(), e.pinyin.clone(), e.frequency, e.count))
+                .map(|(w, e)| (w.clone(), e.pinyin.clone(), e.base, e.delta, e.count))
                 .collect(),
             recent: self.recent.iter().map(|(w, t)| (w.clone(), *t)).collect(),
         }
@@ -159,11 +163,6 @@ impl OverlayDict {
         self.freq.is_empty()
     }
 
-    /// 诊断:频次增强上界引用(保持常量被使用;上限语义与 L1 一致)。
-    pub fn enhance_cap() -> u64 {
-        let _ = (FREQ_ENHANCE_STEP, FREQ_ENHANCE_CAP);
-        FREQ_ENHANCE_CAP
-    }
 }
 
 #[cfg(test)]
@@ -184,9 +183,9 @@ mod tests {
         l1.record_commit("自生词", "zishengci", t);
 
         let mut l2 = OverlayDict::default();
-        // 预置 L2 已有 你好(旧沉淀):count 合并、频率取大者。
+        // 预置 L2 已有 你好(旧沉淀,同种子 base):count 合并、delta 累加。
         l2.load(
-            vec![("你好".into(), "nihao".into(), 1_000, 4)],
+            vec![("你好".into(), "nihao".into(), 42_000, 100, 4)],
             vec![("你好".into(), t - 86_400_000)],
         );
         let l1_freq: HashMap<String, FreqEntry> = HashMap::new();
@@ -199,7 +198,8 @@ mod tests {
 
         let e = l2.freq_entry("你好").unwrap();
         assert_eq!(e.count, 6, "L2.count 4 + L1.count 2");
-        assert_eq!(e.frequency, 42_000, "频率取大者(继承 > 旧沉淀)");
+        assert_eq!(e.base, 42_000, "base 不改写(①:同种子 base 一致)");
+        assert!(e.delta > 100, "delta 累加(④:100 + L1 两笔正增量): {}", e.delta);
         assert_eq!(l2.recent_ms("你好"), Some(t + 1), "时间取新");
         assert!(l1.is_empty(), "L1 清空(数据已搬走)");
         assert!(l1.recent_ms("你好").is_none());
@@ -220,8 +220,8 @@ mod tests {
         assert_eq!(hits.len(), 1);
         let (w, f) = &hits[0];
         assert_eq!(w, "李正明");
-        // 基础 100 + 3×10 增强 → 130。
-        assert_eq!(*f, 130);
+        // 中频默认 30_000 + 3 笔调和增量(账本)。
+        assert_eq!(*f, crate::store::memory::SELF_GEN_FREQUENCY + 5_980, "3 笔调和增量(1600+2666+1714)");
         assert!(l2.lookup("lizhengmin").is_empty(), "全拼精确,不做前缀");
     }
 
@@ -230,7 +230,7 @@ mod tests {
         let t = now();
         let mut l2 = OverlayDict::default();
         l2.load(
-            vec![("刚用".into(), "gangyong".into(), 500, 1)],
+            vec![("刚用".into(), "gangyong".into(), 500, 0, 1)],
             vec![("刚用".into(), t - 5_000)],
         );
         assert!((l2.recency_boost("刚用", t) - crate::store::memory::RECENCY_GAIN_MAX).abs() < 1e-4, "L2 直查(穿透测试在 wordbook 层)");
@@ -248,7 +248,8 @@ mod tests {
 
         let mut l2b = OverlayDict::default();
         l2b.load(snap.freq, snap.recent);
-        assert_eq!(l2b.freq_entry("词").unwrap().frequency, 9_000);
+        assert_eq!(l2b.freq_entry("词").unwrap().base, 9_000);
+        assert_eq!(l2b.freq_entry("词").unwrap().delta, l2.freq_entry("词").unwrap().delta, "delta 随快照往返");
         assert_eq!(l2b.recent_ms("词"), Some(t));
     }
 }

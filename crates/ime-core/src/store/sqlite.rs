@@ -76,7 +76,8 @@ impl WeightStore {
                 word      TEXT NOT NULL PRIMARY KEY,
                 pinyin    TEXT NOT NULL DEFAULT '',
                 frequency INTEGER NOT NULL DEFAULT 0,
-                count     INTEGER NOT NULL DEFAULT 0
+                count     INTEGER NOT NULL DEFAULT 0,
+                delta     INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS overlay_recent (
                 word    TEXT NOT NULL PRIMARY KEY,
@@ -291,26 +292,44 @@ impl WeightStore {
 
     // ── L2 OverlayDict(round19 三级架构;分表:频率/时间)──────────────
 
-    /// Save the L2 frequency table(全量快照替换)。
-    pub fn save_overlay_freq(&self, rows: &[(String, String, u64, u32)]) {
+    /// Save the L2 frequency table(全量快照替换;行含 delta 账本)。
+    /// 旧库迁移:无 delta 列时补列,旧行的旧公式增强折入 delta。
+    pub fn save_overlay_freq(&self, rows: &[(String, String, u64, i64, u32)]) {
         let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "ALTER TABLE overlay_freq ADD COLUMN delta INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE overlay_freq SET delta = MIN(count * 10, 5000) WHERE delta = 0 AND count > 0",
+            [],
+        );
         let _ = conn.execute("DELETE FROM overlay_freq", []);
-        let mut stmt = match conn
-            .prepare("INSERT INTO overlay_freq (word, pinyin, frequency, count) VALUES (?1, ?2, ?3, ?4)")
-        {
+        let mut stmt = match conn.prepare(
+            "INSERT INTO overlay_freq (word, pinyin, frequency, delta, count) VALUES (?1, ?2, ?3, ?4, ?5)",
+        ) {
             Ok(s) => s,
             Err(_) => return,
         };
-        for (w, p, f, c) in rows {
-            let _ = stmt.execute(params![w, p, f, c]);
+        for (w, p, f, d, c) in rows {
+            let _ = stmt.execute(params![w, p, f, d, c]);
         }
     }
 
-    /// Load the L2 frequency table。
-    pub fn load_overlay_freq(&self) -> Vec<(String, String, u64, u32)> {
+    /// Load the L2 frequency table(行 = word, pinyin, base, delta, count)。
+    pub fn load_overlay_freq(&self) -> Vec<(String, String, u64, i64, u32)> {
         let conn = self.conn.lock().unwrap();
+        // 旧库迁移:补列 + 旧公式增强折入 delta(幂等:delta=0 且有 count)。
+        let _ = conn.execute(
+            "ALTER TABLE overlay_freq ADD COLUMN delta INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE overlay_freq SET delta = MIN(count * 10, 5000) WHERE delta = 0 AND count > 0",
+            [],
+        );
         let Ok(mut stmt) = conn
-            .prepare("SELECT word, pinyin, frequency, count FROM overlay_freq")
+            .prepare("SELECT word, pinyin, frequency, delta, count FROM overlay_freq")
         else {
             return Vec::new();
         };
@@ -319,7 +338,8 @@ impl WeightStore {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, u64>(2)?,
-                row.get::<_, u32>(3)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, u32>(4)?,
             ))
         })
         .ok()

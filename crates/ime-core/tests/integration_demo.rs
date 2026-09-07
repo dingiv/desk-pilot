@@ -279,7 +279,7 @@ fn recency_persistence_across_sessions() {
     let freq = store.load_overlay_freq();
     let recent = store.load_overlay_recent();
     assert_eq!(
-        freq.first().map(|(w, _, _, _)| w.as_str()),
+        freq.first().map(|(w, ..)| w.as_str()),
         Some("你好"),
         "freq: {freq:?}"
     );

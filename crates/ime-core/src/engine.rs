@@ -421,7 +421,7 @@ impl ImeEngine {
     }
 
     /// L2 OverlayDict 冷加载(round19 三级架构)。
-    pub fn warm_overlay_dict(&self, freq: Vec<(String, String, u64, u32)>, recent: Vec<(String, i64)>) {
+    pub fn warm_overlay_dict(&self, freq: Vec<(String, String, u64, i64, u32)>, recent: Vec<(String, i64)>) {
         if freq.is_empty() && recent.is_empty() {
             return;
         }

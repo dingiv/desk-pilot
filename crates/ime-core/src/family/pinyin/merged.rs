@@ -54,13 +54,13 @@ pub fn apply_overlay_override(
     // ── 覆盖:逐候选取最高优先层的有效频率 ──────────────────────────
     for c in cands.iter_mut() {
         if let Some(e) = mem.freq_entry(&c.text) {
-            if e.frequency > 0 && !e.pinyin.is_empty() && e.pinyin == input {
+            if e.base > 0 && !e.pinyin.is_empty() && e.pinyin == input {
                 c.raw_score = lat.freq_to_score(freq_scale, e.effective_frequency());
                 continue; // L1 最热,直接定分
             }
         }
         if let Some(e) = l2.freq_entry(&c.text) {
-            if e.frequency > 0 && !e.pinyin.is_empty() && e.pinyin == input {
+            if e.base > 0 && !e.pinyin.is_empty() && e.pinyin == input {
                 c.raw_score = lat.freq_to_score(freq_scale, e.effective_frequency());
             }
         }

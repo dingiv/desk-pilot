@@ -21,40 +21,66 @@
 
 use std::collections::HashMap;
 
-/// 自生词默认基础频率(与拼音家族 merged 覆盖层共用常量)。
-pub const SELF_GEN_FREQUENCY: u64 = 100;
-/// 频次增强步长:每累计 1 次提交,有效频率在基础频率上加这么多。
-/// 加性小步长 —— 常用种子词(频次数千)相对漂移可忽略(排序近似稳定),
-/// 自生词(基础 100)随使用稳步爬升。
-pub const FREQ_ENHANCE_STEP: u64 = 10;
-/// 频次增强上限(防止无界增长;约等于一个中等词频量级)。
-pub const FREQ_ENHANCE_CAP: u64 = 5_000;
+/// 自生词默认基础频率(round22 ②:近似中频种子词 —— rime-ice 中频档
+/// ≈ 12k~50k;旧值 100 使新造词起步垫底,与"用户造的词立刻可用"相悳)。
+pub const SELF_GEN_FREQUENCY: u64 = 30_000;
+/// 有机增量分子(round22 ③):第 n 次提交记 δ = GAIN_UNIT×rel/(n+SAT),
+/// 累计 ≈ GAIN_UNIT×ln((n+SAT)/SAT) —— 对数增长从**记账方式**中自然
+/// 涌现,读取时不算公式;误选 1~2 次影响微小(容错)。
+pub const FREQ_GAIN_UNIT: f64 = 8_000.0;
+/// 调和级数饱和偏移(首笔不至于过大:n=1 → δ≈GAIN_UNIT/5×rel)。
+pub const FREQ_HARMONIC_SAT: f64 = 4.0;
+/// 有机增量总量封顶(round22:50k ≈ rime 顶流的 1/10,习惯词升到
+/// 高频档但压不过「的/了」级超高频,不霸榜)。
+pub const DELTA_ORGANIC_CAP: i64 = 50_000;
+/// 手工调整步长(#freq/up|down,round22 ④):一笔 ≈ 30 次使用的累计量。
+pub const FREQ_MANUAL_STEP: i64 = 25_000;
+/// 增量总上限(有机 + 手工合计;手工允许突破有机封顶)。
+pub const DELTA_CEIL: i64 = 100_000;
+/// 增量下限比例(round22 ④:负向只降到基础的一半,不埋葬)。
+pub const DELTA_FLOOR_RATIO: f64 = 0.5;
+/// 相对增量夹限(round22 ⑤):rel = count/均值 ∈ [0.5, 2.0]。
+pub const REL_FLOOR: f64 = 0.5;
+pub const REL_CEIL: f64 = 2.0;
 /// flush 阈值(round19):L1 频率表攒满即整体搬入 L2 并清空。
 pub const FLUSH_THRESHOLD: usize = 128;
 
-/// 频率统计表的一行:提交映射对 + 统计 + 基础频率。
+/// 频率统计表的一行(round22 增量账本):映射对 + 不可改写的基础频率
+/// + 可正可负的增量 + 原始计数。
+///
 /// (时间统计独立在 [`MemoryLayer::recent`] 表 —— round19 分表指令。)
 #[derive(Debug, Clone, PartialEq)]
 pub struct FreqEntry {
     /// 提交时的拼音(映射对的另一半;英文词为空)。
     pub pinyin: String,
-    /// 累计提交次数(自生词登记时为 0,由提交增长)。
+    /// **基础频率**(round22 ①:永不改写):种子词 = 首次继承的 SeedDict
+    /// 原始频率;自生词 = [`SELF_GEN_FREQUENCY`];0 = 尚无(旧迁移
+    /// 种子),覆盖算法不作用于 0。与 FST value 同量纲,经
+    /// `freq_to_score` 线性重标后才参与排序。
+    pub base: u64,
+    /// **增量账本**(round22 ③④):提交记正笔(调和级数×rel),
+    /// #freq 手工记账可正可负;全体单词共享同一条账本语义。
+    pub delta: i64,
+    /// 累计提交次数(原始统计:诊断 + ⑤ 相对增量的分母材料,
+    /// 不再直接驱动分数)。
     pub count: u32,
-    /// 词典域**基础频率**:种子词继承 SeedDict 原始频率;自生词取固定
-    /// 默认([`SELF_GEN_FREQUENCY`])。0 = 尚无(旧迁移种子),覆盖算法
-    /// 不作用于 0。注意:这不是运行时 0..1 的权重浮点 —— 与 FST value
-    /// 同量纲,经 `freq_to_score` 线性重标后才参与排序;最终预测顺序由
-    /// 运行时权重值决定。
-    pub frequency: u64,
+}
+
+/// 有效频率 = 基础 + 增量,夹在 [基础×[`DELTA_FLOOR_RATIO`],
+/// 基础+[`DELTA_CEIL`]](负向只降到一半,不埋葬;正向有总顶,不霸榜)。
+pub fn effective_frequency(base: u64, delta: i64) -> u64 {
+    if base == 0 {
+        return 0;
+    }
+    let floor = (base as f64 * DELTA_FLOOR_RATIO) as i64;
+    let ceil = base as i64 + DELTA_CEIL;
+    (base as i64 + delta).clamp(floor, ceil) as u64
 }
 
 impl FreqEntry {
-    /// **有效频率** = 基础频率 + 频次增强(随提交次数线性增长,封顶)。
-    /// MergedDict 覆盖以此换算运行时权重;存储存基础值(稳定、无写放大),
-    /// 增强在读取时派生。
+    /// **有效频率** = 基础 + 增量(见 [`effective_frequency`])。
     pub fn effective_frequency(&self) -> u64 {
-        self.frequency
-            .saturating_add((self.count as u64 * FREQ_ENHANCE_STEP).min(FREQ_ENHANCE_CAP))
+        effective_frequency(self.base, self.delta)
     }
 }
 
@@ -76,55 +102,107 @@ const MAX_ENTRIES: usize = 512;
 /// L1 工作集:频率统计表 + 时间统计表(独立,不是一张表)。
 #[derive(Default)]
 pub struct MemoryLayer {
-    /// 频率统计:词 → (拼音, 基础频率, 累计次数)。
+    /// 频率统计:词 → (拼音, 基础频率, 增量, 累计次数)。
     freq: HashMap<String, FreqEntry>,
     /// 时间统计:词 → 最近提交 wall-clock ms。
     recent: HashMap<String, i64>,
+    /// Σcount 累加器(⑤ 相对增量的分母材料;增删改时同步维护)。
+    total_count: u64,
 }
 
 impl MemoryLayer {
+    /// 词条平均提交次数(⑤ rel 分母;空表返回 1 防除零)。
+    fn mean_count(&self) -> f64 {
+        if self.freq.is_empty() {
+            return 1.0;
+        }
+        (self.total_count as f64 / self.freq.len() as f64).max(1.0)
+    }
+
     /// 后处理提交登记:频率表计数 +1(并设定映射对/继承频率),
     /// 时间表独立盖章。
     pub fn record_commit(&mut self, word: &str, pinyin: &str, now_ms: i64) {
         self.record_commit_weighted(word, pinyin, now_ms, None);
     }
 
-    /// 带频率版提交登记:`frequency = Some(f)` 设定 overlay 基础频率
-    /// (种子词继承 SeedDict 频率 / 自生词默认);`None` 保留既有频率。
+    /// 带频率版提交登记(round22 增量账本):
+    /// - `base = Some(f)` 仅在首次登记(base==0)时生效 —— **基础频率
+    ///   永不改写**(①);既有条目的后续提交只动 count 与 delta。
+    /// - 每次提交记一笔正增量:δ = GAIN_UNIT × rel / (count+SAT),
+    ///   rel = count/全体均值 ∈ [0.5,2.0](⑤ 相对增量:同样 30 次,
+    ///   冷门词库里的重度偏好满加成,热门词库里温和加成;别人用得
+    ///   多 → 自己的 rel 走低 —— 有机负向,无需事件级惩罚)。
+    ///   调和级数累计 → 对数增长;有机总量封顶 [`DELTA_ORGANIC_CAP`]。
     pub fn record_commit_weighted(
         &mut self,
         word: &str,
         pinyin: &str,
         now_ms: i64,
-        frequency: Option<u64>,
+        base: Option<u64>,
     ) {
         if word.is_empty() {
             return;
         }
-        // 频率表:计数 + 继承频率 + 映射对。
+        let mean = self.mean_count();
+        // 频率表:计数 + 首次继承基础频率 + 映射对。
         let e = self
             .freq
             .entry(word.to_string())
             .or_insert_with(|| FreqEntry {
                 pinyin: String::new(),
+                base: 0,
+                delta: 0,
                 count: 0,
-                frequency: 0,
             });
         if !pinyin.is_empty() {
             e.pinyin = pinyin.to_string();
         }
-        if let Some(f) = frequency {
-            e.frequency = f;
+        if let Some(f) = base {
+            if e.base == 0 {
+                e.base = f.max(1);
+            }
         }
         e.count = e.count.saturating_add(1);
+        self.total_count = self.total_count.saturating_add(1);
+        // 正向记账(③⑤):rel 用记账后的 count/记账前的均值。
+        let rel = (e.count as f64 / mean).clamp(REL_FLOOR, REL_CEIL);
+        let incr = (FREQ_GAIN_UNIT * rel / (e.count as f64 + FREQ_HARMONIC_SAT)) as i64;
+        e.delta = (e.delta + incr).min(DELTA_ORGANIC_CAP);
         // 时间表:独立一行(分表,不与频率统计混存)。
         self.recent.insert(word.to_string(), now_ms);
         self.evict_overflow();
     }
 
+    /// 手工调整记账(round22 ④,#freq/up|down 魔法命令):
+    /// 一笔 ±[`FREQ_MANUAL_STEP`];`seed_base` 在词条尚无基础频率时
+    /// 补继承(种子词查 lattice,无则自生词默认)。计入总顶
+    /// [`DELTA_CEIL`] / 底限 base×0.5(在 effective 读取时夹取)。
+    /// 不动 count / mean(手工调整不算使用行为)。
+    pub fn apply_manual_adjust(&mut self, word: &str, pinyin: &str, step: i64, seed_base: Option<u64>) {
+        if word.is_empty() {
+            return;
+        }
+        let e = self
+            .freq
+            .entry(word.to_string())
+            .or_insert_with(|| FreqEntry {
+                pinyin: String::new(),
+                base: seed_base.unwrap_or(SELF_GEN_FREQUENCY).max(1),
+                delta: 0,
+                count: 0,
+            });
+        if !pinyin.is_empty() {
+            e.pinyin = pinyin.to_string();
+        }
+        if e.base == 0 {
+            e.base = seed_base.unwrap_or(SELF_GEN_FREQUENCY).max(1);
+        }
+        e.delta = (e.delta + step).clamp(-DELTA_CEIL, DELTA_CEIL);
+    }
+
     /// 自生词登记(后处理学习路径):入册但不计提交(count = 0),
-    /// 赋固定默认频率(Wordbook 同步记录词 + 拼音 + 词频)。
-    /// 已有条目只补拼音,不动计数与既有频率。
+    /// 基础频率 = 中频档默认(round22 ②)。已有条目只补拼音,
+    /// 不动计数与既有账本。
     pub fn register_self_generated(&mut self, word: &str, pinyin: &str) {
         if word.is_empty() {
             return;
@@ -134,8 +212,9 @@ impl MemoryLayer {
             .entry(word.to_string())
             .or_insert_with(|| FreqEntry {
                 pinyin: String::new(),
+                base: SELF_GEN_FREQUENCY,
+                delta: 0,
                 count: 0,
-                frequency: SELF_GEN_FREQUENCY,
             });
         if !pinyin.is_empty() {
             e.pinyin = pinyin.to_string();
@@ -197,6 +276,7 @@ impl MemoryLayer {
             freq: std::mem::take(&mut self.freq),
             recent: std::mem::take(&mut self.recent),
         });
+        self.total_count = 0;
         n
     }
 
@@ -206,11 +286,14 @@ impl MemoryLayer {
             if now_ms - t > T3D {
                 continue;
             }
+            let legacy_boost = (c as u64 * 10).min(5_000) as i64; // 旧公式的增强折入增量
             self.freq.entry(w.clone()).or_insert_with(|| FreqEntry {
                 pinyin: p,
                 count: c,
-                frequency: freq,
+                base: freq,
+                delta: legacy_boost,
             });
+            self.total_count = self.total_count.saturating_add(c as u64);
             self.recent.entry(w).or_insert(t);
         }
     }
@@ -268,7 +351,7 @@ mod tests {
         assert_eq!(e.pinyin, "zhongde", "映射对被记录(空拼音不覆盖)");
         assert_eq!(m.recent_ms("中的"), Some(t + 1_000), "时间表独立盖章");
         assert_eq!(e.count, 2, "累计次数");
-        assert_eq!(e.frequency, 0, "None → 保留既有基础频率");
+        assert_eq!(e.base, 0, "None → 不设基础频率");
     }
 
     #[test]
@@ -316,9 +399,9 @@ mod tests {
         let mut m = MemoryLayer::default();
         let t = now();
         for _ in 0..10 {
-            m.record_commit("高频", "gaopin", t - 86_400_000);
+            m.record_commit_weighted("高频", "gaopin", t - 86_400_000, Some(50_000));
         }
-        m.record_commit("低频", "dipin", t - 86_400_000);
+        m.record_commit_weighted("低频", "dipin", t - 86_400_000, Some(50_000));
         // 同 age、不同 count → 增益相同(差异由 effective_frequency 承担)。
         let g_hi = m.recency_boost("高频", t);
         let g_lo = m.recency_boost("低频", t);
@@ -340,24 +423,75 @@ mod tests {
     }
 
     #[test]
-    fn effective_frequency_enhances_with_count() {
+    #[test]
+    fn delta_ledger_grows_harmonically_and_caps() {
         let t = now();
         let mut m = MemoryLayer::default();
-        m.register_self_generated("自生词", "zishengci"); // 基础 100
+        m.register_self_generated("自生词", "zishengci"); // 中频基础 30_000
         let e0 = m.freq_entry("自生词").unwrap().clone();
-        assert_eq!(e0.frequency, 100);
-        assert_eq!(e0.effective_frequency(), 100, "count=0 → 无增强");
-        for _ in 0..5 {
+        assert_eq!(e0.base, SELF_GEN_FREQUENCY);
+        assert_eq!(e0.effective_frequency(), SELF_GEN_FREQUENCY, "count=0 → 无增量");
+        // 首笔:mean=1 → rel=1,δ = 8000×1/(1+4) = 1600(精确锚点)。
+        m.record_commit("自生词", "", t);
+        assert_eq!(m.freq_entry("自生词").unwrap().delta, 1_600, "首笔精确值");
+        for _ in 0..4 {
             m.record_commit("自生词", "", t);
         }
         let e = m.freq_entry("自生词").unwrap();
-        assert_eq!(e.frequency, 100, "存储存基础值");
-        assert_eq!(e.effective_frequency(), 150, "count=5 → +5×10");
-        for _ in 0..1000 {
+        assert_eq!(e.base, SELF_GEN_FREQUENCY, "基础频率不改写(①)");
+        // 次线性:5 笔累计 < 5×首笔(调和级数,非线性叠加)。
+        assert!(e.delta > 6_000 && e.delta < 9_000, "调和级数累计(③,次线性<5×1600): {}", e.delta);
+        for _ in 0..5_000 {
             m.record_commit("自生词", "", t);
         }
         let e = m.freq_entry("自生词").unwrap();
-        assert_eq!(e.effective_frequency(), 100 + FREQ_ENHANCE_CAP, "增强封顶");
+        assert_eq!(e.delta, DELTA_ORGANIC_CAP, "有机增量封顶");
+        assert!(e.effective_frequency() <= SELF_GEN_FREQUENCY + DELTA_ORGANIC_CAP as u64);
+    }
+
+    #[test]
+    fn manual_adjust_moves_delta_both_ways() {
+        let t = now();
+        let mut m = MemoryLayer::default();
+        // #freq/up:种子词补继承 base。
+        m.apply_manual_adjust("异步", "yibu", FREQ_MANUAL_STEP, Some(100_000));
+        let e = m.freq_entry("异步").unwrap();
+        assert_eq!((e.base, e.delta, e.count), (100_000, FREQ_MANUAL_STEP, 0), "手工不计 count");
+        m.apply_manual_adjust("异步", "yibu", FREQ_MANUAL_STEP, Some(100_000));
+        assert_eq!(m.freq_entry("异步").unwrap().delta, 2 * FREQ_MANUAL_STEP);
+        // 连续 down 穿过 0:底限在 effective 读取时夹取,账本只夹 ±CEIL。
+        for _ in 0..10 {
+            m.apply_manual_adjust("异步", "yibu", -FREQ_MANUAL_STEP, None);
+        }
+        let e = m.freq_entry("异步").unwrap();
+        assert_eq!(e.delta, -DELTA_CEIL, "账本夹总顶/总底");
+        assert_eq!(
+            e.effective_frequency(),
+            (100_000.0 * DELTA_FLOOR_RATIO) as u64,
+            "有效频率底限 = base×0.5(④不埋葬)"
+        );
+    }
+
+    #[test]
+    fn rel_normalizes_against_corpus_mean() {
+        // ⑤:同样 count=3,冷门词库(均值低)满加成,热门词库(均值高)减半。
+        let t = now();
+        let mut cold = MemoryLayer::default();
+        for _ in 0..3 {
+            cold.record_commit_weighted("唯一", "weiyi", t, Some(50_000));
+        }
+        let mut hot = MemoryLayer::default();
+        for w in ["a", "b", "c", "d", "e", "f", "g"] {
+            for _ in 0..30 {
+                hot.record_commit_weighted(w, "", t, Some(50_000));
+            }
+        }
+        for _ in 0..3 {
+            hot.record_commit_weighted("新词", "xinci", t, Some(50_000));
+        }
+        let d_cold = cold.freq_entry("唯一").unwrap().delta;
+        let d_hot = hot.freq_entry("新词").unwrap().delta;
+        assert!(d_cold > d_hot, "冷库 rel 高、热库 rel 低: {d_cold} vs {d_hot}");
     }
 
     #[test]
@@ -397,9 +531,9 @@ mod tests {
 
         // L2:频率表(含继承频率)+ 时间表都在。
         let e = l2.freq_entry("你好").unwrap();
-        assert_eq!((e.pinyin.as_str(), e.frequency), ("nihao", 42_000));
+        assert_eq!((e.pinyin.as_str(), e.base), ("nihao", 42_000));
         assert_eq!(l2.recent_ms("你好"), Some(t));
-        assert_eq!(l2.freq_entry("自生词").unwrap().frequency, SELF_GEN_FREQUENCY);
+        assert_eq!(l2.freq_entry("自生词").unwrap().base, SELF_GEN_FREQUENCY);
     }
 
     #[test]
@@ -411,7 +545,7 @@ mod tests {
             t,
         );
         m.load_legacy_recent(vec![("旧表词".into(), t - 60_000)], t);
-        assert_eq!(m.freq_entry("有效").unwrap().frequency, 7_000);
+        assert_eq!(m.freq_entry("有效").unwrap().base, 7_000);
         assert_eq!(m.recent_ms("有效"), Some(t - 1_000));
         assert!((m.recency_boost("旧表词", t) - RECENCY_GAIN_MAX).abs() < 0.01, "旧 recency 表迁移种子生效(仅时间表)");
         assert!(m.freq_entry("旧表词").is_none(), "旧表种子不进频率表");

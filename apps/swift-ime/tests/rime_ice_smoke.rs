@@ -27,7 +27,7 @@ fn engine_with_rime() -> ImeEngine {
     let wordlist = Path::new(&format!("{pkg}/assets/dict/hermitdave/en_freq.tsv"))
         .exists()
         .then(|| format!("{pkg}/assets/dict/hermitdave/en_freq.tsv"));
-    let mut engine = ImeEngine::with_config(
+    let engine = ImeEngine::with_config(
         PinyinWeights::default(),
         EnglishWeights::default(),
         wordlist,

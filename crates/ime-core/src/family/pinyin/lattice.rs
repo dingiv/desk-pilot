@@ -172,15 +172,12 @@ pub struct LatticeDecoder {
     max_freq: f64,
 }
 
-/// overlay 旁路频率表:拼音 → (词, 基础频率, count)。
-pub type OverlayMap = HashMap<String, Vec<(String, u64, u32)>>;
+/// overlay 旁路频率表:拼音 → (词, 有效频率)。
+/// (有效频率在灌入时由 store::memory::effective_frequency(base, delta)
+/// 算好 —— 旁路词典只消费结果,不持有账本字段。)
+pub type OverlayMap = HashMap<String, Vec<(String, u64)>>;
 /// overlay 声母索引:声母串 → (拼音, 词, 有效频率)。
 pub type OverlayInitialsIndex = HashMap<String, Vec<(String, String, u64)>>;
-
-/// overlay 有效频率(与 store::memory 同公式:基础 + count×10 封顶 5000)。
-fn effective(base: &u64, count: u32) -> u64 {
-    base.saturating_add((count as u64 * 10).min(5_000))
-}
 
 impl LatticeDecoder {
     /// Build from an already-loaded FST. `fst_path` is the original .fst file path; the `.idx`
@@ -273,13 +270,14 @@ impl LatticeDecoder {
 
     /// 整体替换 overlay 旁路词典(round19):L2 OverlayDict flush/冷加载
     /// 后由家族侧调用(生成号比对,避免每查询重灌)。
-    pub fn set_overlay_entries(&self, rows: &[(String, String, u64, u32)]) {
+    pub fn set_overlay_entries(&self, rows: &[(String, String, u64, i64, u32)]) {
         let mut map: OverlayMap = HashMap::new();
         let mut imap: OverlayInitialsIndex = HashMap::new();
-        for (word, pinyin, freq, count) in rows {
+        for (word, pinyin, base, delta, _count) in rows {
+            let f = crate::store::memory::effective_frequency(*base, *delta);
             map.entry(pinyin.clone())
                 .or_default()
-                .push((word.clone(), *freq, *count));
+                .push((word.clone(), f));
             // 声母索引:与种子 initials_index 同构(Mixed/Initials 对齐用)。
             if let Some(seg) = inputx_pinyin::segment(pinyin).into_iter().next() {
                 let initials: String =
@@ -287,7 +285,7 @@ impl LatticeDecoder {
                 if initials.len() >= 2 {
                     imap.entry(initials)
                         .or_default()
-                        .push((pinyin.clone(), word.clone(), effective(freq, *count)));
+                        .push((pinyin.clone(), word.clone(), f));
                 }
             }
         }
@@ -518,12 +516,11 @@ impl LatticeDecoder {
         // 同词双册(FST + overlay)时 overlay 有效频率胜出(越热越权威)。
         let ov = self.overlay.read().unwrap();
         if let Some(rows) = ov.get(pinyin) {
-            for (w, base, count) in rows {
-                let f = effective(base, *count);
+            for (w, f) in rows {
                 if let Some(e) = out.iter_mut().find(|(t, _)| t == w) {
-                    e.1 = f;
+                    e.1 = *f;
                 } else {
-                    out.push((w.clone(), f));
+                    out.push((w.clone(), *f));
                 }
             }
         }
@@ -545,10 +542,10 @@ impl LatticeDecoder {
         {
             let ov = self.overlay.read().unwrap();
             for (code, rows) in ov.iter().filter(|(c, _)| c.starts_with(input)) {
-                for (word, base, count) in rows {
+                for (word, f) in rows {
                     results.push(LatticeResult {
                         text: word.clone(),
-                        freq_score: effective(base, *count) as f64,
+                        freq_score: *f as f64,
                         match_type: MatchType::Prefix,
                         pinyin: code.clone(),
                     });
@@ -609,11 +606,11 @@ impl LatticeDecoder {
         {
             let ov = self.overlay.read().unwrap();
             if let Some(rows) = ov.get(input) {
-                for (word, base, count) in rows {
+                for (word, f) in rows {
                     if !results.iter().any(|r| &r.text == word) {
                         results.push(LatticeResult {
                             text: word.clone(),
-                            freq_score: effective(base, *count) as f64,
+                            freq_score: *f as f64,
                             match_type: MatchType::Full,
                             pinyin: input.to_string(),
                         });
