@@ -31,9 +31,12 @@ struct MenuState {
     effective: u64,
 }
 
-/// 结果态:已记账,展示 before → after。
+/// 结果态:已记账,回显完整命令形态(`women'#freq/down/1000`)+ 变化量。
 struct AppliedState {
+    /// 触发本次记账的命令输入(菜单态 = "#freq/up";带参态 = "#freq/up/10000")。
+    input: String,
     word: String,
+    cmd: String,
     before: u64,
     after: u64,
 }
@@ -48,19 +51,36 @@ impl FreqMember {
         FreqMember { menu: None, applied: None }
     }
 
-    /// 命令输入 → 方向(Some(1)=up, Some(-1)=down, None=查询)。
-    fn direction_of(input: &str) -> Option<i64> {
-        match input.trim_start_matches('#') {
-            "freq/up" => Some(1),
-            "freq/down" => Some(-1),
-            _ => None,
-        }
+    /// 命令输入 → (方向, 步长参数)。方向:Some(1)=up / Some(-1)=down /
+    /// None=查询;步长:完整命令形态 `#freq/down/1000` 的量级参数
+    ///(无参 → None,走量化菜单)。
+    fn parse(input: &str) -> (Option<i64>, Option<i64>) {
+        let rest = input.trim_start_matches('#').strip_prefix("freq").unwrap_or("");
+        let mut segs = rest.trim_start_matches('/').split('/');
+        let dir = match segs.next() {
+            Some("up") => Some(1),
+            Some("down") => Some(-1),
+            _ => return (None, None),
+        };
+        let mag = segs.next().and_then(|s| s.parse::<i64>().ok());
+        (dir, mag)
     }
 
     /// 词条当前有效频率(±0 询问:step=0 不改账本;未入册词条此时顺手
     /// 建账,返回建账后的有效频率,避免首查显示 0)。
     fn effective_of(env: &dyn FamilyEnv, root: &str, word: &str) -> Option<u64> {
         env.adjust_word_freq(root, word, 0).map(|(_, after)| after)
+    }
+
+    /// 结果视图(单一出口:完整命令 · before → after,提交 raw = 词)。
+    fn result_view(&self) -> Vec<Prediction> {
+        let Some(a) = &self.applied else {
+            return Vec::new();
+        };
+        vec![Prediction::commit_raw(
+            format!("{} · {} → {}", a.cmd, a.before, a.after),
+            a.word.clone(),
+        )]
     }
 }
 
@@ -106,19 +126,38 @@ impl MagicMember for FreqMember {
         }
         let root = upstream.root_text.clone();
 
-        // 结果视图(输入未变):已记账 → 展示 before → after,空格提交词。
+        // 结果视图(同词条已记账):回显**完整命令形态** + 变化量,
+        // 空格提交该词(round23:选中档位后提示补全为 women'#freq/down/1000)。
         if let Some(a) = &self.applied {
-            if a.word == word {
-                let arrow = if a.after >= a.before { "↑" } else { "↓" };
+            if a.word == word && a.input == input {
                 return vec![Prediction::commit_raw(
-                    format!("{} {arrow} 词频 {} → {}", a.word, a.before, a.after),
+                    format!("{} · {} → {}", a.cmd, a.before, a.after),
                     a.word.clone(),
                 )];
             }
         }
         self.applied = None;
 
-        match Self::direction_of(input) {
+        let (dir_of, mag) = Self::parse(input);
+        // 完整命令形态(#freq/down/1000):带参直接执行(幂等:同输入同词只记一次)。
+        if let (Some(dir), Some(step)) = (dir_of, mag) {
+            let Some(eff) = Self::effective_of(env, &root, &word) else {
+                return vec![Prediction::interactive("(词频调整未接线)")];
+            };
+            let _ = eff;
+            let (before, after) = env
+                .adjust_word_freq(&root, &word, step * dir)
+                .unwrap_or((0, 0));
+            self.applied = Some(AppliedState {
+                input: input.to_string(),
+                word: word.clone(),
+                cmd: format!("{root}'#freq/{}/{}", if dir > 0 { "up" } else { "down" }, step),
+                before,
+                after,
+            });
+            return self.result_view();
+        }
+        match dir_of {
             None => {
                 // 查询视图:`#freq` = 当前有效频率(±0),up/down 由补全提示续入。
                 match Self::effective_of(env, &root, &word) {
@@ -168,7 +207,14 @@ impl MagicMember for FreqMember {
             .adjust_word_freq(&menu.root, &menu.word, delta)
             .unwrap_or((menu.effective, menu.effective));
         self.applied = Some(AppliedState {
+            input: menu.input,
             word: menu.word,
+            cmd: format!(
+                "{}'#freq/{}/{}",
+                menu.root,
+                if menu.dir > 0 { "up" } else { "down" },
+                step
+            ),
             before,
             after,
         });
@@ -189,10 +235,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direction_parses_paths() {
-        assert_eq!(FreqMember::direction_of("#freq"), None, "裸查询");
-        assert_eq!(FreqMember::direction_of("#freq/up"), Some(1));
-        assert_eq!(FreqMember::direction_of("#freq/down"), Some(-1));
-        assert_eq!(FreqMember::direction_of("#freq/sideways"), None);
+    fn parses_paths_and_magnitude_args() {
+        assert_eq!(FreqMember::parse("#freq"), (None, None), "裸查询");
+        assert_eq!(FreqMember::parse("#freq/up"), (Some(1), None), "方向菜单");
+        assert_eq!(FreqMember::parse("#freq/down"), (Some(-1), None));
+        assert_eq!(FreqMember::parse("#freq/down/1000"), (Some(-1), Some(1000)), "完整命令形态");
+        assert_eq!(FreqMember::parse("#freq/up/abc"), (Some(1), None), "非数字参数回退菜单");
+        assert_eq!(FreqMember::parse("#freq/sideways"), (None, None));
     }
 }

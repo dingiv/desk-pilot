@@ -697,8 +697,8 @@ fn freq_magic_adjusts_word_frequency() {
     eng.predict(KeyEvent { kind: ime_core::fsm::key::KeyKind::Digit(5), ctrl: false, shift: false, alt: false });
     let result = eng.candidates();
     assert!(
-        result.iter().any(|c| c.contains("异步") && c.contains("↑")),
-        "applied view shows before → after: {result:?}"
+        result.iter().any(|c| c.contains("'#freq/up/10000") && c.contains("30000 → 40000")),
+        "applied view echoes the complete command form: {result:?}"
     );
     // 空格提交 → 结果视图的 raw(异步)上屏。
     let v = eng.predict(KeyEvent::space());
@@ -712,4 +712,26 @@ fn freq_magic_adjusts_word_frequency() {
     let pos2 = cands2.iter().position(|c| c == "异步").expect("异步 still present");
     assert!(pos2 <= 3, "异步 boosted after #freq/up +10000 (was {pos}, now {pos2}): {:?}",
         cands2.iter().take(5).collect::<Vec<_>>());
+}
+
+#[test]
+fn freq_magic_direct_magnitude_arg_form() {
+    // round23:完整命令形态一步到位 —— `yibu'#freq/down/1000`(菜单选档
+    // 后回显的同款字符串,直接输入也成立)。
+    let mut eng = ImeEngine::new();
+    for c in "yibu".chars() {
+        eng.predict(KeyEvent::char(c));
+    }
+    let cands = eng.candidates();
+    let pos = cands.iter().position(|c| c == "异步").expect("异步 in panel");
+    for _ in 0..pos {
+        eng.predict(KeyEvent { kind: ime_core::fsm::key::KeyKind::Down, ctrl: false, shift: false, alt: false });
+    }
+    for c in "'#freq/down/1000".chars() {
+        eng.predict(KeyEvent::char(c));
+    }
+    // 参数输入态 submit(空格 force_fire):#freq 带参形态沿用 #del 语义
+    // —— 触发即提交(操作对象 = 锚定的高亮词,非上游 top1)。
+    let v = eng.predict(KeyEvent::space());
+    assert_eq!(commit(&v), "异步", "fires the anchored word in one step");
 }

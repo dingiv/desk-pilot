@@ -505,11 +505,16 @@ impl SessionState {
                 _ => (input.clone(), vec![]),
             };
             let upstream_buf = join_segments(&prefix);
+            // 锚点重排(与 query_chained_mock 同一规则):强触发也以分链时
+            // 的高亮词为操作对象,不是上游 top1。
+            let mut upstream_cands = self.eval_upstream(&upstream_buf, env);
+            if let Some(anchor) = self.chain_anchor.clone() {
+                if let Some(pos) = upstream_cands.iter().position(|c| *c == anchor) {
+                    upstream_cands.swap(0, pos);
+                }
+            }
             let upstream = ChainContext {
-                items: chain_context_items(
-                    &upstream_buf,
-                    &self.eval_upstream(&upstream_buf, env),
-                ),
+                items: chain_context_items(&upstream_buf, &upstream_cands),
                 root_text: split_segments(&input)
                     .into_iter()
                     .find_map(|s| match s {
