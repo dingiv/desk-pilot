@@ -371,6 +371,10 @@ pub(crate) struct PostOutcome {
     pub full_comp_count: usize,
 }
 
+/// 造词单字区之前的真词头窗口(见 postprocess 内注释:多音节输入时
+/// 多字词优先,单字区后靠)。
+const COMPOSE_HEAD_WORDS: usize = 10;
+
 /// Stage 3 后处理纯函数(round13 四步显式化):
 /// ① **家族间综合评分**(merge:×priority / 全局排序 / 跨家族去重);
 /// ② **评分微调**(promote_single_letter 置顶 + FilterChain Drop/Demote);
@@ -410,12 +414,17 @@ pub(crate) fn postprocess(req: PostRequest, env: &dyn StepEnv) -> PostOutcome {
         //    词头只收**真词**(非 decomp 链:X食品 类拼接对逐字造词
         //    无价值);嵌入词典场景全 decomp 时保底收首候选(nihao 的
         //    "你好"也是链,head 空会让单字区顶到槽 1,space 变部分提交)。
+        //    窗口取 10(修 round20 反馈:yibu → 异步被挤到 #38):
+        //    多音节输入的意图首先是多字词,真词头必须整页优先于造词
+        //    单字区 —— 旧窗口 4 远小于单字区 32,词头之后的全部真词
+        //    (如 #5 的异步)被活埋在 32 个单字后面。10 ≈ 覆盖第一页
+        //    真词 + 余量,单字区从第二页起仍可翻页直达。
         let real_words: Vec<usize> = items
             .iter()
             .enumerate()
             .filter(|(_, it)| it.meta.source != "decomp")
             .map(|(i, _)| i)
-            .take(4)
+            .take(COMPOSE_HEAD_WORDS)
             .collect();
         let real_words = if real_words.is_empty() { vec![0] } else { real_words };
         let texts: Vec<String> = items.iter().map(|it| it.text.clone()).collect();
