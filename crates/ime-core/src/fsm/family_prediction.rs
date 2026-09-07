@@ -600,6 +600,13 @@ impl SessionState {
             self.comp.buffer.push('\'');
             self.comp.raw_buffer.push('\'');
             self.comp.sync_preedit();
+            // 单链 + 尾分隔(women'):面板**整页原样**(含英文候选与高亮,
+            // 链式一贯行为)—— 只更新 preedit,不重查。多链/后续字符照旧
+            // 走链式组合。
+            let parts: Vec<&str> = self.comp.buffer.split('\'').collect();
+            if parts.len() == 2 && parts[1].is_empty() && !parts[0].is_empty() {
+                return self.make_view();
+            }
             self.panel.fresh = false;
             return self.query_pinyin(env);
         }

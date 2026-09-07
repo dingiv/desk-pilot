@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use super::member::{CommandArgs, MagicMember, Prediction};
+use super::member::{preview_text, CommandArgs, MagicMember, Prediction};
 use super::MagicResources;
 use super::FamilyEnv;
 
@@ -54,6 +54,25 @@ impl MagicMember for SnippetMember {
         let raw = input.strip_prefix('#').unwrap_or(input);
         let args = CommandArgs::parse(raw);
         let name = args.path.first().cloned().unwrap_or_default();
+        // 裸 `#`(无路径):列出全部片段(名称 + 备注预览,选前 8 条)——
+        // 用户从这里看到有什么可用,再续 `/name` 展开。
+        if name.is_empty() {
+            let snippets = self.resources.snippets.lock().unwrap();
+            let mut list: Vec<_> = snippets.iter().collect();
+            list.sort_by_key(|(n, _)| (*n).clone());
+            return list
+                .into_iter()
+                .take(8)
+                .map(|(n, e)| {
+                    let preview = if e.comment.is_empty() {
+                        preview_text(&e.template, 24)
+                    } else {
+                        e.comment.clone()
+                    };
+                    Prediction::interactive(format!("/{n} — {preview}"))
+                })
+                .collect();
+        }
         let entry = self.resources.snippets.lock().unwrap().get(&name).cloned();
 
         match entry {

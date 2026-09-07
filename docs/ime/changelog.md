@@ -171,3 +171,19 @@
 - 存储只剩一套最新逻辑:overlay_freq(base/delta/count)+
   overlay_recent;旧库文件仅补 delta 列(schema 同步,无数据迁移)。
 - 验证:221 测试全绿;clippy 0;eval 持平 98.0/99.4。
+
+## round 23 — #freq 交互改版(查询视图 + 量化步长菜单)
+
+用户规格逐项落地(women 序列实测对齐):
+- `women'`(单链尾分隔):面板**整页原样**(含英文候选与高亮)—— 只更新
+  preedit 不重查;此前重查丢失英文候选。
+- `women'#`(裸 #):路由到空名 snippet 成员,列出全部片段(/angle …)。
+- `women'#freq`(裸查询):视图 `women:[有效频率]±0` + up/down 补全。
+- `women'#freq/up|down`:量化步长菜单 ±0/10/100/1000/10000(interactive
+  + 数字键选档,member.pick 记账 → 结果视图 before→after,空格提交该词),
+  取代旧的一次性 ±25k;`magic.selectable` 放宽为"预测含交互项即可选"。
+- **修复 CLI 展示模式污染账本**:show_candidates_with_async 末尾 Enter(raw
+  强选,会学习)改 Escape 复位 —— 此前每次诊断运行都把 buffer 全文记成
+  一次提交(women 莫名 +1600 的根因;weight-scoring.md 评测注意事项的
+  同一教训)。
+- 验证:221 全绿;clippy 0;eval 持平 98.0/99.4。

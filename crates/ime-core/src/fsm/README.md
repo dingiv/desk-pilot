@@ -77,3 +77,6 @@ MergedDict
 另一层架构呢，是持久化了的overlay数据。那么，它的数据量是比较大的。每一次启动冷加载, 现在呢，我们新的设计之后呢，就它就不需要再和seed dict进行合并了。它单独作为一层。它单独作为一层。然后呢？每次当……Overlay data它的数量达到某一个级别的时候呢？它就从 overlay data 里面持久化到 overlay dict 里面。一旦被持久化到 overlay dict 里面，我们就需要将当前 overlay data 里面的数据进行清空，因为这里面的数据已经被移动到 overlay dict 里面去了。
 
  那最后一层呢，就是我们的系统seed词典。这一层是不可变的。
+
+
+

@@ -239,8 +239,15 @@ impl PinyinFamily {
     fn predict_chained(&self, input: &str) -> Vec<ScoredCandidate> {
         self.sync_lattice_overlay();
         let chains: Vec<&str> = input.split('\'').filter(|s| !s.is_empty()).collect();
+        // 尾空链(`women'`,用户刚键入分隔符还未打下游):**透明透传** ——
+        // 直接展示上游单链的预测页(round22 需求:高亮/页面在键入 ' 的
+        // 那一刻不变,链式一贯行为)。
+        if input.ends_with('\'') && chains.len() == 1 {
+            return self.predict(chains[0], &InputContext::new());
+        }
         if chains.len() < 2 {
-            // 单链(`ti'`)或纯分隔(`''`,P2 空链语义)—— 未完成,等用户继续。
+            // 单链(`ti'` 已由上面透传)或纯分隔(`''`,P2 空链语义)——
+            // 未完成,等用户继续。
             return Vec::new();
         }
 

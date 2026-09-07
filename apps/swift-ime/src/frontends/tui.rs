@@ -293,7 +293,10 @@ fn show_candidates_with_async(
         if candidates.is_empty() { println!("(no candidates)"); }
     }
 
-    engine.predict(KeyEvent::enter());
+    // Escape 复位(不学习):展示模式不得污染用户账本。此前用 Enter 收尾
+    // 是 raw 强选 —— 每次诊断运行都会把 buffer 全文记成一次提交(recency
+    // /增量账本,见 weight-scoring.md 的评测注意事项,同一教训)。
+    engine.predict(KeyEvent::escape());
     candidates
 }
 

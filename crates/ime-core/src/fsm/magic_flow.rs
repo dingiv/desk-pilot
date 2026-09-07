@@ -143,7 +143,10 @@ impl SessionState {
                 };
                 self.magic.predictions = preds;
                 self.magic.hints.clear();
-                self.magic.selectable = cmd == format!("#{name}");
+                // 可选中:裸命令名(历史语义)或预测含交互项(#freq 步长
+                // 菜单一类:数字键选档,选中经 pick 回调)。
+                self.magic.selectable = cmd == format!("#{name}")
+                    || self.magic.predictions.iter().any(|p| p.interactive);
             }
             // 片段命令(X'#/hello):片段展开 × 上游拼接(片段不感知上下文)。
             MagicMatch::Snippet => {

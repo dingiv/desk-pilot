@@ -367,8 +367,10 @@ impl MagicFamily {
     ///
     /// 见 [`MagicMatch`]。
     pub fn match_command(&self, input: &str) -> MagicMatch {
-        // 片段命令:`#/hello?name=Mike` → 空名命令。
-        if input.starts_with("#/") {
+        // 片段命令:`#/hello?name=Mike` → 空名命令;裸 `#`(用户刚键入
+        // 触发符)同样路由到片段成员 —— 列出全部片段供挑选(round22 需求:
+        // 单独一个 # 与 snippet 的空 # 魔法命令对得上)。
+        if input.starts_with("#/") || input == "#" {
             return MagicMatch::Snippet;
         }
         if input.len() < 2 || !input.starts_with('#') {
