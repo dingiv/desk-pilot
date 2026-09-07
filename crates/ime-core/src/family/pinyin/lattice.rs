@@ -429,9 +429,12 @@ impl LatticeDecoder {
     }
 
     fn save_cache(&self) {
-        // Build the blob once, then write to the first writable candidate (beside the .fst in
-        // dev; the user dir when the system dir is read-only). Failing all is fine — next start
-        // rebuilds.
+        // Build the blob once, then write to the user data dir only. The
+        // beside-the-.fst candidate is READ-only preference (dev ships one in
+        // the repo); writing there is never attempted — the deb's system dict
+        // dir is read-only, and a guaranteed-failing attempt just spams the
+        // log with a permission error (round24 修复)。Failing all is fine —
+        // next start rebuilds.
         let mut buf = format!(
             "{} {} {}\n",
             Self::CACHE_MAGIC_V2,
@@ -451,7 +454,8 @@ impl LatticeDecoder {
                 buf.extend_from_slice(&freq.to_le_bytes());
             }
         }
-        for cp in Self::cache_paths(&self.fst_path) {
+        // 跳过首迷( .fst 旁,读偏好),只写 DATA 命名空间用户路径。
+        for cp in Self::cache_paths(&self.fst_path).into_iter().skip(1) {
             if let Some(parent) = cp.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
