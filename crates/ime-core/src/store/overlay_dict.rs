@@ -104,26 +104,24 @@ impl OverlayDict {
         self.recent.get(word).copied()
     }
 
-    /// 近期指数(时间表 + 频次增强;与 L1 同档位边界)。
-    pub fn tier(&self, word: &str, now_ms: i64) -> u32 {
-        const T10S: i64 = 10_000;
-        const T1H: i64 = 3_600_000;
-        const T5H: i64 = 18_000_000;
-        const T1D: i64 = 86_400_000;
+    /// 近期指数(连续 0..=5,与 L1 同一半衰期/同频次增强公式;见
+    /// [`crate::store::memory::MemoryLayer::tier`])。L2 只读:过期条目
+    /// 不惰性删,留待下次 flush 清理。
+    pub fn tier(&self, word: &str, now_ms: i64) -> f64 {
         const T3D: i64 = 259_200_000;
         let Some(&last) = self.recent.get(word) else {
-            return 0;
+            return 0.0;
         };
-        let base = match now_ms - last {
-            age if age <= T10S => 5,
-            age if age <= T1H => 4,
-            age if age <= T5H => 3,
-            age if age <= T1D => 2,
-            age if age <= T3D => 1,
-            _ => return 0, // L2 过期条目留待下次 flush 清理,不惰性删
-        };
+        let age = now_ms - last;
+        if age > T3D {
+            return 0.0;
+        }
+        let b_time =
+            crate::store::memory::RECENCY_MAX * 0.5f64.powf(age as f64
+                / crate::store::memory::RECENCY_HALF_LIFE_MS as f64);
         let count = self.freq.get(word).map(|e| e.count).unwrap_or(0);
-        (base + u32::from(count >= 3)).min(5)
+        let bonus = (count as f64 / 3.0).min(1.0);
+        (b_time + bonus).min(crate::store::memory::RECENCY_MAX)
     }
 
     /// 冷加载(启动)。
@@ -239,8 +237,8 @@ mod tests {
             vec![("刚用".into(), "gangyong".into(), 500, 1)],
             vec![("刚用".into(), t - 5_000)],
         );
-        assert_eq!(l2.tier("刚用", t), 5, "L1 miss → L2 时间表穿透");
-        assert_eq!(l2.tier("不存在", t), 0);
+        assert!((l2.tier("刚用", t) - crate::store::memory::RECENCY_MAX).abs() < 1e-6, "L1 miss → L2 时间表穿透");
+        assert_eq!(l2.tier("不存在", t), 0.0);
     }
 
     #[test]

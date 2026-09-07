@@ -76,7 +76,7 @@ effective_frequency = frequency + min(count × 10, 5_000)
 |---|---|
 | `record_commit_weighted(word, pinyin, now, weight)` | 提交登记:映射对 + 计数 +1 + 继承/设定权威权重 |
 | `register_self_generated(word, pinyin)` | 自生词入册(count=0,基础频率 100) |
-| `tier(word, now) -> 0..5` | 近期指数:时间 5 档 + 频次增强(≥3 次提交档位+1,封顶 5);>3 天移出 |
+| `tier(word, now) -> f64` | 近期指数(**连续** 0..=5,round20 指数衰减 + count 线性增强;>3 天移出) |
 | `effective_frequency()` | 基础频率 + count 增强(读取时派生) |
 | `flush_into(&OverlayDict)` | 达阈值整体搬入 L2 |
 | `load_legacy / load_legacy_recent` | 旧 memory 单表 / 旧 recency 表迁移 |

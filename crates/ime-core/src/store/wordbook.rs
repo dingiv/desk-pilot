@@ -111,12 +111,13 @@ impl WordBook {
         n
     }
 
-    /// tier 三级穿透(round19):L1 时间表 miss → L2 时间表
-    /// (flush 清空 L1 后,刚沉淀的词不丢近期加成)。
-    pub fn tier(&self, word: &str, now_ms: i64) -> u32 {
+    /// 近期指数(连续 0..=5,round20 连续衰减;见
+    /// [`crate::store::memory::MemoryLayer::tier`]):L1 时间表 miss →
+    /// L2 时间表(flush 清空 L1 后,刚沉淀的词不丢近期加成)。
+    pub fn tier(&self, word: &str, now_ms: i64) -> f64 {
         let mut l1 = self.memory.lock().unwrap();
         let t = l1.tier(word, now_ms);
-        if t > 0 {
+        if t > 0.0 {
             return t;
         }
         drop(l1);
