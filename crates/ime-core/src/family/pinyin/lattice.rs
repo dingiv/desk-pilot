@@ -150,6 +150,13 @@ pub enum MatchType {
 pub struct LatticeDecoder {
     /// FST dict (for frequency scores and code lookup).
     fst: inputx_fsa::Dict<Vec<u8>>,
+    /// overlay 旁路词典(round19):L2 OverlayDict 的 (word, 基础频率,
+    /// count),按拼音索引。自生词/沉淀词不在 FST 里 —— 查询点全部与
+    /// FST 合并,lattice 预测(含长句切分对齐)对自生词生效。
+    /// RwLock:运行时 flush/冷加载后整体替换(生成号驱动,见家族侧)。
+    overlay: std::sync::RwLock<OverlayMap>,
+    /// overlay 声母索引(随 set_overlay_entries 重建;Mixed/Initials 对齐)。
+    overlay_initials: std::sync::RwLock<OverlayInitialsIndex>,
     /// Initials index: "gysj" → [(pinyin, word, freq), ...].
     /// Stores full pinyin code for pattern verification.
     initials_index: HashMap<String, Vec<(String, String, u64)>>,
@@ -165,6 +172,16 @@ pub struct LatticeDecoder {
     max_freq: f64,
 }
 
+/// overlay 旁路频率表:拼音 → (词, 基础频率, count)。
+pub type OverlayMap = HashMap<String, Vec<(String, u64, u32)>>;
+/// overlay 声母索引:声母串 → (拼音, 词, 有效频率)。
+pub type OverlayInitialsIndex = HashMap<String, Vec<(String, String, u64)>>;
+
+/// overlay 有效频率(与 store::memory 同公式:基础 + count×10 封顶 5000)。
+fn effective(base: &u64, count: u32) -> u64 {
+    base.saturating_add((count as u64 * 10).min(5_000))
+}
+
 impl LatticeDecoder {
     /// Build from an already-loaded FST. `fst_path` is the original .fst file path; the `.idx`
     /// cache lives in the USER data dir (`~/.desk-pilot/`), not next to the .fst — the .fst may
@@ -173,6 +190,8 @@ impl LatticeDecoder {
         let fst_len = std::fs::metadata(fst_path).map(|m| m.len()).unwrap_or(0);
         let mut decoder = LatticeDecoder {
             fst,
+            overlay: std::sync::RwLock::new(HashMap::new()),
+            overlay_initials: std::sync::RwLock::new(HashMap::new()),
             initials_index: HashMap::new(),
             fst_path: fst_path.to_string(),
             fst_len,
@@ -250,6 +269,34 @@ impl LatticeDecoder {
         );
         // Save cache for next time.
         self.save_cache();
+    }
+
+    /// 整体替换 overlay 旁路词典(round19):L2 OverlayDict flush/冷加载
+    /// 后由家族侧调用(生成号比对,避免每查询重灌)。
+    pub fn set_overlay_entries(&self, rows: &[(String, String, u64, u32)]) {
+        let mut map: OverlayMap = HashMap::new();
+        let mut imap: OverlayInitialsIndex = HashMap::new();
+        for (word, pinyin, freq, count) in rows {
+            map.entry(pinyin.clone())
+                .or_default()
+                .push((word.clone(), *freq, *count));
+            // 声母索引:与种子 initials_index 同构(Mixed/Initials 对齐用)。
+            if let Some(seg) = inputx_pinyin::segment(pinyin).into_iter().next() {
+                let initials: String =
+                    seg.syllables.iter().filter_map(|s| s.chars().next()).collect();
+                if initials.len() >= 2 {
+                    imap.entry(initials)
+                        .or_default()
+                        .push((pinyin.clone(), word.clone(), effective(freq, *count)));
+                }
+            }
+        }
+        for v in imap.values_mut() {
+            v.sort_by_key(|(_, _, f)| std::cmp::Reverse(*f));
+            v.truncate(64);
+        }
+        *self.overlay.write().unwrap() = map;
+        *self.overlay_initials.write().unwrap() = imap;
     }
 
     /// 该 FST 是否携带**真实词频梯度**(rime-ice 类,max_freq 为实际最大
@@ -461,11 +508,26 @@ impl LatticeDecoder {
     /// 全拼命中的所有 (word, freq) 对 —— 供上下文感知的"前缀整词联想"
     /// (prev_pinyin + input 拼起来查整词)。
     pub fn words_for(&self, pinyin: &str) -> Vec<(String, u64)> {
-        self.fst
+        let mut out: Vec<(String, u64)> = self
+            .fst
             .get(pinyin.as_bytes())
             .iter()
             .map(|(item, value)| (String::from_utf8_lossy(item).into_owned(), *value))
-            .collect()
+            .collect();
+        // overlay 旁路(round19):自生词/沉淀词与 FST 词条同台。
+        // 同词双册(FST + overlay)时 overlay 有效频率胜出(越热越权威)。
+        let ov = self.overlay.read().unwrap();
+        if let Some(rows) = ov.get(pinyin) {
+            for (w, base, count) in rows {
+                let f = effective(base, *count);
+                if let Some(e) = out.iter_mut().find(|(t, _)| t == w) {
+                    e.1 = f;
+                } else {
+                    out.push((w.clone(), f));
+                }
+            }
+        }
+        out
     }
 
     /// 前缀联想收集池上限:FST 按字典序遍历、回调无法中断,宽前缀
@@ -479,6 +541,20 @@ impl LatticeDecoder {
     /// `naozh` → `naozhong`(闹钟)—— 用户还在打字,联想出目标词。
     pub fn predict_prefix(&self, input: &str, max_results: usize) -> Vec<LatticeResult> {
         let mut results = Vec::new();
+        // overlay 前缀(round19):自生词/沉淀词参与前缀联想。
+        {
+            let ov = self.overlay.read().unwrap();
+            for (code, rows) in ov.iter().filter(|(c, _)| c.starts_with(input)) {
+                for (word, base, count) in rows {
+                    results.push(LatticeResult {
+                        text: word.clone(),
+                        freq_score: effective(base, *count) as f64,
+                        match_type: MatchType::Prefix,
+                        pinyin: code.clone(),
+                    });
+                }
+            }
+        }
         self.fst
             .prefix_for_each(input.as_bytes(), |code, item, value| {
                 if results.len() >= Self::PREFIX_SCAN_CAP {
@@ -529,6 +605,23 @@ impl LatticeDecoder {
         // 成 die|r(die 是合法音节挡路),exact 被整体跳过,"第二"消失,
         // dierge/diertian 更是全军覆没(只剩 Mixed 对齐的"跌入")。
         let mut results: Vec<LatticeResult> = Vec::new();
+        // ── overlay exact(round19):自生词/沉淀词与 FST exact 同台 ──
+        {
+            let ov = self.overlay.read().unwrap();
+            if let Some(rows) = ov.get(input) {
+                for (word, base, count) in rows {
+                    if !results.iter().any(|r| &r.text == word) {
+                        results.push(LatticeResult {
+                            text: word.clone(),
+                            freq_score: effective(base, *count) as f64,
+                            match_type: MatchType::Full,
+                            pinyin: input.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
         if has_valid_split(input) {
             self.fst
                 .get(input.as_bytes())
@@ -563,6 +656,24 @@ impl LatticeDecoder {
 
         // ── Mixed / Initials 变体(声母对齐),与 exact 命中合并 ──
         let initials: String = segments.iter().map(|s| s.initial()).collect();
+        // overlay 声母索引(round19):自生词参与 Mixed/Initials 对齐。
+        {
+            let oi = self.overlay_initials.read().unwrap();
+            if let Some(candidates) = oi.get(&initials) {
+                for (code, word, freq) in candidates {
+                    if pattern_match(code, &segments)
+                        && !results.iter().any(|r| &r.text == word)
+                    {
+                        results.push(LatticeResult {
+                            text: word.clone(),
+                            freq_score: *freq as f64,
+                            match_type,
+                            pinyin: code.clone(),
+                        });
+                    }
+                }
+            }
+        }
         if let Some(candidates) = self.initials_index.get(&initials) {
             for (code, word, freq) in candidates {
                 if pattern_match(code, &segments)

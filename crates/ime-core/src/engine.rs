@@ -406,6 +406,36 @@ impl ImeEngine {
         self.filters.len()
     }
 
+    /// 旧 memory 表迁移种子(round16 单表 → round19 分表):灌 L1。
+    pub fn warm_memory(&self, entries: Vec<(String, String, i64, u32, u64)>) {
+        if entries.is_empty() {
+            return;
+        }
+        let count = entries.len();
+        self.wordbook
+            .memory
+            .lock()
+            .unwrap()
+            .load_legacy(entries, crate::family::now_ms());
+        eprintln!("[ime-core] memory: migrated {count} legacy overlay entries");
+    }
+
+    /// L2 OverlayDict 冷加载(round19 三级架构)。
+    pub fn warm_overlay_dict(&self, freq: Vec<(String, String, u64, u32)>, recent: Vec<(String, i64)>) {
+        if freq.is_empty() && recent.is_empty() {
+            return;
+        }
+        let n = freq.len();
+        self.wordbook
+            .overlay_dict
+            .lock()
+            .unwrap()
+            .load(freq, recent);
+        // L2 → lattice overlay 旁路同步(round19):首查前即生效。
+        self.pinyin_family.sync_lattice_overlay();
+        eprintln!("[ime-core] overlay_dict: cold-loaded {n} freq entries");
+    }
+
     /// 临时关闭/恢复上下文感知(swift-ime.yaml → input.context_aware)。
     /// 同时作用于两个家族:拼音的 recency/整词联想/bigram,英文的 recency。
     /// 关闭后候选排序纯频率驱动。
@@ -1353,5 +1383,16 @@ mod tests {
         // A should still have "ni"
         let view = e.predict_ctx(1, ' ');
         assert!(ImeView::str_field(&view.commit_text).contains("你"));
+    }
+}
+
+/// 引擎关闭保底(round19):L1 工作集未达 flush 阈值也不丢 ——
+/// 无条件搬入 L2 并落盘(数据已搬走才允许连接关闭)。
+impl Drop for ImeEngine {
+    fn drop(&mut self) {
+        let n = self.wordbook.flush_now();
+        if n > 0 {
+            tracing::info!(n, "engine drop: flushed overlay workset into L2");
+        }
     }
 }

@@ -5,8 +5,8 @@ use self::phrase::PhraseBook;
 use super::{CandidateFamily, InputContext, ScoredCandidate};
 pub mod dict;
 pub mod lattice;
+pub mod merged;
 pub mod phrase;
-pub mod recency;
 
 
 use dict::LargeDict;
@@ -37,6 +37,9 @@ pub struct PinyinFamily {
     wordbook: std::sync::Arc<crate::store::wordbook::WordBook>,
     large_dict: Mutex<LargeDict>,
     lattice: Mutex<Option<lattice::LatticeDecoder>>,
+    /// lattice overlay 旁路的已同步生成号(round19):与 L2 OverlayDict
+    /// 的 generation 比对,变了才重灌(避免每查询重灌)。
+    overlay_gen: std::sync::atomic::AtomicU64,
     /// 运行时开关(AtomicBool:trait `set_family_enabled` 经 `&self` 写入)。
     enabled: AtomicBool,
     weights: PinyinWeights,
@@ -178,6 +181,7 @@ impl PinyinFamily {
             wordbook,
             large_dict: Mutex::new(LargeDict::new()),
             lattice: Mutex::new(None),
+            overlay_gen: std::sync::atomic::AtomicU64::new(0),
             enabled: AtomicBool::new(true),
             weights,
             freq_scale: scoring.freq_scale,
@@ -218,11 +222,7 @@ impl PinyinFamily {
     /// wall-clock time and double-writes the table to SQLite (full-snapshot
     /// replace, ≤512 rows) so the time-decay survives restarts.
     pub fn record_commit(&self, word: &str) {
-        let mut rec = self.wordbook.pinyin.recency.lock().unwrap();
-        rec.record(word, super::now_ms());
-        if let Some(ref store) = *self.wordbook.pinyin.store.lock().unwrap() {
-            store.save_recency(&rec.dump());
-        }
+        self.wordbook.record_commit(false, word);
     }
 
     // record_pick → 见下方「家族私有能力」区的全功能版(L0 + 前缀联想上下文)。
@@ -237,6 +237,7 @@ impl PinyinFamily {
     /// 某条链无候选(非法音节 / 英文串)→ 整体无组合(返回空)—— 上层
     /// 回退到常规候选路径,不会出现半截拼接。
     fn predict_chained(&self, input: &str) -> Vec<ScoredCandidate> {
+        self.sync_lattice_overlay();
         let chains: Vec<&str> = input.split('\'').filter(|s| !s.is_empty()).collect();
         if chains.len() < 2 {
             // 单链(`ti'`)或纯分隔(`''`,P2 空链语义)—— 未完成,等用户继续。
@@ -414,6 +415,22 @@ impl PinyinFamily {
     pub fn record_pick(&self, pinyin: &str, word: &str) {
         self.engine.dict().record_pick(pinyin, word);
         *self.last_commit.lock().unwrap() = (word.to_string(), pinyin.to_string());
+        // 统一记忆层:提交映射对(词 + 提交时拼音)+ 计数(round16);
+        // overlay 权重继承(round17):词在 SeedDict → 继承原始频率分,
+        // 否则按自生词默认权重(SELF_GEN_WEIGHT)。
+        let seed_freq = self.lattice.lock().unwrap().as_ref().and_then(|lat| {
+            lat.words_for(pinyin).into_iter().find(|(w, _)| w == word).map(|(_, f)| f)
+        });
+        self.wordbook
+            .memory
+            .lock()
+            .unwrap()
+            .record_commit_weighted(
+                word,
+                pinyin,
+                super::now_ms(),
+                Some(seed_freq.unwrap_or(crate::store::memory::SELF_GEN_FREQUENCY)),
+            );
         // Persist the L0 user model (pins + pick counters) — same double-write
         // cadence as recency, so the 3-pick auto-pin survives restarts.
         if let Some(ref store) = *self.wordbook.pinyin.store.lock().unwrap() {
@@ -432,6 +449,7 @@ impl PinyinFamily {
 
     /// 自生词流程:多字拼音逐字选择组成的整体,无条件加入单词本。
     pub fn learn_composed_phrase(&self, pinyin: &str, hanzi: &str) {
+        self.wordbook.register_memory(pinyin, hanzi);
         self.learn_phrase_inner(pinyin, hanzi);
     }
 
@@ -482,8 +500,12 @@ impl PinyinFamily {
     pub fn warm_recencies(&self, entries: Vec<(String, i64)>) {
         if !entries.is_empty() {
             let count = entries.len();
-            self.wordbook.pinyin.recency.lock().unwrap().load_bulk(entries, super::now_ms());
-            eprintln!("[ime-core] pinyin: warmed {count} recency entries from store");
+            self.wordbook
+                .memory
+                .lock()
+                .unwrap()
+                .load_legacy_recent(entries, super::now_ms());
+            eprintln!("[ime-core] pinyin: migrated {count} legacy recency entries");
         }
     }
 
@@ -500,7 +522,25 @@ impl PinyinFamily {
     /// 候选施加 `dict.bigram_boost(prev, word)` 的词频量纲加成 —— 语料里
     /// (今天,天气) 这类相邻对把"天气"抬过同侪。无 bigram 数据的候选
     /// boost = 0,纯增益不伤现有排序。单音节表 / 造词 / 单词本不适用。
+    /// L2 → lattice overlay 旁路同步(round19):生成号变了才重灌。
+    /// predict 入口各调一次;L2 冷加载 / flush(absorb)都会 bump 生成号。
+    pub(crate) fn sync_lattice_overlay(&self) {
+        let l2 = self.wordbook.overlay_dict.lock().unwrap();
+        let gen = l2.generation();
+        if gen == self.overlay_gen.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        drop(l2);
+        let snap = self.wordbook.overlay_dict.lock().unwrap().dump();
+        if let Some(lat) = self.lattice.lock().unwrap().as_ref() {
+            lat.set_overlay_entries(&snap.freq);
+        }
+        self.overlay_gen
+            .store(gen, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn predict_inner(&self, input: &str, prev_word: &str) -> Vec<ScoredCandidate> {
+        self.sync_lattice_overlay();
         if input.is_empty() {
             return Vec::new();
         }
@@ -780,9 +820,23 @@ impl PinyinFamily {
             }
         }
 
-        if !out.is_empty() {
-            out.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap());
-            return out;
+        // ── MergedDict 三级覆盖(round19):同一预测对三个词典各查一次 ——
+        // L3 SeedDict(现有路径)/ L2 OverlayDict(独立出候选)/ L1 工作集;
+        // 同词多层命中 → 越热越权威(L1 > L2 > L3),有效频率同刻度换算。
+        // 种子词继承原频率 → 分数不变,排序兼容。统计微调(recency tier,
+        // 三级穿透)在调用方叠加 —— overlay 定基线,统计做微调。
+        {
+            let mem = self.wordbook.memory.lock().unwrap();
+            let l2 = self.wordbook.overlay_dict.lock().unwrap();
+            let lat = self.lattice.lock().unwrap();
+            merged::apply_overlay_override(
+                &mem,
+                &l2,
+                input,
+                lat.as_ref(),
+                &self.freq_scale,
+                &mut out,
+            );
         }
 
         out.sort_by(|a, b| b.raw_score.partial_cmp(&a.raw_score).unwrap());
@@ -857,18 +911,19 @@ impl CandidateFamily for PinyinFamily {
         // b = 近期指数(1-5,按距上次使用时间分档;>3d 条目在查询时被移出)。
         // 合成公式:z = (1-a)(a+b)/8 + a —— 增量与 (1-a) 成比例,低权重词
         // 获得更大加成,高权重词增量趋零,z 天然 < 1(不会顶满 1.0)。
-        let mut recency = self.wordbook.pinyin.recency.lock().unwrap();
-        if !recency.is_empty() {
+        // tier 三级穿透(round19):L1 时间表 miss → L2 时间表
+        //(flush 清空 L1 后,刚沉淀的词不丢近期加成)。
+        {
             let now = super::now_ms();
             for c in &mut candidates {
-                let b = recency.tier(&c.text, now);
+                // 近期指数(时间分档 + 频次增强:≥3 次提交档位 +1)。
+                let b = self.wordbook.tier(&c.text, now);
                 if b > 0 {
                     let a = c.raw_score;
                     c.raw_score = (1.0 - a) * (a + b as f64) / 8.0 + a;
                 }
             }
         }
-        drop(recency);
 
         // ── Layer 2: 前缀整词联想(替换旧的 bigram/surrounding/字符级 boost)──
         // 上一提交词的拼音 + 当前输入拼音 → 查词典整词;整词以上一词开头的,

@@ -274,15 +274,23 @@ fn recency_persistence_across_sessions() {
         "recency boost restored from store: warm={warm_score:.3} cold={cold_score:.3}"
     );
 
-    // The persisted table is also directly readable (word + last-used ms).
+    // round19:L1 在引擎关闭时 flush 进 L2 两表(频率/时间,分表)。
     let store = ime_core::store::WeightStore::open(&db_path).unwrap();
-    let ring = store.load_recency();
+    let freq = store.load_overlay_freq();
+    let recent = store.load_overlay_recent();
     assert_eq!(
-        ring.first().map(|(w, _)| w.as_str()),
+        freq.first().map(|(w, _, _, _)| w.as_str()),
         Some("你好"),
-        "ring: {ring:?}"
+        "freq: {freq:?}"
     );
-    assert!(ring[0].1 > 0, "timestamp persisted: {ring:?}");
+    // round17:种子词继承 SeedDict 频率 → overlay 频率非零。
+    assert!(freq[0].2 > 0, "overlay frequency inherited: {freq:?}");
+    assert_eq!(
+        recent.first().map(|(w, _)| w.as_str()),
+        Some("你好"),
+        "recent: {recent:?}"
+    );
+    assert!(recent[0].1 > 0, "timestamp persisted: {recent:?}");
 
     let _ = std::fs::remove_file(&db_path);
 }

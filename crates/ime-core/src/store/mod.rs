@@ -26,9 +26,12 @@
 
 mod manager;
 mod sqlite;
+pub mod memory;
+pub mod overlay_dict;
 pub mod wordbook;
 pub mod snippet_md;
 
 pub use manager::PersistenceManager;
+pub use memory::MemoryLayer;
 pub use wordbook::WordBook;
 pub use sqlite::WeightStore;

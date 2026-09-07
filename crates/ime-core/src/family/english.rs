@@ -334,6 +334,8 @@ impl EnglishFamily {
         // 保留原始大小写:专有名词(iPhone、NASA)匹配时大小写不敏感,
         // 提交时回词典原始大小写。
         self.merge_into_user(&[(word.to_string(), 10_000)]);
+        // 统一记忆层:英文自生词入 overlay(round16)。
+        self.wordbook.register_memory("", word);
         if let Some(ref store) = *self.store.lock().unwrap() {
             store.record_en_user(word);
         }
@@ -351,7 +353,7 @@ impl EnglishFamily {
 
     /// Record a committed word(引擎提交路径按家族分派到这里)。
     pub fn record_commit(&self, word: &str) {
-        self.wordbook.english.recency.lock().unwrap().record(word, now_ms());
+        self.wordbook.record_commit(true, word);
     }
 
     /// 临时关闭/恢复上下文感知(recency boost;`input.context_aware` 与
@@ -366,13 +368,10 @@ impl EnglishFamily {
         if !*self.context_aware.lock().unwrap() {
             return;
         }
-        let mut recency = self.wordbook.english.recency.lock().unwrap();
-        if recency.is_empty() {
-            return;
-        }
         let now = now_ms();
         for c in out.iter_mut() {
-            let b = recency.tier(&c.text, now);
+            // 近期指数(时间分档 + 频次增强;三级穿透 L1→L2)。
+            let b = self.wordbook.tier(&c.text, now);
             if b > 0 {
                 let a = c.raw_score;
                 c.raw_score = (1.0 - a) * (a + b as f64) / 8.0 + a;
@@ -402,17 +401,23 @@ impl EnglishFamily {
 
     /// Load from file path. Auto-detects dict type from `# @type:` header.
     /// Uses a `.en_cache` file to avoid re-normalizing on every startup.
+    ///
+    /// 缓存落点遵循 FileLoader 管理(round19 审计修正):候选 = 源词典旁
+    /// (dev 便捷;prod assets 只读则自然失败)→ `DATA::<stem>.en_cache`
+    /// (dev: data/,prod: ~/.desk-pilot/ —— 命名空间保证可写)。读:取
+    /// 第一个有效命中;写:取第一个可写。
     pub fn load_dict_file(&self, path: &str) -> std::io::Result<usize> {
         let data = std::fs::read(path)?;
 
         // ── Check cache ──
         let file_hash = Self::hash_bytes(&data);
-        let cache_path = format!("{path}.en_cache");
-        if let Ok(words) = Self::load_cache_if_valid(&cache_path, path, file_hash) {
-            let count = words.len();
-            self.merge_into_user(&words);
-            tracing::info!(count, path, "english: loaded from cache");
-            return Ok(count);
+        for cache_path in Self::cache_candidates(path) {
+            if let Ok(words) = Self::load_cache_if_valid(&cache_path, path, file_hash) {
+                let count = words.len();
+                self.merge_into_user(&words);
+                tracing::info!(count, path, cache = %cache_path, "english: loaded from cache");
+                return Ok(count);
+            }
         }
 
         // ── Parse, normalize, cache ──
@@ -420,11 +425,30 @@ impl EnglishFamily {
         let words = Self::parse_and_normalize(&data, dict_type);
         let count = words.len();
 
-        let _ = Self::write_cache(&cache_path, path, file_hash, &words);
+        for cache_path in Self::cache_candidates(path) {
+            if Self::write_cache(&cache_path, path, file_hash, &words).is_ok() {
+                break;
+            }
+        }
 
         self.merge_into_user(&words);
         tracing::info!(count, path, ?dict_type, "english: loaded + cached");
         Ok(count)
+    }
+
+    /// en_cache 候选落点(FileLoader 管理):源旁 → DATA 命名空间。
+    fn cache_candidates(path: &str) -> Vec<String> {
+        let mut v = vec![format!("{path}.en_cache")];
+        let name = std::path::Path::new(path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "en_freq.tsv".into());
+        if let Some(p) = shared::loader!(".")
+            .resolve(&format!("DATA::{name}.en_cache"))
+        {
+            v.push(p.to_string_lossy().into_owned());
+        }
+        v
     }
 
     // ── Cache helpers ─────────────────────────────────────────────────

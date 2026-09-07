@@ -23,22 +23,111 @@
 //! `init_store` 时注入,学习/提交路径双写与旧实现同拍。
 
 use crate::family::pinyin::phrase::PhraseBook;
-use crate::family::pinyin::recency::RecentStore;
 use crate::store::WeightStore;
 use std::sync::{Arc, Mutex};
 
-/// 单词本(跨会话共享;持久化模块所有)。
+/// 单词本 + 统一记忆层(跨会话共享;持久化模块所有)。
+///
+/// round16:`recency` 从两册摘除,统一进 [`MemoryLayer`](overlay dict:
+/// 词 → (拼音映射对, 最近提交时间, 累计提交次数));家族/后处理经
+/// `wordbook.memory` 共享。
 #[derive(Default)]
 pub struct WordBook {
     pub pinyin: PinyinBook,
     pub english: EnglishBook,
+    /// L1 OverlayData(round16):实时工作集,攒满即 flush 进 L2。
+    /// (Mutex:`Arc<WordBook>` 共享下的内部可变性。)
+    pub memory: Mutex<crate::store::memory::MemoryLayer>,
+    /// L2 OverlayDict(round19 三级架构):持久化沉淀层,冷加载 +
+    /// flush 时吸收 L1;独立预测层(与 SeedDict 同一查询方式)。
+    pub overlay_dict: Mutex<crate::store::overlay_dict::OverlayDict>,
 }
 
-/// 拼音册:自生词短语本 + 最近使用(recency)。
+impl WordBook {
+    /// 提交登记到统一记忆层(时间盖章 + 计数;拼音侧带 SQLite 快照双写,
+    /// 英文侧进程内生命周期 —— 与旧 recency 双册行为严格一致)。
+    pub fn record_commit(&self, english: bool, word: &str) {
+        if english {
+            self.memory
+                .lock()
+                .unwrap()
+                .record_commit(word, "", crate::family::now_ms());
+        } else {
+            let mut mem = self.memory.lock().unwrap();
+            mem.record_commit(word, "", crate::family::now_ms());
+            drop(mem);
+            self.maybe_flush();
+        }
+    }
+
+    /// 自生词登记进统一记忆层(overlay dict;count=0,提交后增长)。
+    pub fn register_memory(&self, pinyin: &str, word: &str) {
+        self.memory
+            .lock()
+            .unwrap()
+            .register_self_generated(word, pinyin);
+    }
+
+    /// flush 检查(round19):L1 攒满阈值 → 搬入 L2 并全量快照落盘
+    /// (L2 两表:overlay_freq / overlay_recent —— 分表)。
+    /// 返回搬走的词数(0 = 未达阈值或无持久化句柄)。
+    pub fn maybe_flush(&self) -> usize {
+        let reached = {
+            let mem = self.memory.lock().unwrap();
+            mem.len() >= crate::store::memory::FLUSH_THRESHOLD
+        };
+        if !reached {
+            return 0;
+        }
+        let mut l2 = self.overlay_dict.lock().unwrap();
+        let n = self.memory.lock().unwrap().flush_into(&mut l2);
+        if n > 0 {
+            if let Some(ref store) = *self.pinyin.store.lock().unwrap() {
+                let snap = l2.dump();
+                store.save_overlay_freq(&snap.freq);
+                store.save_overlay_recent(&snap.recent);
+            }
+        }
+        n
+    }
+
+    /// 无条件 flush(round19:引擎关闭时保底,未达阈值的 L1 不丢)。
+    pub fn flush_now(&self) -> usize {
+        {
+            let mem = self.memory.lock().unwrap();
+            if mem.is_empty() {
+                return 0;
+            }
+        }
+        let mut l2 = self.overlay_dict.lock().unwrap();
+        let n = self.memory.lock().unwrap().flush_into(&mut l2);
+        if n > 0 {
+            if let Some(ref store) = *self.pinyin.store.lock().unwrap() {
+                let snap = l2.dump();
+                store.save_overlay_freq(&snap.freq);
+                store.save_overlay_recent(&snap.recent);
+            }
+        }
+        n
+    }
+
+    /// tier 三级穿透(round19):L1 时间表 miss → L2 时间表
+    /// (flush 清空 L1 后,刚沉淀的词不丢近期加成)。
+    pub fn tier(&self, word: &str, now_ms: i64) -> u32 {
+        let mut l1 = self.memory.lock().unwrap();
+        let t = l1.tier(word, now_ms);
+        if t > 0 {
+            return t;
+        }
+        drop(l1);
+        self.overlay_dict.lock().unwrap().tier(word, now_ms)
+    }
+}
+
+/// 拼音册:自生词短语本(recency 已归 [`WordBook::memory`])。
 #[derive(Default)]
 pub struct PinyinBook {
     pub(crate) phrase_book: Mutex<PhraseBook>,
-    pub(crate) recency: Mutex<RecentStore>,
     pub(crate) store: Mutex<Option<Arc<WeightStore>>>,
 }
 
@@ -69,21 +158,14 @@ impl PinyinBook {
         }
     }
 
-    /// 提交 recency:盖章 + SQLite 全量快照双写(时间衰减跨重启存活)。
-    pub fn record_commit(&self, word: &str) {
-        let mut rec = self.recency.lock().unwrap();
-        rec.record(word, crate::family::now_ms());
-        if let Some(ref store) = self.store() {
-            store.save_recency(&rec.dump());
-        }
-    }
+
+
 }
 
-/// 英文册:user 层自生词 + 最近使用(recency)。
+/// 英文册:user 层自生词(recency 已归 [`WordBook::memory`])。
 #[derive(Default)]
 pub struct EnglishBook {
     pub(crate) user_words: Mutex<Vec<(String, u32)>>,
-    pub(crate) recency: Mutex<RecentStore>,
     pub(crate) store: Mutex<Option<Arc<WeightStore>>>,
 }
 
@@ -127,8 +209,5 @@ impl EnglishBook {
         user.sort_by_key(|(w, _)| w.to_lowercase());
     }
 
-    /// 提交 recency 加权(进程内生命周期,不持久化)。
-    pub fn record_commit(&self, word: &str) {
-        self.recency.lock().unwrap().record(word, crate::family::now_ms());
-    }
+
 }

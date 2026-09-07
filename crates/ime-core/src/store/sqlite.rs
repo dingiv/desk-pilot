@@ -72,6 +72,23 @@ impl WeightStore {
                 word     TEXT NOT NULL PRIMARY KEY,
                 used_at  INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS overlay_freq (
+                word      TEXT NOT NULL PRIMARY KEY,
+                pinyin    TEXT NOT NULL DEFAULT '',
+                frequency INTEGER NOT NULL DEFAULT 0,
+                count     INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS overlay_recent (
+                word    TEXT NOT NULL PRIMARY KEY,
+                last_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS memory (
+                word     TEXT NOT NULL PRIMARY KEY,
+                pinyin   TEXT NOT NULL DEFAULT '',
+                last_ms  INTEGER NOT NULL,
+                count    INTEGER NOT NULL DEFAULT 0,
+                frequency INTEGER NOT NULL DEFAULT 0
+            );
             CREATE TABLE IF NOT EXISTS en_user (
                 word  TEXT NOT NULL PRIMARY KEY,
                 count INTEGER NOT NULL DEFAULT 1
@@ -214,6 +231,129 @@ impl WeightStore {
         .into_iter()
         .flat_map(|rows| rows.filter_map(|r| r.ok()))
         .collect()
+    }
+
+    /// Save the unified memory overlay(全量快照替换;≤512 行单事务)。
+    pub fn save_memory(&self, entries: &[(String, String, i64, u32, u64)]) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute("DELETE FROM memory", []);
+        let mut stmt = match conn
+            .prepare(
+                "INSERT INTO memory (word, pinyin, last_ms, count, frequency) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+        {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        for (w, p, t, c, wt) in entries {
+            let _ = stmt.execute(params![w, p, t, c, wt]);
+        }
+    }
+
+    /// Load the persisted memory overlay entries。
+    pub fn load_memory(&self) -> Vec<(String, String, i64, u32, u64)> {
+        let conn = self.conn.lock().unwrap();
+        // 迁移链:旧库 memory 表可能缺 frequency 列(round17 引入时叫
+        // weight,round18 改名)→ 逐一补齐/改名,默认 0 = 无权威频率。
+        let cols: Vec<String> = {
+            conn.prepare("SELECT name FROM pragma_table_info('memory')")
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |r| r.get::<_, String>(0))
+                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default()
+        };
+        if cols.iter().any(|c| c == "weight") && !cols.iter().any(|c| c == "frequency") {
+            let _ = conn.execute("ALTER TABLE memory RENAME COLUMN weight TO frequency", []);
+        } else if !cols.iter().any(|c| c == "frequency") {
+            let _ = conn.execute("ALTER TABLE memory ADD COLUMN frequency INTEGER NOT NULL DEFAULT 0", []);
+        }
+        let mut stmt = match conn
+            .prepare("SELECT word, pinyin, last_ms, count, frequency FROM memory")
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, u32>(3)?,
+                row.get::<_, u64>(4)?,
+            ))
+        })
+        .ok()
+        .into_iter()
+        .flat_map(|rows| rows.filter_map(|r| r.ok()))
+        .collect()
+    }
+
+    // ── L2 OverlayDict(round19 三级架构;分表:频率/时间)──────────────
+
+    /// Save the L2 frequency table(全量快照替换)。
+    pub fn save_overlay_freq(&self, rows: &[(String, String, u64, u32)]) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute("DELETE FROM overlay_freq", []);
+        let mut stmt = match conn
+            .prepare("INSERT INTO overlay_freq (word, pinyin, frequency, count) VALUES (?1, ?2, ?3, ?4)")
+        {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        for (w, p, f, c) in rows {
+            let _ = stmt.execute(params![w, p, f, c]);
+        }
+    }
+
+    /// Load the L2 frequency table。
+    pub fn load_overlay_freq(&self) -> Vec<(String, String, u64, u32)> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) = conn
+            .prepare("SELECT word, pinyin, frequency, count FROM overlay_freq")
+        else {
+            return Vec::new();
+        };
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, u32>(3)?,
+            ))
+        })
+        .ok()
+        .into_iter()
+        .flat_map(|rows| rows.filter_map(|r| r.ok()))
+        .collect()
+    }
+
+    /// Save the L2 time table(全量快照替换)。
+    pub fn save_overlay_recent(&self, rows: &[(String, i64)]) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute("DELETE FROM overlay_recent", []);
+        let mut stmt = match conn
+            .prepare("INSERT INTO overlay_recent (word, last_ms) VALUES (?1, ?2)")
+        {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        for (w, t) in rows {
+            let _ = stmt.execute(params![w, t]);
+        }
+    }
+
+    /// Load the L2 time table。
+    pub fn load_overlay_recent(&self) -> Vec<(String, i64)> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) = conn.prepare("SELECT word, last_ms FROM overlay_recent") else {
+            return Vec::new();
+        };
+        stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .ok()
+            .into_iter()
+            .flat_map(|rows| rows.filter_map(|r| r.ok()))
+            .collect()
     }
 
     /// Drop the table (used when the in-memory store is empty).

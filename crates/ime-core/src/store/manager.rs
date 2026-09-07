@@ -73,7 +73,21 @@ impl PersistenceManager {
             eprintln!("[ime-core] english: warmed learned words");
         }
 
-        // Recency ring (most-recent-first; the family reverses for load_bulk).
+        // L2 OverlayDict 冷加载(round19 三级架构)。
+        let of = self.store.load_overlay_freq();
+        let or = self.store.load_overlay_recent();
+        if !of.is_empty() || !or.is_empty() {
+            eng.warm_overlay_dict(of, or);
+        }
+
+        // 统一记忆层(round16):overlay dict 主表。
+        let memory = self.store.load_memory();
+        if !memory.is_empty() {
+            eng.warm_memory(memory);
+        }
+
+        // 旧 recency 表迁移种子(仅补 memory 表中没有的键;首次升级后
+        // 该表不再写入,自然枯竭)。
         let recency = self.store.load_recency();
         if !recency.is_empty() {
             eng.warm_recencies(recency);

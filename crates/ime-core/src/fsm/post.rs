@@ -322,11 +322,7 @@ pub(crate) fn learn_commit(
         }
         CommitReceipt::Commit { text, family } => {
             // recency 按家族分流:english → 英文册,其余 → 拼音册。
-            if *family == Some("english") {
-                wb.english.record_commit(text);
-            } else {
-                wb.pinyin.record_commit(text);
-            }
+            wb.record_commit(*family == Some("english"), text);
             env.record_commit_len(text);
             // 纯 ASCII 字母数字且非英文族提交 → 学入英文册 user 层。
             if *family != Some("english")
