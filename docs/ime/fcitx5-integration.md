@@ -1,6 +1,27 @@
 # swift-ime × fcitx5 集成技术文档
 
-> 基于 fcitx5 5.1.14 + fcitx5-chinese-addons 源码分析。2026-07-23。
+> 基于 fcitx5 5.1.14 + fcitx5-chinese-addons 源码分析。2026-07-23;
+> 线程模型一节于 round12–15(事件驱动模型)后更新。
+
+## 0. 线程与无按键刷新模型(原 eventloop.md,已并入)
+
+```text
+fcitx5 主线程                          引擎 io 线程(io_thread.rs)
+────────────────                       ──────────────────────────
+keyEvent ──→ swift_ime_key             VoiceSession(aura 数据面
+  只做非阻塞内存读写,                    GET /api/asr_stream)
+  微秒级返回                              │ SSE 事件直推
+       ▲                                 ▼
+       │ wake pipe                 SharedTranscript(MagicResources)
+       │                                  │ 推进时 FrontEndHandle::
+swift_ime_magic_tick  ←───────  refresh_ui 推送通知前端
+  调 magic_tick 拿最新视图重建候选窗
+```
+
+- **keyEvent 路径零阻塞**:网络 I/O 全在后台线程;主线程只读共享状态
+- **推送式刷新**(round12):语音等异步状态推进时主动 wake 前端,无按键
+  也能刷新;一次性 CLI 模式以 200ms 探询兑底
+- 控制面(settings 快照)不走此路;识别文字只走数据面
 
 ## 1. fcitx5 架构概览
 

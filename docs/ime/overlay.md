@@ -1,204 +1,206 @@
-# Overlay 词典与常态化学习 — 设计文档
+# Overlay 用户词典体系(三级架构)
 
-> **状态:设计稿(2026-09-04),未实施。** 目标:让预测从"语料库的分布"
-> 变成"这一个用户的分布"。分两个 Phase:**Phase 0 词典大清洗**(前置,
-> 语料频率维必须真实,overlay 的嫁接才有意义)→ **Phase 1/2 Overlay 词典**
-> (用户频率维 + 用户上下文维)。
+> **状态:三级架构已实施(round16–19,见 `changelog.md`);Phase 0 词典
+> 清洗仍为待办。** 本文合并原 `overlay.md`(早期设计稿)、
+> `overlay-dict-arch.md`(round16–18 两级实现)、`overlay-three-tier.md`
+> (round19 三级设计),为唯一的 overlay 体系文档。代码为准:
+> `crates/ime-core/src/store/{memory,overlay_dict,wordbook}.rs`、
+> `family/pinyin/merged.rs`、`family/pinyin/lattice.rs`。
 
-## 一、动机与现状缺口
+## 一、动机
 
-现有五套学习机制全部"事件驱动 + 苛刻条件",没有任何一套回答
-"**这个用户历史上常用哪些词**":
+Seed 词典(rime-ice.fst)是"死"的、非用户定制的。引擎此前记录的是
+"语料库认为什么常用",不是"这个人常用什么"。Overlay 体系提供**单用户
+专一优化**:用户反复输入的词在后续预测中增强;系统词典没有的自生词
+也进入使用统计并直接出候选。
 
-| 机制 | 门槛 | 缺口 |
+## 二、三级架构(已实施)
+
+```text
+L1  OverlayData(内存,实时)         小而热:当前工作集
+    · store/memory.rs — MemoryLayer,freq / recent 双表(频率与时间
+      统计分表)
+    · 每个新词进来 → 全套重建流程(重算有效频率、重排);量小成本可忽略
+    · 达到阈值(128)→ 整体持久化到 L2,然后清空
+    · 上限 512 条,超限淘汰最旧
+
+L2  OverlayDict(持久化,冷加载)      大而稳:历史沉淀
+    · store/overlay_dict.rs;SQLite overlay_freq / overlay_recent 两表
+    · 启动冷加载,独立成层(不与 SeedDict 合并)
+    · 直接作为预测候选来源之一(自生词即使不在 seed 也能出候选)
+    · 会话内只读(被 L1 覆盖时不改写;下一次 flush 才吸收新状态)
+
+L3  SeedDict(不可变)                rime-ice.fst + 用户静态词典
+```
+
+查找优先级(同词多层命中时,**越热越权威**):
+
+```text
+L1 OverlayData  >  L2 OverlayDict  >  L3 SeedDict
+   (实时增强)      (上次沉淀)         (原始频率)
+```
+
+### 2.1 MemoryLayer(L1)
+
+一条记忆 = 提交映射对 + 统计 + 词典域频率:
+
+```rust
+pub struct MemEntry {
+    pub pinyin: String,    // 提交时拼音(映射对另一半;英文为空)
+    pub last_ms: i64,      // 最近提交时间(wall-clock ms)
+    pub count: u32,        // 累计提交次数(自生词登记 = 0)
+    pub frequency: u64,    // 词典域基础频率(0 = 尚无,如旧迁移种子)
+}
+```
+
+> **量纲申明(round18)**:`frequency` 是**词典域频率**(与 FST value
+> 同量纲,如 rime-ice 的成千上万级词频),**不是**程序运行时 0..1 的
+> 权重浮点。两者经 `LatticeDecoder::freq_to_score`(log₂ 归一)相连:
+> frequency → 运行时权重。**最终决定预测顺序的是运行时权重**;
+> frequency 只是它的词典域来源。
+
+**频次增强(round18)**:有效频率在基础频率上线性增强,读取时派生,
+存储只存基础值(无写放大):
+
+```text
+effective_frequency = frequency + min(count × 10, 5_000)
+                      // FREQ_ENHANCE_STEP=10, FREQ_ENHANCE_CAP=5_000
+```
+
+- 自生词(基础 `SELF_GEN_FREQUENCY = 100`)随使用稳步爬升;
+- 常用种子词(频次数千)相对漂移可忽略 → 排序近似稳定(eval 持平)。
+
+关键 API:
+
+| 方法 | 语义 |
+|---|---|
+| `record_commit_weighted(word, pinyin, now, weight)` | 提交登记:映射对 + 计数 +1 + 继承/设定权威权重 |
+| `register_self_generated(word, pinyin)` | 自生词入册(count=0,基础频率 100) |
+| `tier(word, now) -> 0..5` | 近期指数:时间 5 档 + 频次增强(≥3 次提交档位+1,封顶 5);>3 天移出 |
+| `effective_frequency()` | 基础频率 + count 增强(读取时派生) |
+| `flush_into(&OverlayDict)` | 达阈值整体搬入 L2 |
+| `load_legacy / load_legacy_recent` | 旧 memory 单表 / 旧 recency 表迁移 |
+
+### 2.2 OverlayDict(L2)
+
+- `absorb(FlushBatch)`:同词 count 累加、频率取 `max(L2 基础, L1 有效)`、
+  时间取新、generation 递增;
+- `lookup(pinyin)`:全拼精确命中 → (词, 基础频率)——独立预测层;
+- `tier(word, now)`:穿透查询(L1 时间表 miss 时继续算档,刚沉淀的词
+  不丢近期加成);
+- `generation`(AtomicU64):absorb / load 递增,lattice 旁路词典靠它
+  比对同步(见 §四)。
+
+### 2.3 flush(L1 → L2)
+
+```text
+L1.len() ≥ FLUSH_THRESHOLD(128)
+  → 逐条 upsert 进 L2 → L1 清空 → L2 全量快照落盘(双表同步搬运)
+```
+
+进入 L2 的条目以"基础频率 + 累计 count"形态沉淀;有效频率读取时派生。
+**关闭保底**:引擎 `Drop` 时 L1 无条件 flush——未达阈值的会话数据不丢
+(CLI 单词会话靠它跨进程存活)。周期化的时间策略待设计(见 §六)。
+
+## 三、权重从何而来(继承链,round19)
+
+提交路径按词条来源三级回溯(`PinyinFamily::record_pick`):
+
+```text
+L2 命中        → 继承 L2 基础频率
+L3 命中        → 查 lattice(FST)words_for(pinyin) 继承原始频率
+否则(自生词)  → SELF_GEN_FREQUENCY(100),并同步写 Wordbook
+```
+
+→ OverlayData = 种子词典权重继承 ∪ Wordbook 自生词。用户的反复使用
+不改变权威权重,频次影响走统计微调(tier / 频次增强)。
+
+## 四、预测路径(读取)
+
+### 4.1 MergedDict 三级覆盖 + 独立出候选
+
+`family/pinyin/merged.rs::apply_overlay_override`,在 `predict_inner`
+收尾(所有 bonus 之后、排序之前)施加:
+
+```text
+候选来源:L3(现有 FST/lattice 路径,不变)
+        + L2(pinyin == input 的词条直接出候选,freq_to_score 同刻度)
+        + L1(工作集词条同上;量小,线性扫)
+覆盖:同词多层命中 → 高优先层的有效频率换算运行时权重
+      独立词条 source = "overlay" 注入(上限 8;自生词主路)
+微调:tier(recency + 频次增强)在覆盖之后照旧叠加(不变)
+```
+
+**排序兼容性(设计核心)**:种子词继承的 frequency == FST 原频率,同刻度
+线性重标 → 分数与纯种子路径完全一致 → 覆盖不改变排序。eval 持平
+(98.0 / 99.4)即这一性质的直接验证。
+
+### 4.2 自生词进 lattice(round19 续)
+
+`LatticeDecoder` 挂 **overlay 旁路词典**(生成号驱动):
+
+- `overlay: RwLock<OverlayMap>`(拼音 → (词, 基础频率, count))+
+  `overlay_initials: RwLock<OverlayInitialsIndex>`(声母索引,Mixed/
+  Initials 对齐用);`set_overlay_entries` 整体替换;
+- 五个查询点全部与 FST 合并:`words_for`(单字区/继承/整词联想)、
+  predict exact、predict Mixed/Initials 声母对齐、predict_prefix;
+  同词双册时 overlay 有效频率胜出;
+- 同步:L2 generation 比对缓存代,变了才重灌(避免每查询重灌);
+  predict_inner / predict_chained 入口各调一次,warm 后主动同步一次。
+
+### 4.3 三层词典同一查询方式(用户指令)
+
+对同一预测,三层词典用**同一方式**查询:全拼精确命中 → (词, 有效频率)。
+三层完全一致,只是优先级不同。
+
+## 五、数据流(一次提交的生命周期)
+
+```text
+用户选词/提交
+  → stage2 产出 CommitReceipt
+  → ControlPane 统一结算 post::learn_commit(receipt, wordbook, env)
+      ├─ PinyinPick → record_pick:L0 计数 + last_commit(bigram 上下文)
+      │               + memory.record_commit_weighted(三级继承频率)
+      ├─ Commit     → wordbook.record_commit(按家族分流)+ commit_len
+      ├─ ComposedPhrase → learn_composed_phrase(Wordbook)
+      │               + memory.register_self_generated(基础 100)
+      └─ Ascii      → english learn_word(Wordbook)+ register_memory
+  → L1 满 128 条(或引擎 Drop)→ flush 进 L2 → 双表落盘
+  → 下一次预测:三级覆盖 + lattice 旁路 + tier 微调 + 上下文感知
+```
+
+启动:`SeedDict 加载 → L2 冷加载(overlay_freq/overlay_recent)→ L1 空`;
+`warm_memory` 做旧表(memory 单表 / recency 表)一次性迁移。
+
+**所有权链**:PersistenceManager(所有者)→ `Arc<WordBook>` →
+`{ pinyin: PinyinBook, english: EnglishBook, memory: Mutex<MemoryLayer>,
+overlay_dict: Mutex<OverlayDict> }`,Arc 分发至 SessionState / 两家族 /
+post::learn_commit。
+
+## 六、待办与演进
+
+| 项 | 现状 | 目标 |
 |---|---|---|
-| PhraseBook 自造词(`pinyin/mod.rs phrase_score`) | 必须走数字键逐字造词流程 | **直接空格选词不学**(weight-scoring.md 明确豁免:decomp 词不进本) |
-| recency(`pinyin/recency.rs`) | 1 次即记 | 纯时间衰减,3 天过期;无频率维度、≤512 行 |
-| L0 pins(3 选自动 pin) | 3 次 | 二值钉住,非统计 |
-| bigram(`dict.bigram_boost`) | 语料共现 | 相邻词对,**语料的**上下文,不是用户的 |
-| en_user(raw 提交) | Enter 强选 | 只收英文自造词 |
+| OverlayDict 周期化 | 阈值 128 触发 + Drop 保底 | 定时/定量的时间策略(待设计) |
+| Phase 0 词典清洗 | 未做(见 §七) | 清洗后继承权重才完全保真 |
+| 家族预测源直读 overlay | 已部分完成(lattice 旁路);PhraseBook/en_user 仍是自生词预测源 | 40+ 引用迁移(单轮风险大) |
+| bigram 上下文迁 memory | `last_commit` 仍在拼音家族内 | 上下文统一从 MemoryLayer 出数 |
+| 英文 overlay 覆盖 | 英文仅 tier 微调 | 对齐拼音侧三级覆盖语义 |
 
-核心缺口:**用户直接空格选中的词典词(占日常提交的绝大多数)零统计**。
-引擎记录的是"语料库认为什么常用",不是"这个人常用什么"。
+## 七、Phase 0 — 词典大清洗(前置待办,设计保留)
 
-## 二、Phase 0 — 词典大清洗(前置硬依赖)
+rime-ice(91.6 万条 → 22MB FST)的 weight **两种量纲混用**:单字是真实
+语料字频(的 76,938,354),多字词组是词库作者手工标注等级("版权"
+13,204,281、人工抬顶词条 19,260,817)。后果:量纲断崖 58 倍、同档同分
+(及时/即使、出示/初始)、人名/诗性词/拟声词占池、敏感词条随库带入。
 
-### 2.1 数据质量问题清单(实测证据)
+清洗方案(设计于早期,实施待定):
 
-rime-ice(91.6 万条 → `rime-ice.fst` 22MB)的 weight **两种量纲混用**:
-
-| 词条类型 | weight 来源 | 实测 |
-|---|---|---|
-| 单字(8105 字表) | 真实语料**字频** | 的 76,938,354 / 一 35,278,860 / 是 31,422,712 |
-| 多字词组 | 词库作者**手工标注等级** | 顶流"版权"13,204,281、**"江泽民"19,260,817(人工抬顶)** |
-
-后果(全部在 round10 评测中实测暴露):
-
-1. **量纲断崖 58 倍**:词频嫁接(W1 词频驱动 single、E1 bigram 嫁接)
-   在跨量纲时失真——单字真实词频压倒一切,多字词组内部却是手工序;
-2. **同档同分**:及时/即使(jishi)、出示/初始(chushi)Top-1 二选一纯碰运气
-   (手工标注同等级,round10 执行记录遗留项);
-3. **噪声词占池**:人名(杜淳/张翰/蒋钦)、诗性词(度春宵/骀荡)、拟声重复
-   (啊啊啊 ×4)、网络词以不低的 weight 挤占候选池(round10 评测 57 个
-   Top-1 miss 的主要成分);
-4. **政治/敏感/过时词条**随词库带入(见上"江泽民"权重顶流)。
-
-### 2.2 清洗数据源
-
-**OpenSubtitles 中文词频**(hermitdave/FrequencyWords,与英文侧
-`hermitdave.tsv` **同源同格式**,英文侧 round10 W2 已验证这套数据质量):
-
-- `zh_50k.txt` / `zh_full.txt`:`词 count` 两列,**已分词的真实字幕语料频
-  率**,单字与词组**同一量纲** —— 直接解决量纲断崖;
-- 获取:新脚本 `scripts/fetch_zh_freq.sh`(照抄 `fetch_emoji.sh` 的
-  下载+转换模式),入库 `assets/dict/zh_freq.tsv`。
-
-### 2.3 清洗管线(`scripts/refine_dict.sh`,可重复执行、规则可配、不手工)
-
-```
-rime-ice TSV ──┐
-               ├─ refine_dict → cleaned TSV → build_dict → rime-ice.fst(v2)
-zh_freq.tsv ───┘
-```
-
-规则(按序,每条独立开关,输出统计报告):
-
-1. **语料频率覆盖**(核心):`word ∈ zh_freq` → `weight = 语料 count`
-   (量纲统一;单字/词组同源)。预计覆盖常用词的绝大多数;
-2. **未覆盖词条降置信**:不在语料表 → 保留原 weight × 0.05 缩放
-   (保留可查但沉底),并打 `# @uncalibrated` 统计;
-3. **拟声/重复词过滤**:`A+` 模式(啊啊/啊啊啊/哈哈哈哈)weight × 0.1;
-4. **噪声词降级**:纯 ASCII 夹杂、超长(≥8 字)非成语词条删除;
-5. **敏感/人工抬顶词条**:维护一个显式删除清单文件
-   (`assets/dict/blocklist.txt`,人工审阅制,不自动判)。
-
-产物:新 `rime-ice.fst`(build_dict 现有工具链直接复用)+ 清洗报告
-(条数/覆盖率/删除清单)。`.fst.idx` 缓存随 FST mtime 自动失效重建。
-
-### 2.4 Phase 0 验收
-
-- `jishi → 及时 #1`、`chushi → 出示 #1`(真实语料序);
-- tc_dict_sample(789 条)Top-1 ≥ 98%(round10 为 97.5%);
-- 人名/诗性词类 miss 显著下降;`江泽民` 级词条不再出现于前排。
-
-## 三、Phase 1 — Overlay 词典(用户频率维)
-
-### 3.1 记录:上屏即 +1
-
-记录点**已存在**:`FamilyPipeline::commit_text`(fsm/family.rs:670)是
-一切真实上屏的统一出口,`env.record_commit_text(word, family)` 钩子现成
-(engine.rs:835 现只做 recency 分派)。
-
-- **记**:空格选词、数字选词、英文 exact 提交 —— 词典词与自造词一视同仁;
-- **不记**(豁免表):`family == None` 的模板类提交(snippet 展开/魔法
-  命令/语音整段)、Enter raw 强提(未选词)、`#del`/`#clip` 类命令产物。
-
-### 3.2 存储
-
-```sql
-CREATE TABLE IF NOT EXISTS overlay (
-  word TEXT PRIMARY KEY,
-  pinyin TEXT,        -- 最近一次提交拼音(参考用,非查询键)
-  count INTEGER,      -- 累计使用次数(永久)
-  last_ms INTEGER     -- 最近使用时间(展示/诊断)
-);
-```
-
-- 写穿:提交时 UPSERT `count+1`(SQLite WAL,提交频率低,毫秒级);
-- warm:`init_store` 后全量载入内存 `HashMap<String, (u64, u64)>`
-  (热路径 O(1);5 万行 ≈ 数 MB,可接受);
-- 上限:软告警 10 万行(超出仅告警,不自动淘汰 —— 用户习惯不应被清理)。
-
-### 3.3 合成:词频嫁接(与 E1 bigram 同构,不发明新刻度)
-
-在 `predict_inner` 的 lattice/single 候选循环内(E1 同位置):
-
-```
-overlay_boost(count) = 50_000 × ln(1+count) / ln(1+1000)
-boosted_freq = dict_freq + overlay_boost(count) × weights.overlay_weight
-score = freq_to_score(boosted_freq)        # 与 lattice 同一条映射,自然封顶
-```
-
-- **覆盖语义 = 只升不降**:词典原分不动,overlay 只做加法;
-- 曲线容错:误选 1~2 次 boost≈数百等效词频,不改变排序;30 次 ≈ +25k、
-  100 次 ≈ +37k、封顶 50k —— **远小于清洗后的语料顶流**(亿级),用户的
-  习惯词升到"高频档",但永远压不过"的/了"级超高频,无需担心霸榜;
-- PhraseBook 自造词同样吃 boost(词表维 + 频率维自然叠加);
-- bare 引擎(无 FST 词频域):overlay 命中词直接以
-  `freq_to_score(boost)` 作为该词分 —— 语义等价(全部词频都来自用户)。
-
-### 3.4 与 recency 的关系(正交两维,明确分工)
-
-| | overlay(Phase 1) | recency(现有) |
-|---|---|---|
-| 维度 | **频率**("历史上常用") | **时间**("刚用过") |
-| 衰减 | 无(永久累计) | 五档时间指数,3 天过期 |
-| 门槛 | 曲线自然(ln) | 1 次 |
-| 数据 | overlay 表(count) | recency 表(≤512 行) |
-
-**合成链(单向,不互相感知)**:
-
-```
-dict_freq ──(+overlay_boost)──► freq_to_score ──► raw_score
-                                 ──(recency z 合成)──► 最终分
-```
-
-- overlay 先行(家族内,嫁接进词频),recency 后行(排序前的 z 合成,
-  现有 `apply_recency` 位置不变)—— 两层各自封顶,无过冲;
-- 常见疑问"30 天没用的词 boost 还在,会不会压新词?"——会,但这正是
-  "常态化"的语义(年度报告词一年用一次,每次都想要它);新词靠自己的
-  overlay 累积 + recency 短期 boost 竞争。若实测确实僵化,再考虑对
-  `last_ms` 超一年(半衰)的词条打折 —— **列为观测项,先不做**。
-
-### 3.5 上下文感知(Phase 2 — 用户 bigram)
-
-现有上下文全是**语料的**(语料 bigram、context_comp 整词联想)。Phase 2
-补用户维:
-
-- 新表 `user_bigrams(prev TEXT, next TEXT, count INTEGER, PRIMARY KEY(prev,next))`;
-- 记录:同 `commit_text`,与 overlay 同点(上次提交词 = prev);
-- 合成:与语料 bigram **同点同量纲相加**:
-  `total_boost = corpus_bigram(prev,next) + user_bigram_boost(count)`;
-- gate:沿用 `input.context_aware` 统一开关(含语料与用户两层)。
-
-### 3.6 配置面
-
-```yaml
-input:
-  overlay_learning: true     # false = 不记不用(隐私开关)
-weights:
-  overlay_weight: 1.0        # 嫁接系数;0 = 只记不合
-```
-
-### 3.7 隐私与诊断
-
-- overlay 是**本地行为记录**(本地 SQLite,不外传,不进任何日志);
-- `swift-cli --overlay-stats`(后续):count Top-N / 总词条数;
-- `--reset-overlay`(后续):清表重来。
-
-## 四、分期计划
-
-| Phase | 内容 | 验收 |
-|---|---|---|
-| **P0** | 词典大清洗(refine_dict 管线 + zh_freq 语料) | §2.4 三条 |
-| **P1** | overlay 表 + commit 记录 + 词频嫁接 + 配置 | 场景:提交"部署"×5 → `bugu` 部署稳 #1;全量 eval 无回归 |
-| **P2** | user_bigrams + 语料 bigram 同点合成 | 场景:常打"部署"后输 "huanjing" → 环境 提前 |
-
-## 五、风险
-
-- **清洗误伤**:zh_freq 语料(字幕口语)覆盖不了书面词(成语/术语)——
-  降置信(×0.05)而非删除;blocklist 人工审阅;
-- **隐私**:overlay/user_bigrams 是行为画像 —— 本地存储、隐私开关、
-  reset CLI 三件套;
-- **性能**:热路径 HashMap 查询 O(1);每提交一次 UPSERT(低频,毫秒级);
-- **测试**:round 计划里既有测试全绿为硬约束;清洗 FST 后
-  rime_ice_smoke/global_ranking 两条 golden 线必须逐条复核(权重域整体
-  移动,可能出现需按新词频修订的断言 —— 修订须在清洗报告佐证下进行)。
-
-## 关联
-
-- 前置事实:round10(W1 词频驱动 single / W2 hermitdave 并入 / E1 bigram
-  嫁接先例);weight-scoring.md 的分数来源对照表
-- 用户原话:引擎必须记录用户输入的每一个词(含词典词与自造词),统计形成
-  overlay 词典,覆盖在已有词典之上,极大重塑预测结果,符合单一用户习惯;
-  先清洗词典(当前词典数据太差)。
+- 数据源:OpenSubtitles 中文词频(hermitdave/FrequencyWords,
+  `zh_50k.txt`,与英文侧 `hermitdave.tsv` 同源同格式,单字与词组同一
+  量纲);
+- 管线:`refine_dict.sh`(rime-ice TSV + zh_freq.tsv → 清洗规则 →
+  重建 FST)。规则:语料覆盖词条改 weight = 语料 count;未覆盖降置信
+  (×0.05);拟声/重复词 ×0.1;人名/诗性词删除;blocklist 人工审阅;
+- 验收:`jishi → 及时 #1`、`chushi → 出示 #1`;tc_dict_sample ≥ 98%;
+  golden 断言逐条复核(权重域整体移动,修订须以清洗报告佐证)。

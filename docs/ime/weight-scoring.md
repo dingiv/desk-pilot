@@ -3,6 +3,8 @@
 > **状态: ✅ 已实现(2026-08-10 大改版;2026-09-01 round10 精准度改版)。**
 > 打分参数全部可配(`swift-ime.yaml` → `weights`);调试模式
 > (`debug.candidate_meta`)可在候选词后直接显示 `[score family/source]`。
+> round17–19 起,排序前还会经过 **overlay 三级覆盖**(L1 > L2 > L3,
+> 种子词同刻度换算 → 排序兼容),详见 [overlay.md](overlay.md)。
 
 ## round10 改版摘要(2026-09-01,评测驱动)
 
@@ -162,7 +164,9 @@ emoji 提交不进拼音单词本(它们会吃 phrase+recent 双重加成霸榜)
 
 ### Recent member(近期指数权重合成)
 
-提交时记录词 + wall-clock 时间戳;候选再次出现时按距上次使用分档:
+提交时记录词 + wall-clock 时间戳(round16 起由 MemoryLayer 的 recent 表
+承载,round19 起时间统计 L1/L2 分表、tier 三级穿透);候选再次出现时
+按距上次使用分档:
 
 | 距上次使用 | 近期指数 b |
 |---|---|
@@ -285,18 +289,21 @@ predict(input)
   tc_draft 手工 16 条维持 14/16(`jishi→即使`/`chushi→初始` #2:语料词频
   及时≈即使、出示≈初始,log₂ 刻度同分,属数据粒度问题非排序逻辑)。
 
-## 分数来源对照表(第六轮 D3)
+## 分数来源对照表(第六轮 D3 立表,W3/round19 修订)
 
 | 家族/成员 | 分数来源 | 刻度 | 代码 |
 |---|---|---|---|
 | pinyin lattice(全拼/混写/简拼/前缀) | `FreqScale` log₂ 归一:`log2(freq+1)/log2(max+1)`,clamp [0.25, 0.90];max=0 → 索引实际最大词频(auto) | 连续 [0.25, 0.90] | `lattice.rs freq_to_score` |
-| english exact | 固定 `weights.exact`(0.88),词频不参与 | 常数 | `english.rs predict` |
-| english prefix | 四档词频(`frequency_band`:0.90/0.70/0.50/0.35/0.25)× 匹配率,叠 `prefix_base + prefix_quality` | 地板+质量式 | `english.rs query_layer` |
+| pinyin overlay 覆盖/独立候选(round19) | 同上 `freq_to_score(有效频率)`(基础频率 + count 增强);种子词继承原频率 → 排序兼容 | 同 lattice 刻度 | `merged.rs` |
+| pinyin chain(round15 链式预测) | 缓存基线分继承,下游段重算 | 继承 lattice 刻度 | `pinyin/mod.rs` source="chain" |
+| english exact | **W3 词频化**:`exact(0.88) + exact_quality(0.08) × frequency_band(词分)`,user 层再乘 `user_boost` | 常数+词频质量 | `english.rs query_layer` |
+| english prefix | `prefix_base(0.60) 地板 + prefix_quality(0.25) × 词频 × 匹配率`(`frequency_band` 四档离散) | 地板+质量式 | `english.rs query_layer` |
 | pinyin 成员常数 | `PinyinWeights`(phrase_base/step 曲线、jianpin 折扣、prefix_lookup 等) | 常数表 | `pinyin/mod.rs` |
 | 跨家族合成 | `final = raw × (priority / 100)`;同文本去重取高分 | 全局 | `family/mod.rs rank_detailed` |
 
 注意:`freq_to_score` 在 lattice(log₂ 连续)与 english 的 `frequency_band`
-(四档离散)是**两套刻度**,不要混用调参。
+(四档离散)是**两套刻度**,不要混用调参。overlay 的有效频率属于前者
+(词典域频率,经 `freq_to_score` 换算),见 [overlay.md](overlay.md)。
 
 ## 中英能力矩阵(第六轮 D6)
 

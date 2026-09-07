@@ -4,8 +4,9 @@
 > 引擎落地为 `crates/ime-core` + `apps/swift-ime`(fcitx5 C ABI 手写在
 > `apps/swift-ime/src/frontends/fcitx5.rs`,没有 cbindgen/ime-core-ffi;
 > voice 走 `ime-core` io_thread 的推送刷新,没有 bridge.rs/100ms 轮询)。
-> 逐轮变更见 `docs/ime/issues-round*.md`;as-built 见
-> `fcitx5-integration.md` / `input-router.md` / `eventloop.md`。
+> 逐轮变更历史见 `docs/ime/changelog.md`(原 issues-round*.md 已并入);
+> as-built 见 `pinyin.md` / `weight-scoring.md` / `overlay.md` /
+> `input-router.md` / `fcitx5-integration.md`。
 
 ## 定位：秘书系统的"写"之手
 
