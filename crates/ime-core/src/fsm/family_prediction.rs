@@ -586,14 +586,27 @@ impl SessionState {
         if ch == '\'' {
             // round22 链式高亮锚点:分链那一刻捕获面板高亮词(供
             // `yibu'#freq/up` 类上下文命令定位操作对象)。
-            if let Some(word) = self
+            // round24:锚点必须是**拼音词条** —— ASCII 直通/english exact
+            // (如 mingling 页的 "mingling" 本身)可能以跨家族高分占据面板
+            // 首位,把它当操作对象会让 #freq 把记账记在拼音串头上(实测
+            // 调整不生效的根因)。高亮落在非拼音候选上时,回退到面板中
+            // 第一个拼音家族候选(捕获时刻冻结,不随后续预测漂移)。
+            let anchor = self
                 .panel
-                .items
+                .meta
                 .get(self.panel.highlight)
-                .filter(|w| !w.is_empty())
-            {
-                self.chain_anchor = Some(word.clone());
-            }
+                .filter(|m| m.family == "pinyin")
+                .map(|_| self.panel.items[self.panel.highlight].clone())
+                .or_else(|| {
+                    self.panel
+                        .items
+                        .iter()
+                        .zip(self.panel.meta.iter())
+                        .find(|(_, m)| m.family == "pinyin")
+                        .map(|(w, _)| w.clone())
+                })
+                .filter(|w| !w.is_empty());
+            self.chain_anchor = anchor;
             if let Some(tx) = env.voice_cmd_tx() {
                 tx.send(crate::io_thread::VoiceCmd::FlushParagraph);
             }

@@ -248,7 +248,21 @@ impl SessionState {
             }
             ChainSeg::Text(t) => {
                 let ranked = env.scorer().rank_detailed(t, &self.context);
-                let texts: Vec<String> = ranked.into_iter().map(|c| c.text).take(8).collect();
+                // 链式上游是拼音文本段:候选页只保留拼音家族 —— 否则 ASCII
+                // 直通/english exact(如 mingling 本身)会以跨家族高分占据
+                // 上游首位,#freq 类感知上下文的命令拿 first_text() 时拿
+                // 到的是拼音串而不是用户看到并要操作的目标词(round24)。
+                // 过滤后为空(非拼音输入)则回退全家族序。
+                let mut texts: Vec<String> = ranked
+                    .iter()
+                    .filter(|c| c.family == "pinyin")
+                    .map(|c| c.text.clone())
+                    .collect();
+                if texts.is_empty() {
+                    texts = ranked.into_iter().map(|c| c.text).collect();
+                } else {
+                    texts.truncate(8);
+                }
                 if upstream_first.is_empty() {
                     texts
                 } else {

@@ -175,7 +175,6 @@ impl MemoryLayer {
         let rel = (e.count as f64 / mean).clamp(REL_FLOOR, REL_CEIL);
         let incr = (FREQ_GAIN_UNIT * rel / (e.count as f64 + FREQ_HARMONIC_SAT)) as i64;
         e.delta = (e.delta + incr).min(DELTA_ORGANIC_CAP);
-        drop(e);
         self.bump();
         // 时间表:独立一行(分表,不与频率统计混存)。
         self.recent.insert(word.to_string(), now_ms);
@@ -207,7 +206,6 @@ impl MemoryLayer {
             e.base = seed_base.unwrap_or(SELF_GEN_FREQUENCY).max(1);
         }
         e.delta = (e.delta + step).clamp(-DELTA_CEIL, DELTA_CEIL);
-        drop(e);
         self.bump();
     }
 
