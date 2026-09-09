@@ -460,6 +460,13 @@ impl SessionState {
     pub fn select_magic(&mut self, index: usize, env: &dyn StepEnv) -> ImeView {
         let n_preds = self.magic.predictions.len();
         let n_hints = self.magic.hints.len();
+        // round24:本页提交前是否有活跃 #asr 会话(语音候选上屏后要归档段落)。
+        let was_voice = self
+            .magic
+            .active
+            .as_ref()
+            .map(|m| m.name() == "asr")
+            .unwrap_or(false);
         // 1. 精确匹配的预测选项。
         if index < n_preds {
             let pred = self.magic.predictions[index].clone();
@@ -485,6 +492,14 @@ impl SessionState {
             // 提交用 commit_text(展示转义时原文提交),光标针对展示文本。
             let commit = pred.commit_value().to_string();
             self.commit_text(&commit, None);
+            // round24:语音候选上屏 = 用户"拿走"了这段话 —— 与分链 `'` 同一
+            // 语义,让 aura 立即归档开放段落(整窗 batch,跳过 merge_gap
+            // 等待);无语音会话时服务端自愈,零开销。
+            if was_voice {
+                if let Some(tx) = env.voice_cmd_tx() {
+                    tx.send(crate::io_thread::VoiceCmd::FlushParagraph);
+                }
+            }
             return match pred.cursor {
                 Some(c) => commit_view_at(&commit, c),
                 None => commit_view(&commit),
