@@ -137,6 +137,11 @@ pub trait FamilyEnv: Send + Sync {
     fn adjust_word_freq(&self, _pinyin: &str, _word: &str, _step: i64) -> Option<(u64, u64)> {
         None
     }
+    /// 某拼音输入下被拉黑(delta < 0)的词条,|delta| 降序(round24,
+    /// #freq/up 恢复回退)。默认空 = 未接线。
+    fn downweighted_for(&self, _pinyin: &str) -> Vec<(String, i64)> {
+        Vec::new()
+    }
     /// 学短语(已在词典的词不入本)。
     fn learn_phrase(&self, _pinyin: &str, _hanzi: &str) {}
     /// 造词学习(逐字选择完成后整词入单词本)。

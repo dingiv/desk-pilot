@@ -143,6 +143,41 @@ impl WordBook {
         drop(l1);
         self.overlay_dict.lock().unwrap().recency_boost(word, now_ms)
     }
+
+    /// 手工增量查询(round24,#freq 拉黑/加权消费侧):L1 → L2 三级穿透,
+    /// 要求拼音映射对 == 查询拼音(同预测选项语义)。增量仅在
+    /// `#freq/up|down` 产生:负 = 用户显式降权,正 = 显式加权(也可能含
+    /// 有机增量 —— 有机永不产生负笔,负号即拉黑信号)。
+    pub fn manual_delta(&self, pinyin: &str, word: &str) -> Option<i64> {
+        if let Some(e) = self.memory.lock().unwrap().freq_entry(word) {
+            if !e.pinyin.is_empty() && e.pinyin == pinyin {
+                return Some(e.delta);
+            }
+        }
+        let l2 = self.overlay_dict.lock().unwrap();
+        let e = l2.freq_entry(word)?;
+        (!e.pinyin.is_empty() && e.pinyin == pinyin).then_some(e.delta)
+    }
+
+    /// 某拼音输入下被拉黑(delta < 0)的词条,|delta| 降序(round24):
+    /// L1 ∪ L2(#freq/up 恢复回退 —— 被拉黑词已沉出候选页、高亮不到,
+    /// up 的对象按“恢复我拉黑过的词”回退定位)。
+    pub fn downweighted_for(&self, pinyin: &str) -> Vec<(String, i64)> {
+        let mut out: Vec<(String, i64)> = self
+            .memory
+            .lock()
+            .unwrap()
+            .downweighted(pinyin);
+        let l2 = self.overlay_dict.lock().unwrap();
+        for (w, d) in l2.downweighted(pinyin) {
+            if !out.iter().any(|(rw, _)| rw == &w) {
+                out.push((w, d));
+            }
+        }
+        out.sort_by_key(|(_, d)| -d.abs());
+        out.dedup();
+        out
+    }
 }
 
 /// 拼音册:自生词短语本(recency 已归 [`WordBook::memory`])。

@@ -275,6 +275,15 @@ impl MemoryLayer {
         self.freq.get(word)
     }
 
+    /// 某拼音下被拉黑(delta < 0)的词条(round24,#freq/up 恢复回退)。
+    pub fn downweighted(&self, pinyin: &str) -> Vec<(String, i64)> {
+        self.freq
+            .iter()
+            .filter(|(_, e)| e.delta < 0 && !e.pinyin.is_empty() && e.pinyin == pinyin)
+            .map(|(w, e)| (w.clone(), e.delta))
+            .collect()
+    }
+
     /// 时间表条目(只读;诊断 / flush 合并 / 三级穿透)。
     pub fn recent_ms(&self, word: &str) -> Option<i64> {
         self.recent.get(word).copied()

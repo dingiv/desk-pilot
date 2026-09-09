@@ -828,6 +828,9 @@ impl crate::family::FamilyEnv for ImeEngine {
         let seed = self.pinyin_family.seed_frequency(pinyin, word);
         self.wordbook.adjust_freq(pinyin, word, step, seed)
     }
+    fn downweighted_for(&self, pinyin: &str) -> Vec<(String, i64)> {
+        self.wordbook.downweighted_for(pinyin)
+    }
     fn compose_single_chars(
         &self,
         input: &str,

@@ -132,6 +132,17 @@ impl MagicMember for FreqMember {
         }
         let root = upstream.root_text.clone();
 
+        // round24:up 恢复回退 —— 被拉黑词已沉出候选页、高亮不到;若锚点
+        // 词本身没有负增量而该输入下存在拉黑词,up 的操作对象回退到
+        // |delta| 最大的拉黑词("恢复我拉黑过的词")。
+        let mut word = word;
+        if Self::parse(input).0 == Some(1) {
+            let dw = env.downweighted_for(&root);
+            if !dw.is_empty() && !dw.iter().any(|(w, _)| *w == word) {
+                word = dw[0].0.clone();
+            }
+        }
+
         // 结果视图(同词条已记账):回显**完整命令形态** + 变化量,
         // 空格提交该词(round23:选中档位后提示补全为 women'#freq/down/1000)。
         if let Some(a) = &self.applied {

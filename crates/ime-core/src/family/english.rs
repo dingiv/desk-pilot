@@ -721,6 +721,32 @@ impl CandidateFamily for EnglishFamily {
             &mut out,
         );
 
+        // ── round24:overlay 手工覆盖消费侧(#freq 拉黑/加权)——
+        // 拼音侧 MergedDict 覆盖的英文对齐。#freq/down 产生负增量(有机
+        // 记账永不为负,负号 = 用户显式拉黑)→ 本尊 exact 降权一档
+        // (×short_word_penalty,0.90→0.54,优先级后 0.378,让位中文
+        // lattice 顶词);#freq/up → 质量档顶格(0.952,压过普通 exact)。
+        // 语料频率不动,只覆盖本尊命中 —— 与拼音侧 "用户意图覆盖语料"
+        // 同构。
+        if let Some(delta) = self.wordbook.manual_delta(&input_lower, &input_lower) {
+            let boost_top = self.weights.exact + self.weights.exact_quality * 0.90;
+            for c in out.iter_mut() {
+                if c.text.to_ascii_lowercase() != input_lower {
+                    continue;
+                }
+                match c.source {
+                    "exact" | "user" => {
+                        if delta < 0 {
+                            c.raw_score *= self.weights.short_word_penalty;
+                        } else if delta > 0 {
+                            c.raw_score = c.raw_score.max(boost_top);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // ── E2:近期使用加权(排序前;刚提交过的词浮上来)──
         self.apply_recency(&mut out);
 
