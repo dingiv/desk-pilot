@@ -318,6 +318,13 @@ pub trait MagicMember: Send + Sync {
         let _ = (index, text, ctx, env); // 默认:无交互副作用
     }
 
+    /// 交互 pick 之后的落点(round24):`Some(pred)` = 会话终结,`pred`
+    /// (必须非 interactive)直接上屏、组合结束 —— 元命令(#freq)记账
+    /// 完成后结果不再浮在候选框里;`None` = 默认,重新预测替换选项。
+    fn after_pick(&mut self) -> Option<Prediction> {
+        None
+    }
+
     /// 该命令注册的**全部完整触发路径**(不含 `#`)。默认 = 命令名 + 别名;
     /// addon 成员覆盖为配置里的所有路径(`eg`、`eg/name`、`eg1`…)。
     /// 框架据此做完整路径精确匹配(执行)与前缀预测(补全)。

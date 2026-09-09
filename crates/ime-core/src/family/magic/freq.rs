@@ -15,7 +15,9 @@
 //! ```
 //!
 //! 步长是**量化菜单**而非一次性大步:细调(+10/+100)粗调(+1000/+10000)
-//! 由用户指尖决定;±0 = 只看不改(选中后直接进结果视图,空格提交词)。
+//! 由用户指尖决定;±0 = 只看不改。round24:结果**直接上屏** —— 完整命令
+//! (带数字参数,空格触发)与菜单选档后均上屏 `词: 原 → 新` 并结束组合,
+//! 不再浮交互式结果视图。
 
 use super::member::{ChainContext, ContextKind, MagicMember, Prediction};
 use super::FamilyEnv;
@@ -26,31 +28,27 @@ pub const FREQ_STEPS: [i64; 5] = [0, 1_000, 10_000, 100_000, 1_000_000];
 
 /// 菜单态:最近一次 `#freq/up|down` 预测的上下文(pick 时据此记账)。
 struct MenuState {
-    input: String,
     word: String,
     root: String,
     dir: i64,
     effective: u64,
 }
 
-/// 结果态:已记账,回显完整命令形态(`women'#freq/down/1000`)+ 变化量。
-struct AppliedState {
-    /// 触发本次记账的命令输入(菜单态 = "#freq/up";带参态 = "#freq/up/10000")。
-    input: String,
-    word: String,
-    cmd: String,
-    before: u64,
-    after: u64,
+/// 结果文本(单一出口:`词: 原 → 新`,round24 直接上屏 —— 完整命令
+/// 触发或菜单选档后组合即结束,不再浮交互式结果视图)。
+fn result_text(word: &str, before: u64, after: u64) -> String {
+    format!("{word}: {before} → {after}")
 }
 
 pub struct FreqMember {
     menu: Option<MenuState>,
-    applied: Option<AppliedState>,
+    /// pick 后待上屏的结果文本(round24:选档即终结会话)。
+    pending_commit: Option<String>,
 }
 
 impl FreqMember {
     pub fn new() -> Self {
-        FreqMember { menu: None, applied: None }
+        FreqMember { menu: None, pending_commit: None }
     }
 
     /// 命令输入 → (方向, 步长参数)。方向:Some(1)=up / Some(-1)=down /
@@ -72,21 +70,6 @@ impl FreqMember {
     /// 建账,返回建账后的有效频率,避免首查显示 0)。
     fn effective_of(env: &dyn FamilyEnv, root: &str, word: &str) -> Option<u64> {
         env.adjust_word_freq(root, word, 0).map(|(_, after)| after)
-    }
-
-    /// 结果视图(单一出口:完整命令 · before → after)。**interactive**:
-    /// #freq 是元命令,不得有文本提交副作用 —— force_fire 的
-    /// fire-and-commit 语义会把被调词顺手提交,recency(g≈0.70)与有机
-    /// 增量会当场淹没调整(down 变净升,round23 实测 0.545 → 0.717)。
-    /// Esc 退出会话即可。
-    fn result_view(&self) -> Vec<Prediction> {
-        let Some(a) = &self.applied else {
-            return Vec::new();
-        };
-        vec![Prediction::interactive(format!(
-            "{} · {} → {}",
-            a.cmd, a.before, a.after
-        ))]
     }
 }
 
@@ -143,33 +126,16 @@ impl MagicMember for FreqMember {
             }
         }
 
-        // 结果视图(同词条已记账):回显**完整命令形态** + 变化量,
-        // 空格提交该词(round23:选中档位后提示补全为 women'#freq/down/1000)。
-        if let Some(a) = &self.applied {
-            if a.word == word && a.input == input {
-                return self.result_view();
-            }
-        }
-        self.applied = None;
-
         let (dir_of, mag) = Self::parse(input);
-        // 完整命令形态(#freq/down/1000):带参直接执行(幂等:同输入同词只记一次)。
+        // 完整命令形态(#freq/down/1000):带参直接执行,结果**直接上屏**
+        // (round24:`词: 原 → 新`,组合即结束 —— 不再浮交互式结果视图;
+        // force_fire 的 fire-and-commit 在此恰好是需要的语义,上屏的是
+        // 结果文本,不是被调词)。
         if let (Some(dir), Some(step)) = (dir_of, mag) {
-            let Some(eff) = Self::effective_of(env, &root, &word) else {
-                return vec![Prediction::interactive("(词频调整未接线)")];
-            };
-            let _ = eff;
             let (before, after) = env
                 .adjust_word_freq(&root, &word, step * dir)
                 .unwrap_or((0, 0));
-            self.applied = Some(AppliedState {
-                input: input.to_string(),
-                word: word.clone(),
-                cmd: format!("{root}'#freq/{}/{}", if dir > 0 { "up" } else { "down" }, step),
-                before,
-                after,
-            });
-            return self.result_view();
+            return vec![Prediction::commit(result_text(&word, before, after))];
         }
         match dir_of {
             None => {
@@ -185,7 +151,6 @@ impl MagicMember for FreqMember {
                     return vec![Prediction::interactive("(词频调整未接线)")];
                 };
                 self.menu = Some(MenuState {
-                    input: input.to_string(),
                     word: word.clone(),
                     root,
                     dir,
@@ -220,18 +185,13 @@ impl MagicMember for FreqMember {
         let (before, after) = env
             .adjust_word_freq(&menu.root, &menu.word, delta)
             .unwrap_or((menu.effective, menu.effective));
-        self.applied = Some(AppliedState {
-            input: menu.input,
-            word: menu.word,
-            cmd: format!(
-                "{}'#freq/{}/{}",
-                menu.root,
-                if menu.dir > 0 { "up" } else { "down" },
-                step
-            ),
-            before,
-            after,
-        });
+        // round24:选档即终结 —— 结果待 after_pick 上屏,不再浮结果视图。
+        self.pending_commit = Some(result_text(&menu.word, before, after));
+    }
+
+    fn after_pick(&mut self) -> Option<Prediction> {
+        let text = self.pending_commit.take()?;
+        Some(Prediction::commit(text))
     }
 
     /// 无上游的单独调用:提示链式用法(选中不上屏)。

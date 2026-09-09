@@ -462,9 +462,19 @@ impl SessionState {
                 return self.force_fire(env);
             }
             if pred.interactive {
-                // 交互式:传给命令 → 重新预测,替换选项(不上屏)。
+                // 交互式:传给命令 → pick。round24:成员可在 pick 后终结
+                // 会话(after_pick 返回非交互预测 = 直接上屏,#freq 选档);
+                // 否则重新预测,替换选项(不上屏)。
                 if let Some(mut m) = self.magic.active.take() {
                     m.pick(index, &pred.text, self.ctx, env);
+                    let follow = m.after_pick();
+                    if let Some(p) = follow {
+                        self.clear_active_command();
+                        self.reset();
+                        let commit = p.commit_value().to_string();
+                        self.commit_text(&commit, None);
+                        return commit_view(&commit);
+                    }
                     self.magic.active = Some(m);
                 }
                 return self.query_magic(env);
